@@ -242,3 +242,6 @@ pub fun user_ok(pml4: u64, va: u64, len: u64, write: u8) u8 {
     }
     ret 1;
 }
+
+# where physical memory is visible to the kernel
+pub fun phys_to_virt(pa: u64) u64 { ret pa + hhdm; }

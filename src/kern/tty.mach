@@ -1,8 +1,9 @@
 # the console terminal: keyboard and serial bytes come in here, get line
 # edited (echo, backspace, ^C, ^D) and wait in `ready` until a reader takes
-# whole lines
+# whole lines. ^C kills the foreground process group
 
 use kprint: machos.kern.kprint;
+use proc:   machos.kern.proc;
 
 val LINE: u64 = 256;
 val RING: u64 = 4096;
@@ -14,7 +15,7 @@ var ring: [4096]u8;
 var head: u64 = 0;  # next byte to read
 var count: u64 = 0; # bytes waiting
 var eofs: u64 = 0;  # pending ^D on an empty line, each reads as end of file
-var interrupts: u64 = 0;
+var fg: u64 = 0;    # process group ^C is delivered to, 0 = nobody
 
 fun push(c: u8) {
     if (count == RING) { ret; }
@@ -29,6 +30,7 @@ fun commit() {
         i = i + 1;
     }
     line_len = 0;
+    proc.wakeup(proc.CHAN_TTY);
 }
 
 # one input byte from a device
@@ -40,12 +42,16 @@ pub fun input(raw: u8) {
     if (c == 3) {
         kprint.puts("^C\n\0");
         line_len = 0;
-        interrupts = interrupts + 1;
+        if (fg != 0) { proc.kill_group(fg); }
         ret;
     }
     if (c == 4) {
-        if (line_len == 0) { eofs = eofs + 1; }
-        or                 { commit(); }
+        if (line_len == 0) {
+            eofs = eofs + 1;
+            proc.wakeup(proc.CHAN_TTY);
+        } or {
+            commit();
+        }
         ret;
     }
     if (c == 8) {
@@ -96,9 +102,4 @@ pub fun read(buf: *u8, n: u64) u64 {
     ret i;
 }
 
-# ^C presses since the last call
-pub fun take_interrupts() u64 {
-    val n: u64 = interrupts;
-    interrupts = 0;
-    ret n;
-}
+pub fun set_foreground(group: u64) { fg = group; }

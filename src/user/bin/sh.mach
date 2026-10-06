@@ -1,0 +1,607 @@
+# sh: the MachOS shell.
+#   words, 'single' and "double" quotes, \escapes, $? (last status), # comments
+#   a | b | c        pipelines
+#   < f  > f  >> f   redirections
+#   a ; b   a && b   a || b   a &   sequencing, conditionals, background
+#   builtins: cd pwd exit help jobs
+# usage: sh                 interactive on the console
+#        sh FILE            run the commands in FILE
+#        sh -c 'COMMANDS'   run COMMANDS
+
+use abi: machos.abi.sys;
+use sys: machos.user.sys;
+use io:  machos.user.io;
+use rt:  machos.user.rt;
+
+val T_WORD:   u8 = 1;
+val T_PIPE:   u8 = 2;
+val T_IN:     u8 = 3;
+val T_OUT:    u8 = 4;
+val T_APPEND: u8 = 5;
+val T_SEMI:   u8 = 6;
+val T_AND:    u8 = 7;
+val T_OR:     u8 = 8;
+val T_BG:     u8 = 9;
+
+val MAX_TOK:  u64 = 128;
+val WBUF:     u64 = 4096;
+val MAX_CMDS: u64 = 8;
+val MAX_BG:   u64 = 16;
+val NONE:     u64 = 0xFFFFFFFFFFFFFFFF;
+val STATUS_MARK: u8 = 1; # stands for $? inside a word until it runs
+
+var tk: [128]u8;  # token kinds
+var ts: [128]u64; # word start in wbuf
+var tl: [128]u64; # word length
+var ntok: u64 = 0;
+var wbuf: [4096]u8;
+var wlen: u64 = 0;
+var overflow: u8 = 0;
+
+var status: u64 = 0;
+var bg: [16]u64;
+var nbg: u64 = 0;
+var quit: u8 = 0;
+var interactive: u8 = 0;
+
+fun is_space(c: u8) u8 {
+    if (c == 32 || c == 9 || c == 10 || c == 13) { ret 1; }
+    ret 0;
+}
+
+fun is_special(c: u8) u8 {
+    if (c == 124 || c == 60 || c == 62 || c == 59 || c == 38) { ret 1; }
+    ret 0;
+}
+
+fun push(c: u8) {
+    if (wlen + 1 >= WBUF) {
+        overflow = 1;
+        ret;
+    }
+    wbuf[wlen] = c;
+    wlen = wlen + 1;
+}
+
+fun add(kind: u8, start: u64, n: u64) u8 {
+    if (ntok == MAX_TOK) { ret 0; }
+    tk[ntok] = kind;
+    ts[ntok] = start;
+    tl[ntok] = n;
+    ntok = ntok + 1;
+    ret 1;
+}
+
+fun word(t: u64) *u8 { ret ?wbuf[ts[t]]; }
+
+# copy word `t` into out[0..cap) with $? replaced by the current status;
+# returns the length (NUL written after it), or NONE if it does not fit
+fun expand(t: u64, out: *u8, cap: u64) u64 {
+    val w: *u8 = word(t);
+    var n: u64 = 0;
+    var i: u64 = 0;
+    for (i < tl[t]) {
+        if (w[i] == STATUS_MARK) {
+            var num: [20]u8;
+            val k: u64 = io.fmt_dec(status, ?num[0]);
+            if (n + k >= cap) { ret NONE; }
+            io.copy(?out[n], ?num[0], k);
+            n = n + k;
+        } or {
+            if (n + 1 >= cap) { ret NONE; }
+            out[n] = w[i];
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    out[n] = 0;
+    ret n;
+}
+
+fun syntax(msg: *u8) u8 {
+    io.err("sh: \0");
+    io.err(msg);
+    io.err("\n\0");
+    status = 2;
+    ret 0;
+}
+
+# split line[0..n] into tokens; 0 (after printing why) if it is malformed
+fun lex(line: *u8, n: u64) u8 {
+    ntok = 0;
+    wlen = 0;
+    overflow = 0;
+    var i: u64 = 0;
+    for (i < n) {
+        val c: u8 = line[i];
+        if (is_space(c) != 0) {
+            i = i + 1;
+            cnt;
+        }
+        if (c == 35) { brk; } # comment
+        var next: u8 = 0;
+        if (i + 1 < n) { next = line[i + 1]; }
+        var op: u8 = 0;
+        var oplen: u64 = 1;
+        if (c == 124) {
+            op = T_PIPE;
+            if (next == 124) { op = T_OR; oplen = 2; }
+        } or (c == 38) {
+            op = T_BG;
+            if (next == 38) { op = T_AND; oplen = 2; }
+        } or (c == 59) {
+            op = T_SEMI;
+        } or (c == 60) {
+            op = T_IN;
+        } or (c == 62) {
+            op = T_OUT;
+            if (next == 62) { op = T_APPEND; oplen = 2; }
+        }
+        if (op != 0) {
+            if (add(op, 0, 0) == 0) { ret syntax("too many words\0"); }
+            i = i + oplen;
+            cnt;
+        }
+
+        val start: u64 = wlen;
+        for (i < n && is_space(line[i]) == 0 && is_special(line[i]) == 0) {
+            val d: u8 = line[i];
+            if (d == 39) { # 'literal'
+                i = i + 1;
+                for (i < n && line[i] != 39) {
+                    push(line[i]);
+                    i = i + 1;
+                }
+                if (i >= n) { ret syntax("unterminated '\0"); }
+                i = i + 1;
+            } or (d == 34) { # "with \escapes and $?"
+                i = i + 1;
+                for (i < n && line[i] != 34) {
+                    if (line[i] == 36 && i + 1 < n && line[i + 1] == 63) {
+                        push(STATUS_MARK);
+                        i = i + 2;
+                        cnt;
+                    }
+                    if (line[i] == 92 && i + 1 < n) { i = i + 1; }
+                    push(line[i]);
+                    i = i + 1;
+                }
+                if (i >= n) { ret syntax("unterminated \"\0"); }
+                i = i + 1;
+            } or (d == 92 && i + 1 < n) {
+                push(line[i + 1]);
+                i = i + 2;
+            } or (d == 36 && i + 1 < n && line[i + 1] == 63) { # $?, expanded when run
+                push(STATUS_MARK);
+                i = i + 2;
+            } or {
+                push(d);
+                i = i + 1;
+            }
+        }
+        val wl: u64 = wlen - start;
+        push(0);
+        if (add(T_WORD, start, wl) == 0) { ret syntax("too many words\0"); }
+    }
+    if (overflow != 0) { ret syntax("line too long\0"); }
+    ret 1;
+}
+
+fun write_to(h: u64, s: *u8) { io.write_all(h, s, io.len(s)); }
+
+fun cwd(buf: *u8, cap: u64) u64 {
+    val n: u64 = sys.getcwd(buf, cap);
+    if (abi.is_err(n) != 0 || n > cap) { ret 0; }
+    ret n;
+}
+
+fun help(out: u64) {
+    write_to(out, "MachOS shell. builtins:\n\0");
+    write_to(out, "  cd [DIR]    change directory (default /)\n\0");
+    write_to(out, "  pwd         print the current directory\n\0");
+    write_to(out, "  exit [N]    leave the shell\n\0");
+    write_to(out, "  jobs        list background jobs\n\0");
+    write_to(out, "  help        this text\n\0");
+    write_to(out, "syntax: a | b, < f, > f, >> f, a ; b, a && b, a || b, a &, 'q', \"q\", $?\n\0");
+    write_to(out, "programs live in /bin: try `ls /bin`\n\0");
+}
+
+# run a builtin if `name` is one; returns 0 if it is not
+fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
+    if (io.streq(name, "cd\0") != 0) {
+        var dir: *u8 = "/\0";
+        if (argc > 1) { dir = args[1]; }
+        val r: u64 = sys.chdir(dir, io.len(dir));
+        if (abi.is_err(r) != 0) {
+            io.fail("cd\0", dir, r);
+            status = 1;
+        } or {
+            status = 0;
+        }
+        ret 1;
+    }
+    if (io.streq(name, "pwd\0") != 0) {
+        var buf: [256]u8;
+        val n: u64 = cwd(?buf[0], 256);
+        io.write_all(out, ?buf[0], n);
+        write_to(out, "\n\0");
+        status = 0;
+        ret 1;
+    }
+    if (io.streq(name, "exit\0") != 0) {
+        var code: u64 = status;
+        if (argc > 1) {
+            var okk: u8 = 0;
+            code = io.parse_dec(args[1], io.len(args[1]), ?okk);
+        }
+        status = code;
+        quit = 1;
+        ret 1;
+    }
+    if (io.streq(name, "help\0") != 0) {
+        help(out);
+        status = 0;
+        ret 1;
+    }
+    if (io.streq(name, "jobs\0") != 0) {
+        var i: u64 = 0;
+        for (i < nbg) {
+            write_to(out, "[\0");
+            var num: [20]u8;
+            io.write_all(out, ?num[0], io.fmt_dec(bg[i], ?num[0]));
+            write_to(out, "] running\n\0");
+            i = i + 1;
+        }
+        status = 0;
+        ret 1;
+    }
+    ret 0;
+}
+
+fun is_builtin(name: *u8) u8 {
+    if (io.streq(name, "cd\0") != 0 || io.streq(name, "pwd\0") != 0 ||
+        io.streq(name, "exit\0") != 0 || io.streq(name, "help\0") != 0 ||
+        io.streq(name, "jobs\0") != 0) { ret 1; }
+    ret 0;
+}
+
+# "/bin/" + name unless name already has a slash; 0 if it does not exist
+fun resolve(name: *u8, out: *u8) u64 {
+    val n: u64 = io.len(name);
+    var has_slash: u8 = 0;
+    var i: u64 = 0;
+    for (i < n) {
+        if (name[i] == 47) { has_slash = 1; }
+        i = i + 1;
+    }
+    var len: u64 = 0;
+    if (has_slash == 0) {
+        if (n + 5 >= 256) { ret 0; }
+        io.copy(out, "/bin/\0", 5);
+        io.copy(?out[5], name, n);
+        len = n + 5;
+    } or {
+        if (n >= 256) { ret 0; }
+        io.copy(out, name, n);
+        len = n;
+    }
+    out[len] = 0;
+    var st: abi.Stat;
+    val r: u64 = sys.stat(out, len, ?st);
+    if (abi.is_err(r) != 0 || st.kind != abi.KIND_FILE) { ret 0; }
+    ret len;
+}
+
+fun close_if(h: u64, keep: u64) {
+    if (h != NONE && h != keep) { sys.close(h); }
+}
+
+# the handle a redirection opens, or NONE after saying why
+fun redirect(kind: u8, f: *u8) u64 {
+    var flags: u64 = abi.O_READ;
+    if (kind == T_OUT) { flags = abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC; }
+    if (kind == T_APPEND) { flags = abi.O_WRITE | abi.O_CREATE | abi.O_APPEND; }
+    val h: u64 = sys.open(f, io.len(f), flags);
+    if (abi.is_err(h) != 0) {
+        io.fail("sh\0", f, h);
+        ret NONE;
+    }
+    ret h;
+}
+
+# tokens [a, b) are one pipeline
+fun run_pipeline(a: u64, b: u64, background: u8) {
+    var cs: [8]u64;
+    var ce: [8]u64;
+    var k: u64 = 0;
+    var s: u64 = a;
+    var t: u64 = a;
+    for (t <= b) {
+        if (t == b || tk[t] == T_PIPE) {
+            if (k == MAX_CMDS) { syntax("pipeline too long\0"); ret; }
+            if (t == s) { syntax("empty command\0"); ret; }
+            cs[k] = s;
+            ce[k] = t;
+            k = k + 1;
+            s = t + 1;
+        }
+        t = t + 1;
+    }
+
+    var pids: [8]u64;
+    var spawned: u64 = 0;
+    var group: u64 = 0;
+    var prev_read: u64 = NONE;
+    var c: u64 = 0;
+    for (c < k) {
+        var in: u64 = abi.STDIN;
+        if (prev_read != NONE) { in = prev_read; }
+        var out: u64 = abi.STDOUT;
+        var next_read: u64 = NONE;
+        if (c + 1 < k) {
+            var ends: [2]u64;
+            val r: u64 = sys.pipe(?ends);
+            if (abi.is_err(r) != 0) {
+                io.fail("sh\0", "pipe\0", r);
+                close_if(prev_read, NONE);
+                brk;
+            }
+            out = ends[1];
+            next_read = ends[0];
+        }
+
+        # arguments and redirections
+        var args: [32]*u8;
+        var argc: u64 = 0;
+        var abuf: [2048]u8;
+        var alen: u64 = 0;
+        var bad: u8 = 0;
+        var u: u64 = cs[c];
+        for (u < ce[c] && bad == 0) {
+            if (tk[u] == T_WORD) {
+                val wl: u64 = expand(u, ?abuf[alen], 2048 - alen);
+                if (argc == 31 || wl == NONE) {
+                    syntax("too many arguments\0");
+                    bad = 1;
+                    brk;
+                }
+                args[argc] = ?abuf[alen];
+                argc = argc + 1;
+                alen = alen + wl + 1;
+                u = u + 1;
+                cnt;
+            }
+            if (u + 1 >= ce[c] || tk[u + 1] != T_WORD) {
+                syntax("redirection needs a file name\0");
+                bad = 1;
+                brk;
+            }
+            var fname: [256]u8;
+            if (expand(u + 1, ?fname[0], 256) == NONE) {
+                syntax("file name too long\0");
+                bad = 1;
+                brk;
+            }
+            val h: u64 = redirect(tk[u], ?fname[0]);
+            if (h == NONE) {
+                status = 1;
+                bad = 1;
+                brk;
+            }
+            if (tk[u] == T_IN) {
+                close_if(in, abi.STDIN);
+                in = h;
+            } or {
+                close_if(out, abi.STDOUT);
+                out = h;
+            }
+            u = u + 2;
+        }
+        args[argc] = nil;
+        if (bad == 0 && argc == 0) {
+            syntax("missing command\0");
+            bad = 1;
+        }
+
+        if (bad == 0 && k == 1 && background == 0 && is_builtin(args[0]) != 0) {
+            builtin(args[0], argc, ?args[0], out);
+            close_if(in, abi.STDIN);
+            close_if(out, abi.STDOUT);
+            ret;
+        }
+
+        if (bad == 0) {
+            var full: [256]u8;
+            val fl: u64 = resolve(args[0], ?full[0]);
+            if (fl == 0) {
+                io.err(args[0]);
+                io.err(": command not found\n\0");
+                status = 127;
+            } or {
+                var g: u64 = group;
+                if (g == 0) { g = abi.NEW_GROUP; }
+                var how: abi.Spawn = abi.Spawn{ handles: [3]u64{in, out, abi.STDERR}, group: g };
+                val pid: u64 = sys.spawn(?full[0], fl, ?abuf[0], alen, ?how);
+                if (abi.is_err(pid) != 0) {
+                    io.fail("sh\0", args[0], pid);
+                    status = 126;
+                } or {
+                    pids[spawned] = pid;
+                    spawned = spawned + 1;
+                    if (group == 0) { group = pid; }
+                }
+            }
+        }
+        # the children hold their own references now
+        close_if(in, abi.STDIN);
+        close_if(out, abi.STDOUT);
+        prev_read = next_read;
+        c = c + 1;
+    }
+    close_if(prev_read, NONE);
+    if (spawned == 0) { ret; }
+
+    if (background != 0) {
+        var i: u64 = 0;
+        for (i < spawned) {
+            if (nbg < MAX_BG) {
+                bg[nbg] = pids[i];
+                nbg = nbg + 1;
+            }
+            i = i + 1;
+        }
+        io.out("[\0");
+        io.dec(group);
+        io.out("]\n\0");
+        status = 0;
+        ret;
+    }
+
+    sys.setfg(group);
+    var i: u64 = 0;
+    for (i < spawned) {
+        val r: u64 = sys.wait(pids[i]);
+        if (i + 1 == spawned) {
+            if (abi.is_err(r) != 0) { status = 1; }
+            or                      { status = r; }
+        }
+        i = i + 1;
+    }
+    sys.setfg(0);
+}
+
+# run every pipeline of the tokenized line, honouring ; && || &
+fun run_line() {
+    var i: u64 = 0;
+    var prev: u8 = T_SEMI;
+    for (i < ntok && quit == 0) {
+        var j: u64 = i;
+        for (j < ntok && tk[j] != T_SEMI && tk[j] != T_AND && tk[j] != T_OR && tk[j] != T_BG) {
+            j = j + 1;
+        }
+        var conn: u8 = T_SEMI;
+        if (j < ntok) { conn = tk[j]; }
+        if (j == i) {
+            syntax("empty command\0");
+            ret;
+        }
+        var go: u8 = 1;
+        if (prev == T_AND && status != 0) { go = 0; }
+        if (prev == T_OR && status == 0) { go = 0; }
+        if (go != 0) {
+            var background: u8 = 0;
+            if (conn == T_BG) { background = 1; }
+            run_pipeline(i, j, background);
+        }
+        prev = conn;
+        i = j + 1;
+    }
+}
+
+fun reap_jobs() {
+    var i: u64 = 0;
+    for (i < nbg) {
+        val r: u64 = sys.poll(bg[i]);
+        if (abi.is_err(r) != 0 && abi.err_code(r) == abi.E_AGAIN) {
+            i = i + 1;
+            cnt;
+        }
+        io.out("[\0");
+        io.dec(bg[i]);
+        io.out("] done\n\0");
+        bg[i] = bg[nbg - 1];
+        nbg = nbg - 1;
+    }
+}
+
+fun prompt() {
+    var buf: [256]u8;
+    val n: u64 = cwd(?buf[0], 256);
+    io.out("\x1b[1;32mmachos\x1b[0m:\x1b[1;34m\0");
+    io.outn(?buf[0], n);
+    io.out("\x1b[0m$ \0");
+}
+
+# lines from a handle: the console gives one per read, files get split
+var rbuf: [4096]u8;
+var rlen: u64 = 0;
+var rpos: u64 = 0;
+var reof: u8 = 0;
+
+# the next line (without its newline) into `line`, or NONE at the end
+fun getline(h: u64, line: *u8, cap: u64) u64 {
+    var n: u64 = 0;
+    for {
+        if (rpos == rlen) {
+            if (reof != 0) {
+                if (n > 0) { ret n; }
+                ret NONE;
+            }
+            val r: u64 = sys.read(h, ?rbuf[0], 4096);
+            if (abi.is_err(r) != 0 || r == 0) {
+                reof = 1;
+                cnt;
+            }
+            rlen = r;
+            rpos = 0;
+        }
+        val c: u8 = rbuf[rpos];
+        rpos = rpos + 1;
+        if (c == 10) { ret n; }
+        if (n < cap) {
+            line[n] = c;
+            n = n + 1;
+        }
+    }
+    ret n;
+}
+
+fun run_string(s: *u8, n: u64) {
+    if (lex(s, n) != 0) { run_line(); }
+}
+
+fun motd() {
+    val h: u64 = sys.open("/etc/motd\0", 9, abi.O_READ);
+    if (abi.is_err(h) != 0) { ret; }
+    var buf: [512]u8;
+    for {
+        val r: u64 = sys.read(h, ?buf[0], 512);
+        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        io.outn(?buf[0], r);
+    }
+    sys.close(h);
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var src: u64 = abi.STDIN;
+    if (argc > 2 && io.streq(argv[1], "-c\0") != 0) {
+        run_string(argv[2], io.len(argv[2]));
+        ret status;
+    }
+    if (argc > 1) {
+        src = sys.open(argv[1], io.len(argv[1]), abi.O_READ);
+        if (abi.is_err(src) != 0) {
+            io.fail("sh\0", argv[1], src);
+            ret 127;
+        }
+    } or {
+        interactive = 1;
+        motd();
+    }
+
+    var line: [1024]u8;
+    for (quit == 0) {
+        if (interactive != 0) {
+            reap_jobs();
+            prompt();
+        }
+        val n: u64 = getline(src, ?line[0], 1024);
+        if (n == NONE) {
+            if (interactive != 0) { io.out("exit\n\0"); }
+            brk;
+        }
+        run_string(?line[0], n);
+    }
+    ret status;
+}

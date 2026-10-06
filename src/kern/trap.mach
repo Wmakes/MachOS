@@ -7,10 +7,8 @@ use kprint: machos.kern.kprint;
 use serial: machos.dev.serial;
 use kbd:    machos.dev.ps2kbd;
 use tty:    machos.kern.tty;
-
-var ticks: u64 = 0;
-
-pub fun uptime_ticks() u64 { ret ticks; }
+use proc:   machos.kern.proc;
+use sys:    machos.kern.sys;
 
 fun name_of(v: u64) *u8 {
     if (v == 0)  { ret "divide error\0"; }
@@ -36,15 +34,13 @@ fun name_of(v: u64) *u8 {
     ret "reserved\0";
 }
 
-pub fun exception_name(v: u64) *u8 { ret name_of(v); }
-
 fun reg(name: *u8, v: u64) {
     kprint.puts(name);
     kprint.hex(v);
     kprint.putc(10);
 }
 
-pub fun dump(f: *idt.Frame) {
+fun dump(f: *idt.Frame) {
     kprint.puts("\n*** exception \0");
     kprint.dec(f.vector);
     kprint.puts(": \0");
@@ -62,19 +58,52 @@ pub fun dump(f: *idt.Frame) {
     reg("  rsi    \0", f.rsi);
 }
 
+# a user program faulted: say so on the console and end it
+fun user_fault(f: *idt.Frame) {
+    val p: *proc.Proc = proc.current();
+    kprint.puts("\0");
+    kprint.dec(p.pid);
+    kprint.putc(32);
+    var i: u64 = 0;
+    for (i < p.name_len) {
+        kprint.putc(p.name[i]);
+        i = i + 1;
+    }
+    kprint.puts(": \0");
+    kprint.puts(name_of(f.vector));
+    kprint.puts(" at \0");
+    kprint.hex(f.rip);
+    if (f.vector == 14) {
+        kprint.puts(", address \0");
+        kprint.hex(cpu.cr2());
+    }
+    kprint.putc(10);
+    sys.do_exit(128 + f.vector);
+}
+
 #[symbol("isr_dispatch")]
 fun isr_dispatch(f: *idt.Frame) {
+    val from_user: u8 = ((f.cs & 3) == 3)::u8;
     if (f.vector < 32) {
+        if (from_user != 0) { user_fault(f); }
         dump(f);
-        kprint.panic("unhandled exception\0");
+        kprint.panic("kernel exception\0");
     }
     if (f.vector == apic.SPURIOUS_VECTOR) { ret; } # no eoi for spurious
+    var preempt: u8 = 0;
     if (f.vector == apic.TIMER_VECTOR) {
-        ticks = ticks + 1;
+        proc.tick();
+        preempt = from_user;
     } or (f.vector == apic.IRQ_BASE + 1) {
         kbd.irq();
     } or (f.vector == apic.IRQ_BASE + 4) {
         for (serial.ready() != 0) { tty.input(serial.getc()); }
     }
     apic.eoi();
+
+    # only ever switch away on the way back to user mode
+    if (from_user != 0) {
+        if (proc.current().killed != 0) { sys.do_exit(130); }
+        if (preempt != 0) { proc.yield(); }
+    }
 }

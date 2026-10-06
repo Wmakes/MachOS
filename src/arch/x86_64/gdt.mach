@@ -63,6 +63,9 @@ fun tss_load() {
     }
 }
 
+# the stack the cpu switches to when an interrupt arrives from user mode
+pub fun set_rsp0(top: u64) { tss.rsp0 = top; }
+
 pub fun init() {
     table[0] = 0;
     table[1] = 0x00AF9A000000FFFF; # kernel code, long mode

@@ -1,0 +1,23 @@
+# free: memory use
+
+use abi: machos.abi.sys;
+use sys: machos.user.sys;
+use io:  machos.user.io;
+use rt:  machos.user.rt;
+
+fun row(name: *u8, bytes: u64) {
+    io.out(name);
+    io.dec_pad(bytes / 1024, 10);
+    io.out(" KiB\n\0");
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var i: abi.Info;
+    sys.info(?i);
+    row("total \0", i.mem_total);
+    row("used  \0", i.mem_total - i.mem_free);
+    row("free  \0", i.mem_free);
+    row("kheap \0", i.heap_used);
+    ret 0;
+}

@@ -235,7 +235,9 @@ fun isr_stubs() {
     }
 }
 
-# save every gpr, hand the frame to isr_dispatch, restore, drop vector+error, iretq
+# save every gpr and the fpu/sse state, hand the frame to isr_dispatch,
+# then leave through isr_return. the frame is 16-byte aligned here: the cpu
+# aligns rsp before its 5 pushes, and 2 + 15 more keep it so
 #[naked]
 #[symbol("isr_common")]
 fun isr_common() {
@@ -256,8 +258,23 @@ fun isr_common() {
         push r14
         push r15
         cld
-        mov rdi, rsp
+        sub rsp, 512
+        .byte 0x48, 0x0f, 0xae, 0x04, 0x24 :: writes()
+        lea rdi, [rsp + 512]
         call isr_dispatch
+        jmp isr_return
+    }
+}
+
+# the one way back out of the kernel: restore the fpu/sse state and every
+# gpr, drop vector+error, iretq. a new process starts by "returning" here
+# from a frame built by proc
+#[naked]
+#[symbol("isr_return")]
+pub fun isr_return() {
+    asm x86_64 {
+        .byte 0x48, 0x0f, 0xae, 0x0c, 0x24 :: writes()
+        add rsp, 512
         pop r15
         pop r14
         pop r13
@@ -277,6 +294,8 @@ fun isr_common() {
         iretq
     }
 }
+
+pub val FPU_AREA: u64 = 512; # fxsave image below every Frame
 
 #[naked]
 #[symbol("idt_load")]

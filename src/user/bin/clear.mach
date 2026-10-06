@@ -1,0 +1,10 @@
+# clear: clear the screen
+
+use io: machos.user.io;
+use rt: machos.user.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    io.out("\x1b[2J\x1b[H\0");
+    ret 0;
+}

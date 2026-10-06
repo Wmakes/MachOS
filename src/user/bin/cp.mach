@@ -1,0 +1,39 @@
+# cp FROM TO: copy a file
+
+use abi: machos.abi.sys;
+use sys: machos.user.sys;
+use io:  machos.user.io;
+use rt:  machos.user.rt;
+
+var buf: [4096]u8;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc != 3) {
+        io.err("usage: cp FROM TO\n\0");
+        ret 2;
+    }
+    val src: u64 = sys.open(argv[1], io.len(argv[1]), abi.O_READ);
+    if (abi.is_err(src) != 0) {
+        io.fail("cp\0", argv[1], src);
+        ret 1;
+    }
+    val dst: u64 = sys.open(argv[2], io.len(argv[2]), abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC);
+    if (abi.is_err(dst) != 0) {
+        io.fail("cp\0", argv[2], dst);
+        ret 1;
+    }
+    for {
+        val r: u64 = sys.read(src, ?buf[0], 4096);
+        if (abi.is_err(r) != 0) {
+            io.fail("cp\0", argv[1], r);
+            ret 1;
+        }
+        if (r == 0) { brk; }
+        if (io.write_all(dst, ?buf[0], r) == 0) {
+            io.err("cp: write failed\n\0");
+            ret 1;
+        }
+    }
+    ret 0;
+}

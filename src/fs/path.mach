@@ -1,0 +1,52 @@
+# path normalization: absolute result, no ".", "..", or repeated slashes
+
+pub val MAX: u64 = 256;
+
+# append the components of `p` to the absolute path in out[0..len]
+fun walk(out: *u8, len: u64, p: *u8, n: u64) u64 {
+    var o: u64 = len;
+    var i: u64 = 0;
+    for (i < n) {
+        for (i < n && p[i] == 47) { i = i + 1; }
+        val start: u64 = i;
+        for (i < n && p[i] != 47) { i = i + 1; }
+        val clen: u64 = i - start;
+        if (clen == 0 || (clen == 1 && p[start] == 46)) { cnt; }
+        if (clen == 2 && p[start] == 46 && p[start + 1] == 46) {
+            for (o > 1 && out[o - 1] != 47) { o = o - 1; }
+            if (o > 1) { o = o - 1; } # drop the slash too, but keep the root
+            cnt;
+        }
+        if (o + clen + 1 >= MAX) { ret 0; }
+        if (o > 1) {
+            out[o] = 47;
+            o = o + 1;
+        }
+        var k: u64 = 0;
+        for (k < clen) {
+            out[o + k] = p[start + k];
+            k = k + 1;
+        }
+        o = o + clen;
+    }
+    ret o;
+}
+
+# resolve `p` (absolute, or relative to the absolute `cwd`) into `out`, which
+# must hold MAX bytes; returns the length, or 0 if it does not fit
+pub fun resolve(cwd: *u8, cwd_len: u64, p: *u8, n: u64, out: *u8) u64 {
+    out[0] = 47;
+    var len: u64 = 1;
+    if (n == 0 || p[0] != 47) {
+        len = walk(out, len, cwd, cwd_len);
+        if (len == 0) { ret 0; }
+    }
+    ret walk(out, len, p, n);
+}
+
+# index where the last component of a normalized path starts
+pub fun base_index(p: *u8, n: u64) u64 {
+    var i: u64 = n;
+    for (i > 0 && p[i - 1] != 47) { i = i - 1; }
+    ret i;
+}

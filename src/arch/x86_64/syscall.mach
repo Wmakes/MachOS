@@ -1,0 +1,72 @@
+# the `syscall` instruction. entry builds the same Frame an interrupt
+# would (vector SYSCALL_VECTOR), calls syscall_dispatch, and leaves through
+# isr_return with iretq, so a process blocked in a call can be switched
+# away from and resumed exactly like one that was interrupted
+
+use cpu: machos.arch.x86_64.cpu;
+use gdt: machos.arch.x86_64.gdt;
+
+pub val SYSCALL_VECTOR: u64 = 0x7F;
+
+# only touched with interrupts off on the one cpu
+#[symbol("sc_kstack")]
+var sc_kstack: u64 = 0; # top of the running process's kernel stack
+#[symbol("sc_rsp")]
+var sc_rsp: u64 = 0;    # its user rsp while the frame is being built
+
+pub fun set_kstack(top: u64) { sc_kstack = top; }
+
+# frame offsets: r15 @0 ... rax @112, vector @120, error @128,
+# rip @136, cs @144, rflags @152, rsp @160, ss @168
+#[naked]
+#[symbol("syscall_entry")]
+fun syscall_entry() {
+    asm x86_64 {
+        mov [sc_rsp], rsp
+        mov rsp, [sc_kstack]
+        sub rsp, 16
+        push r11
+        push 0x23
+        push rcx
+        push 0
+        push 0x7f
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push rbp
+        push r8
+        push r9
+        push r10
+        push r11
+        push r12
+        push r13
+        push r14
+        push r15
+        mov rax, [sc_rsp]
+        mov [rsp + 160], rax
+        mov rax, 0x1b
+        mov [rsp + 168], rax
+        mov rax, [rsp + 112]
+        cld
+        sub rsp, 512
+        .byte 0x48, 0x0f, 0xae, 0x04, 0x24 :: writes()
+        lea rdi, [rsp + 512]
+        call syscall_dispatch
+        jmp isr_return
+    }
+}
+
+val MSR_STAR:   u32 = 0xC0000081;
+val MSR_LSTAR:  u32 = 0xC0000082;
+val MSR_FMASK:  u32 = 0xC0000084;
+
+pub fun init() {
+    cpu.wrmsr(cpu.MSR_EFER, cpu.rdmsr(cpu.MSR_EFER) | 1); # SCE
+    # kernel cs = 0x08 (ss 0x10); sysret base 0x10 -> user ss 0x18, cs 0x20
+    cpu.wrmsr(MSR_STAR, (gdt.KCODE::u64 << 32) | ((gdt.KDATA::u64 | 3) << 48));
+    cpu.wrmsr(MSR_LSTAR, syscall_entry::u64);
+    cpu.wrmsr(MSR_FMASK, 0x40700); # clear IF, DF, TF, AC on entry
+}

@@ -1,0 +1,23 @@
+# touch FILE...: create empty files that do not exist yet
+
+use abi: machos.abi.sys;
+use sys: machos.user.sys;
+use io:  machos.user.io;
+use rt:  machos.user.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var status: u64 = 0;
+    var i: u64 = 1;
+    for (i < argc) {
+        val h: u64 = sys.open(argv[i], io.len(argv[i]), abi.O_WRITE | abi.O_CREATE);
+        if (abi.is_err(h) != 0) {
+            io.fail("touch\0", argv[i], h);
+            status = 1;
+        } or {
+            sys.close(h);
+        }
+        i = i + 1;
+    }
+    ret status;
+}

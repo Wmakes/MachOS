@@ -1,0 +1,22 @@
+# echo [-n] WORDS...: print the words separated by spaces
+
+use io: machos.user.io;
+use rt: machos.user.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var i: u64 = 1;
+    var newline: u8 = 1;
+    if (argc > 1 && io.streq(argv[1], "-n\0") != 0) {
+        newline = 0;
+        i = 2;
+    }
+    val first: u64 = i;
+    for (i < argc) {
+        if (i > first) { io.putc(32); }
+        io.out(argv[i]);
+        i = i + 1;
+    }
+    if (newline != 0) { io.putc(10); }
+    ret 0;
+}

@@ -1,0 +1,23 @@
+# pid 1: keep a shell running on the console
+
+use abi: machos.abi.sys;
+use sys: machos.user.sys;
+use io:  machos.user.io;
+use rt:  machos.user.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    io.out("init: starting /bin/sh\n\0");
+    for {
+        var how: abi.Spawn = abi.Spawn{ handles: [3]u64{0, 1, 2}, group: abi.NEW_GROUP };
+        val pid: u64 = sys.spawn("/bin/sh\0", 7, "/bin/sh\0", 8, ?how);
+        if (abi.is_err(pid) != 0) {
+            io.fail("init\0", "/bin/sh\0", pid);
+            sys.sleep(1000);
+            cnt;
+        }
+        sys.wait(pid);
+        io.out("init: shell exited, starting a new one\n\0");
+    }
+    ret 0;
+}

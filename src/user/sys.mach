@@ -1,0 +1,52 @@
+# system call wrappers for user programs (the interface: abi/sys.mach)
+
+use abi: machos.abi.sys;
+
+# syscall(n, a, b, c, d, e): a plain function call, so the compiler already
+# treats rcx and r11 (which `syscall` overwrites) as clobbered
+#[naked]
+#[symbol("sys_call")]
+pub fun raw(n: u64, a: u64, b: u64, c: u64, d: u64, e: u64) u64 {
+    asm x86_64 {
+        mov rax, rdi
+        mov rdi, rsi
+        mov rsi, rdx
+        mov rdx, rcx
+        mov r10, r8
+        mov r8, r9
+        syscall
+        ret
+    }
+}
+
+pub fun exit(code: u64) { raw(abi.EXIT, code, 0, 0, 0, 0); }
+
+pub fun read(h: u64, buf: *u8, n: u64) u64 { ret raw(abi.READ, h, buf::u64, n, 0, 0); }
+pub fun write(h: u64, buf: *u8, n: u64) u64 { ret raw(abi.WRITE, h, buf::u64, n, 0, 0); }
+
+pub fun open(p: *u8, n: u64, flags: u64) u64 { ret raw(abi.OPEN, p::u64, n, flags, 0, 0); }
+pub fun close(h: u64) u64 { ret raw(abi.CLOSE, h, 0, 0, 0, 0); }
+
+pub fun spawn(p: *u8, n: u64, args: *u8, args_len: u64, how: *abi.Spawn) u64 {
+    ret raw(abi.SPAWN, p::u64, n, args::u64, args_len, how::u64);
+}
+pub fun wait(pid: u64) u64 { ret raw(abi.WAIT, pid, 0, 0, 0, 0); }
+pub fun poll(pid: u64) u64 { ret raw(abi.WAIT, pid, abi.WAIT_NOHANG, 0, 0, 0); }
+
+pub fun readdir(h: u64, idx: u64, out: *abi.Entry) u64 { ret raw(abi.READDIR, h, idx, out::u64, 0, 0); }
+pub fun stat(p: *u8, n: u64, out: *abi.Stat) u64 { ret raw(abi.STAT, p::u64, n, out::u64, 0, 0); }
+pub fun mkdir(p: *u8, n: u64) u64 { ret raw(abi.MKDIR, p::u64, n, 0, 0, 0); }
+pub fun remove(p: *u8, n: u64) u64 { ret raw(abi.REMOVE, p::u64, n, 0, 0, 0); }
+pub fun rename(a: *u8, an: u64, b: *u8, bn: u64) u64 { ret raw(abi.RENAME, a::u64, an, b::u64, bn, 0); }
+pub fun chdir(p: *u8, n: u64) u64 { ret raw(abi.CHDIR, p::u64, n, 0, 0, 0); }
+pub fun getcwd(buf: *u8, n: u64) u64 { ret raw(abi.GETCWD, buf::u64, n, 0, 0, 0); }
+pub fun seek(h: u64, off: u64) u64 { ret raw(abi.SEEK, h, off, 0, 0, 0); }
+
+pub fun pipe(ends: *[2]u64) u64 { ret raw(abi.PIPE, ends::u64, 0, 0, 0, 0); }
+pub fun sleep(ms: u64) u64 { ret raw(abi.SLEEP, ms, 0, 0, 0, 0); }
+pub fun info(out: *abi.Info) u64 { ret raw(abi.INFO, out::u64, 0, 0, 0, 0); }
+pub fun getpid() u64 { ret raw(abi.GETPID, 0, 0, 0, 0, 0); }
+pub fun procs(idx: u64, out: *abi.ProcInfo) u64 { ret raw(abi.PROCS, idx, out::u64, 0, 0, 0); }
+pub fun kill(pid: u64) u64 { ret raw(abi.KILL, pid, 0, 0, 0, 0); }
+pub fun sbrk(n: u64) u64 { ret raw(abi.SBRK, n, 0, 0, 0, 0); }
+pub fun setfg(group: u64) u64 { ret raw(abi.SETFG, group, 0, 0, 0, 0); }

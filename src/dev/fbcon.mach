@@ -1,6 +1,9 @@
 # framebuffer text console: 8x16 glyphs on a 32 bpp linear framebuffer.
-# the character grid is mirrored in `cells`, so scrolling redraws only the
-# cells that change and never reads video memory back
+# the character grid and each cell's colours are mirrored in `cells` and
+# `attrs`, so scrolling redraws only the cells that change and never reads
+# video memory back. understands the ANSI sequences a shell needs:
+# SGR colours (ESC[...m), clear screen (ESC[2J), home (ESC[H), and clear to
+# end of line (ESC[K)
 
 use info: machos.boot.info;
 
@@ -10,6 +13,13 @@ val FONT: [4096]u8; # 256 glyphs, 16 rows each, msb = leftmost pixel
 val GW: u64 = 8;
 val GH: u64 = 16;
 val MAX_CELLS: u64 = 32768; # 240x135 cells is 1920x2160, plenty
+val DEFAULT: u8 = 0x07;     # light grey on black: bg in the high nibble
+
+# the 16 colours, in ANSI order: black red green yellow blue magenta cyan
+# white, then their bright versions
+val PAL_R: [16]u8 = [16]u8{0x00, 0xAA, 0x00, 0xAA, 0x00, 0xAA, 0x00, 0xAA, 0x55, 0xFF, 0x55, 0xFF, 0x55, 0xFF, 0x55, 0xFF};
+val PAL_G: [16]u8 = [16]u8{0x00, 0x00, 0xAA, 0x55, 0x00, 0x00, 0xAA, 0xAA, 0x55, 0x55, 0xFF, 0xFF, 0x55, 0x55, 0xFF, 0xFF};
+val PAL_B: [16]u8 = [16]u8{0x00, 0x00, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0x55, 0x55, 0x55, 0x55, 0xFF, 0xFF, 0xFF, 0xFF};
 
 var base: u64 = 0; # virtual address of pixel (0,0), 0 = no console
 var pitch: u64 = 0;
@@ -17,9 +27,15 @@ var cols: u64 = 0;
 var rows: u64 = 0;
 var cx: u64 = 0;
 var cy: u64 = 0;
-var fg: u32 = 0;
-var bg: u32 = 0;
+var attr: u8 = 0x07;
+var bold: u8 = 0;
+var palette: [16]u32;
 var cells: [32768]u8;
+var attrs: [32768]u8;
+
+var esc: u8 = 0;         # 0 normal, 1 after ESC, 2 inside ESC[
+var params: [8]u64;
+var nparams: u64 = 0;
 
 fun channel(v: u32, size: u8, shift: u8) u32 {
     # scale an 8-bit channel down to `size` bits, then place it
@@ -32,8 +48,10 @@ fun rgb(f: *info.Framebuffer, r: u32, g: u32, b: u32) u32 {
       | channel(b, f.b_size, f.b_shift);
 }
 
-fun draw(i: u64) {
+fun paint(i: u64, a: u8) {
     val c: u64 = cells[i]::u64;
+    val fg: u32 = palette[a & 15];
+    val bg: u32 = palette[a >> 4];
     val px: u64 = base + (i / cols) * GH * pitch + (i % cols) * GW * 4;
     var y: u64 = 0;
     for (y < GH) {
@@ -49,22 +67,43 @@ fun draw(i: u64) {
     }
 }
 
-fun set(i: u64, c: u8) {
-    if (cells[i] != c) {
+fun draw(i: u64) { paint(i, attrs[i]); }
+
+fun set(i: u64, c: u8, a: u8) {
+    if (cells[i] != c || attrs[i] != a) {
         cells[i] = c;
+        attrs[i] = a;
         draw(i);
     }
 }
+
+# the cursor is the cell under it drawn with fg and bg swapped
+fun cursor_cell() u64 {
+    var x: u64 = cx;
+    if (x >= cols) { x = cols - 1; }
+    ret cy * cols + x;
+}
+
+fun hide() { draw(cursor_cell()); }
+
+fun show() {
+    val i: u64 = cursor_cell();
+    val a: u8 = attrs[i];
+    paint(i, (a << 4) | (a >> 4));
+}
+
+# an empty cell: the current background, a visible foreground for the cursor
+fun blank() u8 { ret (attr & 0xF0) | 0x07; }
 
 fun scroll() {
     val n: u64 = (rows - 1) * cols;
     var i: u64 = 0;
     for (i < n) {
-        set(i, cells[i + cols]);
+        set(i, cells[i + cols], attrs[i + cols]);
         i = i + 1;
     }
     for (i < rows * cols) {
-        set(i, 32);
+        set(i, 32, blank());
         i = i + 1;
     }
 }
@@ -73,6 +112,69 @@ fun newline() {
     cx = 0;
     if (cy + 1 < rows) { cy = cy + 1; }
     or                 { scroll(); }
+}
+
+fun clear_from(i: u64, end: u64) {
+    var k: u64 = i;
+    for (k < end) {
+        set(k, 32, blank());
+        k = k + 1;
+    }
+}
+
+fun sgr(p: u64) {
+    if (p == 0) {
+        attr = DEFAULT;
+        bold = 0;
+    } or (p == 1) {
+        bold = 1;
+        attr = attr | 0x08;
+    } or (p == 22) {
+        bold = 0;
+        attr = attr & 0xF7;
+    } or (p >= 30 && p <= 37) {
+        attr = (attr & 0xF0) | (p - 30)::u8;
+        if (bold != 0) { attr = attr | 0x08; }
+    } or (p == 39) {
+        attr = (attr & 0xF0) | 0x07;
+        if (bold != 0) { attr = attr | 0x08; }
+    } or (p >= 40 && p <= 47) {
+        attr = (attr & 0x0F) | ((p - 40)::u8 << 4);
+    } or (p == 49) {
+        attr = attr & 0x0F;
+    } or (p >= 90 && p <= 97) {
+        attr = (attr & 0xF0) | (p - 90)::u8 | 0x08;
+    }
+}
+
+fun csi(final: u8) {
+    if (final == 109) { # m
+        if (nparams == 0) { sgr(0); }
+        var i: u64 = 0;
+        for (i < nparams) {
+            sgr(params[i]);
+            i = i + 1;
+        }
+    } or (final == 74) { # J: 2 = whole screen
+        if (nparams > 0 && params[0] == 2) {
+            clear_from(0, rows * cols);
+            cx = 0;
+            cy = 0;
+        } or {
+            clear_from(cursor_cell(), rows * cols);
+        }
+    } or (final == 72) { # H: row;col, 1-based
+        var r: u64 = 1;
+        var c: u64 = 1;
+        if (nparams > 0 && params[0] > 0) { r = params[0]; }
+        if (nparams > 1 && params[1] > 0) { c = params[1]; }
+        if (r > rows) { r = rows; }
+        if (c > cols) { c = cols; }
+        cy = r - 1;
+        cx = c - 1;
+    } or (final == 75) { # K: to the end of the line
+        clear_from(cursor_cell(), (cy + 1) * cols);
+    }
 }
 
 # take over the framebuffer; returns 0 when it is missing or not 32 bpp
@@ -84,16 +186,19 @@ pub fun init(f: *info.Framebuffer) u8 {
     cols  = f.width / GW;
     rows  = f.height / GH;
     if (cols * rows > MAX_CELLS) { rows = MAX_CELLS / cols; }
-    fg = rgb(f, 0xC0, 0xC0, 0xC0);
-    bg = rgb(f, 0x00, 0x00, 0x00);
+    var k: u64 = 0;
+    for (k < 16) {
+        palette[k] = rgb(f, PAL_R[k]::u32, PAL_G[k]::u32, PAL_B[k]::u32);
+        k = k + 1;
+    }
 
-    # paint every cell, including the strip right of the last column
+    # paint every pixel, including the strip right of the last column
     var y: u64 = 0;
     for (y < f.height) {
         val row: *u32 = (base + y * pitch)::*u32;
         var x: u64 = 0;
         for (x < f.width) {
-            row[x] = bg;
+            row[x] = palette[0];
             x = x + 1;
         }
         y = y + 1;
@@ -101,30 +206,74 @@ pub fun init(f: *info.Framebuffer) u8 {
     var i: u64 = 0;
     for (i < rows * cols) {
         cells[i] = 32;
+        attrs[i] = DEFAULT;
         i = i + 1;
     }
     cx = 0;
     cy = 0;
+    show();
     ret 1;
 }
 
 pub fun cols_of() u64 { ret cols; }
 pub fun rows_of() u64 { ret rows; }
 
-pub fun putc(c: u8) {
-    if (base == 0) { ret; }
+fun put(c: u8) {
+    if (esc == 1) {
+        if (c == 91) { # [
+            esc = 2;
+            nparams = 0;
+            params[0] = 0;
+        } or {
+            esc = 0;
+        }
+        ret;
+    }
+    if (esc == 2) {
+        if (c >= 48 && c <= 57) {
+            if (nparams == 0) { nparams = 1; }
+            params[nparams - 1] = params[nparams - 1] * 10 + (c - 48)::u64;
+        } or (c == 59) { # ;
+            if (nparams == 0) { nparams = 1; }
+            if (nparams < 8) {
+                params[nparams] = 0;
+                nparams = nparams + 1;
+            }
+        } or (c >= 64 && c <= 126) {
+            esc = 0;
+            csi(c);
+        } or (c != 63) { # tolerate '?' in private modes, give up on the rest
+            esc = 0;
+        }
+        ret;
+    }
+    if (c == 27) { esc = 1; ret; }
     if (c == 10) { newline(); ret; }
     if (c == 13) { cx = 0; ret; }
+    if (c == 12) { # form feed clears the screen
+        clear_from(0, rows * cols);
+        cx = 0;
+        cy = 0;
+        ret;
+    }
     if (c == 8) {
         if (cx > 0) { cx = cx - 1; }
         ret;
     }
     if (c == 9) {
-        putc(32);
-        for ((cx % 8) != 0) { putc(32); }
+        put(32);
+        for ((cx % 8) != 0 && cx < cols) { put(32); }
         ret;
     }
+    if (c < 32) { ret; }
     if (cx >= cols) { newline(); }
-    set(cy * cols + cx, c);
+    set(cy * cols + cx, c, attr);
     cx = cx + 1;
+}
+
+pub fun putc(c: u8) {
+    if (base == 0) { ret; }
+    hide();
+    put(c);
+    show();
 }

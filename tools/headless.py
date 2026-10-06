@@ -5,7 +5,7 @@ usage: tools/headless.py [-p release] [-t SECONDS] STEP...
 
 steps run in order:
   wait:REGEX     wait until the serial output (since the last wait) matches
-  send:TEXT      type TEXT on the serial port (\\n becomes Enter)
+  send:TEXT      type TEXT on the serial port (\\n is Enter, \\x03 is ^C)
   keys:TEXT      type TEXT on the PS/2 keyboard (via the QEMU monitor)
   sleep:SECONDS  pause
   shot:PATH      save a PNG screenshot of the framebuffer
@@ -30,6 +30,8 @@ SHIFTED = {"|": "backslash", ">": "dot", "<": "comma", "_": "minus", "+": "equal
 
 
 def keyname(c):
+    if ord(c) < 32 and c not in KEYNAMES:
+        return "ctrl-" + chr(ord(c) + 96)
     if c.isalpha() and c.isupper():
         return "shift-" + c.lower()
     if c in SHIFTED:
@@ -133,11 +135,11 @@ def main():
                 if status:
                     break
             elif kind == "send":
-                for ch in arg.replace("\\n", "\n"):
+                for ch in arg.encode().decode("unicode_escape"):
                     s.sendall(b"\r" if ch == "\n" else ch.encode())
                     time.sleep(0.01)
             elif kind == "keys":
-                for ch in arg.replace("\\n", "\n"):
+                for ch in arg.encode().decode("unicode_escape"):
                     monitor("sendkey " + keyname(ch))
             elif kind == "sleep":
                 time.sleep(float(arg))

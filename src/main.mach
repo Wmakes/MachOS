@@ -15,6 +15,12 @@ use apic:   machos.arch.x86_64.apic;
 use kbd:    machos.dev.ps2kbd;
 use tty:    machos.kern.tty;
 use trap:   machos.kern.trap;
+use syscall: machos.arch.x86_64.syscall;
+use proc:   machos.kern.proc;
+use sys:    machos.kern.sys;
+use abi:    machos.abi.sys;
+use ramfs:  machos.fs.ramfs;
+use initrd: machos.fs.initrd;
 
 var boot: info.BootInfo;
 
@@ -100,20 +106,32 @@ fun kmain() {
     kprint.dec(apic.HZ);
     kprint.puts(" Hz, keyboard and serial input routed\n\0");
 
-    kprint.puts("idle\n\0");
-    var buf: [256]u8;
-    for {
-        cpu.wait();
-        if (tty.readable() != 0) {
-            val n: u64 = tty.read(?buf[0], 255);
-            buf[n] = 0;
-            kprint.puts("got [\0");
-            kprint.puts(?buf[0]);
-            kprint.puts("] at tick \0");
-            kprint.dec(trap.uptime_ticks());
-            kprint.putc(10);
-        }
+    syscall.init();
+
+    if (ramfs.init() == 0) { kprint.panic("ramfs: out of memory\0"); }
+    val dev: *ramfs.Node = ramfs.create(ramfs.get_root(), "dev\0", 3, abi.KIND_DIR);
+    make_dev(dev, "console\0", 7, ramfs.DEV_CONSOLE);
+    make_dev(dev, "null\0", 4, ramfs.DEV_NULL);
+    make_dev(dev, "zero\0", 4, ramfs.DEV_ZERO);
+    if (boot.initrd == 0) { kprint.panic("no initrd module\0"); }
+    kprint.puts("initrd: \0");
+    kprint.dec(initrd.unpack(boot.initrd, boot.initrd_len));
+    kprint.puts(" files, \0");
+    kprint.dec(boot.initrd_len / 1024);
+    kprint.puts(" KiB\n\0");
+
+    val pid: u64 = sys.spawn_init("/bin/init\0");
+    if (abi.is_err(pid) != 0) {
+        kprint.puts("/bin/init: \0");
+        kprint.panic(abi.err_name(pid));
     }
+    proc.scheduler();
+}
+
+fun make_dev(dir: *ramfs.Node, name: *u8, n: u64, id: u64) {
+    val d: *ramfs.Node = ramfs.create(dir, name, n, abi.KIND_DEV);
+    if (d == nil) { kprint.panic("ramfs: out of memory\0"); }
+    d.dev = id;
 }
 
 #[naked]

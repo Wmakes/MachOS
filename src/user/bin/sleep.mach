@@ -1,0 +1,19 @@
+# sleep SECONDS: wait
+
+use sys: machos.user.sys;
+use io:  machos.user.io;
+use rt:  machos.user.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var ok: u8 = 0;
+    if (argc == 2) {
+        val s: u64 = io.parse_dec(argv[1], io.len(argv[1]), ?ok);
+        if (ok != 0) {
+            sys.sleep(s * 1000);
+            ret 0;
+        }
+    }
+    io.err("usage: sleep SECONDS\n\0");
+    ret 2;
+}
