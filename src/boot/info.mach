@@ -30,6 +30,12 @@ pub rec Framebuffer {
 pub rec BootInfo {
     hhdm:       u64; # virtual = physical + hhdm
     rsdp:       u64; # physical, 0 when absent
+    kphys:      u64; # where the kernel image was loaded
+    kvirt:      u64; # and where it is linked
+    kelf:       u64; # virtual address of the kernel's own ELF file
+    kelf_len:   u64;
+    initrd:     u64; # virtual address of the initrd tar, 0 when absent
+    initrd_len: u64;
     fb:         Framebuffer;
     mem:        [128]MemRegion;
     mem_len:    u64;

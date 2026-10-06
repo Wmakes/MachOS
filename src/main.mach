@@ -9,13 +9,21 @@ use serial: machos.dev.serial;
 use fbcon:  machos.dev.fbcon;
 use kprint: machos.kern.kprint;
 use pmm:    machos.mm.pmm;
+use vmm:    machos.mm.vmm;
 
 var boot: info.BootInfo;
+
+# the boot stack, in the kernel image so it stays mapped once Limine's
+# memory is no longer trusted
+#[align(16)]
+#[symbol("boot_stack")]
+var boot_stack: [65536]u8;
 
 #[symbol("kmain")]
 fun kmain() {
     serial.init();
     cpu.pic_disable();
+    cpu.init();
     val err: *u8 = limine.collect(?boot);
     if (err != nil) { kprint.panic(err); }
     val have_fb: u8 = fbcon.init(?boot.fb);
@@ -47,6 +55,9 @@ fun kmain() {
     kprint.puts("gdt, tss, idt loaded\n\0");
 
     pmm.init(?boot);
+    val verr: *u8 = vmm.init(?boot);
+    if (verr != nil) { kprint.panic(verr); }
+    kprint.puts("vmm: own page tables live\n\0");
     kprint.puts("pmm: \0");
     kprint.dec(pmm.free_pages() * pmm.PAGE / 1024 / 1024);
     kprint.puts(" MiB free\n\0");
@@ -65,7 +76,8 @@ fun kmain() {
 #[symbol("_start")]
 fun start() {
     asm x86_64 {
-        and rsp, -16
+        lea rsp, [boot_stack]
+        add rsp, 65536
         call kmain
     }
 }

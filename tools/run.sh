@@ -8,25 +8,15 @@ cd "$(dirname "$0")/.."
 PROFILE=debug
 if [ "${1:-}" = "release" ]; then PROFILE=release; shift; fi
 
-LIMINE="${LIMINE:-/usr/share/limine}"
 OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
 OVMF_VARS="${OVMF_VARS:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}"
 OUT="out/kernel/$PROFILE"
 
-for f in "$LIMINE/BOOTX64.EFI" "$OVMF_CODE" "$OVMF_VARS"; do
+for f in "$OVMF_CODE" "$OVMF_VARS"; do
     [ -f "$f" ] || { echo "run.sh: missing $f" >&2; exit 1; }
 done
 
-mach build . -t kernel -p "$PROFILE"
-
-IMG="$OUT/disk.img"
-rm -f "$IMG"
-dd if=/dev/zero of="$IMG" bs=1M count=64 2>/dev/null
-mformat -i "$IMG" -F ::
-mmd   -i "$IMG" ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
-mcopy -i "$IMG" "$LIMINE/BOOTX64.EFI" ::/EFI/BOOT/
-mcopy -i "$IMG" tools/limine.conf ::/boot/limine/
-mcopy -i "$IMG" "$OUT/kernel.elf" ::/boot/kernel.elf
+IMG="$(tools/mkimage.sh "$PROFILE")"
 
 # OVMF keeps its NVRAM (boot entries etc.) in a writable copy of the vars file
 [ -f "$OUT/vars.fd" ] || cp "$OVMF_VARS" "$OUT/vars.fd"

@@ -52,3 +52,82 @@ pub fun halt() {
         }
     }
 }
+
+pub fun rdmsr(msr: u32) u64 {
+    var lo: u32 = 0;
+    var hi: u32 = 0;
+    asm x86_64 {
+        mov ecx, {msr}
+        rdmsr
+        mov {lo}, eax
+        mov {hi}, edx
+    }
+    ret (hi::u64 << 32) | lo::u64;
+}
+
+pub fun wrmsr(msr: u32, v: u64) {
+    val lo: u32 = (v & 0xFFFFFFFF)::u32;
+    val hi: u32 = (v >> 32)::u32;
+    asm x86_64 {
+        mov ecx, {msr}
+        mov eax, {lo}
+        mov edx, {hi}
+        wrmsr
+    }
+}
+
+pub fun set_cr3(v: u64) {
+    asm x86_64 {
+        mov rax, {v}
+        mov cr3, rax
+    }
+}
+
+pub fun cr0() u64 {
+    var v: u64 = 0;
+    asm x86_64 {
+        mov rax, cr0
+        mov {v}, rax
+    }
+    ret v;
+}
+
+pub fun set_cr0(v: u64) {
+    asm x86_64 {
+        mov rax, {v}
+        mov cr0, rax
+    }
+}
+
+pub fun cr4() u64 {
+    var v: u64 = 0;
+    asm x86_64 {
+        mov rax, cr4
+        mov {v}, rax
+    }
+    ret v;
+}
+
+pub fun set_cr4(v: u64) {
+    asm x86_64 {
+        mov rax, {v}
+        mov cr4, rax
+    }
+}
+
+# drop one page's translation from the TLB (invlpg [rdi])
+pub fun invlpg(va: u64) {
+    asm x86_64 {
+        mov rdi, {va}
+        .byte 0x0f, 0x01, 0x3f :: writes()
+    }
+}
+
+pub val MSR_EFER: u32 = 0xC0000080;
+
+# no-execute pages, write protection in ring 0, SSE usable everywhere
+pub fun init() {
+    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | (1 << 11));           # EFER.NXE
+    set_cr0((cr0() | (1 << 16) | (1 << 1)) & ~(1::u64 << 2)); # WP, MP, clear EM
+    set_cr4(cr4() | (1 << 9) | (1 << 10));                   # OSFXSR, OSXMMEXCPT
+}

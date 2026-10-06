@@ -1,0 +1,244 @@
+# page tables. the kernel builds its own: the kernel image with per-segment
+# permissions, and the hhdm (virtual = physical + hhdm) over every memory
+# region the bootloader reported. the upper half (pml4 entries 256-511) is
+# allocated once here and shared by every address space; the lower half
+# belongs to one process
+
+use info: machos.boot.info;
+use elf:  machos.kern.elf;
+use cpu:  machos.arch.x86_64.cpu;
+use pmm:  machos.mm.pmm;
+
+pub val P:   u64 = 1;       # present
+pub val W:   u64 = 2;       # writable
+pub val U:   u64 = 4;       # user accessible
+pub val PWT: u64 = 8;       # write-through
+pub val PCD: u64 = 16;      # cache disable
+pub val PS:  u64 = 0x80;    # 2 MiB page at the pd level
+pub val G:   u64 = 0x100;   # global: survives cr3 reloads
+pub val NX:  u64 = 0x8000000000000000;
+
+pub val USER_END: u64 = 0x0000800000000000; # first address past the lower half
+
+val ADDR: u64 = 0x000FFFFFFFFFF000;   # physical address bits of an entry
+val PAGE: u64 = 4096;
+val BIG:  u64 = 0x200000;
+
+var hhdm: u64 = 0;
+var kernel_pml4: u64 = 0;
+
+fun tab(phys: u64) *u64 {
+    ret (phys + hhdm)::*u64;
+}
+
+fun index(va: u64, level: u64) u64 {
+    ret (va >> (12 + 9 * level)) & 511;
+}
+
+# the table an entry points to, allocating it when `create` is set;
+# 0 when it is absent or the entry maps a large page
+fun descend(t: *u64, i: u64, create: u8, user: u8) u64 {
+    val e: u64 = t[i];
+    if ((e & P) != 0) {
+        if ((e & PS) != 0) { ret 0; }
+        ret e & ADDR;
+    }
+    if (create == 0) { ret 0; }
+    val fresh: u64 = pmm.alloc();
+    if (fresh == 0) { ret 0; }
+    var flags: u64 = P | W;
+    if (user != 0) { flags = flags | U; }
+    t[i] = fresh | flags;
+    ret fresh;
+}
+
+# pointer to the level-1 entry for `va`, or nil
+fun walk(pml4: u64, va: u64, create: u8) *u64 {
+    var user: u8 = 0;
+    if (va < USER_END) { user = 1; }
+    var t: u64 = pml4;
+    var level: u64 = 3;
+    for (level > 0) {
+        t = descend(tab(t), index(va, level), create, user);
+        if (t == 0) { ret nil; }
+        level = level - 1;
+    }
+    val pt: *u64 = tab(t);
+    ret ?pt[index(va, 0)];
+}
+
+# map one 4 KiB page; returns 0 when a table could not be allocated
+pub fun map(pml4: u64, va: u64, pa: u64, flags: u64) u8 {
+    val e: *u64 = walk(pml4, va, 1);
+    if (e == nil) { ret 0; }
+    @e = (pa & ADDR) | flags | P;
+    ret 1;
+}
+
+# remove one 4 KiB mapping; returns the physical page it mapped, or 0
+pub fun unmap(pml4: u64, va: u64) u64 {
+    val e: *u64 = walk(pml4, va, 0);
+    if (e == nil || (@e & P) == 0) { ret 0; }
+    val pa: u64 = @e & ADDR;
+    @e = 0;
+    cpu.invlpg(va);
+    ret pa;
+}
+
+# the level-1 entry mapping `va` (flags included), or 0
+pub fun lookup(pml4: u64, va: u64) u64 {
+    val e: *u64 = walk(pml4, va, 0);
+    if (e == nil) { ret 0; }
+    ret @e;
+}
+
+fun map_big(pml4: u64, va: u64, pa: u64, flags: u64) {
+    val pdpt: u64 = descend(tab(pml4), index(va, 3), 1, 0);
+    if (pdpt == 0) { ret; }
+    val pd: u64 = descend(tab(pdpt), index(va, 2), 1, 0);
+    if (pd == 0) { ret; }
+    val t: *u64 = tab(pd);
+    if ((t[index(va, 1)] & P) == 0) { t[index(va, 1)] = pa | flags | PS | P; }
+}
+
+# map [pa, pa+len) at hhdm + pa, using 2 MiB pages where they fit
+fun map_hhdm(pa: u64, len: u64, flags: u64) {
+    var p: u64 = pa & ~(PAGE - 1);
+    val end: u64 = (pa + len + PAGE - 1) & ~(PAGE - 1);
+    for (p < end) {
+        if ((p & (BIG - 1)) == 0 && end - p >= BIG) {
+            map_big(kernel_pml4, p + hhdm, p, flags);
+            p = p + BIG;
+        } or {
+            val e: *u64 = walk(kernel_pml4, p + hhdm, 1);
+            if (e != nil && (@e & P) == 0) { @e = p | flags | P; }
+            p = p + PAGE;
+        }
+    }
+}
+
+# make physical memory outside the reported regions (device registers,
+# firmware tables) reachable through the hhdm; returns its virtual address
+pub fun map_phys(pa: u64, len: u64, uncached: u8) u64 {
+    var flags: u64 = W | G | NX;
+    if (uncached != 0) { flags = flags | PCD | PWT; }
+    var p: u64 = pa & ~(PAGE - 1);
+    val end: u64 = (pa + len + PAGE - 1) & ~(PAGE - 1);
+    for (p < end) {
+        val e: *u64 = walk(kernel_pml4, p + hhdm, 1);
+        if (e != nil && (@e & P) == 0) {
+            @e = p | flags | P;
+            cpu.invlpg(p + hhdm);
+        }
+        p = p + PAGE;
+    }
+    ret pa + hhdm;
+}
+
+fun map_kernel(bi: *info.BootInfo) u8 {
+    if (elf.valid(bi.kelf, bi.kelf_len) == 0) { ret 0; }
+    var i: u64 = 0;
+    for (i < elf.phnum(bi.kelf)) {
+        val ph: *elf.Phdr = elf.phdr(bi.kelf, i);
+        if (ph.kind == elf.PT_LOAD) {
+            var flags: u64 = G;
+            if ((ph.flags & elf.PF_W) != 0) { flags = flags | W; }
+            if ((ph.flags & elf.PF_X) == 0) { flags = flags | NX; }
+            var va: u64 = ph.vaddr & ~(PAGE - 1);
+            val end: u64 = (ph.vaddr + ph.memsz + PAGE - 1) & ~(PAGE - 1);
+            for (va < end) {
+                if (map(kernel_pml4, va, bi.kphys + (va - bi.kvirt), flags) == 0) { ret 0; }
+                va = va + PAGE;
+            }
+        }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# build the kernel's page tables and switch to them; returns an error
+# message or nil
+pub fun init(bi: *info.BootInfo) *u8 {
+    hhdm = bi.hhdm;
+    kernel_pml4 = pmm.alloc();
+    if (kernel_pml4 == 0) { ret "vmm: out of memory\0"; }
+
+    # every upper-half pml4 entry exists up front, so address spaces made
+    # later by copying them see all future kernel mappings
+    var i: u64 = 256;
+    for (i < 512) {
+        if (descend(tab(kernel_pml4), i, 1, 0) == 0) { ret "vmm: out of memory\0"; }
+        i = i + 1;
+    }
+
+    if (map_kernel(bi) == 0) { ret "vmm: cannot map the kernel image\0"; }
+
+    i = 0;
+    for (i < bi.mem_len) {
+        val r: *info.MemRegion = ?bi.mem[i];
+        if (r.kind == info.MEM_FRAMEBUFFER) {
+            map_hhdm(r.base, r.len, W | G | NX | PWT);
+        } or (r.kind != info.MEM_RESERVED) {
+            map_hhdm(r.base, r.len, W | G | NX);
+        }
+        i = i + 1;
+    }
+
+    cpu.set_cr3(kernel_pml4);
+    ret nil;
+}
+
+pub fun kernel_space() u64 { ret kernel_pml4; }
+
+# a fresh address space: empty lower half, the shared kernel upper half
+pub fun new_space() u64 {
+    val pml4: u64 = pmm.alloc();
+    if (pml4 == 0) { ret 0; }
+    val src: *u64 = tab(kernel_pml4);
+    val dst: *u64 = tab(pml4);
+    var i: u64 = 256;
+    for (i < 512) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    ret pml4;
+}
+
+fun free_level(t: u64, level: u64) {
+    val e: *u64 = tab(t);
+    var i: u64 = 0;
+    for (i < 512) {
+        if ((e[i] & P) != 0) {
+            if (level > 1) { free_level(e[i] & ADDR, level - 1); }
+            or             { pmm.free(e[i] & ADDR); }
+        }
+        i = i + 1;
+    }
+    pmm.free(t);
+}
+
+# free every page and table of an address space's lower half, then the pml4.
+# the caller must not be running on it
+pub fun free_space(pml4: u64) {
+    val e: *u64 = tab(pml4);
+    var i: u64 = 0;
+    for (i < 256) {
+        if ((e[i] & P) != 0) { free_level(e[i] & ADDR, 3); }
+        i = i + 1;
+    }
+    pmm.free(pml4);
+}
+
+# whether [va, va+len) is mapped user-accessible (and writable if `write`)
+pub fun user_ok(pml4: u64, va: u64, len: u64, write: u8) u8 {
+    if (len == 0) { ret 1; }
+    if (va >= USER_END || len > USER_END - va) { ret 0; }
+    var need: u64 = P | U;
+    if (write != 0) { need = need | W; }
+    var p: u64 = va & ~(PAGE - 1);
+    for (p < va + len) {
+        if ((lookup(pml4, p) & need) != need) { ret 0; }
+        p = p + PAGE;
+    }
+    ret 1;
+}

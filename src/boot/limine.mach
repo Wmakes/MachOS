@@ -21,6 +21,18 @@ rec MemmapResponse { revision: u64; count: u64; entries: **MemmapEntry; }
 rec MemmapEntry { base: u64; length: u64; kind: u64; }
 
 #[volatile]
+rec ExecAddrResponse { revision: u64; phys: u64; virt: u64; }
+
+#[volatile]
+rec ExecFileResponse { revision: u64; file: *File; }
+
+#[volatile]
+rec ModuleResponse { revision: u64; count: u64; modules: **File; }
+
+#[volatile]
+rec File { revision: u64; address: u64; size: u64; path: *u8; }
+
+#[volatile]
 rec FbResponse { revision: u64; count: u64; fbs: **Fb; }
 
 #[volatile]
@@ -62,6 +74,27 @@ var rsdp_req: Request = Request{
     revision: 0, response: 0,
 };
 
+#[section(".limine_requests")]
+#[align(8)]
+var exec_addr_req: Request = Request{
+    id: [4]u64{0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x71ba76863cc55f63, 0xb2644a48c516a487},
+    revision: 0, response: 0,
+};
+
+#[section(".limine_requests")]
+#[align(8)]
+var exec_file_req: Request = Request{
+    id: [4]u64{0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0xad97e90e83f1ed67, 0x31eb5d1c5ff23b69},
+    revision: 0, response: 0,
+};
+
+#[section(".limine_requests")]
+#[align(8)]
+var module_req: Request = Request{
+    id: [4]u64{0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x3e7e279702be32af, 0xca1c4f3bd1280cee},
+    revision: 0, response: 0,
+};
+
 fun kind_of(k: u64) u8 {
     if (k == 0) { ret info.MEM_USABLE; }
     if (k == 2) { ret info.MEM_RECLAIMABLE; } # acpi reclaimable
@@ -92,6 +125,27 @@ pub fun collect(bi: *info.BootInfo) *u8 {
         i = i + 1;
     }
     bi.mem_len = n;
+
+    if (exec_addr_req.response == 0) { ret "limine: no executable address\0"; }
+    val ea: *ExecAddrResponse = exec_addr_req.response::*ExecAddrResponse;
+    bi.kphys = ea.phys;
+    bi.kvirt = ea.virt;
+
+    if (exec_file_req.response == 0) { ret "limine: no executable file\0"; }
+    val kf: *File = (@(exec_file_req.response::*ExecFileResponse)).file;
+    bi.kelf = kf.address;
+    bi.kelf_len = kf.size;
+
+    bi.initrd = 0;
+    bi.initrd_len = 0;
+    if (module_req.response != 0) {
+        val mr: *ModuleResponse = module_req.response::*ModuleResponse;
+        if (mr.count > 0) {
+            val m: *File = mr.modules[0];
+            bi.initrd = m.address;
+            bi.initrd_len = m.size;
+        }
+    }
 
     bi.rsdp = 0;
     if (rsdp_req.response != 0) { bi.rsdp = (@(rsdp_req.response::*RsdpResponse)).address; }
