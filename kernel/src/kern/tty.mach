@@ -102,11 +102,21 @@ pub fun input(raw: u8) {
     if (c == 13) { c = 10; }
     if (c == 127) { c = 8; }
 
-    if (c == 3 && (lflag & abi.ISIG) != 0) {
-        kprint.puts("^C\n\0");
+    # ^C, ^Z and ^\ signal the foreground group
+    if ((lflag & abi.ISIG) != 0 && (c == 3 || c == 26 || c == 28)) {
+        var sig: u64 = abi.SIGINT;
+        if (c == 26) {
+            sig = abi.SIGTSTP;
+            kprint.puts("^Z\n\0");
+        } or (c == 28) {
+            sig = abi.SIGQUIT;
+            kprint.puts("^\\\n\0");
+        } or {
+            kprint.puts("^C\n\0");
+        }
         line_len = 0;
         esc = 0;
-        if (fg != 0) { proc.kill_group(fg); }
+        if (fg != 0) { proc.send_group(fg, sig); }
         ret;
     }
     if ((lflag & abi.ICANON) != 0) {
@@ -144,6 +154,7 @@ pub fun read(buf: *u8, n: u64) u64 {
 }
 
 pub fun set_foreground(group: u64) { fg = group; }
+pub fun foreground() u64 { ret fg; }
 
 pub fun get_lflag() u64 { ret lflag; }
 

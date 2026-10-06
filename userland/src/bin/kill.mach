@@ -1,28 +1,76 @@
-# kill PID...: end processes
+# kill [-SIGNAL] PID...: send a signal (TERM unless named) to processes;
+# a negative PID means a process group. kill -l lists the signals
 
 use abi: sdk.abi;
 use sys: sdk.sys;
 use io:  sdk.io;
 use rt:  sdk.rt;
 
+val NAMES: [21]*u8 = [21]*u8{"0\0", "HUP\0", "INT\0", "QUIT\0", "ILL\0", "TRAP\0", "ABRT\0",
+    "BUS\0", "FPE\0", "KILL\0", "USR1\0", "SEGV\0", "USR2\0", "PIPE\0", "ALRM\0", "TERM\0",
+    "16\0", "CHLD\0", "CONT\0", "STOP\0", "TSTP\0"};
+
+# a signal by number or name (with or without SIG); 0xFF if unknown
+fun parse_sig(s: *u8) u64 {
+    var okk: u8 = 0;
+    val n: u64 = io.parse_dec(s, io.len(s), ?okk);
+    if (okk != 0 && n < abi.NSIG) { ret n; }
+    var name: *u8 = s;
+    if (io.len(s) > 3 && s[0] == 83 && s[1] == 73 && s[2] == 71) { name = ?s[3]; }
+    var i: u64 = 1;
+    for (i < 21) {
+        if (io.streq(name, NAMES[i]) != 0) { ret i; }
+        i = i + 1;
+    }
+    ret 0xFF;
+}
+
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
-    if (argc < 2) {
-        io.err("usage: kill PID...\n\0");
+    if (argc == 2 && io.streq(argv[1], "-l\0") != 0) {
+        var i: u64 = 1;
+        for (i < 21) {
+            io.dec(i);
+            io.putc(32);
+            io.out(NAMES[i]);
+            io.putc(10);
+            i = i + 1;
+        }
+        ret 0;
+    }
+    var sig: u64 = abi.SIGTERM;
+    var i: u64 = 1;
+    if (i < argc && argv[i][0] == 45 && (argv[i][1] < 48 || argv[i][1] > 57 || argc > 2)) {
+        # -SIG, unless it is the only argument and a number (then it is -PID)
+        val s: u64 = parse_sig(?argv[i][1]);
+        if (s != 0xFF && (argv[i][1] < 48 || argv[i][1] > 57 || i + 1 < argc)) {
+            sig = s;
+            i = i + 1;
+        }
+    }
+    if (i == argc) {
+        io.err("usage: kill [-SIGNAL] PID...  |  kill -l\n\0");
         ret 2;
     }
     var status: u64 = 0;
-    var i: u64 = 1;
     for (i < argc) {
-        var ok: u8 = 0;
-        val pid: u64 = io.parse_dec(argv[i], io.len(argv[i]), ?ok);
-        if (ok == 0) {
+        var a: *u8 = argv[i];
+        var neg: u8 = 0;
+        if (a[0] == 45) {
+            neg = 1;
+            a = ?a[1];
+        }
+        var okk: u8 = 0;
+        val pid: u64 = io.parse_dec(a, io.len(a), ?okk);
+        if (okk == 0) {
             io.err("kill: not a pid: \0");
             io.err(argv[i]);
             io.err("\n\0");
             status = 1;
         } or {
-            val r: u64 = sys.kill(pid);
+            var target: u64 = pid;
+            if (neg != 0) { target = 0 - pid; }
+            val r: u64 = sys.kill(target, sig);
             if (abi.is_err(r) != 0) {
                 io.fail("kill\0", argv[i], r);
                 status = 1;

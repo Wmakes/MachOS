@@ -113,7 +113,7 @@ TESTS = [
       "sleep:1.5", "send:cat\\n", "sleep:0.5", "send:\\x03", "wait:" + P,
       "send:seq 1 100000000 | wc\\n", "sleep:1", "send:\\x03", "wait:" + P,
       "send:echo alive\\n", "wait:alive\\r\\n.*" + P],
-     ["sleep", "running", "^C", "done", "^C", "alive"]),
+     ["sleep", "running", "^C", "Done", "^C", "alive"]),
 
     ("files", False, True,
      ["wait:" + P,
@@ -155,6 +155,16 @@ TESTS = [
       "send:set | grep -c PATH=; pwd | cat; export | grep -c HOME; cd /etc | cat; pwd\\n", "wait:" + P],
      ["/ /bin", "x=1 1y", "0", "X=1", "Y=only-here", "[]", "[]", "/ 2", "via-path z", "/tmp/b/tool",
       "K=v", "a\\nb $", "1", "/", "1", "/"]),
+
+    ("job-control", False, False,
+     ["wait:" + P, "send:sleep 3\\n", "sleep:0.7", "send:\\x1a", "wait:Stopped.*\\n.*" + P,
+      "send:ps | grep sleep; bg; jobs\\n", "wait:" + P,
+      "send:fg\\n", "wait:sleep 3.*\\n.*" + P, "send:echo fg-status=$?\\n", "wait:" + P,
+      "send:sleep 30\\n", "sleep:0.5", "send:\\x1a", "wait:Stopped.*\\n.*" + P,
+      "send:fg\\n", "sleep:0.5", "send:\\x03", "wait:" + P,
+      "send:echo status=$?; kill -l | grep -c TERM; kill -TERM 999\\n", "wait:" + P],
+     ["^Z", "Stopped  sleep 3", "stopped", "Running  sleep 3", "fg-status=0", "Stopped  sleep 30",
+      "^C", "status=130", "1", "no such process"]),
 
     # repair a disk that debugfs damaged on the host
     ("fsck", False, False,

@@ -21,9 +21,9 @@ pub val SLEEP:   u64 = 14; # (milliseconds)
 pub val INFO:    u64 = 15; # (*Info)
 pub val GETPID:  u64 = 16; # ()                                      -> pid
 pub val PROCS:   u64 = 17; # (index, *ProcInfo)                      -> 1, or 0 past the end
-pub val KILL:    u64 = 18; # (pid)
+pub val KILL:    u64 = 18; # (pid, sig)    pid > 0: it, 0: my group, ANY_CHILD-style -1: all, -g: group g
 pub val SBRK:    u64 = 19; # (bytes)                                 -> old break
-pub val SETFG:   u64 = 20; # (group)                                 ^C goes to this group
+pub val SETFG:   u64 = 20; # (group)                                 = TCSETPGRP on the console
 pub val RENAME:  u64 = 21; # (from, from_len, to, to_len)
 pub val SEEK:    u64 = 22; # (fd, offset, SEEK_*)                    -> new offset
 pub val SYNC:    u64 = 23; # ()                                      put every pending write on the disk
@@ -42,7 +42,25 @@ pub val FSTAT:   u64 = 35; # (fd, *Stat)
 pub val FORK:    u64 = 36; # ()                                      -> child pid, 0 in the child
 pub val EXECVE:  u64 = 37; # (path, path_len, args, args_len, env, env_len)  replaces the program
 pub val GETPPID: u64 = 38; # ()                                      -> parent pid
-pub val COUNT:   u64 = 39;
+pub val SIGACTION:   u64 = 39; # (sig, handler, restorer, mask)    -> the old handler
+pub val SIGPROCMASK: u64 = 40; # (SIG_*, set)                      -> the old mask
+pub val SIGRETURN:   u64 = 41; # ()  only from the SDK's restorer, at the end of a handler
+pub val ALARM:       u64 = 42; # (seconds)                         -> seconds left on the old one
+pub val SETPGID:     u64 = 43; # (pid, pgid)                       0, 0: lead a new group
+pub val GETPGID:     u64 = 44; # (pid)                             0: me
+pub val SETSID:      u64 = 45; # ()                                -> the new session (= group = my pid)
+pub val GETSID:      u64 = 46; # (pid)
+pub val TCSETPGRP:   u64 = 47; # (fd, pgid)                        the terminal's foreground group
+pub val TCGETPGRP:   u64 = 48; # (fd)
+pub val COUNT:       u64 = 49;
+
+# signal handlers and masks
+pub val SIG_DFL: u64 = 0;
+pub val SIG_IGN: u64 = 1;
+pub val SIG_BLOCK:   u64 = 0;
+pub val SIG_UNBLOCK: u64 = 1;
+pub val SIG_SETMASK: u64 = 2;
+pub fun sigbit(sig: u64) u64 { ret 1::u64 << sig; }
 
 # SEEK whence
 pub val SEEK_SET: u64 = 0;
@@ -64,11 +82,14 @@ pub val REBOOT_RESTART:  u64 = 1;
 # exit code << 8 for an exit, the signal number for a kill
 pub val ANY_CHILD: u64 = 0xFFFFFFFFFFFFFFFF;
 pub val WNOHANG:   u64 = 1; # return 0 instead of waiting while children run
+pub val WUNTRACED: u64 = 2; # also report children that stopped (status: sig << 8 | 0x7F)
 
 pub fun wifexited(st: u64) u8 { ret ((st & 0x7F) == 0)::u8; }
 pub fun wexitstatus(st: u64) u64 { ret (st >> 8) & 0xFF; }
 pub fun wifsignaled(st: u64) u8 { ret ((st & 0x7F) != 0 && (st & 0x7F) != 0x7F)::u8; }
 pub fun wtermsig(st: u64) u64 { ret st & 0x7F; }
+pub fun wifstopped(st: u64) u8 { ret ((st & 0xFF) == 0x7F)::u8; }
+pub fun wstopsig(st: u64) u64 { ret (st >> 8) & 0xFF; }
 
 # signal numbers (the kernel uses them for exit statuses already)
 pub val SIGHUP:  u64 = 1;
@@ -123,6 +144,8 @@ pub val E_IO:       u64 = 19; # the disk failed
 pub val E_XDEV:     u64 = 20; # across filesystems
 pub val E_BUSY:     u64 = 21; # in use
 pub val E_NOTTY:    u64 = 22; # not a terminal
+pub val E_INTR:     u64 = 23; # interrupted by a signal
+pub val E_PERM:     u64 = 24; # not allowed
 
 pub val ERR_MIN: u64 = 0xFFFFFFFFFFFFF000;
 
@@ -159,6 +182,8 @@ pub fun err_name(v: u64) *u8 {
     if (e == E_XDEV)     { ret "cannot move across filesystems\0"; }
     if (e == E_BUSY)     { ret "busy\0"; }
     if (e == E_NOTTY)    { ret "not a terminal\0"; }
+    if (e == E_INTR)     { ret "interrupted\0"; }
+    if (e == E_PERM)     { ret "operation not permitted\0"; }
     ret "unknown error\0";
 }
 
@@ -249,6 +274,7 @@ pub val STATE_RUNNABLE: u64 = 1;
 pub val STATE_RUNNING:  u64 = 2;
 pub val STATE_BLOCKED:  u64 = 3;
 pub val STATE_ZOMBIE:   u64 = 4;
+pub val STATE_STOPPED:  u64 = 5;
 
 pub rec ProcInfo {
     pid:      u64;

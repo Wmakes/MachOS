@@ -22,6 +22,8 @@ use mount:  machos.fs.mount;
 use parts:  machos.fs.parts;
 use ext2:   machos.fs.ext2;
 use power:  machos.kern.power;
+use exit:   machos.kern.exit;
+use signal: machos.kern.signal;
 use version: machos.abi.version;
 use cpu:    machos.arch.x86_64.cpu;
 use fbcon:  machos.dev.fbcon;
@@ -82,24 +84,8 @@ fun set_name(p: *proc.Proc, full: *u8, n: u64) {
     p.name_len = k;
 }
 
-# the end of every process: release its handles, then let proc tear it down.
-# `status` is the wait status (exit_with / killed_by make one)
-pub fun exit_with(code: u64) { do_exit((code & 0xFF) << 8); }
-pub fun killed_by(sig: u64) { do_exit(sig & 0x7F); }
-
-pub fun do_exit(code: u64) {
-    val p: *proc.Proc = cur();
-    var i: u64 = 0;
-    for (i < abi.MAX_HANDLES) {
-        if (p.handles[i] != 0) {
-            file.close(p.handles[i]::*file.Handle);
-            p.handles[i] = 0;
-        }
-        i = i + 1;
-    }
-    if (p.pid == 1) { kprint.panic("init exited\0"); }
-    proc.exit(code);
-}
+pub fun exit_with(code: u64) { exit.exit_with(code); }
+pub fun killed_by(sig: u64) { exit.killed_by(sig); }
 
 # create a process running `nd`. hs[i] (a Handle, or 0 for closed) becomes
 # its fd i. returns the pid or an error
@@ -114,6 +100,18 @@ fun spawn(parent: *proc.Proc, nd: *vfs.Node, full: *u8, full_len: u64,
     } or {
         c.cwd[0] = 47;
         c.cwd_len = 1;
+    }
+    if (parent != nil) {
+        c.session = parent.session;
+        c.sig_mask = parent.sig_mask;
+        # ignored signals stay ignored in the new program (like fork + exec)
+        var sg: u64 = 0;
+        for (sg < abi.NSIG) {
+            if (parent.sig_handler[sg] == abi.SIG_IGN) { c.sig_handler[sg] = abi.SIG_IGN; }
+            sg = sg + 1;
+        }
+    } or {
+        c.session = c.pid;
     }
     if (group == abi.NEW_GROUP) { c.group = c.pid; }
     or (group == 0 && parent != nil) { c.group = parent.group; }
@@ -250,6 +248,11 @@ fun sys_wait(pid: u64, status: u64, flags: u64) u64 {
             val c: *proc.Proc = proc.slot(i);
             if (c.state != proc.FREE && c.ppid == p.pid && (pid == abi.ANY_CHILD || c.pid == pid)) {
                 any = 1;
+                if (c.state == proc.STOPPED && c.report_stop != 0 && (flags & abi.WUNTRACED) != 0) {
+                    c.report_stop = 0;
+                    if (status != 0) { @(status::*u64) = (c.stop_sig << 8) | 0x7F; }
+                    ret c.pid;
+                }
                 if (c.state == proc.ZOMBIE) {
                     val got: u64 = c.pid;
                     if (status != 0) { @(status::*u64) = c.exit_code; }
@@ -261,7 +264,7 @@ fun sys_wait(pid: u64, status: u64, flags: u64) u64 {
         }
         if (any == 0) { ret e(abi.E_CHILD); }
         if ((flags & abi.WNOHANG) != 0) { ret 0; }
-        if (p.killed != 0) { ret e(abi.E_CHILD); }
+        if (proc.interrupted(p) != 0) { ret e(abi.E_INTR); }
         proc.sleep_on(p::u64);
     }
     ret 0;
@@ -283,6 +286,15 @@ fun sys_fork() u64 {
     }
     c.ppid = p.pid;
     c.group = p.group;
+    c.session = p.session;
+    c.sig_mask = p.sig_mask;
+    c.restorer = p.restorer;
+    var sg: u64 = 0;
+    for (sg < abi.NSIG) {
+        c.sig_handler[sg] = p.sig_handler[sg];
+        c.sig_hmask[sg] = p.sig_hmask[sg];
+        sg = sg + 1;
+    }
     c.brk = p.brk;
     c.brk_base = p.brk_base;
     c.pages = p.pages;
@@ -389,6 +401,14 @@ fun sys_execve(pva: u64, plen: u64, ava: u64, alen: u64, eva: u64) u64 {
         }
         i = i + 1;
     }
+    # caught signals go back to their defaults (the handlers are gone);
+    # ignored ones stay ignored
+    var sg: u64 = 0;
+    for (sg < abi.NSIG) {
+        if (p.sig_handler[sg] > 1) { p.sig_handler[sg] = abi.SIG_DFL; }
+        sg = sg + 1;
+    }
+    p.alarm_at = 0;
     # start over: the frame now returns into the new program
     val f: *idt.Frame = frame;
     mem.fill(f::u64, 0, 15 * 8); # r15 ... rax
@@ -596,12 +616,98 @@ fun sys_procs(idx: u64, out: u64) u64 {
     ret 0;
 }
 
-fun sys_kill(pid: u64) u64 {
-    val p: *proc.Proc = proc.find(pid);
-    if (p == nil || p.state == proc.ZOMBIE) { ret e(abi.E_SRCH); }
-    if (p.pid == 1) { ret e(abi.E_INVAL); }
-    proc.kill(p);
+# pid > 0: that process, 0: my group, -1: everyone but init and me,
+# -g: group g. signal 0 only checks that the target exists
+fun sys_kill(pid: u64, sig: u64) u64 {
+    if (sig >= abi.NSIG) { ret e(abi.E_INVAL); }
+    val me: *proc.Proc = cur();
+    var group: u64 = 0;
+    if (pid == 0) { group = me.group; }
+    or (pid >= 0x8000000000000000) { group = 0 - pid; } # negative: a group (or -1)
+    if (pid != 0 && pid < 0x8000000000000000) {
+        val p: *proc.Proc = proc.find(pid);
+        if (p == nil || p.state == proc.ZOMBIE) { ret e(abi.E_SRCH); }
+        if (p.pid == 1 && sig != 0) { ret e(abi.E_PERM); }
+        if (sig != 0) { proc.send(p, sig); }
+        ret 0;
+    }
+    var found: u64 = 0;
+    var i: u64 = 0;
+    for (i < proc.MAX) {
+        val p: *proc.Proc = proc.slot(i);
+        if (p.state != proc.FREE && p.state != proc.ZOMBIE && p.pid != 1) {
+            if ((group == 1 && p != me) || (group != 1 && p.group == group)) {
+                found = found + 1;
+                if (sig != 0) { proc.send(p, sig); }
+            }
+        }
+        i = i + 1;
+    }
+    if (found == 0) { ret e(abi.E_SRCH); }
     ret 0;
+}
+
+fun sys_sigaction(sig: u64, handler: u64, restorer: u64, mask: u64) u64 {
+    if (sig == 0 || sig >= abi.NSIG || sig == abi.SIGKILL || sig == abi.SIGSTOP) { ret e(abi.E_INVAL); }
+    if (handler > 1 && handler >= vmm.USER_END) { ret e(abi.E_FAULT); }
+    val p: *proc.Proc = cur();
+    val old: u64 = p.sig_handler[sig];
+    p.sig_handler[sig] = handler;
+    p.sig_hmask[sig] = mask;
+    if (restorer != 0) { p.restorer = restorer; }
+    # ignoring a signal drops it if it waits
+    if (handler == abi.SIG_IGN) { p.sig_pending = p.sig_pending & ~abi.sigbit(sig); }
+    ret old;
+}
+
+fun sys_sigprocmask(how: u64, set: u64) u64 {
+    val p: *proc.Proc = cur();
+    val old: u64 = p.sig_mask;
+    if (how == abi.SIG_BLOCK) { p.sig_mask = old | set; }
+    or (how == abi.SIG_UNBLOCK) { p.sig_mask = old & ~set; }
+    or (how == abi.SIG_SETMASK) { p.sig_mask = set; }
+    or { ret e(abi.E_INVAL); }
+    p.sig_mask = p.sig_mask & ~(abi.sigbit(abi.SIGKILL) | abi.sigbit(abi.SIGSTOP));
+    ret old;
+}
+
+fun sys_alarm(seconds: u64) u64 {
+    val p: *proc.Proc = cur();
+    var left: u64 = 0;
+    val now: u64 = proc.uptime_ticks();
+    if (p.alarm_at > now) { left = (p.alarm_at - now + apic.HZ - 1) / apic.HZ; }
+    p.alarm_at = 0;
+    if (seconds > 0) { p.alarm_at = now + seconds * apic.HZ; }
+    ret left;
+}
+
+fun sys_setpgid(pid: u64, pgid: u64) u64 {
+    val me: *proc.Proc = cur();
+    var p: *proc.Proc = me;
+    if (pid != 0) {
+        p = proc.find(pid);
+        if (p == nil) { ret e(abi.E_SRCH); }
+        if (p != me && p.ppid != me.pid) { ret e(abi.E_PERM); }
+    }
+    var g: u64 = pgid;
+    if (g == 0) { g = p.pid; }
+    p.group = g;
+    ret 0;
+}
+
+fun sys_getpgid(pid: u64) u64 {
+    if (pid == 0) { ret cur().group; }
+    val p: *proc.Proc = proc.find(pid);
+    if (p == nil) { ret e(abi.E_SRCH); }
+    ret p.group;
+}
+
+fun sys_setsid() u64 {
+    val p: *proc.Proc = cur();
+    if (p.group == p.pid) { ret e(abi.E_PERM); } # a group leader cannot
+    p.session = p.pid;
+    p.group = p.pid;
+    ret p.pid;
 }
 
 fun sys_sbrk(n: u64) u64 {
@@ -794,8 +900,15 @@ fun sys_fstat(h: u64, out: u64) u64 {
 
 fun sys_sleep(ms: u64) u64 {
     val t: u64 = (ms * apic.HZ + 999) / 1000;
-    if (t == 0) { proc.yield(); }
-    or          { proc.sleep_ticks(t); }
+    if (t == 0) {
+        proc.yield();
+        ret 0;
+    }
+    val until: u64 = proc.uptime_ticks() + t;
+    for (proc.uptime_ticks() < until) {
+        if (proc.interrupted(cur()) != 0) { ret e(abi.E_INTR); }
+        proc.sleep_ticks(until - proc.uptime_ticks());
+    }
     ret 0;
 }
 
@@ -836,7 +949,31 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.INFO)    { ret sys_info(a); }
     if (n == abi.GETPID)  { ret cur().pid; }
     if (n == abi.PROCS)   { ret sys_procs(a, b); }
-    if (n == abi.KILL)    { ret sys_kill(a); }
+    if (n == abi.KILL)    { ret sys_kill(a, b); }
+    if (n == abi.SIGACTION) { ret sys_sigaction(a, b, c, d); }
+    if (n == abi.SIGPROCMASK) { ret sys_sigprocmask(a, b); }
+    if (n == abi.SIGRETURN) { ret signal.sigreturn(frame); }
+    if (n == abi.ALARM)   { ret sys_alarm(a); }
+    if (n == abi.SETPGID) { ret sys_setpgid(a, b); }
+    if (n == abi.GETPGID) { ret sys_getpgid(a); }
+    if (n == abi.SETSID)  { ret sys_setsid(); }
+    if (n == abi.GETSID) {
+        if (a == 0) { ret cur().session; }
+        val p: *proc.Proc = proc.find(a);
+        if (p == nil) { ret e(abi.E_SRCH); }
+        ret p.session;
+    }
+    if (n == abi.TCSETPGRP) {
+        val r: u64 = tty_handle(a);
+        if (abi.is_err(r) != 0) { ret r; }
+        tty.set_foreground(b);
+        ret 0;
+    }
+    if (n == abi.TCGETPGRP) {
+        val r: u64 = tty_handle(a);
+        if (abi.is_err(r) != 0) { ret r; }
+        ret tty.foreground();
+    }
     if (n == abi.SBRK)    { ret sys_sbrk(a); }
     if (n == abi.SETFG) {
         tty.set_foreground(a);
@@ -888,5 +1025,5 @@ fun syscall_dispatch(f: *idt.Frame) {
         last_sync = now;
         if (blk.dirty_count() > 0) { blk.sync(); }
     }
-    if (cur().killed != 0) { killed_by(abi.SIGINT); }
+    signal.deliver(f);
 }

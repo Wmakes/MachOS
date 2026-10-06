@@ -103,7 +103,33 @@ pub fun sleep(ms: u64) u64 { ret raw(abi.SLEEP, ms, 0, 0, 0, 0); }
 pub fun info(out: *abi.Info) u64 { ret raw(abi.INFO, out::u64, 0, 0, 0, 0); }
 pub fun getpid() u64 { ret raw(abi.GETPID, 0, 0, 0, 0, 0); }
 pub fun procs(idx: u64, out: *abi.ProcInfo) u64 { ret raw(abi.PROCS, idx, out::u64, 0, 0, 0); }
-pub fun kill(pid: u64) u64 { ret raw(abi.KILL, pid, 0, 0, 0, 0); }
+pub fun kill(pid: u64, sig: u64) u64 { ret raw(abi.KILL, pid, sig, 0, 0, 0); }
+pub fun killpg(group: u64, sig: u64) u64 { ret raw(abi.KILL, 0 - group, sig, 0, 0, 0); }
+
+# where a signal handler returns to: straight into SIGRETURN
+#[naked]
+#[symbol("sdk_sigreturn")]
+fun restorer() {
+    asm x86_64 {
+        mov eax, 41
+        syscall
+    }
+}
+
+# handle `sig` with `handler` (a fun(sig: u64) as u64, or abi.SIG_DFL /
+# abi.SIG_IGN); `mask` is also blocked while it runs. -> the old handler
+pub fun sigaction(sig: u64, handler: u64, mask: u64) u64 {
+    ret raw(abi.SIGACTION, sig, handler, restorer::u64, mask, 0);
+}
+pub fun signal(sig: u64, handler: u64) u64 { ret sigaction(sig, handler, 0); }
+pub fun sigprocmask(how: u64, set: u64) u64 { ret raw(abi.SIGPROCMASK, how, set, 0, 0, 0); }
+pub fun alarm(seconds: u64) u64 { ret raw(abi.ALARM, seconds, 0, 0, 0, 0); }
+pub fun setpgid(pid: u64, pgid: u64) u64 { ret raw(abi.SETPGID, pid, pgid, 0, 0, 0); }
+pub fun getpgid(pid: u64) u64 { ret raw(abi.GETPGID, pid, 0, 0, 0, 0); }
+pub fun setsid() u64 { ret raw(abi.SETSID, 0, 0, 0, 0, 0); }
+pub fun getsid(pid: u64) u64 { ret raw(abi.GETSID, pid, 0, 0, 0, 0); }
+pub fun tcsetpgrp(fd: u64, group: u64) u64 { ret raw(abi.TCSETPGRP, fd, group, 0, 0, 0); }
+pub fun tcgetpgrp(fd: u64) u64 { ret raw(abi.TCGETPGRP, fd, 0, 0, 0, 0); }
 pub fun sbrk(n: u64) u64 { ret raw(abi.SBRK, n, 0, 0, 0, 0); }
 pub fun setfg(group: u64) u64 { ret raw(abi.SETFG, group, 0, 0, 0, 0); }
 pub fun sync() u64 { ret raw(abi.SYNC, 0, 0, 0, 0, 0); }

@@ -50,7 +50,8 @@ pub fun close_writer(p: *Pipe) {
 # 0 = every writer is gone and the pipe is drained
 pub fun read(p: *Pipe, buf: u64, n: u64) u64 {
     for (p.count == 0) {
-        if (p.writers == 0 || proc.current().killed != 0) { ret 0; }
+        if (p.writers == 0) { ret 0; }
+        if (proc.interrupted(proc.current()) != 0) { ret abi.err(abi.E_INTR); }
         proc.sleep_on(p::u64);
     }
     var i: u64 = 0;
@@ -71,8 +72,11 @@ pub fun write(p: *Pipe, buf: u64, n: u64) u64 {
     val b: *u8 = buf::*u8;
     val dst: *u8 = p.buf::*u8;
     for (i < n) {
-        if (p.readers == 0) { ret abi.err(abi.E_PIPE); }
-        if (proc.current().killed != 0) { ret abi.err(abi.E_PIPE); }
+        if (p.readers == 0) {
+            proc.send(proc.current(), abi.SIGPIPE); # nobody will ever read this
+            ret abi.err(abi.E_PIPE);
+        }
+        if (proc.interrupted(proc.current()) != 0) { ret abi.err(abi.E_INTR); }
         if (p.count == CAP) {
             proc.wakeup(p::u64);
             proc.sleep_on(p::u64);

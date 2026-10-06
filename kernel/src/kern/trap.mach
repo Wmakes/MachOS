@@ -11,6 +11,7 @@ use proc:   machos.kern.proc;
 use sys:    machos.kern.sys;
 use vmm:    machos.mm.vmm;
 use abi:    sdk.abi;
+use signal: machos.kern.signal;
 
 fun name_of(v: u64) *u8 {
     if (v == 0)  { ret "divide error\0"; }
@@ -85,7 +86,7 @@ fun user_fault(f: *idt.Frame) {
     or (f.vector == 6) { sig = abi.SIGILL; }
     or (f.vector == 3 || f.vector == 1) { sig = abi.SIGTRAP; }
     or (f.vector == 17) { sig = abi.SIGBUS; }
-    sys.killed_by(sig);
+    signal.fault(sig); # ends the program unless it has a handler for sig
 }
 
 #[symbol("isr_dispatch")]
@@ -98,7 +99,11 @@ fun isr_dispatch(f: *idt.Frame) {
         if (f.vector == 14 && from_user != 0 && (f.error & 7) == 7) {
             if (vmm.cow_break(proc.current().pml4, cpu.cr2()) != 0) { ret; }
         }
-        if (from_user != 0) { user_fault(f); }
+        if (from_user != 0) {
+            user_fault(f);
+            signal.deliver(f);
+            ret;
+        }
         dump(f);
         kprint.panic("kernel exception\0");
     }
@@ -116,7 +121,7 @@ fun isr_dispatch(f: *idt.Frame) {
 
     # only ever switch away on the way back to user mode
     if (from_user != 0) {
-        if (proc.current().killed != 0) { sys.killed_by(abi.SIGINT); }
+        signal.deliver(f);
         if (preempt != 0) { proc.yield(); }
     }
 }

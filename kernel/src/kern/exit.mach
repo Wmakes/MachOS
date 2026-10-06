@@ -1,0 +1,24 @@
+# the end of every process: release its fds, then let proc tear it down.
+# the status is what waitpid reports (exit_with / killed_by make one)
+
+use abi:    sdk.abi;
+use kprint: machos.kern.kprint;
+use proc:   machos.kern.proc;
+use file:   machos.fs.file;
+
+pub fun exit_with(code: u64) { do_exit((code & 0xFF) << 8); }
+pub fun killed_by(sig: u64) { do_exit(sig & 0x7F); }
+
+pub fun do_exit(status: u64) {
+    val p: *proc.Proc = proc.current();
+    var i: u64 = 0;
+    for (i < abi.MAX_HANDLES) {
+        if (p.handles[i] != 0) {
+            file.close(p.handles[i]::*file.Handle);
+            p.handles[i] = 0;
+        }
+        i = i + 1;
+    }
+    if (p.pid == 1) { kprint.panic("init exited\0"); }
+    proc.exit(status);
+}

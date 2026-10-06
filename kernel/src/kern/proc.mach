@@ -25,6 +25,7 @@ pub val RUNNABLE: u64 = 1;
 pub val RUNNING:  u64 = 2;
 pub val BLOCKED:  u64 = 3;
 pub val ZOMBIE:   u64 = 4;
+pub val STOPPED:  u64 = 5;
 
 pub val CWD_MAX: u64 = 256;
 
@@ -37,7 +38,15 @@ pub rec Proc {
     ppid:      u64;  # 0 once the parent is gone
     group:     u64;
     state:     u64;
-    killed:    u8;
+    sig_pending: u64; # bit per signal
+    sig_mask:  u64;   # blocked signals
+    sig_handler: [32]u64; # abi.SIG_DFL, SIG_IGN, or a user function
+    sig_hmask: [32]u64;   # also blocked while that handler runs
+    restorer:  u64;   # where handlers return to (the SDK's sigreturn call)
+    stop_sig:  u64;   # STOPPED: the signal that stopped it
+    report_stop: u8;  # a stop waitpid(WUNTRACED) has not seen yet
+    alarm_at:  u64;   # tick SIGALRM is due, 0 = none
+    session:   u64;
     exit_code: u64;  # the wait status: code << 8, or the signal
     ksp:       u64;  # saved kernel rsp while switched out
     kstack:    u64;  # heap block holding the kernel stack
@@ -235,28 +244,77 @@ pub fun tick() {
     for (i < MAX) {
         val p: *Proc = ?table[i];
         if (p.state == BLOCKED && p.chan == CHAN_TIMER && p.wake_at <= ticks) { p.state = RUNNABLE; }
+        if (p.alarm_at != 0 && p.alarm_at <= ticks && p.state != FREE) {
+            p.alarm_at = 0;
+            send(p, abi.SIGALRM);
+        }
         i = i + 1;
     }
 }
 
-# mark a process to die the next time it heads back to user mode
-pub fun kill(p: *Proc) {
-    if (p.state == FREE || p.state == ZOMBIE) { ret; }
-    p.killed = 1;
-    if (p.state == BLOCKED) { p.state = RUNNABLE; }
+# signals whose default action is to do nothing
+fun default_ignored(sig: u64) u8 {
+    if (sig == abi.SIGCHLD || sig == abi.SIGCONT || sig == 23 || sig == 28) { ret 1; }
+    ret 0;
 }
 
-pub fun kill_group(group: u64) u64 {
+# send `sig` to `p`. it is acted on when `p` next heads back to user mode;
+# a blocked call is woken to return E_INTR. SIGCONT resumes a stopped
+# process, SIGKILL any process
+pub fun send(p: *Proc, sig: u64) {
+    if (p.state == FREE || p.state == ZOMBIE || sig == 0 || sig >= abi.NSIG) { ret; }
+    if (sig == abi.SIGCONT || sig == abi.SIGKILL) {
+        if (p.state == STOPPED) { p.state = RUNNABLE; }
+        if (sig == abi.SIGCONT) {
+            # a pending stop is cancelled by a continue
+            p.sig_pending = p.sig_pending & ~(abi.sigbit(abi.SIGSTOP) | abi.sigbit(abi.SIGTSTP));
+        }
+    }
+    if (sig == abi.SIGSTOP || sig == abi.SIGTSTP) {
+        p.sig_pending = p.sig_pending & ~abi.sigbit(abi.SIGCONT);
+    }
+    val h: u64 = p.sig_handler[sig];
+    if (sig != abi.SIGKILL && sig != abi.SIGSTOP) {
+        if (h == abi.SIG_IGN) { ret; }
+        if (h == abi.SIG_DFL && default_ignored(sig) != 0) { ret; }
+    }
+    p.sig_pending = p.sig_pending | abi.sigbit(sig);
+    if (p.state == BLOCKED && interrupted(p) != 0) { p.state = RUNNABLE; }
+}
+
+# whether a signal waits that `p` will act on (so a blocking call should give up)
+pub fun interrupted(p: *Proc) u8 {
+    val always: u64 = abi.sigbit(abi.SIGKILL) | abi.sigbit(abi.SIGSTOP);
+    if ((p.sig_pending & (~p.sig_mask | always)) != 0) { ret 1; }
+    ret 0;
+}
+
+# send `sig` to every process of `group`; how many there were
+pub fun send_group(group: u64, sig: u64) u64 {
     var n: u64 = 0;
     var i: u64 = 0;
     for (i < MAX) {
         if (table[i].group == group && table[i].state != FREE && table[i].state != ZOMBIE) {
-            kill(?table[i]);
+            send(?table[i], sig);
             n = n + 1;
         }
         i = i + 1;
     }
     ret n;
+}
+
+# stop the current process until SIGCONT (or SIGKILL); its parent hears of it
+pub fun stop_self(sig: u64) {
+    val p: *Proc = cur;
+    p.state = STOPPED;
+    p.stop_sig = sig;
+    p.report_stop = 1;
+    val parent: *Proc = find(p.ppid);
+    if (parent != nil) {
+        send(parent, abi.SIGCHLD);
+        wakeup(parent::u64);
+    }
+    sched();
 }
 
 # free everything a zombie still holds and its slot
@@ -288,7 +346,10 @@ pub fun exit(code: u64) {
     p.state = ZOMBIE;
     if (p.ppid != 0) {
         val parent: *Proc = find(p.ppid);
-        if (parent != nil) { wakeup(parent::u64); }
+        if (parent != nil) {
+            send(parent, abi.SIGCHLD);
+            wakeup(parent::u64);
+        }
     }
     sched();
 }

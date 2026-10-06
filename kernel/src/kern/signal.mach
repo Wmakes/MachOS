@@ -1,0 +1,127 @@
+# acting on signals, on the way back to user mode (after a system call or
+# an interrupt that came from user mode). a signal with a handler gets a
+# frame on the user stack, from the bottom:
+#   [ return address: the SDK's restorer ]  <- rsp when the handler starts
+#   [ the fxsave image, 512 bytes ]         <- frame base (16-aligned)
+#   [ the interrupted Frame, 176 bytes ]
+#   [ the mask before the handler ][ pad ]
+# the restorer calls SIGRETURN, which puts all of it back
+
+use abi:  sdk.abi;
+use idt:  machos.arch.x86_64.idt;
+use cpu:  machos.arch.x86_64.cpu;
+use vmm:  machos.mm.vmm;
+use mem:  machos.kern.mem;
+use proc: machos.kern.proc;
+use exit: machos.kern.exit;
+
+val FRAME: u64 = 176;
+val TOTAL: u64 = 704; # fxsave + Frame + mask + pad
+val RED_ZONE: u64 = 128;
+
+fun unblockable() u64 { ret abi.sigbit(abi.SIGKILL) | abi.sigbit(abi.SIGSTOP); }
+
+fun is_stop(sig: u64) u8 {
+    if (sig == abi.SIGSTOP || sig == abi.SIGTSTP || sig == 21 || sig == 22) { ret 1; }
+    ret 0;
+}
+
+fun default_ignored(sig: u64) u8 {
+    if (sig == abi.SIGCHLD || sig == abi.SIGCONT || sig == 23 || sig == 28) { ret 1; }
+    ret 0;
+}
+
+fun lowest(bits: u64) u64 {
+    var i: u64 = 1;
+    for (i < abi.NSIG) {
+        if ((bits & abi.sigbit(i)) != 0) { ret i; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun user_copy(dst: u64, src: u64, n: u64) {
+    val smap: u8 = cpu.has_smap();
+    if (smap != 0) { cpu.stac(); }
+    mem.copy(dst, src, n);
+    if (smap != 0) { cpu.clac(); }
+}
+
+# build the handler's frame; 0 if the user stack cannot take it
+fun enter_handler(p: *proc.Proc, f: *idt.Frame, sig: u64, handler: u64) u8 {
+    if (f.rsp < TOTAL + RED_ZONE + 64) { ret 0; }
+    val base: u64 = (f.rsp - RED_ZONE - TOTAL) & ~15::u64;
+    if (vmm.user_ok(p.pml4, base - 8, TOTAL + 8, 1) == 0) { ret 0; }
+    val ret_addr: u64 = p.restorer;
+    val mask: u64 = p.sig_mask;
+    user_copy(base, f::u64 - idt.FPU_AREA, idt.FPU_AREA);
+    user_copy(base + idt.FPU_AREA, f::u64, FRAME);
+    user_copy(base + idt.FPU_AREA + FRAME, (?mask)::u64, 8);
+    user_copy(base - 8, (?ret_addr)::u64, 8);
+    p.sig_mask = p.sig_mask | p.sig_hmask[sig] | abi.sigbit(sig);
+    f.rsp = base - 8;
+    f.rip = handler;
+    f.rdi = sig;
+    f.rsi = 0;
+    f.rdx = 0;
+    f.rflags = f.rflags & ~0x500::u64; # TF and DF clear in the handler
+    ret 1;
+}
+
+# act on the signals that are due, before returning to user mode with `f`
+pub fun deliver(f: *idt.Frame) {
+    val p: *proc.Proc = proc.current();
+    for {
+        val ready: u64 = p.sig_pending & (~p.sig_mask | unblockable());
+        if (ready == 0) { ret; }
+        val sig: u64 = lowest(ready);
+        p.sig_pending = p.sig_pending & ~abi.sigbit(sig);
+        val h: u64 = p.sig_handler[sig];
+        if (sig == abi.SIGKILL) { exit.killed_by(sig); }
+        if (sig == abi.SIGSTOP || (h == abi.SIG_DFL && is_stop(sig) != 0)) {
+            proc.stop_self(sig);
+            cnt;
+        }
+        if (h == abi.SIG_IGN) { cnt; }
+        if (h == abi.SIG_DFL) {
+            if (default_ignored(sig) != 0) { cnt; }
+            exit.killed_by(sig);
+        }
+        if (p.restorer == 0 || enter_handler(p, f, sig, h) == 0) { exit.killed_by(abi.SIGSEGV); }
+        ret; # one handler at a time; the next waits for its sigreturn
+    }
+}
+
+# a fault in user mode: hand it to the program's handler if it has one that
+# can run, otherwise end the program with that signal
+pub fun fault(sig: u64) {
+    val p: *proc.Proc = proc.current();
+    val h: u64 = p.sig_handler[sig];
+    if (h == abi.SIG_DFL || h == abi.SIG_IGN || (p.sig_mask & abi.sigbit(sig)) != 0) {
+        exit.killed_by(sig);
+    }
+    p.sig_pending = p.sig_pending | abi.sigbit(sig);
+}
+
+# SIGRETURN: put back what enter_handler saved; returns the saved rax
+pub fun sigreturn(f: *idt.Frame) u64 {
+    val p: *proc.Proc = proc.current();
+    val base: u64 = f.rsp;
+    if (vmm.user_ok(p.pml4, base, TOTAL, 0) == 0) { exit.killed_by(abi.SIGSEGV); }
+    var saved: idt.Frame;
+    var mask: u64 = 0;
+    user_copy(f::u64 - idt.FPU_AREA, base, idt.FPU_AREA);
+    user_copy((?saved)::u64, base + idt.FPU_AREA, FRAME);
+    user_copy((?mask)::u64, base + idt.FPU_AREA + FRAME, 8);
+    # a bad MXCSR would make fxrstor fault in the kernel
+    val mxcsr: *u32 = (f::u64 - idt.FPU_AREA + 24)::*u32;
+    @mxcsr = @mxcsr & 0xFFFF;
+    val cs: u64 = f.cs;
+    val ss: u64 = f.ss;
+    mem.copy(f::u64, (?saved)::u64, FRAME);
+    f.cs = cs; # never let user memory choose segments or privileged flags
+    f.ss = ss;
+    f.rflags = (saved.rflags & 0xDD5) | 0x202;
+    p.sig_mask = mask & ~unblockable();
+    ret saved.rax;
+}

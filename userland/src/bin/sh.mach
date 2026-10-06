@@ -3,7 +3,8 @@
 #   $? (last status), $0-$9 and $# (script arguments), $$ (the shell's pid),
 #   $NAME and ${NAME} (variables), ~ (home)
 #   NAME=value  set a variable; NAME=value cmd  run cmd with it in its environment
-#   builtins: cd pwd exit jobs export unset set
+#   builtins: cd pwd exit jobs fg bg export unset set
+#   job control: ^Z stops the foreground job; fg / bg [N] continue it
 #   a | b | c        pipelines
 #   < f  > f  >> f   redirections, also N< f  N> f  N>> f  N>&M  N>&-  (fds 0-9)
 #   a ; b   a && b   a || b   a &   sequencing, conditionals, background
@@ -52,8 +53,22 @@ var wlen: u64 = 0;
 var overflow: u8 = 0;
 
 var status: u64 = 0;
-var bg: [16]u64;
-var nbg: u64 = 0;
+# jobs: pipelines started in the background or stopped with ^Z
+rec Job {
+    used:    u8;
+    id:      u64;
+    group:   u64;
+    npids:   u64;
+    pids:    [8]u64;
+    done:    [8]u8;
+    stopped: u8;
+    tlen:    u64;
+    text:    [64]u8;
+}
+
+var jobs: [16]Job;
+var line_text: [1024]u8; # the line being run, for job listings
+var line_text_len: u64 = 0;
 var quit: u8 = 0;
 var params: **u8 = nil; # $0 $1 ... (a script's path and arguments)
 
@@ -507,22 +522,153 @@ fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
     }
     if (io.streq(name, "jobs\0") != 0) {
         var i: u64 = 0;
-        for (i < nbg) {
-            write_to(out, "[\0");
-            var num: [20]u8;
-            io.write_all(out, ?num[0], io.fmt_dec(bg[i], ?num[0]));
-            write_to(out, "] running\n\0");
+        for (i < MAX_BG) {
+            val j: *Job = ?jobs[i];
+            if (j.used != 0) {
+                if (j.stopped != 0) { job_line(out, j, "Stopped\0"); }
+                or                  { job_line(out, j, "Running\0"); }
+            }
             i = i + 1;
         }
         status = 0;
         ret 1;
     }
+    if (io.streq(name, "fg\0") != 0 || io.streq(name, "bg\0") != 0) {
+        val j: *Job = pick_job(argc, args);
+        if (j == nil) {
+            io.err(name);
+            io.err(": no such job\n\0");
+            status = 1;
+            ret 1;
+        }
+        if (name[0] == 102) { # fg
+            io.outn(?j.text[0], j.tlen);
+            io.putc(10);
+            if (j.stopped != 0) {
+                j.stopped = 0;
+                sys.killpg(j.group, abi.SIGCONT);
+            }
+            wait_job(j);
+        } or {
+            if (j.stopped != 0) {
+                j.stopped = 0;
+                sys.killpg(j.group, abi.SIGCONT);
+            }
+            job_line(out, j, "Running\0");
+            status = 0;
+        }
+        ret 1;
+    }
     ret 0;
+}
+
+fun job_line(out: u64, j: *Job, state: *u8) {
+    var num: [20]u8;
+    write_to(out, "[\0");
+    io.write_all(out, ?num[0], io.fmt_dec(j.id, ?num[0]));
+    write_to(out, "]  \0");
+    write_to(out, state);
+    write_to(out, "  \0");
+    io.write_all(out, ?j.text[0], j.tlen);
+    write_to(out, "\n\0");
+}
+
+# the job a fg/bg argument names (N or %N), or the newest one
+fun pick_job(argc: u64, args: **u8) *Job {
+    var want: u64 = 0;
+    if (argc > 1) {
+        var a: *u8 = args[1];
+        if (a[0] == 37) { a = ?a[1]; }
+        var okk: u8 = 0;
+        want = io.parse_dec(a, io.len(a), ?okk);
+        if (okk == 0) { ret nil; }
+    }
+    var best: *Job = nil;
+    var i: u64 = 0;
+    for (i < MAX_BG) {
+        val j: *Job = ?jobs[i];
+        if (j.used != 0) {
+            if (want != 0 && j.id == want) { ret j; }
+            if (want == 0 && (best == nil || j.id > best.id)) { best = j; }
+        }
+        i = i + 1;
+    }
+    ret best;
+}
+
+fun job_new(group: u64, pids: *u64, n: u64) *Job {
+    var id: u64 = 1;
+    var taken: u8 = 1;
+    for (taken != 0) {
+        taken = 0;
+        var i: u64 = 0;
+        for (i < MAX_BG) {
+            if (jobs[i].used != 0 && jobs[i].id == id) { taken = 1; }
+            i = i + 1;
+        }
+        if (taken != 0) { id = id + 1; }
+    }
+    var i: u64 = 0;
+    for (i < MAX_BG) {
+        val j: *Job = ?jobs[i];
+        if (j.used == 0) {
+            j.used = 1;
+            j.id = id;
+            j.group = group;
+            j.npids = n;
+            j.stopped = 0;
+            var k: u64 = 0;
+            for (k < n) {
+                j.pids[k] = pids[k];
+                j.done[k] = 0;
+                k = k + 1;
+            }
+            var t: u64 = line_text_len;
+            if (t > 64) { t = 64; }
+            io.copy(?j.text[0], ?line_text[0], t);
+            j.tlen = t;
+            ret j;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# run `j` in the foreground until it ends or stops
+fun wait_job(j: *Job) {
+    # (a pipeline of builtins only runs in the shell's own group, which must
+    # never become the foreground: ^C would reach the shell)
+    if (j.group != sys.getpgid(0)) { sys.tcsetpgrp(abi.STDIN, j.group); }
+    var k: u64 = 0;
+    for (k < j.npids) {
+        if (j.done[k] == 0) {
+            var st: u64 = 0;
+            val r: u64 = sys.waitpid(j.pids[k], ?st, abi.WUNTRACED);
+            if (r == j.pids[k] && abi.wifstopped(st) != 0) {
+                j.stopped = 1;
+                sys.tcsetpgrp(abi.STDIN, 0);
+                io.putc(10);
+                job_line(abi.STDOUT, j, "Stopped\0");
+                status = 128 + abi.wstopsig(st);
+                ret;
+            }
+            j.done[k] = 1;
+            if (k + 1 == j.npids) {
+                if (abi.is_err(r) != 0) { status = 1; }
+                or (abi.wifexited(st) != 0) { status = abi.wexitstatus(st); }
+                or { status = 128 + abi.wtermsig(st); }
+            }
+        }
+        k = k + 1;
+    }
+    j.used = 0;
+    sys.tcsetpgrp(abi.STDIN, 0);
 }
 
 fun is_builtin(name: *u8) u8 {
     if (io.streq(name, "cd\0") != 0 || io.streq(name, "pwd\0") != 0 ||
         io.streq(name, "exit\0") != 0 || io.streq(name, "jobs\0") != 0 ||
+        io.streq(name, "fg\0") != 0 || io.streq(name, "bg\0") != 0 ||
         io.streq(name, "export\0") != 0 || io.streq(name, "unset\0") != 0 ||
         io.streq(name, "set\0") != 0) { ret 1; }
     ret 0;
@@ -828,33 +974,28 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
     close_if(prev_read, NONE);
     if (spawned == 0) { ret; }
 
-    if (background != 0) {
+    var g: u64 = group;
+    if (g == 0) { g = sys.getpgid(0); } # only builtins: they stay in my group
+    val j: *Job = job_new(g, ?pids[0], spawned);
+    if (j == nil) { # no room in the table: just wait for them
         var i: u64 = 0;
         for (i < spawned) {
-            if (nbg < MAX_BG) {
-                bg[nbg] = pids[i];
-                nbg = nbg + 1;
-            }
+            val r: u64 = sys.wait(pids[i]);
+            if (i + 1 == spawned && abi.is_err(r) == 0) { status = r; }
             i = i + 1;
         }
+        ret;
+    }
+    if (background != 0) {
         io.out("[\0");
-        io.dec(group);
-        io.out("]\n\0");
+        io.dec(j.id);
+        io.out("] \0");
+        io.dec(g);
+        io.putc(10);
         status = 0;
         ret;
     }
-
-    sys.setfg(group);
-    var i: u64 = 0;
-    for (i < spawned) {
-        val r: u64 = sys.wait(pids[i]);
-        if (i + 1 == spawned) {
-            if (abi.is_err(r) != 0) { status = 1; }
-            or                      { status = r; }
-        }
-        i = i + 1;
-    }
-    sys.setfg(0);
+    wait_job(j);
 }
 
 # run every pipeline of the tokenized line, honouring ; && || &
@@ -885,19 +1026,29 @@ fun run_line() {
     }
 }
 
+# say which background jobs finished since the last prompt
 fun reap_jobs() {
     var i: u64 = 0;
-    for (i < nbg) {
-        val r: u64 = sys.poll(bg[i]);
-        if (abi.is_err(r) != 0 && abi.err_code(r) == abi.E_AGAIN) {
-            i = i + 1;
-            cnt;
+    for (i < MAX_BG) {
+        val j: *Job = ?jobs[i];
+        if (j.used != 0 && j.stopped == 0) {
+            var left: u64 = 0;
+            var k: u64 = 0;
+            for (k < j.npids) {
+                if (j.done[k] == 0) {
+                    var st: u64 = 0;
+                    val r: u64 = sys.waitpid(j.pids[k], ?st, abi.WNOHANG);
+                    if (r == j.pids[k] || abi.is_err(r) != 0) { j.done[k] = 1; }
+                    or { left = left + 1; }
+                }
+                k = k + 1;
+            }
+            if (left == 0) {
+                job_line(abi.STDOUT, j, "Done\0");
+                j.used = 0;
+            }
         }
-        io.out("[\0");
-        io.dec(bg[i]);
-        io.out("] done\n\0");
-        bg[i] = bg[nbg - 1];
-        nbg = nbg - 1;
+        i = i + 1;
     }
 }
 
@@ -955,6 +1106,10 @@ fun getline(h: u64, line: *u8, cap: u64) u64 {
 }
 
 fun run_string(s: *u8, n: u64) {
+    var t: u64 = n;
+    if (t > 1024) { t = 1024; }
+    io.copy(?line_text[0], s, t);
+    line_text_len = t;
     if (lex(s, n) != 0) { run_line(); }
 }
 

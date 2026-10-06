@@ -19,6 +19,7 @@ fun main(argc: u64, argv: **u8) u64 {
         if (p.state == abi.STATE_RUNNING)       { io.out(" running \0"); }
         or (p.state == abi.STATE_RUNNABLE)      { io.out(" ready   \0"); }
         or (p.state == abi.STATE_BLOCKED)       { io.out(" waiting \0"); }
+        or (p.state == abi.STATE_STOPPED)       { io.out(" stopped \0"); }
         or                                      { io.out(" zombie  \0"); }
         io.dec_pad(p.pages * 4, 5);
         io.out("K  \0");

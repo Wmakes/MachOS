@@ -133,7 +133,7 @@ fun disk_io(h: *Handle, buf: u64, n: u64, write: u8) u64 {
 
 fun console_read(buf: u64, n: u64) u64 {
     for (tty.readable() == 0) {
-        if (proc.current().killed != 0) { ret 0; }
+        if (proc.interrupted(proc.current()) != 0) { ret abi.err(abi.E_INTR); }
         proc.sleep_on(proc.CHAN_TTY);
     }
     ret tty.read(buf::*u8, n);

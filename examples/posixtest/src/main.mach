@@ -140,11 +140,97 @@ fun processes() {
     check("execve of nothing fails\0", (abi.err_code(sys.execve("/nope\0", 5, nil, 0)) == abi.E_NOENT)::u8);
 }
 
+var caught: u64 = 0;
+var caught_sig: u64 = 0;
+
+fun on_signal(sig: u64) {
+    caught = caught + 1;
+    caught_sig = sig;
+}
+
+fun on_segv(sig: u64) {
+    sys.exit(42); # cannot go back to the faulting instruction
+}
+
+fun signals() {
+    val me: u64 = sys.getpid();
+    sys.signal(abi.SIGUSR1, on_signal::u64);
+    var keep: u64 = 12345;
+    sys.kill(me, abi.SIGUSR1);
+    check("a handler runs\0", (caught == 1 && caught_sig == abi.SIGUSR1)::u8);
+    check("registers survive it\0", (keep == 12345)::u8);
+
+    sys.sigprocmask(abi.SIG_BLOCK, abi.sigbit(abi.SIGUSR1));
+    sys.kill(me, abi.SIGUSR1);
+    check("a blocked signal waits\0", (caught == 1)::u8);
+    sys.sigprocmask(abi.SIG_UNBLOCK, abi.sigbit(abi.SIGUSR1));
+    check("and arrives when unblocked\0", (caught == 2)::u8);
+
+    sys.signal(abi.SIGUSR2, abi.SIG_IGN);
+    sys.kill(me, abi.SIGUSR2);
+    check("an ignored signal is ignored\0", 1);
+
+    sys.signal(abi.SIGALRM, on_signal::u64);
+    sys.alarm(1);
+    val r: u64 = sys.sleep(5000);
+    check("alarm interrupts sleep (EINTR)\0", (abi.err_code(r) == abi.E_INTR && caught_sig == abi.SIGALRM)::u8);
+
+    var st: u64 = 0;
+    val t: u64 = sys.fork();
+    if (t == 0) {
+        sys.sleep(5000);
+        sys.exit(0);
+    }
+    sys.kill(t, abi.SIGTERM);
+    sys.waitpid(t, ?st, 0);
+    check("SIGTERM's default kills\0", (abi.wifsignaled(st) != 0 && abi.wtermsig(st) == abi.SIGTERM)::u8);
+
+    val sv: u64 = sys.fork();
+    if (sv == 0) {
+        sys.signal(abi.SIGSEGV, on_segv::u64);
+        val nowhere: *u64 = 8::*u64;
+        @nowhere = 1;
+        sys.exit(0);
+    }
+    sys.waitpid(sv, ?st, 0);
+    check("a SIGSEGV handler runs\0", (abi.wifexited(st) != 0 && abi.wexitstatus(st) == 42)::u8);
+
+    var ends: [2]u64;
+    sys.pipe(?ends);
+    val pw: u64 = sys.fork();
+    if (pw == 0) {
+        sys.close(ends[0]);
+        sys.sleep(100);
+        io.write_all(ends[1], "x\0", 1);
+        sys.exit(0);
+    }
+    sys.close(ends[0]);
+    sys.close(ends[1]);
+    sys.waitpid(pw, ?st, 0);
+    check("writing to a dead pipe is SIGPIPE\0", (abi.wifsignaled(st) != 0 && abi.wtermsig(st) == abi.SIGPIPE)::u8);
+
+    val sp: u64 = sys.fork();
+    if (sp == 0) {
+        sys.setpgid(0, 0);
+        for { sys.sleep(1000); }
+    }
+    sys.sleep(50);
+    check("setpgid made a group\0", (sys.getpgid(sp) == sp)::u8);
+    sys.kill(sp, abi.SIGSTOP);
+    check("WUNTRACED sees the stop\0", (sys.waitpid(sp, ?st, abi.WUNTRACED) == sp && abi.wifstopped(st) != 0 && abi.wstopsig(st) == abi.SIGSTOP)::u8);
+    sys.kill(sp, abi.SIGCONT);
+    sys.killpg(sp, abi.SIGKILL);
+    sys.waitpid(sp, ?st, 0);
+    check("killpg reaches the group\0", (abi.wifsignaled(st) != 0 && abi.wtermsig(st) == abi.SIGKILL)::u8);
+    sys.signal(abi.SIGUSR1, abi.SIG_DFL);
+}
+
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     fds();
     envs();
     processes();
+    signals();
     io.out("posixtest: \0");
     io.dec(failures);
     io.out(" failures\n\0");
