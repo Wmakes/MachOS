@@ -1,0 +1,115 @@
+# Limine boot protocol adapter: requests in .limine_requests, responses -> BootInfo
+
+use info: machos.boot.info;
+
+#[volatile]
+rec BaseRevision { id0: u64; id1: u64; rev: u64; }
+
+#[volatile]
+rec Request { id: [4]u64; revision: u64; response: u64; }
+
+#[volatile]
+rec HhdmResponse { revision: u64; offset: u64; }
+
+#[volatile]
+rec RsdpResponse { revision: u64; address: u64; }
+
+#[volatile]
+rec MemmapResponse { revision: u64; count: u64; entries: **MemmapEntry; }
+
+#[volatile]
+rec MemmapEntry { base: u64; length: u64; kind: u64; }
+
+#[volatile]
+rec FbResponse { revision: u64; count: u64; fbs: **Fb; }
+
+#[volatile]
+rec Fb {
+    address: u64; width: u64; height: u64; pitch: u64; bpp: u16;
+    memory_model: u8;
+    red_size: u8; red_shift: u8; green_size: u8; green_shift: u8; blue_size: u8; blue_shift: u8;
+}
+
+#[section(".limine_requests")]
+#[align(8)]
+var base_revision: BaseRevision = BaseRevision{ id0: 0xf9562b2d5c95a6c8, id1: 0x6a7b384944536bdc, rev: 3 };
+
+#[section(".limine_requests")]
+#[align(8)]
+var hhdm_req: Request = Request{
+    id: [4]u64{0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x48dcf1cb8ad2b852, 0x63984e959a98244b},
+    revision: 0, response: 0,
+};
+
+#[section(".limine_requests")]
+#[align(8)]
+var memmap_req: Request = Request{
+    id: [4]u64{0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x67cf3d9d378a806f, 0xe304acdfc50c3c62},
+    revision: 0, response: 0,
+};
+
+#[section(".limine_requests")]
+#[align(8)]
+var fb_req: Request = Request{
+    id: [4]u64{0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x9d5827dcd881dd75, 0xa3148604f6fab11b},
+    revision: 0, response: 0,
+};
+
+#[section(".limine_requests")]
+#[align(8)]
+var rsdp_req: Request = Request{
+    id: [4]u64{0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0xc5e77b6b397e7b43, 0x27637845accdcf3c},
+    revision: 0, response: 0,
+};
+
+fun kind_of(k: u64) u8 {
+    if (k == 0) { ret info.MEM_USABLE; }
+    if (k == 2) { ret info.MEM_RECLAIMABLE; } # acpi reclaimable
+    if (k == 3) { ret info.MEM_ACPI; }
+    if (k == 5) { ret info.MEM_RECLAIMABLE; } # bootloader reclaimable
+    if (k == 6) { ret info.MEM_KERNEL; }
+    if (k == 7) { ret info.MEM_FRAMEBUFFER; }
+    ret info.MEM_RESERVED;
+}
+
+# fill `bi`; returns an error message, or nil on success
+pub fun collect(bi: *info.BootInfo) *u8 {
+    if (base_revision.rev != 0) { ret "limine: base revision 3 not supported\0"; }
+
+    if (hhdm_req.response == 0) { ret "limine: no hhdm\0"; }
+    bi.hhdm = (@(hhdm_req.response::*HhdmResponse)).offset;
+
+    if (memmap_req.response == 0) { ret "limine: no memory map\0"; }
+    val mm: *MemmapResponse = memmap_req.response::*MemmapResponse;
+    var n: u64 = mm.count;
+    if (n > info.MEM_MAX) { n = info.MEM_MAX; }
+    var i: u64 = 0;
+    for (i < n) {
+        val e: *MemmapEntry = mm.entries[i];
+        bi.mem[i].base = e.base;
+        bi.mem[i].len  = e.length;
+        bi.mem[i].kind = kind_of(e.kind);
+        i = i + 1;
+    }
+    bi.mem_len = n;
+
+    bi.rsdp = 0;
+    if (rsdp_req.response != 0) { bi.rsdp = (@(rsdp_req.response::*RsdpResponse)).address; }
+
+    bi.fb.addr = 0;
+    if (fb_req.response != 0) {
+        val fr: *FbResponse = fb_req.response::*FbResponse;
+        if (fr.count > 0) {
+            val f: *Fb = fr.fbs[0];
+            bi.fb.addr   = f.address;
+            bi.fb.width  = f.width;
+            bi.fb.height = f.height;
+            bi.fb.pitch  = f.pitch;
+            bi.fb.bpp    = f.bpp;
+            bi.fb.r_size = f.red_size;   bi.fb.r_shift = f.red_shift;
+            bi.fb.g_size = f.green_size; bi.fb.g_shift = f.green_shift;
+            bi.fb.b_size = f.blue_size;  bi.fb.b_shift = f.blue_shift;
+        }
+    }
+    ret nil;
+}

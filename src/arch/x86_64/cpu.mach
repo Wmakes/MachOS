@@ -1,0 +1,54 @@
+# port i/o and small cpu primitives
+
+pub fun outb(port: u16, v: u8) {
+    asm x86_64 {
+        mov dx, {port}
+        mov al, {v}
+        out dx, al
+    }
+}
+
+pub fun inb(port: u16) u8 {
+    var v: u8 = 0;
+    asm x86_64 {
+        mov dx, {port}
+        in al, dx
+        mov {v}, al
+    }
+    ret v;
+}
+
+pub fun cr2() u64 {
+    var v: u64 = 0;
+    asm x86_64 {
+        mov rax, cr2
+        mov {v}, rax
+    }
+    ret v;
+}
+
+pub fun cr3() u64 {
+    var v: u64 = 0;
+    asm x86_64 {
+        mov rax, cr3
+        mov {v}, rax
+    }
+    ret v;
+}
+
+# mask both legacy 8259 PICs; interrupts will come from the APIC
+pub fun pic_disable() {
+    outb(0x21, 0xFF);
+    outb(0xA1, 0xFF);
+}
+
+# park the core for good. `nop` after `hlt`: mach treats hlt as no-return
+pub fun halt() {
+    for {
+        asm x86_64 {
+            cli
+            hlt
+            nop
+        }
+    }
+}

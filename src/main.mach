@@ -1,0 +1,71 @@
+# kernel entry
+
+use info:   machos.boot.info;
+use limine: machos.boot.limine;
+use cpu:    machos.arch.x86_64.cpu;
+use gdt:    machos.arch.x86_64.gdt;
+use idt:    machos.arch.x86_64.idt;
+use serial: machos.dev.serial;
+use fbcon:  machos.dev.fbcon;
+use kprint: machos.kern.kprint;
+use pmm:    machos.mm.pmm;
+
+var boot: info.BootInfo;
+
+#[symbol("kmain")]
+fun kmain() {
+    serial.init();
+    cpu.pic_disable();
+    val err: *u8 = limine.collect(?boot);
+    if (err != nil) { kprint.panic(err); }
+    val have_fb: u8 = fbcon.init(?boot.fb);
+
+    kprint.puts("machos 0.1.0\n\0");
+    if (have_fb != 0) {
+        kprint.puts("fb: \0");
+        kprint.dec(boot.fb.width);
+        kprint.putc(120);
+        kprint.dec(boot.fb.height);
+        kprint.puts(", \0");
+        kprint.dec(fbcon.cols_of());
+        kprint.putc(120);
+        kprint.dec(fbcon.rows_of());
+        kprint.puts(" text\n\0");
+    } or {
+        kprint.puts("fb: none, serial only\n\0");
+    }
+    kprint.puts("boot: \0");
+    kprint.dec(boot.mem_len);
+    kprint.puts(" memory regions, hhdm \0");
+    kprint.hex(boot.hhdm);
+    kprint.puts("  rsdp \0");
+    kprint.hex(boot.rsdp);
+    kprint.putc(10);
+
+    gdt.init();
+    idt.init();
+    kprint.puts("gdt, tss, idt loaded\n\0");
+
+    pmm.init(?boot);
+    kprint.puts("pmm: \0");
+    kprint.dec(pmm.free_pages() * pmm.PAGE / 1024 / 1024);
+    kprint.puts(" MiB free\n\0");
+
+    val a: u64 = pmm.alloc();
+    val b: u64 = pmm.alloc();
+    pmm.free(a);
+    val c: u64 = pmm.alloc();
+    if (a == 0 || b == 0 || c != a) { kprint.panic("pmm self-test failed\0"); }
+
+    kprint.puts("idle\n\0");
+    cpu.halt();
+}
+
+#[naked]
+#[symbol("_start")]
+fun start() {
+    asm x86_64 {
+        and rsp, -16
+        call kmain
+    }
+}

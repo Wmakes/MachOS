@@ -1,0 +1,130 @@
+# framebuffer text console: 8x16 glyphs on a 32 bpp linear framebuffer.
+# the character grid is mirrored in `cells`, so scrolling redraws only the
+# cells that change and never reads video memory back
+
+use info: machos.boot.info;
+
+#[embed("font8x16.bin")]
+val FONT: [4096]u8; # 256 glyphs, 16 rows each, msb = leftmost pixel
+
+val GW: u64 = 8;
+val GH: u64 = 16;
+val MAX_CELLS: u64 = 32768; # 240x135 cells is 1920x2160, plenty
+
+var base: u64 = 0; # virtual address of pixel (0,0), 0 = no console
+var pitch: u64 = 0;
+var cols: u64 = 0;
+var rows: u64 = 0;
+var cx: u64 = 0;
+var cy: u64 = 0;
+var fg: u32 = 0;
+var bg: u32 = 0;
+var cells: [32768]u8;
+
+fun channel(v: u32, size: u8, shift: u8) u32 {
+    # scale an 8-bit channel down to `size` bits, then place it
+    ret (v >> (8 - size::u32)) << shift::u32;
+}
+
+fun rgb(f: *info.Framebuffer, r: u32, g: u32, b: u32) u32 {
+    ret channel(r, f.r_size, f.r_shift)
+      | channel(g, f.g_size, f.g_shift)
+      | channel(b, f.b_size, f.b_shift);
+}
+
+fun draw(i: u64) {
+    val c: u64 = cells[i]::u64;
+    val px: u64 = base + (i / cols) * GH * pitch + (i % cols) * GW * 4;
+    var y: u64 = 0;
+    for (y < GH) {
+        val bits: u8 = FONT[c * GH + y];
+        val row: *u32 = (px + y * pitch)::*u32;
+        var x: u64 = 0;
+        for (x < GW) {
+            if (((bits << x::u8) & 0x80) != 0) { row[x] = fg; }
+            or                                  { row[x] = bg; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fun set(i: u64, c: u8) {
+    if (cells[i] != c) {
+        cells[i] = c;
+        draw(i);
+    }
+}
+
+fun scroll() {
+    val n: u64 = (rows - 1) * cols;
+    var i: u64 = 0;
+    for (i < n) {
+        set(i, cells[i + cols]);
+        i = i + 1;
+    }
+    for (i < rows * cols) {
+        set(i, 32);
+        i = i + 1;
+    }
+}
+
+fun newline() {
+    cx = 0;
+    if (cy + 1 < rows) { cy = cy + 1; }
+    or                 { scroll(); }
+}
+
+# take over the framebuffer; returns 0 when it is missing or not 32 bpp
+pub fun init(f: *info.Framebuffer) u8 {
+    if (f.addr == 0 || f.bpp != 32) { ret 0; }
+    if (f.r_size > 8 || f.g_size > 8 || f.b_size > 8) { ret 0; }
+    base  = f.addr;
+    pitch = f.pitch;
+    cols  = f.width / GW;
+    rows  = f.height / GH;
+    if (cols * rows > MAX_CELLS) { rows = MAX_CELLS / cols; }
+    fg = rgb(f, 0xC0, 0xC0, 0xC0);
+    bg = rgb(f, 0x00, 0x00, 0x00);
+
+    # paint every cell, including the strip right of the last column
+    var y: u64 = 0;
+    for (y < f.height) {
+        val row: *u32 = (base + y * pitch)::*u32;
+        var x: u64 = 0;
+        for (x < f.width) {
+            row[x] = bg;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    var i: u64 = 0;
+    for (i < rows * cols) {
+        cells[i] = 32;
+        i = i + 1;
+    }
+    cx = 0;
+    cy = 0;
+    ret 1;
+}
+
+pub fun cols_of() u64 { ret cols; }
+pub fun rows_of() u64 { ret rows; }
+
+pub fun putc(c: u8) {
+    if (base == 0) { ret; }
+    if (c == 10) { newline(); ret; }
+    if (c == 13) { cx = 0; ret; }
+    if (c == 8) {
+        if (cx > 0) { cx = cx - 1; }
+        ret;
+    }
+    if (c == 9) {
+        putc(32);
+        for ((cx % 8) != 0) { putc(32); }
+        ret;
+    }
+    if (cx >= cols) { newline(); }
+    set(cy * cols + cx, c);
+    cx = cx + 1;
+}

@@ -1,0 +1,89 @@
+# GDT + TSS. selector layout is fixed for syscall/sysret:
+#   0x08 kernel code   0x10 kernel data   0x18 user data   0x20 user code   0x28 tss
+
+pub val KCODE: u16 = 0x08;
+pub val KDATA: u16 = 0x10;
+pub val UDATA: u16 = 0x18;
+pub val UCODE: u16 = 0x20;
+pub val TSS:   u16 = 0x28;
+
+#[packed]
+rec Pointer { limit: u16; base: u64; }
+
+#[packed]
+pub rec Tss {
+    res0: u32;
+    rsp0: u64; # stack the cpu switches to on user -> kernel entry
+    rsp1: u64;
+    rsp2: u64;
+    res1: u64;
+    ist:  [7]u64; # ist[0] is IST1
+    res2: u64;
+    res3: u16;
+    iomap: u16;
+}
+
+#[align(16)]
+var table: [7]u64;
+var ptr: Pointer;
+
+#[align(16)]
+pub var tss: Tss;
+
+#[align(16)]
+var df_stack: [4096]u8; # double faults run on IST1, a known-good stack
+
+# lgdt [rdi], reload data segments, far-return into the new code segment
+#[naked]
+#[symbol("gdt_load")]
+fun gdt_load(p: *Pointer) {
+    asm x86_64 {
+        .byte 0x0f, 0x01, 0x17 :: writes()
+        mov ax, 0x10
+        .byte 0x8e, 0xd8 :: writes()
+        .byte 0x8e, 0xc0 :: writes()
+        .byte 0x8e, 0xe0 :: writes()
+        .byte 0x8e, 0xe8 :: writes()
+        .byte 0x8e, 0xd0 :: writes()
+        pop rdi
+        push 0x08
+        push rdi
+        .byte 0x48, 0xcb :: writes()
+    }
+}
+
+# ltr ax with ax = 0x28
+#[naked]
+#[symbol("tss_load")]
+fun tss_load() {
+    asm x86_64 {
+        mov ax, 0x28
+        .byte 0x0f, 0x00, 0xd8 :: writes()
+        ret
+    }
+}
+
+pub fun init() {
+    table[0] = 0;
+    table[1] = 0x00AF9A000000FFFF; # kernel code, long mode
+    table[2] = 0x00CF92000000FFFF; # kernel data
+    table[3] = 0x00CFF2000000FFFF; # user data, dpl 3
+    table[4] = 0x00AFFA000000FFFF; # user code, dpl 3, long mode
+
+    tss.iomap = $size_of(Tss)::u16; # no io bitmap
+    tss.ist[0] = (?df_stack[0])::u64 + 4096;
+
+    val base: u64 = (?tss)::u64;
+    val limit: u64 = $size_of(Tss)::u64 - 1;
+    table[5] = (limit & 0xFFFF)
+             | ((base & 0xFFFFFF) << 16)
+             | (0x89::u64 << 40)            # present, 64-bit available tss
+             | (((limit >> 16) & 0xF) << 48)
+             | (((base >> 24) & 0xFF) << 56);
+    table[6] = base >> 32;
+
+    ptr.limit = ($size_of([7]u64) - 1)::u16;
+    ptr.base  = (?table[0])::u64;
+    gdt_load(?ptr);
+    tss_load();
+}

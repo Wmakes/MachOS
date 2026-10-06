@@ -1,0 +1,59 @@
+# physical page allocator: a free list threaded through the free pages
+# themselves, reached through the hhdm
+
+use info: machos.boot.info;
+
+pub val PAGE: u64 = 4096;
+
+var hhdm: u64 = 0;
+var head: u64 = 0; # physical address of the first free page, 0 = empty
+var free_count: u64 = 0;
+var total_count: u64 = 0;
+
+fun link_of(phys: u64) *u64 {
+    ret (phys + hhdm)::*u64;
+}
+
+pub fun free(phys: u64) {
+    @link_of(phys) = head;
+    head = phys;
+    free_count = free_count + 1;
+}
+
+# one zeroed 4 KiB page, or 0 when out of memory
+pub fun alloc() u64 {
+    if (head == 0) { ret 0; }
+    val phys: u64 = head;
+    head = @link_of(phys);
+    free_count = free_count - 1;
+    val p: *u64 = link_of(phys);
+    var i: u64 = 0;
+    for (i < PAGE / 8) {
+        p[i] = 0;
+        i = i + 1;
+    }
+    ret phys;
+}
+
+pub fun free_pages() u64 { ret free_count; }
+pub fun total_pages() u64 { ret total_count; }
+
+pub fun init(bi: *info.BootInfo) {
+    hhdm = bi.hhdm;
+    var i: u64 = 0;
+    for (i < bi.mem_len) {
+        val r: *info.MemRegion = ?bi.mem[i];
+        if (r.kind == info.MEM_USABLE) {
+            # round inward to whole pages; keep page 0 out so 0 can mean "none"
+            var p: u64 = (r.base + PAGE - 1) & ~(PAGE - 1);
+            val end: u64 = (r.base + r.len) & ~(PAGE - 1);
+            if (p == 0) { p = PAGE; }
+            for (p < end) {
+                free(p);
+                total_count = total_count + 1;
+                p = p + PAGE;
+            }
+        }
+        i = i + 1;
+    }
+}

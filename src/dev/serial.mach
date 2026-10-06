@@ -1,0 +1,20 @@
+# COM1 16550 UART: the kernel console
+
+use cpu: machos.arch.x86_64.cpu;
+
+val COM1: u16 = 0x3F8;
+
+pub fun init() {
+    cpu.outb(COM1 + 1, 0x00); # no interrupts
+    cpu.outb(COM1 + 3, 0x80); # DLAB on
+    cpu.outb(COM1 + 0, 0x01); # divisor 1 = 115200 baud
+    cpu.outb(COM1 + 1, 0x00);
+    cpu.outb(COM1 + 3, 0x03); # 8n1, DLAB off
+    cpu.outb(COM1 + 2, 0xC7); # fifo on, cleared, 14-byte threshold
+    cpu.outb(COM1 + 4, 0x03); # DTR + RTS
+}
+
+pub fun putc(c: u8) {
+    for ((cpu.inb(COM1 + 5) & 0x20) == 0) { }
+    cpu.outb(COM1, c);
+}

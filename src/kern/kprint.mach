@@ -1,0 +1,54 @@
+# kernel printing: NUL-terminated strings, hex and decimal numbers,
+# to the serial port and the framebuffer console
+
+use cpu:    machos.arch.x86_64.cpu;
+use serial: machos.dev.serial;
+use fbcon:  machos.dev.fbcon;
+
+pub fun putc(c: u8) {
+    if (c == 10) { serial.putc(13); }
+    serial.putc(c);
+    fbcon.putc(c);
+}
+
+pub fun puts(s: *u8) {
+    var i: u64 = 0;
+    for (s[i] != 0) {
+        putc(s[i]);
+        i = i + 1;
+    }
+}
+
+pub fun hex(v: u64) {
+    puts("0x\0");
+    var shift: u64 = 64;
+    for (shift > 0) {
+        shift = shift - 4;
+        val d: u8 = ((v >> shift) & 0xF)::u8;
+        if (d < 10) { putc(48 + d); }
+        or          { putc(87 + d); }
+    }
+}
+
+pub fun dec(v: u64) {
+    var buf: [20]u8;
+    var n: u64 = 0;
+    var x: u64 = v;
+    for {
+        buf[n] = 48 + (x % 10)::u8;
+        n = n + 1;
+        x = x / 10;
+        if (x == 0) { brk; }
+    }
+    for (n > 0) {
+        n = n - 1;
+        putc(buf[n]);
+    }
+}
+
+pub fun panic(msg: *u8) {
+    puts("\npanic: \0");
+    puts(msg);
+    putc(10);
+    cpu.halt();
+}

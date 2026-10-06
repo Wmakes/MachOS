@@ -1,0 +1,36 @@
+# what the kernel needs from any bootloader. a boot adapter fills this in,
+# nothing past it knows which bootloader ran
+
+pub val MEM_USABLE:      u8 = 0;
+pub val MEM_RESERVED:    u8 = 1;
+pub val MEM_RECLAIMABLE: u8 = 2; # usable once the kernel is done with boot data
+pub val MEM_ACPI:        u8 = 3;
+pub val MEM_KERNEL:      u8 = 4;
+pub val MEM_FRAMEBUFFER: u8 = 5;
+
+pub val MEM_MAX: u64 = 128;
+
+pub rec MemRegion {
+    base: u64;
+    len:  u64;
+    kind: u8;
+}
+
+pub rec Framebuffer {
+    addr:   u64; # virtual
+    width:  u64;
+    height: u64;
+    pitch:  u64; # bytes per row
+    bpp:    u16;
+    r_size: u8; r_shift: u8; # channel layout within a pixel
+    g_size: u8; g_shift: u8;
+    b_size: u8; b_shift: u8;
+}
+
+pub rec BootInfo {
+    hhdm:       u64; # virtual = physical + hhdm
+    rsdp:       u64; # physical, 0 when absent
+    fb:         Framebuffer;
+    mem:        [128]MemRegion;
+    mem_len:    u64;
+}
