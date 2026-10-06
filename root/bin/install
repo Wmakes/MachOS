@@ -1,7 +1,8 @@
 #!/bin/sh
 # install DISK: erase DISK and install MachOS on it, e.g. `install /dev/sdb`
 #   1. gpt     a new partition table: DISK1 EFI system, DISK2 MachOS root
-#   2. mkfat   DISK1, with Limine, its config and the kernel
+#   2. mkfat   DISK1, with Limine, its config, the kernel and (if there is
+#              one) the initrd the rescue entry boots
 #   3. mkext2  DISK2, an empty root filesystem
 #   4. mount DISK2 and copy /bin, /etc and /boot over
 test -n "$1" || echo "usage: install DISK (see ls -l /dev)"
@@ -11,7 +12,7 @@ test -b "$1" || exit 2
 echo "This erases everything on $1 and installs MachOS there."
 confirm "Type yes to continue: " || exit 1
 gpt $1 || exit 1
-mkfat "$1"1 /boot/BOOTX64.EFI:EFI/BOOT/BOOTX64.EFI /boot/limine.conf:boot/limine/limine.conf /boot/kernel.elf:boot/kernel.elf || exit 1
+mkfat "$1"1 /boot/BOOTX64.EFI:EFI/BOOT/BOOTX64.EFI /boot/limine.conf:boot/limine/limine.conf /boot/kernel.elf:boot/kernel.elf ?/boot/initrd.tar:boot/initrd.tar || exit 1
 mkext2 "$1"2 || exit 1
 test -d /mnt || mkdir /mnt
 mount "$1"2 /mnt || exit 1

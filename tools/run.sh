@@ -42,4 +42,4 @@ exec qemu-system-x86_64 -M q35 -cpu max -m 256M \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$OUT/vars.fd" \
     -drive format=raw,file="$IMG" $DISKS \
-    -serial stdio -no-reboot -no-shutdown "$@"
+    -serial stdio "$@"

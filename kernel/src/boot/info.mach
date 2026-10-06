@@ -34,6 +34,7 @@ pub rec BootInfo {
     kvirt:      u64; # and where it is linked
     kelf:       u64; # virtual address of the kernel's own ELF file
     kelf_len:   u64;
+    cmdline:    *u8; # the boot entry's cmdline, NUL-terminated (may be empty)
     initrd:     u64; # virtual address of the initrd tar, 0 when absent
     initrd_len: u64;
     fb:         Framebuffer;

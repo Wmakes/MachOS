@@ -34,7 +34,11 @@ pub val UNAME:   u64 = 27; # (*Uname)
 pub val TCGETATTR: u64 = 28; # (handle, *Termios)                 E_NOTTY unless it is a terminal
 pub val TCSETATTR: u64 = 29; # (handle, *Termios)
 pub val MOUNTS:  u64 = 30; # (index, *MountInfo)                  -> 1, or 0 past the end
-pub val COUNT:   u64 = 31;
+pub val REBOOT:  u64 = 31; # (REBOOT_*)                            sync, unmount, then never returns
+pub val COUNT:   u64 = 32;
+
+pub val REBOOT_POWEROFF: u64 = 0;
+pub val REBOOT_RESTART:  u64 = 1;
 
 # WAIT flags
 pub val WAIT_NOHANG: u64 = 1; # E_AGAIN instead of blocking while it runs

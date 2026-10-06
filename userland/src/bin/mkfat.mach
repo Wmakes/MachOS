@@ -1,6 +1,7 @@
 # mkfat PART [SRC:DEST ...]: format the partition PART (e.g. /dev/sdb1) as
 # FAT32 and copy each file SRC into it as DEST (/boot/kernel.elf:boot/kernel.elf).
-# directories along DEST are made as needed. names that are not plain 8.3
+# directories along DEST are made as needed. ?SRC:DEST copies SRC only if
+# it exists. names that are not plain 8.3
 # get long-name entries, so `limine.conf` stays `limine.conf`.
 #
 # one sector per cluster; every directory is one cluster (16 entries), which
@@ -325,7 +326,12 @@ fun main(argc: u64, argv: **u8) u64 {
 
     var i: u64 = 2;
     for (i < argc) {
-        val a: *u8 = argv[i];
+        var a: *u8 = argv[i];
+        var optional: u8 = 0;
+        if (a[0] == 63) {
+            optional = 1;
+            a = ?a[1];
+        }
         val n: u64 = io.len(a);
         var colon: u64 = 0;
         for (colon < n && a[colon] != 58) { colon = colon + 1; }
@@ -336,6 +342,11 @@ fun main(argc: u64, argv: **u8) u64 {
             ret 2;
         }
         a[colon] = 0;
+        var st: abi.Stat;
+        if (optional != 0 && abi.is_err(sys.stat(a, colon, ?st)) != 0) {
+            i = i + 1;
+            cnt;
+        }
         if (copy_file(a, ?a[colon + 1]) == 0) { ret 1; }
         i = i + 1;
     }

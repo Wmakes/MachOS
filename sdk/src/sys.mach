@@ -59,6 +59,8 @@ pub fun tcgetattr(h: u64, t: *abi.Termios) u64 { ret raw(abi.TCGETATTR, h, t::u6
 pub fun tcsetattr(h: u64, t: *abi.Termios) u64 { ret raw(abi.TCSETATTR, h, t::u64, 0, 0, 0); }
 pub fun mounts(idx: u64, out: *abi.MountInfo) u64 { ret raw(abi.MOUNTS, idx, out::u64, 0, 0, 0); }
 
+pub fun reboot(how: u64) u64 { ret raw(abi.REBOOT, how, 0, 0, 0, 0); }
+
 pub fun isatty(h: u64) u8 {
     var t: abi.Termios;
     if (abi.is_err(tcgetattr(h, ?t)) != 0) { ret 0; }

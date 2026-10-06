@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boot MachOS under QEMU with no window and drive it from a script.
 
-usage: tools/headless.py [-p release] [-t SECONDS] [--keep] [--fsck] [--disk2 IMG] [--boot IMG] STEP...
+usage: tools/headless.py [-p release] [-t SECONDS] [--keep] [--fsck] [--disk2 IMG] [--boot IMG] [--rescue] STEP...
 
 The cpu is QEMU's "max" (with SMEP/SMAP) unless QEMU_CPU says otherwise.
 The disk is rebuilt fresh unless --keep is given (then files written by an
@@ -66,6 +66,7 @@ def main():
     ap.add_argument("--fsck", action="store_true")
     ap.add_argument("--disk2", help="attach this raw image as a second disk")
     ap.add_argument("--boot", help="boot this image as it is instead of building one")
+    ap.add_argument("--rescue", action="store_true", help="boot the rescue entry")
     ap.add_argument("steps", nargs="*")
     a = ap.parse_args()
 
@@ -73,7 +74,7 @@ def main():
     if a.boot:
         img = a.boot
     else:
-        mk = ["tools/mkimage.sh", a.profile] + ([] if a.keep else ["--fresh"])
+        mk = ["tools/mkimage.sh", a.profile] + ([] if a.keep else ["--fresh"]) + (["--rescue"] if a.rescue else [])
         img = subprocess.run(mk, check=True, stdout=subprocess.PIPE, text=True).stdout.strip().splitlines()[-1]
     out = os.path.join("out", "headless")
     os.makedirs(out, exist_ok=True)

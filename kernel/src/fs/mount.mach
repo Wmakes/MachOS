@@ -82,6 +82,7 @@ pub fun mount_root(b: *parts.Bdev) *u8 {
     }
     if (vfs.init_ext2(f) == 0) { ret "out of memory\0"; }
     record(b, p, f, nil);
+    ext2.set_clean(f, 0);
     ret nil;
 }
 
@@ -101,6 +102,7 @@ pub fun mount_at(b: *parts.Bdev, at: *vfs.Node) u64 {
         ret vr;
     }
     record(b, p, f, at.mounted);
+    ext2.set_clean(f, 0);
     ret 0;
 }
 
@@ -108,12 +110,32 @@ fun release(m: *Mount) u64 {
     if (m.root == nil) { ret abi.err(abi.E_BUSY); } # the root stays
     val u: u64 = vfs.unmount(m.root);
     if (abi.is_err(u) != 0) { ret u; }
+    ext2.set_clean(m.fs, 1);
     blk.forget_disk(m.part.disk); # writes everything back first
     heap.free(m.fs::u64);
     heap.free(m.part::u64);
     m.used = 0;
     m.root = nil;
     ret 0;
+}
+
+# shutdown: every mounted filesystem is about to stop being written
+pub fun mark_all_clean() {
+    var i: u64 = 0;
+    for (i < MAX) {
+        if (mounts[i].used != 0) { ext2.set_clean(mounts[i].fs, 1); }
+        i = i + 1;
+    }
+}
+
+# whether the root filesystem was shut down cleanly last time
+pub fun root_was_clean() u8 {
+    var i: u64 = 0;
+    for (i < MAX) {
+        if (mounts[i].used != 0 && mounts[i].root == nil) { ret mounts[i].fs.was_clean; }
+        i = i + 1;
+    }
+    ret 1;
 }
 
 # unmount by the mounted root (what a path to the mountpoint finds)

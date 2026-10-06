@@ -1,0 +1,17 @@
+# shutdown [-r]: write everything back, unmount cleanly, and switch the
+# machine off (-r: restart it)
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var how: u64 = abi.REBOOT_POWEROFF;
+    if (argc > 1 && io.streq(argv[1], "-r\0") != 0) { how = abi.REBOOT_RESTART; }
+    sys.sync();
+    val r: u64 = sys.reboot(how);
+    io.fail("shutdown\0", nil, r);
+    ret 1;
+}

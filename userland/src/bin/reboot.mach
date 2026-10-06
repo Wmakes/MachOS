@@ -1,0 +1,14 @@
+# reboot: shutdown -r
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    sys.sync();
+    val r: u64 = sys.reboot(abi.REBOOT_RESTART);
+    io.fail("reboot\0", nil, r);
+    ret 1;
+}

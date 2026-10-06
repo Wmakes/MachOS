@@ -22,6 +22,8 @@ use abi:    sdk.abi;
 use vfs:    machos.fs.vfs;
 use mount:  machos.fs.mount;
 use parts:  machos.fs.parts;
+use acpi:   machos.acpi.acpi;
+use mem:    machos.kern.mem;
 use initrd: machos.fs.initrd;
 use version: machos.abi.version;
 use clock:  machos.kern.clock;
@@ -123,6 +125,7 @@ fun kmain() {
 
     syscall.init();
     clock.init();
+    acpi.init_power(boot.rsdp);
 
     kprint.puts("pci: \0");
     kprint.dec(pci.scan());
@@ -173,8 +176,23 @@ fun make_dev(dir: *vfs.Node, name: *u8, n: u64, id: u64) {
 
 # the root filesystem: ext2 on the first MachOS root partition found,
 # otherwise the initrd unpacked into memory
+fun rescue() u8 {
+    val c: *u8 = boot.cmdline;
+    if (c == nil) { ret 0; }
+    var i: u64 = 0;
+    for (c[i] != 0) {
+        if (mem.equal(?c[i], "rescue\0", 6) != 0) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
 fun mount_root() {
-    val b: *parts.Bdev = parts.find_root();
+    var b: *parts.Bdev = parts.find_root();
+    if (rescue() != 0) {
+        kprint.puts("rescue mode: running from memory, the disks stay unmounted\n\0");
+        b = nil;
+    }
     if (b != nil) {
         val err: *u8 = mount.mount_root(b);
         kprint.puts("root: \0");
@@ -184,6 +202,10 @@ fun mount_root() {
         kprint.dec(b.part);
         if (err == nil) {
             kprint.putc(10);
+            if (mount.root_was_clean() == 0) {
+                kprint.puts("root: \x1b[1;33mnot shut down cleanly last time\x1b[0m; to check it, boot\n\0");
+                kprint.puts("      'MachOS (rescue)' and run fsck -y on it\n\0");
+            }
             ret;
         }
         kprint.puts(": \0");

@@ -30,7 +30,7 @@ rec ExecFileResponse { revision: u64; file: *File; }
 rec ModuleResponse { revision: u64; count: u64; modules: **File; }
 
 #[volatile]
-rec File { revision: u64; address: u64; size: u64; path: *u8; }
+rec File { revision: u64; address: u64; size: u64; path: *u8; cmdline: *u8; }
 
 #[volatile]
 rec FbResponse { revision: u64; count: u64; fbs: **Fb; }
@@ -135,6 +135,7 @@ pub fun collect(bi: *info.BootInfo) *u8 {
     val kf: *File = (@(exec_file_req.response::*ExecFileResponse)).file;
     bi.kelf = kf.address;
     bi.kelf_len = kf.size;
+    bi.cmdline = kf.cmdline;
 
     bi.initrd = 0;
     bi.initrd_len = 0;

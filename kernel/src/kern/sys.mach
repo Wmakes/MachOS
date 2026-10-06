@@ -21,6 +21,7 @@ use clock:  machos.kern.clock;
 use mount:  machos.fs.mount;
 use parts:  machos.fs.parts;
 use ext2:   machos.fs.ext2;
+use power:  machos.kern.power;
 use version: machos.abi.version;
 use cpu:    machos.arch.x86_64.cpu;
 use fbcon:  machos.dev.fbcon;
@@ -589,6 +590,11 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.TCGETATTR) { ret sys_tcgetattr(a, b); }
     if (n == abi.TCSETATTR) { ret sys_tcsetattr(a, b); }
     if (n == abi.MOUNTS)  { ret sys_mounts(a, b); }
+    if (n == abi.REBOOT) {
+        if (a == abi.REBOOT_RESTART) { power.reboot(); }
+        or (a == abi.REBOOT_POWEROFF) { power.poweroff(); }
+        ret e(abi.E_INVAL);
+    }
     if (n == abi.SYNC) {
         if (blk.sync() == 0) { ret e(abi.E_IO); }
         ret 0;

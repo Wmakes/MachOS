@@ -100,3 +100,71 @@ pub fun madt(rsdp_pa: u64, m: *Madt) *u8 {
     if (m.ioapic == 0) { ret "acpi: no i/o apic\0"; }
     ret nil;
 }
+
+# --- power off --------------------------------------------------------------
+# entering the S5 (soft off) state needs PM1a/b control ports from the FADT
+# and the S5 sleep type, which only the DSDT's \_S5 package holds
+
+var pm1a: u64 = 0;
+var pm1b: u64 = 0;
+var slp_a: u64 = 0;
+var slp_b: u64 = 0;
+var can_off: u8 = 0;
+var reset_port: u64 = 0;  # FADT reset register, when it is an I/O port
+var reset_value: u8 = 0;
+
+# the value of an AML integer at `a` (ZeroOp, OneOp, BytePrefix x); the
+# number of bytes it took in *used
+fun aml_int(a: u64, used: *u64) u64 {
+    val op: u8 = rd8(a);
+    if (op == 0x0A) {
+        @used = 2;
+        ret rd8(a + 1)::u64;
+    }
+    @used = 1;
+    if (op == 0x01) { ret 1; }
+    ret 0;
+}
+
+pub fun init_power(rsdp_pa: u64) {
+    if (rsdp_pa == 0) { ret; }
+    val fadt: u64 = find(rsdp_pa, "FACP\0");
+    if (fadt == 0) { ret; }
+    val flen: u64 = rd32(fadt + 4)::u64;
+    pm1a = rd32(fadt + 64)::u64;
+    pm1b = rd32(fadt + 68)::u64;
+    if (flen >= 129 && rd8(fadt + 116) == 1) { # reset register in I/O space
+        reset_port = rd64(fadt + 120);
+        reset_value = rd8(fadt + 128);
+    }
+    var dsdt_pa: u64 = rd32(fadt + 40)::u64;
+    if (flen >= 148 && rd64(fadt + 140) != 0) { dsdt_pa = rd64(fadt + 140); }
+    if (dsdt_pa == 0 || pm1a == 0) { ret; }
+    val dsdt: u64 = table(dsdt_pa);
+    if (dsdt == 0) { ret; }
+    val end: u64 = dsdt + rd32(dsdt + 4)::u64;
+    var p: u64 = dsdt + 36;
+    for (p + 8 < end) {
+        # NameOp "_S5_" PackageOp PkgLength NumElements SLP_TYPa SLP_TYPb ...
+        if (rd8(p) == 0x5F && rd8(p + 1) == 0x53 && rd8(p + 2) == 0x35 && rd8(p + 3) == 0x5F
+            && rd8(p + 4) == 0x12) {
+            var q: u64 = p + 5;
+            q = q + ((rd8(q) >> 6)::u64) + 1; # skip PkgLength
+            q = q + 1;                        # NumElements
+            var used: u64 = 0;
+            slp_a = aml_int(q, ?used);
+            slp_b = aml_int(q + used, ?used);
+            can_off = 1;
+            ret;
+        }
+        p = p + 1;
+    }
+}
+
+pub fun poweroff_possible() u8 { ret can_off; }
+pub fun pm1a_port() u64 { ret pm1a; }
+pub fun pm1b_port() u64 { ret pm1b; }
+pub fun slp_typ_a() u64 { ret slp_a; }
+pub fun slp_typ_b() u64 { ret slp_b; }
+pub fun reset_reg() u64 { ret reset_port; }
+pub fun reset_val() u8 { ret reset_value; }

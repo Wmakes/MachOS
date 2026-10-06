@@ -1,0 +1,573 @@
+# fsck [-y] PART: check the ext2 filesystem on PART (e.g. /dev/sdb2); with -y
+# repair what it finds. like e2fsck it goes in passes:
+#   1  every inode: the blocks it uses (out of range, used twice, i_blocks)
+#   2  every directory: entries pointing at unused inodes, "." and ".."
+#   3  link counts; files nothing points at go to /lost+found
+#   4  block and inode bitmaps against what is really in use
+#   5  free counts in the group descriptors and the superblock
+# a mounted filesystem can be checked (it is synced first) but not repaired:
+# boot "MachOS (rescue)" to repair the root. exit 0 clean, 1 errors fixed,
+# 4 errors left
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use bd:  sdk.blkdev;
+use rt:  sdk.rt;
+
+val BS: u64 = 4096;
+val MAX_BLOCKS: u64 = 8388608;   # 32 GiB
+val MAX_INODES: u64 = 1048576;
+
+var disk: u64 = 0;
+var fix: u8 = 0;
+var errors: u64 = 0;
+var fixed: u64 = 0;
+var left: u64 = 0; # problems fsck cannot repair
+
+var sb: [1024]u8;
+var blocks: u64 = 0;
+var bpg: u64 = 0;
+var ipg: u64 = 0;
+var isz: u64 = 128;
+var first_ino: u64 = 11;
+var groups: u64 = 0;
+var ninodes: u64 = 0;
+var gdt: [131072]u8;
+
+var used_blocks: [1048576]u8;    # bitmap of blocks found in use
+var inode_kind: [1048576]u8;     # 0 unused, 1 file, 2 directory, 3 other
+var refs: [1048576]u16;          # directory entries naming each inode
+var parent: [1048576]u32;        # for directories: the directory naming them
+
+var blk: [4096]u8;
+var blk2: [4096]u8;
+
+fun g32(b: *u8, o: u64) u64 { ret bd.get32(b, o); }
+fun g16(b: *u8, o: u64) u64 { ret (@((?b[o])::*u16))::u64; }
+
+fun rd(b: u64, out: *u8) u8 { ret bd.pread(disk, b * BS, out, BS); }
+fun wr(b: u64, src: *u8) u8 { ret bd.pwrite(disk, b * BS, src, BS); }
+
+fun problem(what: *u8, n: u64, rest: *u8) {
+    errors = errors + 1;
+    io.out(what);
+    if (n != 0xFFFFFFFFFFFFFFFF) {
+        io.dec(n);
+    }
+    io.out(rest);
+    if (fix != 0) { io.out(" (fixed)\0"); }
+    io.putc(10);
+    if (fix != 0) { fixed = fixed + 1; }
+}
+
+# a problem fsck does not know how to repair
+fun unfixable(what: *u8, n: u64, rest: *u8) {
+    errors = errors + 1;
+    left = left + 1;
+    io.out(what);
+    io.dec(n);
+    io.out(rest);
+    io.out(" (not fixed)\n\0");
+}
+
+fun mark(b: u64) u8 {
+    if (b >= blocks) { ret 0; }
+    val byte: u64 = b / 8;
+    val bit: u8 = 1::u8 << (b % 8)::u8;
+    if ((used_blocks[byte] & bit) != 0) { ret 2; }
+    used_blocks[byte] = used_blocks[byte] | bit;
+    ret 1;
+}
+
+fun is_used(b: u64) u8 {
+    ret ((used_blocks[b / 8] >> (b % 8)::u8) & 1);
+}
+
+fun has_backup(g: u64) u8 {
+    if ((g32(?sb[0], 100) & 1) == 0) { ret 1; } # no sparse_super: every group
+    if (g <= 1) { ret 1; }
+    var p: u64 = 3;
+    for (p <= g) {
+        if (p == g) { ret 1; }
+        p = p * 3;
+    }
+    p = 5;
+    for (p <= g) {
+        if (p == g) { ret 1; }
+        p = p * 5;
+    }
+    p = 7;
+    for (p <= g) {
+        if (p == g) { ret 1; }
+        p = p * 7;
+    }
+    ret 0;
+}
+
+fun gd(g: u64) *u8 { ret ?gdt[g * 32]; }
+
+fun inode_loc(ino: u64) u64 {
+    val g: u64 = (ino - 1) / ipg;
+    ret g32(gd(g), 8) * BS + ((ino - 1) % ipg) * isz;
+}
+
+fun read_inode(ino: u64, out: *u8) u8 { ret bd.pread(disk, inode_loc(ino), out, 128); }
+fun write_inode(ino: u64, src: *u8) u8 { ret bd.pwrite(disk, inode_loc(ino), src, 128); }
+
+# --- pass 1 -----------------------------------------------------------------
+
+var counted: u64 = 0; # blocks found for the inode being walked
+var bad_ptr: u8 = 0;
+
+fun claim(ino: u64, b: u64) {
+    if (b == 0) { ret; }
+    val r: u8 = mark(b);
+    if (r == 0) {
+        bad_ptr = 1;
+        unfixable("inode \0", ino, " points at a block past the end of the filesystem\0");
+    } or (r == 2) {
+        unfixable("inode \0", ino, " uses a block another inode also uses\0");
+    }
+    counted = counted + 1;
+}
+
+fun walk_tree(ino: u64, b: u64, depth: u64) {
+    if (b == 0) { ret; }
+    claim(ino, b);
+    if (depth == 0 || b >= blocks) { ret; }
+    var t: [4096]u8;
+    if (rd(b, ?t[0]) == 0) { ret; }
+    var k: u64 = 0;
+    for (k < 1024) {
+        walk_tree(ino, g32(?t[0], k * 4), depth - 1);
+        k = k + 1;
+    }
+}
+
+fun pass1() {
+    var g: u64 = 0;
+    for (g < groups) {
+        # metadata: superblock and descriptor copies, bitmaps, inode table
+        val start: u64 = g * bpg + g32(?sb[0], 20);
+        if (has_backup(g) != 0) {
+            mark(start);
+            var k: u64 = 0;
+            val gdt_blocks: u64 = (groups * 32 + BS - 1) / BS;
+            val reserved: u64 = g16(?sb[0], 206);
+            for (k < gdt_blocks + reserved) {
+                mark(start + 1 + k);
+                k = k + 1;
+            }
+        }
+        mark(g32(gd(g), 0));
+        mark(g32(gd(g), 4));
+        var t: u64 = 0;
+        val itb: u64 = (ipg * isz + BS - 1) / BS;
+        for (t < itb) {
+            mark(g32(gd(g), 8) + t);
+            t = t + 1;
+        }
+        g = g + 1;
+    }
+
+    # the inode tables, a block (BS / isz inodes) at a time
+    val per: u64 = BS / isz;
+    var tb: [4096]u8;
+    g = 0;
+    for (g < groups) {
+        val itb: u64 = (ipg * isz + BS - 1) / BS;
+        var t: u64 = 0;
+        for (t < itb) {
+            if (rd(g32(gd(g), 8) + t, ?tb[0]) == 0) {
+                unfixable("inode table block \0", g32(gd(g), 8) + t, " cannot be read\0");
+                t = t + 1;
+                cnt;
+            }
+            var j: u64 = 0;
+            for (j < per) {
+                val ino: u64 = g * ipg + t * per + j + 1;
+                if (ino <= ninodes && (t * per + j) < ipg) { check_inode(ino, ?tb[j * isz]); }
+                j = j + 1;
+            }
+            t = t + 1;
+        }
+        g = g + 1;
+    }
+}
+
+fun check_inode(ino: u64, i: *u8) {
+    val mode: u64 = g16(i, 0);
+    val links: u64 = g16(i, 26);
+    if (mode == 0 || links == 0) {
+        if (ino < first_ino) { inode_kind[ino] = 3; } # reserved: always in use
+        ret;
+    }
+    val type: u64 = mode & 0xF000;
+    if (type == 0x4000) { inode_kind[ino] = 2; }
+    or (type == 0x8000) { inode_kind[ino] = 1; }
+    or { inode_kind[ino] = 3; }
+    counted = 0;
+    bad_ptr = 0;
+    # a short symlink keeps its target in i_block itself
+    val fast_link: u8 = (type == 0xA000 && g32(i, 28) == 0)::u8;
+    if (fast_link != 0) { ret; }
+    var k: u64 = 0;
+    for (k < 12) {
+        claim(ino, g32(i, 40 + k * 4));
+        k = k + 1;
+    }
+    walk_tree(ino, g32(i, 88), 1);
+    walk_tree(ino, g32(i, 92), 2);
+    walk_tree(ino, g32(i, 96), 3);
+    if (g32(i, 28) != counted * 8 && bad_ptr == 0) {
+        problem("inode \0", ino, " has the wrong block count\0");
+        if (fix != 0) {
+            var copy: [128]u8;
+            io.copy(?copy[0], i, 128);
+            bd.put32(?copy[0], 28, counted * 8);
+            write_inode(ino, ?copy[0]);
+        }
+    }
+}
+
+# --- pass 2 -----------------------------------------------------------------
+
+var ind_block: u64 = 0;
+var ind: [4096]u8;
+
+# the disk block holding block `lbn` of the inode `i` (0 for a hole)
+fun bmap(i: *u8, lbn: u64) u64 {
+    if (lbn < 12) { ret g32(i, 40 + lbn * 4); }
+    var n: u64 = lbn - 12;
+    if (n < 1024) {
+        val b: u64 = g32(i, 88);
+        if (b == 0 || b >= blocks) { ret 0; }
+        if (ind_block != b) {
+            if (rd(b, ?ind[0]) == 0) { ret 0; }
+            ind_block = b;
+        }
+        ret g32(?ind[0], n * 4);
+    }
+    n = n - 1024;
+    val d: u64 = g32(i, 92);
+    if (n >= 1048576 || d == 0 || d >= blocks) { ret 0; }
+    var t: [4096]u8;
+    if (rd(d, ?t[0]) == 0) { ret 0; }
+    val b: u64 = g32(?t[0], (n / 1024) * 4);
+    if (b == 0 || b >= blocks) { ret 0; }
+    if (rd(b, ?t[0]) == 0) { ret 0; }
+    ret g32(?t[0], (n % 1024) * 4);
+}
+
+fun check_dir(dir: u64) {
+    var i: [128]u8;
+    if (read_inode(dir, ?i[0]) == 0) { ret; }
+    val size: u64 = g32(?i[0], 4);
+    ind_block = 0;
+    var lbn: u64 = 0;
+    for (lbn * BS < size) {
+        val pb: u64 = bmap(?i[0], lbn);
+        lbn = lbn + 1;
+        if (pb == 0 || pb >= blocks || rd(pb, ?blk[0]) == 0) { cnt; }
+        var dirty: u8 = 0;
+        var off: u64 = 0;
+        for (off + 8 <= BS) {
+            val rec: u64 = g16(?blk[0], off + 4);
+            if (rec < 8 || off + rec > BS || (rec & 3) != 0) {
+                problem("directory \0", dir, " has a broken entry\0");
+                if (fix != 0) {
+                    # make the rest of the block one empty entry
+                    bd.put32(?blk[0], off, 0);
+                    bd.put16(?blk[0], off + 4, BS - off);
+                    dirty = 1;
+                }
+                brk;
+            }
+            val target: u64 = g32(?blk[0], off);
+            val nl: u64 = blk[off + 6]::u64;
+            if (target != 0) {
+                val dot: u8 = (nl == 1 && blk[off + 8] == 46)::u8;
+                val dotdot: u8 = (nl == 2 && blk[off + 8] == 46 && blk[off + 9] == 46)::u8;
+                if (target > ninodes || inode_kind[target] == 0) {
+                    problem("directory \0", dir, " names an inode that is not in use\0");
+                    if (fix != 0) {
+                        bd.put32(?blk[0], off, 0);
+                        dirty = 1;
+                    }
+                } or {
+                    refs[target] = refs[target] + 1;
+                    if (dot != 0 && target != dir) {
+                        unfixable("directory \0", dir, ": \".\" points elsewhere\0");
+                    }
+                    if (dot == 0 && dotdot == 0 && inode_kind[target] == 2) { parent[target] = dir::u32; }
+                }
+            }
+            off = off + rec;
+        }
+        if (dirty != 0) { wr(pb, ?blk[0]); }
+    }
+}
+
+fun pass2() {
+    var ino: u64 = 1;
+    for (ino <= ninodes) {
+        if (inode_kind[ino] == 2) { check_dir(ino); }
+        ino = ino + 1;
+    }
+}
+
+# --- pass 3 -----------------------------------------------------------------
+
+# an entry for `ino` in lost+found (inode 11); 0 if there is no room
+fun to_lost_found(ino: u64) u8 {
+    if (inode_kind[11] != 2) { ret 0; }
+    var name: [24]u8;
+    name[0] = 35; # '#'
+    val nl: u64 = 1 + io.fmt_dec(ino, ?name[1]);
+    val need: u64 = (8 + nl + 3) & ~3::u64;
+    var i: [128]u8;
+    if (read_inode(11, ?i[0]) == 0) { ret 0; }
+    val size: u64 = g32(?i[0], 4);
+    ind_block = 0;
+    var lbn: u64 = 0;
+    for (lbn * BS < size) {
+        val pb: u64 = bmap(?i[0], lbn);
+        lbn = lbn + 1;
+        if (pb == 0 || rd(pb, ?blk2[0]) == 0) { cnt; }
+        var off: u64 = 0;
+        for (off + 8 <= BS) {
+            val rec: u64 = g16(?blk2[0], off + 4);
+            if (rec < 8) { brk; }
+            var used: u64 = 0;
+            if (g32(?blk2[0], off) != 0) { used = (8 + blk2[off + 6]::u64 + 3) & ~3::u64; }
+            if (rec - used >= need) {
+                var at: u64 = off;
+                var len: u64 = rec;
+                if (used != 0) {
+                    bd.put16(?blk2[0], off + 4, used);
+                    at = off + used;
+                    len = rec - used;
+                }
+                bd.put32(?blk2[0], at, ino);
+                bd.put16(?blk2[0], at + 4, len);
+                blk2[at + 6] = nl::u8;
+                blk2[at + 7] = 1;
+                if (inode_kind[ino] == 2) { blk2[at + 7] = 2; }
+                io.copy(?blk2[at + 8], ?name[0], nl);
+                wr(pb, ?blk2[0]);
+                ret 1;
+            }
+            off = off + rec;
+        }
+    }
+    ret 0;
+}
+
+fun pass3() {
+    var ino: u64 = 1;
+    for (ino <= ninodes) {
+        if (inode_kind[ino] == 0 || (ino < first_ino && ino != 2)) {
+            ino = ino + 1;
+            cnt;
+        }
+        if (refs[ino] == 0 && ino != 2) {
+            problem("inode \0", ino, " is in use but in no directory: moved to /lost+found\0");
+            if (fix != 0) {
+                if (to_lost_found(ino) != 0) {
+                    refs[ino] = 1;
+                    if (inode_kind[ino] == 2) { refs[11] = refs[11] + 1; } # its ".." now
+                } or {
+                    io.out("  lost+found is full\n\0");
+                    fixed = fixed - 1;
+                }
+            }
+        }
+        var i: [128]u8;
+        if (read_inode(ino, ?i[0]) != 0) {
+            val links: u64 = g16(?i[0], 26);
+            if (refs[ino] != 0 && links != refs[ino]::u64) {
+                problem("inode \0", ino, " has the wrong link count\0");
+                if (fix != 0) {
+                    bd.put16(?i[0], 26, refs[ino]::u64);
+                    write_inode(ino, ?i[0]);
+                }
+            }
+        }
+        ino = ino + 1;
+    }
+}
+
+# --- passes 4 and 5 ---------------------------------------------------------
+
+fun pass45() {
+    var total_free_b: u64 = 0;
+    var total_free_i: u64 = 0;
+    var g: u64 = 0;
+    for (g < groups) {
+        val d: *u8 = gd(g);
+        val start: u64 = g * bpg + g32(?sb[0], 20);
+        var gblocks: u64 = blocks - start;
+        if (gblocks > bpg) { gblocks = bpg; }
+
+        # what the block bitmap should say
+        bd.clear(?blk2[0], BS);
+        var free_b: u64 = 0;
+        var k: u64 = 0;
+        for (k < BS * 8) {
+            if (k >= gblocks || is_used(start + k) != 0) {
+                blk2[k / 8] = blk2[k / 8] | (1::u8 << (k % 8)::u8);
+            } or {
+                free_b = free_b + 1;
+            }
+            k = k + 1;
+        }
+        if (rd(g32(d, 0), ?blk[0]) != 0 && io.eq(?blk[0], BS, ?blk2[0], BS) == 0) {
+            problem("group \0", g, ": the block bitmap is wrong\0");
+            if (fix != 0) { wr(g32(d, 0), ?blk2[0]); }
+        }
+
+        # and the inode bitmap
+        bd.clear(?blk2[0], BS);
+        var free_i: u64 = 0;
+        var dirs: u64 = 0;
+        k = 0;
+        for (k < BS * 8) {
+            val ino: u64 = g * ipg + k + 1;
+            if (k >= ipg || inode_kind[ino] != 0) {
+                blk2[k / 8] = blk2[k / 8] | (1::u8 << (k % 8)::u8);
+                if (k < ipg && inode_kind[ino] == 2) { dirs = dirs + 1; }
+            } or {
+                free_i = free_i + 1;
+            }
+            k = k + 1;
+        }
+        if (rd(g32(d, 4), ?blk[0]) != 0 && io.eq(?blk[0], BS, ?blk2[0], BS) == 0) {
+            problem("group \0", g, ": the inode bitmap is wrong\0");
+            if (fix != 0) { wr(g32(d, 4), ?blk2[0]); }
+        }
+
+        if (g16(d, 12) != free_b || g16(d, 14) != free_i || g16(d, 16) != dirs) {
+            problem("group \0", g, ": wrong free counts\0");
+            bd.put16(d, 12, free_b);
+            bd.put16(d, 14, free_i);
+            bd.put16(d, 16, dirs);
+        }
+        total_free_b = total_free_b + free_b;
+        total_free_i = total_free_i + free_i;
+        g = g + 1;
+    }
+    if (g32(?sb[0], 12) != total_free_b || g32(?sb[0], 16) != total_free_i) {
+        problem("superblock: wrong free counts\0", 0xFFFFFFFFFFFFFFFF, "\0");
+        bd.put32(?sb[0], 12, total_free_b);
+        bd.put32(?sb[0], 16, total_free_i);
+    }
+    if (fix != 0) {
+        val gdt_bytes: u64 = groups * 32;
+        bd.pwrite(disk, (g32(?sb[0], 20) + 1) * BS, ?gdt[0], gdt_bytes);
+    }
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var i: u64 = 1;
+    if (i < argc && io.streq(argv[i], "-y\0") != 0) {
+        fix = 1;
+        i = i + 1;
+    } or (i < argc && io.streq(argv[i], "-n\0") != 0) {
+        i = i + 1;
+    }
+    if (i + 1 != argc) {
+        io.err("usage: fsck [-y] PART\n\0");
+        ret 8;
+    }
+    val path: *u8 = argv[i];
+    sys.sync();
+    disk = bd.open_disk("fsck\0", path, fix);
+    if (abi.is_err(disk) != 0) { ret 8; }
+    if (bd.pread(disk, 1024, ?sb[0], 1024) == 0 || g16(?sb[0], 56) != 0xEF53) {
+        io.err("fsck: no ext2 filesystem on \0");
+        io.err(path);
+        io.err("\n\0");
+        ret 8;
+    }
+    if (g32(?sb[0], 24) != 2) {
+        io.err("fsck: only 4 KiB blocks are supported\n\0");
+        ret 8;
+    }
+    blocks = g32(?sb[0], 4);
+    bpg = g32(?sb[0], 32);
+    ipg = g32(?sb[0], 40);
+    ninodes = g32(?sb[0], 0);
+    if (g32(?sb[0], 76) >= 1) {
+        isz = g16(?sb[0], 88);
+        first_ino = g32(?sb[0], 84);
+    }
+    if (bpg == 0 || ipg == 0 || blocks > MAX_BLOCKS || ninodes >= MAX_INODES || isz < 128) {
+        io.err("fsck: the superblock makes no sense\n\0");
+        ret 8;
+    }
+    groups = (blocks - g32(?sb[0], 20) + bpg - 1) / bpg;
+    if (groups * 32 > 131072 || bd.pread(disk, (g32(?sb[0], 20) + 1) * BS, ?gdt[0], groups * 32) == 0) {
+        io.err("fsck: cannot read the group descriptors\n\0");
+        ret 8;
+    }
+    if (fix != 0) {
+        # writes go straight to the device; a mounted filesystem refuses them
+        var probe: [512]u8;
+        if (bd.pread(disk, 0, ?probe[0], 512) == 0 || bd.pwrite(disk, 0, ?probe[0], 512) == 0) {
+            io.err("fsck: \0");
+            io.err(path);
+            io.err(" is mounted; unmount it (for the root: boot MachOS (rescue))\n\0");
+            ret 8;
+        }
+    }
+
+    pass1();
+    pass2();
+    pass3();
+    pass45();
+
+    var state: u64 = g16(?sb[0], 58);
+    if (fix != 0 || errors == 0) {
+        if (fix != 0) {
+            bd.put16(?sb[0], 58, state | 1); # checked: clean
+            bd.pwrite(disk, 1024, ?sb[0], 1024);
+        }
+    }
+    sys.close(disk);
+    sys.sync();
+
+    var files: u64 = 0;
+    var k: u64 = 1;
+    for (k <= ninodes) {
+        if (inode_kind[k] != 0 && (k >= first_ino || k == 2)) { files = files + 1; }
+        k = k + 1;
+    }
+    io.out(path);
+    io.out(": \0");
+    io.dec(files);
+    io.out(" files, \0");
+    io.dec(blocks - g32(?sb[0], 12));
+    io.putc(47);
+    io.dec(blocks);
+    io.out(" blocks used\0");
+    if (errors == 0) {
+        io.out(", clean\n\0");
+        ret 0;
+    }
+    io.out(", \0");
+    io.dec(errors);
+    if (fix != 0 && left == 0) {
+        io.out(" problems fixed\n\0");
+        ret 1;
+    }
+    if (fix != 0) {
+        io.out(" problems, \0");
+        io.dec(left);
+        io.out(" could not be fixed\n\0");
+        ret 4;
+    }
+    io.out(" problems (run fsck -y to fix them)\n\0");
+    ret 4;
+}

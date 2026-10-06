@@ -67,6 +67,7 @@ pub rec Fs {
     inode_size:   u64;
     first_data:   u64;
     groups:       u64;
+    was_clean:    u8; # the clean flag as it was found at mount
 }
 
 fun sb32(fs: *Fs, off: u64) u32 { ret @((?fs.sb[off])::*u32); }
@@ -95,6 +96,7 @@ pub fun mount(fs: *Fs, p: *blk.Part) *u8 {
     fs.ipg = sb32(fs, 40)::u64;
     if (fs.bpg == 0 || fs.ipg == 0 || fs.blocks_count > blk.blocks(p)) { ret "ext2: bad superblock\0"; }
     fs.groups = (fs.blocks_count - fs.first_data + fs.bpg - 1) / fs.bpg;
+    fs.was_clean = (sb16(fs, 58) & 1)::u8;
     ret nil;
 }
 
@@ -674,6 +676,16 @@ pub fun rename(fs: *Fs, odir: u64, oname: *u8, onl: u64, ndir: u64, nname: *u8, 
         add_links(fs, ndir, 1);
     }
     ret 0;
+}
+
+# the superblock's "cleanly unmounted" bit (s_state & 1): cleared while
+# mounted, set again by a clean unmount, so a crash leaves it clear
+pub fun set_clean(fs: *Fs, clean: u8) {
+    var st: u16 = sb16(fs, 58);
+    if (clean != 0) { st = st | 1; }
+    or              { st = st & 0xFFFE; }
+    @((?fs.sb[58])::*u16) = st;
+    write_sb(fs);
 }
 
 pub fun free_space(fs: *Fs) u64 { ret sb32(fs, 12)::u64 * BS; }

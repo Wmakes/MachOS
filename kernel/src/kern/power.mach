@@ -1,0 +1,43 @@
+# shutting down: put every pending write on the disk, mark the mounted
+# filesystems clean, then switch off (ACPI S5) or restart
+
+use acpi:   machos.acpi.acpi;
+use cpu:    machos.arch.x86_64.cpu;
+use kprint: machos.kern.kprint;
+use blk:    machos.fs.blk;
+use mount:  machos.fs.mount;
+
+fun settle() {
+    blk.sync();
+    mount.mark_all_clean();
+    blk.sync();
+}
+
+pub fun poweroff() {
+    settle();
+    kprint.puts("power: off\n\0");
+    if (acpi.poweroff_possible() != 0) {
+        cpu.outw(acpi.pm1a_port()::u16, ((acpi.slp_typ_a() << 10) | (1 << 13))::u16);
+        if (acpi.pm1b_port() != 0) {
+            cpu.outw(acpi.pm1b_port()::u16, ((acpi.slp_typ_b() << 10) | (1 << 13))::u16);
+        }
+    }
+    # emulators' own off switches: QEMU (older machine types), Bochs, VirtualBox
+    cpu.outw(0x604, 0x2000);
+    cpu.outw(0xB004, 0x2000);
+    cpu.outw(0x4004, 0x3400);
+    kprint.puts("power: could not switch off; it is safe to turn the machine off now\n\0");
+    cpu.halt();
+}
+
+pub fun reboot() {
+    settle();
+    kprint.puts("power: restarting\n\0");
+    if (acpi.reset_reg() != 0) { cpu.outb(acpi.reset_reg()::u16, acpi.reset_val()); }
+    # the keyboard controller's reset line
+    var spins: u64 = 0;
+    for ((cpu.inb(0x64) & 2) != 0 && spins < 100000) { spins = spins + 1; }
+    cpu.outb(0x64, 0xFE);
+    # last resort: a triple fault (no IDT, then an exception)
+    cpu.triple_fault();
+}

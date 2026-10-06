@@ -18,6 +18,14 @@ pub fun inb(port: u16) u8 {
     ret v;
 }
 
+pub fun outw(port: u16, v: u16) {
+    asm x86_64 {
+        mov dx, {port}
+        mov ax, {v}
+        out dx, ax
+    }
+}
+
 pub fun outl(port: u16, v: u32) {
     asm x86_64 {
         mov dx, {port}
@@ -220,4 +228,21 @@ pub fun wait() {
         cli
         ret
     }
+}
+
+# load an empty IDT and raise an exception: the cpu resets
+pub fun triple_fault() {
+    var zero: [10]u8;
+    var i: u64 = 0;
+    for (i < 10) {
+        zero[i] = 0;
+        i = i + 1;
+    }
+    val p: u64 = (?zero[0])::u64;
+    asm x86_64 {
+        mov rax, {p}
+        .byte 0x0f, 0x01, 0x18 :: writes()
+        .byte 0xcc :: writes()
+    }
+    halt();
 }

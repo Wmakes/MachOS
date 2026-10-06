@@ -6,16 +6,19 @@
 # an existing disk is updated in place (EFI files replaced, /bin and /boot
 # refreshed) so files created inside MachOS survive rebuilds; --fresh starts
 # over. the initrd on the EFI partition is the root used when no disk is found
-# usage: tools/mkimage.sh [debug|release] [--fresh]   prints the image path
+# usage: tools/mkimage.sh [debug|release] [--fresh] [--rescue]   prints the image path
+#   --rescue  make "MachOS (rescue)" the entry Limine boots
 set -eu
 cd "$(dirname "$0")/.."
 
 PROFILE=debug
 FRESH=0
+RESCUE=0
 for a in "$@"; do
     case "$a" in
         debug|release) PROFILE="$a" ;;
         --fresh) FRESH=1 ;;
+        --rescue) RESCUE=1 ;;
         *) echo "mkimage.sh: unknown argument $a" >&2; exit 2 ;;
     esac
 done
@@ -49,6 +52,9 @@ cp "$BIN/"* "$ROOTFS/bin/"
 cp "$KERNEL" "$ROOTFS/boot/kernel.elf"
 cp "$LIMINE/BOOTX64.EFI" "$ROOTFS/boot/BOOTX64.EFI"
 tar --format=ustar --owner=0 --group=0 -cf "$OUT/initrd.tar" -C "$ROOTFS" .
+# the disk root also carries the initrd, for `install` to give new disks a
+# rescue entry (the initrd itself cannot contain itself)
+cp "$OUT/initrd.tar" "$ROOTFS/boot/initrd.tar"
 
 IMG="$OUT/disk.img"
 ROOTIMG="$OUT/root.img"
@@ -91,7 +97,12 @@ dd if=/dev/zero of="$ESP" bs=512 count="$ESP_SECTORS" 2>/dev/null
 mformat -i "$ESP" -F -c 1 ::
 mmd   -i "$ESP" ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
 mcopy -i "$ESP" "$LIMINE/BOOTX64.EFI" ::/EFI/BOOT/
-mcopy -i "$ESP" tools/limine.conf ::/boot/limine/
+if [ "$RESCUE" = 1 ]; then
+    { echo "default_entry: 2"; cat tools/limine.conf; } > "$OUT/limine.conf"
+else
+    cp tools/limine.conf "$OUT/limine.conf"
+fi
+mcopy -i "$ESP" "$OUT/limine.conf" ::/boot/limine/limine.conf
 mcopy -i "$ESP" "$KERNEL" ::/boot/kernel.elf
 mcopy -i "$ESP" "$OUT/initrd.tar" ::/boot/initrd.tar
 dd if="$ESP" of="$IMG" bs=512 seek="$ESP_START" conv=notrunc 2>/dev/null

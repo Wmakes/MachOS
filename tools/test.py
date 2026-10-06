@@ -13,6 +13,43 @@ import argparse, os, re, subprocess, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 P = r"\$ "  # the shell prompt
 TARGET = os.path.join(ROOT, "out", "headless", "target.img")
+BROKEN = os.path.join(ROOT, "out", "headless", "broken.img")
+
+
+def sh(cmd):
+    return subprocess.run(cmd, shell=True, cwd=ROOT, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True).stdout
+
+
+def root_state(img):
+    """the ext2 'Filesystem state' of partition 2 of img"""
+    out = sh(f"sgdisk -i 2 {img}")
+    first = int(re.search(r"First sector: (\d+)", out).group(1))
+    last = int(re.search(r"Last sector: (\d+)", out).group(1))
+    sh(f"dd if={img} of=out/headless/st.img bs=512 skip={first} count={last - first + 1} status=none")
+    st = sh("dumpe2fs -h out/headless/st.img 2>/dev/null | grep -i 'state'")
+    os.remove(os.path.join(ROOT, "out/headless/st.img"))
+    return st
+
+
+def make_broken():
+    """a copy of a fresh dev disk with three faults put in by debugfs"""
+    sh("tools/mkimage.sh --fresh")
+    sh(f"cp out/debug/disk.img {BROKEN}")
+    sh(f"dd if={BROKEN} of=out/headless/p.img bs=512 skip=133120 count=389120 status=none")
+    blk = sh("debugfs -R 'blocks /bin/ls' out/headless/p.img 2>/dev/null").split()[0]
+    with open(os.path.join(ROOT, "out/headless/cmds"), "w") as f:
+        f.write(f"set_inode_field /etc/motd links_count 5\nfreeb {blk}\nunlink /bin/true\n")
+    sh("debugfs -w -f out/headless/cmds out/headless/p.img")
+    sh(f"dd if=out/headless/p.img of={BROKEN} bs=512 seek=133120 conv=notrunc status=none")
+    sh("rm -f out/headless/p.img out/headless/cmds")
+
+
+def broken_clean_on_host():
+    sh(f"dd if={BROKEN} of=out/headless/p.img bs=512 skip=133120 count=389120 status=none")
+    out = sh("e2fsck -fn out/headless/p.img")
+    sh("rm -f out/headless/p.img")
+    return "" if re.search(r"Fix|Popraw", out) is None else "e2fsck still finds problems"
 
 TESTS = [
     # name, keep previous disk, fsck, steps, expected output in order
@@ -84,6 +121,34 @@ TESTS = [
       "wait:" + P, "sleep:1"],
      ["kept across reboots", "1000000 1000000 6888896", "19"]),
 
+    # repair a disk that debugfs damaged on the host
+    ("fsck", False, False,
+     ["--disk2", BROKEN, "--prep", make_broken, "--post", broken_clean_on_host,
+      "wait:" + P, "send:fsck /dev/sda2; echo rc=$?.\\n", "wait:rc=[0-9]+\\.",
+      "send:fsck /dev/sdb2; echo rc=$?.\\n", "wait:rc=[0-9]+\\.",
+      "send:fsck -y /dev/sdb2; echo rc=$?.\\n", "wait:rc=[0-9]+\\.",
+      "send:fsck /dev/sdb2; echo rc=$?.\\n", "wait:rc=[0-9]+\\.",
+      "send:fsck -y /dev/sda2; echo rc=$?.\\n", "wait:rc=[0-9]+\\."],
+     ["clean", "rc=0.", "moved to /lost+found", "wrong link count", "block bitmap", "rc=4.",
+      "(fixed)", "3 problems fixed", "rc=1.", "clean", "rc=0.", "is mounted", "rc=8."]),
+
+    # a hard kill leaves the root unclean; rescue mode can check it; a clean
+    # shutdown leaves it clean
+    ("unclean-then-rescue", False, False,
+     ["wait:" + P, "send:echo x > /tmp/y\\n", "wait:" + P],
+     []),
+    ("unclean-warning", True, False,
+     ["wait:" + P, "send:true\\n", "wait:" + P],
+     ["not shut down cleanly", "rescue"]),
+    ("rescue", True, False,
+     ["--rescue", "--rescue",
+      "wait:" + P, "send:ls /; fsck -y /dev/sda2; echo rc=$?.\\n", "wait:rc=[0-9]+\\."],
+     ["rescue mode", "root: initrd in memory", "bin/", "/dev/sda2:", "rc="]),
+    ("shutdown-clean", True, False,
+     ["--post", lambda: "" if "clean" in root_state("out/debug/disk.img") and "not clean" not in root_state("out/debug/disk.img") else "root not clean after poweroff",
+      "wait:" + P, "send:echo hi > /tmp/z; poweroff\\n", "wait:power: off", "sleep:1"],
+     ["power: off"]),
+
     # install onto a blank second disk, then boot that disk on its own
     ("install", False, False,
      ["--disk2", "blank:" + TARGET,
@@ -108,10 +173,24 @@ def run(name, keep, fsck, steps, expect, profile):
     if fsck:
         cmd.append("--fsck")
     # leading "--opt value" pairs go to headless.py; "blank:PATH" makes an
-    # empty 512 MiB disk there first
+    # empty 512 MiB disk there first. --prep FN runs FN first, --post FN runs
+    # it after (it returns "" or a problem)
     steps = list(steps)
-    while steps and steps[0].startswith("--"):
+    post = None
+    while steps and isinstance(steps[0], str) and steps[0].startswith("--"):
         opt, val = steps[0], steps[1]
+        if opt == "--prep":
+            val()
+            steps = steps[2:]
+            continue
+        if opt == "--post":
+            post = val
+            steps = steps[2:]
+            continue
+        if opt == "--rescue":
+            cmd.append("--rescue")
+            steps = steps[2:]
+            continue
         if val.startswith("blank:"):
             val = val[len("blank:"):]
             with open(val, "wb") as f:
@@ -129,6 +208,10 @@ def run(name, keep, fsck, steps, expect, profile):
         problems.append("e2fsck found problems")
     elif r.returncode != 0:
         problems.append(f"headless.py failed ({r.returncode}): {r.stderr.strip()[-300:]}")
+    if post is not None:
+        why = post()
+        if why:
+            problems.append(why)
     at = 0
     for want in expect:
         i = out.find(want, at)
