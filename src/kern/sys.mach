@@ -18,6 +18,8 @@ use vfs:    machos.fs.vfs;
 use file:   machos.fs.file;
 use blk:    machos.fs.blk;
 use clock:  machos.kern.clock;
+use ahci:   machos.dev.ahci;
+use mount:  machos.fs.mount;
 
 val ARGS_MAX: u64 = 65536;
 val SYNC_EVERY: u64 = 5; # seconds: dirty blocks never wait longer than this
@@ -105,7 +107,7 @@ fun spawn(parent: *proc.Proc, nd: *vfs.Node, full: *u8, full_len: u64,
     or { c.group = group; }
     set_name(c, full, full_len);
 
-    val r: u64 = exec.load(c, nd, args, args_len);
+    val r: u64 = exec.load(c, nd, full, full_len, args, args_len);
     if (abi.is_err(r) != 0) {
         vmm.free_space(c.pml4);
         proc.reap(c);
@@ -410,6 +412,32 @@ fun sys_sbrk(n: u64) u64 {
     ret old;
 }
 
+fun sys_mount(dva: u64, dlen: u64, pva: u64, plen: u64) u64 {
+    var dp: [256]u8;
+    val dn: u64 = user_path(dva, dlen, ?dp[0]);
+    if (abi.is_err(dn) != 0) { ret dn; }
+    val dev: *vfs.Node = vfs.lookup(?dp[0], dn);
+    if (dev == nil) { ret e(abi.E_NOENT); }
+    if (dev.kind != abi.KIND_DEV || dev.dev < vfs.DEV_DISK) { ret e(abi.E_INVAL); }
+    val idx: u64 = dev.dev - vfs.DEV_DISK;
+    if (idx >= ahci.disk_count()) { ret e(abi.E_NOENT); }
+    var full: [256]u8;
+    val n: u64 = user_path(pva, plen, ?full[0]);
+    if (abi.is_err(n) != 0) { ret n; }
+    val at: *vfs.Node = vfs.lookup(?full[0], n);
+    if (at == nil) { ret e(abi.E_NOENT); }
+    ret mount.mount_at(ahci.disk(idx), at);
+}
+
+fun sys_umount(pva: u64, plen: u64) u64 {
+    var full: [256]u8;
+    val n: u64 = user_path(pva, plen, ?full[0]);
+    if (abi.is_err(n) != 0) { ret n; }
+    val r: *vfs.Node = vfs.lookup(?full[0], n);
+    if (r == nil) { ret e(abi.E_NOENT); }
+    ret mount.unmount(r);
+}
+
 fun sys_seek(h: u64, off: u64) u64 {
     val f: *file.Handle = handle(h);
     if (f == nil) { ret e(abi.E_BADF); }
@@ -468,6 +496,8 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.RENAME)  { ret sys_rename(a, b, c, d); }
     if (n == abi.SEEK)    { ret sys_seek(a, b); }
     if (n == abi.TIME)    { ret clock.now(); }
+    if (n == abi.MOUNT)   { ret sys_mount(a, b, c, d); }
+    if (n == abi.UMOUNT)  { ret sys_umount(a, b); }
     if (n == abi.SYNC) {
         if (blk.sync() == 0) { ret e(abi.E_IO); }
         ret 0;

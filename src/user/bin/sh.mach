@@ -1,5 +1,6 @@
 # sh: the MachOS shell.
-#   words, 'single' and "double" quotes, \escapes, $? (last status), # comments
+#   words, 'single' and "double" quotes, \escapes, # comments,
+#   $? (last status), $0-$9 and $# (script arguments)
 #   a | b | c        pipelines
 #   < f  > f  >> f   redirections
 #   a ; b   a && b   a || b   a &   sequencing, conditionals, background
@@ -29,6 +30,7 @@ val MAX_CMDS: u64 = 8;
 val MAX_BG:   u64 = 16;
 val NONE:     u64 = 0xFFFFFFFFFFFFFFFF;
 val STATUS_MARK: u8 = 1; # stands for $? inside a word until it runs
+val PARAM_MARK:  u8 = 2; # followed by '0'-'9' or '#': $N / $#
 
 var tk: [128]u8;  # token kinds
 var ts: [128]u64; # word start in wbuf
@@ -42,6 +44,8 @@ var status: u64 = 0;
 var bg: [16]u64;
 var nbg: u64 = 0;
 var quit: u8 = 0;
+var params: **u8 = nil; # $0 $1 ... (a script's path and arguments)
+var nparams: u64 = 0;
 var interactive: u8 = 0;
 
 fun is_space(c: u8) u8 {
@@ -86,6 +90,22 @@ fun expand(t: u64, out: *u8, cap: u64) u64 {
             val k: u64 = io.fmt_dec(status, ?num[0]);
             if (n + k >= cap) { ret NONE; }
             io.copy(?out[n], ?num[0], k);
+            n = n + k;
+        } or (w[i] == PARAM_MARK && i + 1 < tl[t]) {
+            i = i + 1;
+            var num: [20]u8;
+            var src: *u8 = ?num[0];
+            var k: u64 = 0;
+            if (w[i] == 35) { # $#: arguments after $0
+                var c: u64 = 0;
+                if (nparams > 0) { c = nparams - 1; }
+                k = io.fmt_dec(c, ?num[0]);
+            } or ((w[i] - 48)::u64 < nparams) {
+                src = params[(w[i] - 48)::u64];
+                k = io.len(src);
+            }
+            if (n + k >= cap) { ret NONE; }
+            io.copy(?out[n], src, k);
             n = n + k;
         } or {
             if (n + 1 >= cap) { ret NONE; }
@@ -162,6 +182,12 @@ fun lex(line: *u8, n: u64) u8 {
                         i = i + 2;
                         cnt;
                     }
+                    if (line[i] == 36 && i + 1 < n && ((line[i + 1] >= 48 && line[i + 1] <= 57) || line[i + 1] == 35)) {
+                        push(PARAM_MARK);
+                        push(line[i + 1]);
+                        i = i + 2;
+                        cnt;
+                    }
                     if (line[i] == 92 && i + 1 < n) { i = i + 1; }
                     push(line[i]);
                     i = i + 1;
@@ -173,6 +199,10 @@ fun lex(line: *u8, n: u64) u8 {
                 i = i + 2;
             } or (d == 36 && i + 1 < n && line[i + 1] == 63) { # $?, expanded when run
                 push(STATUS_MARK);
+                i = i + 2;
+            } or (d == 36 && i + 1 < n && ((line[i + 1] >= 48 && line[i + 1] <= 57) || line[i + 1] == 35)) {
+                push(PARAM_MARK);
+                push(line[i + 1]);
                 i = i + 2;
             } or {
                 push(d);
@@ -580,6 +610,8 @@ fun main(argc: u64, argv: **u8) u64 {
         ret status;
     }
     if (argc > 1) {
+        params = ?argv[1];
+        nparams = argc - 1;
         src = sys.open(argv[1], io.len(argv[1]), abi.O_READ);
         if (abi.is_err(src) != 0) {
             io.fail("sh\0", argv[1], src);

@@ -12,6 +12,7 @@ import argparse, os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 P = r"\$ "  # the shell prompt
+TARGET = os.path.join(ROOT, "out", "headless", "target.img")
 
 TESTS = [
     # name, keep previous disk, fsck, steps, expected output in order
@@ -59,6 +60,19 @@ TESTS = [
      ["wait:" + P, "send:cat /home/note; wc /home/big; grep -c 77777 /home/big; rm /home/big\\n",
       "wait:" + P, "sleep:1"],
      ["kept across reboots", "1000000 1000000 6888896", "19"]),
+
+    # install onto a blank second disk, then boot that disk on its own
+    ("install", False, False,
+     ["--disk2", "blank:" + TARGET,
+      "wait:" + P, "send:install /dev/disk0\\n", "wait:continue: ", "send:no\\n", "wait:" + P,
+      "send:install /dev/disk1\\n", "wait:continue: ", "send:yes\\n", "wait:" + P],
+     ["MachOS root 446 MiB", "mkfat: FAT32", "mkext2:", "copying the system", "is installed on /dev/disk1"]),
+
+    ("installed-boot", False, True,
+     ["--boot", TARGET, "wait:" + P,
+      "send:uname; ls /boot; echo on-installed > /home/x; cat /home/x; mkdir /mnt; mount /dev/disk0 /mnt\\n", "wait:" + P,
+      "sleep:1"],
+     ["root: ext2 on disk 0", "MachOS", "kernel.elf", "on-installed", "busy"]),
 ]
 
 
@@ -68,6 +82,17 @@ def run(name, keep, fsck, steps, expect, profile):
         cmd.append("--keep")
     if fsck:
         cmd.append("--fsck")
+    # leading "--opt value" pairs go to headless.py; "blank:PATH" makes an
+    # empty 512 MiB disk there first
+    steps = list(steps)
+    while steps and steps[0].startswith("--"):
+        opt, val = steps[0], steps[1]
+        if val.startswith("blank:"):
+            val = val[len("blank:"):]
+            with open(val, "wb") as f:
+                f.truncate(512 << 20)
+        cmd += [opt, val]
+        steps = steps[2:]
     r = subprocess.run(cmd + steps, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     out = r.stdout
     problems = []

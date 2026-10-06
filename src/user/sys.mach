@@ -52,3 +52,5 @@ pub fun sbrk(n: u64) u64 { ret raw(abi.SBRK, n, 0, 0, 0, 0); }
 pub fun setfg(group: u64) u64 { ret raw(abi.SETFG, group, 0, 0, 0, 0); }
 pub fun sync() u64 { ret raw(abi.SYNC, 0, 0, 0, 0, 0); }
 pub fun time() u64 { ret raw(abi.TIME, 0, 0, 0, 0, 0); }
+pub fun mount(disk: *u8, dn: u64, dir: *u8, n: u64) u64 { ret raw(abi.MOUNT, disk::u64, dn, dir::u64, n, 0); }
+pub fun umount(dir: *u8, n: u64) u64 { ret raw(abi.UMOUNT, dir::u64, n, 0, 0, 0); }

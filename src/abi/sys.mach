@@ -28,7 +28,9 @@ pub val RENAME:  u64 = 21; # (from, from_len, to, to_len)
 pub val SEEK:    u64 = 22; # (handle, offset)                        -> offset
 pub val SYNC:    u64 = 23; # ()                                      put every pending write on the disk
 pub val TIME:    u64 = 24; # ()                                      -> seconds since 1970-01-01 UTC
-pub val COUNT:   u64 = 25;
+pub val MOUNT:   u64 = 25; # (disk, disk_len, dir, dir_len)          MachOS partition of /dev/diskN on dir
+pub val UMOUNT:  u64 = 26; # (dir, dir_len)
+pub val COUNT:   u64 = 27;
 
 # WAIT flags
 pub val WAIT_NOHANG: u64 = 1; # E_AGAIN instead of blocking while it runs
@@ -61,6 +63,7 @@ pub val E_NAMETOOLONG: u64 = 17;
 pub val E_NOSPC:    u64 = 18; # disk full
 pub val E_IO:       u64 = 19; # the disk failed
 pub val E_XDEV:     u64 = 20; # across filesystems
+pub val E_BUSY:     u64 = 21; # in use
 
 pub val ERR_MIN: u64 = 0xFFFFFFFFFFFFF000;
 
@@ -95,6 +98,7 @@ pub fun err_name(v: u64) *u8 {
     if (e == E_NOSPC)    { ret "no space left on device\0"; }
     if (e == E_IO)       { ret "input/output error\0"; }
     if (e == E_XDEV)     { ret "cannot move across filesystems\0"; }
+    if (e == E_BUSY)     { ret "busy\0"; }
     ret "unknown error\0";
 }
 

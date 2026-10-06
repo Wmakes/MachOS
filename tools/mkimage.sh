@@ -40,6 +40,9 @@ rm -rf "$ROOTFS"
 mkdir -p "$ROOTFS/bin"
 cp -r root/. "$ROOTFS/"
 cp "out/user/$PROFILE/bin/"* "$ROOTFS/bin/"
+# what `install` puts on a new disk's EFI partition
+cp "$OUT/kernel.elf" "$ROOTFS/boot/kernel.elf"
+cp "$LIMINE/BOOTX64.EFI" "$ROOTFS/boot/BOOTX64.EFI"
 tar --format=ustar --owner=0 --group=0 -cf "$OUT/initrd.tar" -C "$ROOTFS" .
 
 IMG="$OUT/disk.img"
@@ -54,14 +57,21 @@ if [ "$FRESH" = 1 ] || [ ! -f "$IMG" ] || ! sgdisk -p "$IMG" 2>/dev/null | grep 
     dd if="$ROOTIMG" of="$IMG" bs=512 seek="$ROOT_START" conv=notrunc 2>/dev/null
     rm -f "$ROOTIMG"
 else
-    # refresh /bin inside the existing root partition
+    # refresh /bin and /boot inside the existing root partition
     dd if="$IMG" of="$ROOTIMG" bs=512 skip="$ROOT_START" count="$((ROOT_MB * 2048))" 2>/dev/null
     CMDS="$OUT/debugfs.cmds"
     : > "$CMDS"
-    for f in "$ROOTFS"/bin/*; do
-        n=$(basename "$f")
-        echo "rm /bin/$n" >> "$CMDS"
-        echo "write $f /bin/$n" >> "$CMDS"
+    # (only when missing: debugfs's mkdir of an existing directory leaves the
+    # bitmaps inconsistent)
+    if debugfs -R "stat /boot" "$ROOTIMG" 2>&1 | grep -q "File not found"; then
+        echo "mkdir /boot" >> "$CMDS"
+    fi
+    for d in bin boot; do
+        for f in "$ROOTFS/$d"/*; do
+            n=$(basename "$f")
+            echo "rm /$d/$n" >> "$CMDS"
+            echo "write $f /$d/$n" >> "$CMDS"
+        done
     done
     debugfs -w -f "$CMDS" "$ROOTIMG" >/dev/null 2>&1
     dd if="$ROOTIMG" of="$IMG" bs=512 seek="$ROOT_START" conv=notrunc 2>/dev/null

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boot MachOS under QEMU with no window and drive it from a script.
 
-usage: tools/headless.py [-p release] [-t SECONDS] [--keep] [--fsck] STEP...
+usage: tools/headless.py [-p release] [-t SECONDS] [--keep] [--fsck] [--disk2 IMG] [--boot IMG] STEP...
 
 The disk is rebuilt fresh unless --keep is given (then files written by an
 earlier run are still there). --fsck runs e2fsck on the root partition after
@@ -62,12 +62,17 @@ def main():
     ap.add_argument("-t", "--timeout", type=float, default=20.0)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--fsck", action="store_true")
+    ap.add_argument("--disk2", help="attach this raw image as a second disk")
+    ap.add_argument("--boot", help="boot this image as it is instead of building one")
     ap.add_argument("steps", nargs="*")
     a = ap.parse_args()
 
     os.chdir(ROOT)
-    mk = ["tools/mkimage.sh", a.profile] + ([] if a.keep else ["--fresh"])
-    img = subprocess.run(mk, check=True, stdout=subprocess.PIPE, text=True).stdout.strip().splitlines()[-1]
+    if a.boot:
+        img = a.boot
+    else:
+        mk = ["tools/mkimage.sh", a.profile] + ([] if a.keep else ["--fresh"])
+        img = subprocess.run(mk, check=True, stdout=subprocess.PIPE, text=True).stdout.strip().splitlines()[-1]
     out = os.path.join("out", "headless")
     os.makedirs(out, exist_ok=True)
     ser, mon = os.path.join(out, "serial.sock"), os.path.join(out, "monitor.sock")
@@ -83,6 +88,7 @@ def main():
         "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF_CODE}",
         "-drive", f"if=pflash,format=raw,file={vars_fd}",
         "-drive", f"format=raw,file={img}",
+        *(["-drive", f"format=raw,file={a.disk2}"] if a.disk2 else []),
         "-chardev", f"socket,id=s0,path={ser},server=on,wait=off",
         "-serial", "chardev:s0",
         "-monitor", f"unix:{mon},server,nowait",
@@ -166,8 +172,11 @@ def main():
         qemu.wait()
     if a.fsck:
         part = os.path.join(out, "root.img")
-        subprocess.run(["dd", f"if={img}", f"of={part}", "bs=512", "skip=67584",
-                        "count=188416", "status=none"], check=True)
+        info = subprocess.run(["sgdisk", "-i", "2", img], stdout=subprocess.PIPE, text=True).stdout
+        first = int(re.search(r"First sector: (\d+)", info).group(1))
+        last = int(re.search(r"Last sector: (\d+)", info).group(1))
+        subprocess.run(["dd", f"if={img}", f"of={part}", "bs=512", f"skip={first}",
+                        f"count={last - first + 1}", "status=none"], check=True)
         fsck = subprocess.run(["e2fsck", "-fn", part], stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True)
         os.remove(part)

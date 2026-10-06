@@ -1,0 +1,114 @@
+# gpt DISK: replace DISK's partition table with the MachOS layout
+#   1  EFI system partition, 64 MiB (FAT32, for the firmware and Limine)
+#   2  MachOS root, the rest of the disk up to 32 GiB (ext2)
+# writes a protective MBR, the primary GPT, and the backup GPT at the end
+
+use abi: machos.abi.sys;
+use sys: machos.user.sys;
+use io:  machos.user.io;
+use bd:  machos.user.blkdev;
+use rt:  machos.user.rt;
+
+val ESP_START:   u64 = 2048;
+val ESP_SECTORS: u64 = 131072;      # 64 MiB
+val ROOT_MAX:    u64 = 67108864;    # 32 GiB in sectors
+val ROOT_MIN:    u64 = 65536;       # 32 MiB
+val ENTRIES:     u64 = 128;
+val ENTRY_SIZE:  u64 = 128;
+
+var table: [16384]u8; # ENTRIES * ENTRY_SIZE
+
+fun name(e: *u8, s: *u8) {
+    var i: u64 = 0;
+    for (s[i] != 0 && i < 36) {
+        bd.put16(e, 56 + 2 * i, s[i]::u64);
+        i = i + 1;
+    }
+}
+
+fun entry(i: u64, kind: *u8, first: u64, last: u64, label: *u8) {
+    val e: *u8 = ?table[i * ENTRY_SIZE];
+    io.copy(e, kind, 16);
+    bd.guid(?e[16]);
+    bd.put64(e, 32, first);
+    bd.put64(e, 40, last);
+    name(e, label);
+}
+
+fun header(h: *u8, me: u64, other: u64, entries_at: u64, last_usable: u64, disk: *u8, crc_entries: u64) {
+    bd.clear(h, 512);
+    io.copy(h, "EFI PART\0", 8);
+    bd.put32(h, 8, 0x00010000);
+    bd.put32(h, 12, 92);
+    bd.put64(h, 24, me);
+    bd.put64(h, 32, other);
+    bd.put64(h, 40, 34);
+    bd.put64(h, 48, last_usable);
+    io.copy(?h[56], disk, 16);
+    bd.put64(h, 72, entries_at);
+    bd.put32(h, 80, ENTRIES);
+    bd.put32(h, 84, ENTRY_SIZE);
+    bd.put32(h, 88, crc_entries);
+    bd.put32(h, 16, bd.crc32(h, 92));
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc != 2) {
+        io.err("usage: gpt DISK\n\0");
+        ret 2;
+    }
+    val sectors: u64 = bd.disk_size(argv[1]) / bd.SECTOR;
+    val last: u64 = sectors - 1;
+    val last_usable: u64 = last - 33;
+    val root_start: u64 = ESP_START + ESP_SECTORS;
+    if (sectors < root_start + ROOT_MIN + 34) {
+        io.err("gpt: the disk is too small (at least 100 MiB)\n\0");
+        ret 1;
+    }
+    var root_count: u64 = (last_usable + 1 - root_start) / 2048 * 2048;
+    if (root_count > ROOT_MAX) { root_count = ROOT_MAX; }
+    val h: u64 = bd.open_disk("gpt\0", argv[1], 1);
+    if (abi.is_err(h) != 0) { ret 1; }
+
+    bd.clear(?table[0], 16384);
+    entry(0, ?bd.ESP_TYPE[0], ESP_START, ESP_START + ESP_SECTORS - 1, "EFI system\0");
+    entry(1, ?bd.ROOT_TYPE[0], root_start, root_start + root_count - 1, "MachOS root\0");
+    val crc: u64 = bd.crc32(?table[0], 16384);
+    var disk: [16]u8;
+    bd.guid(?disk[0]);
+
+    # protective MBR: one partition of type 0xEE covering the disk
+    var s: [512]u8;
+    bd.clear(?s[0], 512);
+    s[446 + 2] = 2;
+    s[446 + 4] = 0xEE;
+    s[446 + 5] = 0xFF;
+    s[446 + 6] = 0xFF;
+    s[446 + 7] = 0xFF;
+    bd.put32(?s[0], 446 + 8, 1);
+    var mbr_len: u64 = sectors - 1;
+    if (mbr_len > 0xFFFFFFFF) { mbr_len = 0xFFFFFFFF; }
+    bd.put32(?s[0], 446 + 12, mbr_len);
+    s[510] = 0x55;
+    s[511] = 0xAA;
+    var ok: u8 = bd.pwrite(h, 0, ?s[0], 512);
+
+    header(?s[0], 1, last, 2, last_usable, ?disk[0], crc);
+    if (ok != 0) { ok = bd.pwrite(h, bd.SECTOR, ?s[0], 512); }
+    if (ok != 0) { ok = bd.pwrite(h, 2 * bd.SECTOR, ?table[0], 16384); }
+    header(?s[0], last, 1, last - 32, last_usable, ?disk[0], crc);
+    if (ok != 0) { ok = bd.pwrite(h, (last - 32) * bd.SECTOR, ?table[0], 16384); }
+    if (ok != 0) { ok = bd.pwrite(h, last * bd.SECTOR, ?s[0], 512); }
+    sys.close(h);
+    if (ok == 0) {
+        io.err("gpt: writing the disk failed (a filesystem on it may be mounted)\n\0");
+        ret 1;
+    }
+    io.out("gpt: \0");
+    io.out(argv[1]);
+    io.out(": EFI system 64 MiB, MachOS root \0");
+    io.dec(root_count / 2048);
+    io.out(" MiB\n\0");
+    ret 0;
+}

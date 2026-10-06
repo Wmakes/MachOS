@@ -60,6 +60,14 @@ targets = ["user"]
 link = []
 need = []
 
+[artifact.confirm]
+kind = "bin"
+entry = "user/bin/confirm.mach"
+out = "bin/confirm"
+targets = ["user"]
+link = []
+need = []
+
 [artifact.cp]
 kind = "bin"
 entry = "user/bin/cp.mach"
@@ -96,6 +104,14 @@ need = []
 kind = "bin"
 entry = "user/bin/free.mach"
 out = "bin/free"
+targets = ["user"]
+link = []
+need = []
+
+[artifact.gpt]
+kind = "bin"
+entry = "user/bin/gpt.mach"
+out = "bin/gpt"
 targets = ["user"]
 link = []
 need = []
@@ -156,6 +172,30 @@ targets = ["user"]
 link = []
 need = []
 
+[artifact.mkext2]
+kind = "bin"
+entry = "user/bin/mkext2.mach"
+out = "bin/mkext2"
+targets = ["user"]
+link = []
+need = []
+
+[artifact.mkfat]
+kind = "bin"
+entry = "user/bin/mkfat.mach"
+out = "bin/mkfat"
+targets = ["user"]
+link = []
+need = []
+
+[artifact.mount]
+kind = "bin"
+entry = "user/bin/mount.mach"
+out = "bin/mount"
+targets = ["user"]
+link = []
+need = []
+
 [artifact.mv]
 kind = "bin"
 entry = "user/bin/mv.mach"
@@ -212,6 +252,14 @@ targets = ["user"]
 link = []
 need = []
 
+[artifact.test]
+kind = "bin"
+entry = "user/bin/test.mach"
+out = "bin/test"
+targets = ["user"]
+link = []
+need = []
+
 [artifact.touch]
 kind = "bin"
 entry = "user/bin/touch.mach"
@@ -224,6 +272,14 @@ need = []
 kind = "bin"
 entry = "user/bin/true.mach"
 out = "bin/true"
+targets = ["user"]
+link = []
+need = []
+
+[artifact.umount]
+kind = "bin"
+entry = "user/bin/umount.mach"
+out = "bin/umount"
 targets = ["user"]
 link = []
 need = []

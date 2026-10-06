@@ -1,4 +1,5 @@
 
   Welcome to MachOS -- a kernel and userland written in mach.
   Type `help` for the shell's commands, `ls /bin` for programs.
+  To install MachOS on a disk: `ls -l /dev`, then `install /dev/diskN`.
 

@@ -1,0 +1,20 @@
+# umount DIR: unmount what is mounted on DIR (after writing it all back)
+
+use abi: machos.abi.sys;
+use sys: machos.user.sys;
+use io:  machos.user.io;
+use rt:  machos.user.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc != 2) {
+        io.err("usage: umount DIR\n\0");
+        ret 2;
+    }
+    val r: u64 = sys.umount(argv[1], io.len(argv[1]));
+    if (abi.is_err(r) != 0) {
+        io.fail("umount\0", argv[1], r);
+        ret 1;
+    }
+    ret 0;
+}

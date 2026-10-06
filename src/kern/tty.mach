@@ -5,10 +5,10 @@
 use kprint: machos.kern.kprint;
 use proc:   machos.kern.proc;
 
-val LINE: u64 = 256;
+val LINE: u64 = 1024;
 val RING: u64 = 4096;
 
-var line: [256]u8;
+var line: [1024]u8;
 var line_len: u64 = 0;
 
 var ring: [4096]u8;

@@ -152,3 +152,15 @@ pub fun dirty_count() u64 { ret ndirty; }
 pub fun read_count() u64 { ret reads; }
 pub fun write_count() u64 { ret writes; }
 pub fun failed_count() u64 { ret failed; }
+
+# write back and drop every cached block of partitions on disk `d`, so raw
+# writes to the disk and later mounts see the disk as it really is
+pub fun forget_disk(d: *ahci.Disk) {
+    sync();
+    var i: u64 = 0;
+    for (i < CACHE) {
+        val e: *Entry = ?cache[i];
+        if (e.part != nil && e.part.disk == d) { e.part = nil; }
+        i = i + 1;
+    }
+}

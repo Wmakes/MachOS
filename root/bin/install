@@ -1,0 +1,23 @@
+#!/bin/sh
+# install DISK: erase DISK and install MachOS on it, e.g. `install /dev/disk1`
+#   1. gpt     a new partition table: EFI system + MachOS root
+#   2. mkfat   the EFI partition, with Limine, its config and the kernel
+#   3. mkext2  an empty root filesystem
+#   4. mount it and copy /bin, /etc and /boot over
+test -n "$1" || echo "usage: install DISK (see ls -l /dev)"
+test -n "$1" || exit 2
+test -b "$1" || echo "install: $1 is not a disk"
+test -b "$1" || exit 2
+echo "This erases everything on $1 and installs MachOS there."
+confirm "Type yes to continue: " || exit 1
+gpt $1 || exit 1
+mkfat $1 /boot/BOOTX64.EFI:EFI/BOOT/BOOTX64.EFI /boot/limine.conf:boot/limine/limine.conf /boot/kernel.elf:boot/kernel.elf || exit 1
+mkext2 $1 || exit 1
+test -d /mnt || mkdir /mnt
+mount $1 /mnt || exit 1
+echo "copying the system..."
+cp -r /bin /etc /boot /mnt || exit 1
+mkdir /mnt/home
+umount /mnt || exit 1
+sync
+echo "MachOS is installed on $1. Boot from that disk."

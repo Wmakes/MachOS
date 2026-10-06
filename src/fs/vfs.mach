@@ -17,12 +17,16 @@ pub val FS_EXT2: u64 = 1;
 pub val DEV_CONSOLE: u64 = 1;
 pub val DEV_NULL:    u64 = 2;
 pub val DEV_ZERO:    u64 = 3;
+pub val DEV_DISK:    u64 = 16; # + the AHCI disk index
 
 pub rec Node {
     kind:     u64; # abi.KIND_*
     size:     u64;
     fs:       u64; # FS_*
     ino:      u64; # FS_EXT2: inode number
+    fsi:      *ext2.Fs; # FS_EXT2: the filesystem it is on
+    mounted:  *Node;    # a directory with a filesystem mounted on it: that root
+    mount_of: *Node;    # the root of a mounted filesystem: where it is mounted
     loaded:   u8;  # FS_EXT2 directory: entries are in the tree
     cap:      u64; # FS_RAM file: heap buffer `data` of `cap` bytes
     data:     u64;
@@ -85,13 +89,20 @@ pub fun init_ram() u8 {
     ret 1;
 }
 
-# the mounted ext2 filesystem as the root
-pub fun init_ext2() u8 {
-    root = new_node(abi.KIND_DIR, FS_EXT2, "\0", 0);
+# a mounted ext2 filesystem as the root
+pub fun init_ext2(fs: *ext2.Fs) u8 {
+    root = ext2_root(fs);
     if (root == nil) { ret 0; }
     root.parent = root;
-    root.ino = ext2.ROOT_INO;
     ret 1;
+}
+
+fun ext2_root(fs: *ext2.Fs) *Node {
+    val nd: *Node = new_node(abi.KIND_DIR, FS_EXT2, "\0", 0);
+    if (nd == nil) { ret nil; }
+    nd.ino = ext2.ROOT_INO;
+    nd.fsi = fs;
+    ret nd;
 }
 
 pub fun get_root() *Node { ret root; }
@@ -105,36 +116,46 @@ fun load(dir: *Node) {
     var nl: u64 = 0;
     var ino: u64 = 0;
     var kind: u64 = 0;
-    for (ext2.dir_next(dir.ino, ?pos, ?name[0], ?nl, ?ino, ?kind) != 0) {
+    for (ext2.dir_next(dir.fsi, dir.ino, ?pos, ?name[0], ?nl, ?ino, ?kind) != 0) {
         val nd: *Node = new_node(kind, FS_EXT2, ?name[0], nl);
         if (nd == nil) { brk; }
         nd.ino = ino;
+        nd.fsi = dir.fsi;
         var i: ext2.Inode;
-        if (ext2.read_inode(ino, ?i) != 0) { nd.size = ext2.size_of(?i); }
+        if (ext2.read_inode(dir.fsi, ino, ?i) != 0) { nd.size = ext2.size_of(?i); }
         attach(dir, nd);
     }
 }
 
 pub fun child(dir: *Node, name: *u8, n: u64) *Node {
     if (dir.kind != abi.KIND_DIR) { ret nil; }
-    load(dir);
-    var c: *Node = dir.child;
+    val d: *Node = through(dir);
+    load(d);
+    var c: *Node = d.child;
     for (c != nil) {
-        if (c.name_len == n && mem.equal(?c.name[0], name, n) != 0) { ret c; }
+        if (c.name_len == n && mem.equal(?c.name[0], name, n) != 0) { ret through(c); }
         c = c.next;
     }
     ret nil;
 }
 
+# what is visible at `nd`: the root mounted there, if any
+pub fun through(nd: *Node) *Node {
+    if (nd.mounted != nil) { ret nd.mounted; }
+    ret nd;
+}
+
 pub fun nth_child(dir: *Node, idx: u64) *Node {
-    load(dir);
-    var c: *Node = dir.child;
+    val d: *Node = through(dir);
+    load(d);
+    var c: *Node = d.child;
     var i: u64 = 0;
     for (c != nil && i < idx) {
         c = c.next;
         i = i + 1;
     }
-    ret c;
+    if (c == nil) { ret nil; }
+    ret through(c);
 }
 
 pub fun is_empty(dir: *Node) u8 {
@@ -189,12 +210,13 @@ pub fun create(dir: *Node, name: *u8, n: u64, kind: u64, out: **Node) u64 {
     load(dir);
     val nd: *Node = new_node(kind, FS_EXT2, name, n);
     if (nd == nil) { ret e(abi.E_NOMEM); }
-    val ino: u64 = ext2.create(dir.ino, name, n, kind);
+    val ino: u64 = ext2.create(dir.fsi, dir.ino, name, n, kind);
     if (abi.is_err(ino) != 0) {
         heap.free(nd::u64);
         ret ino;
     }
     nd.ino = ino;
+    nd.fsi = dir.fsi;
     nd.loaded = 1; # brand new: nothing on disk to read
     if (kind == abi.KIND_DIR) { nd.size = 4096; }
     attach(dir, nd);
@@ -203,19 +225,20 @@ pub fun create(dir: *Node, name: *u8, n: u64, kind: u64, out: **Node) u64 {
 }
 
 fun destroy(nd: *Node) {
-    if (nd.fs == FS_EXT2 && nd.dead != 0) { ext2.release(nd.ino); }
+    if (nd.fs == FS_EXT2 && nd.dead != 0) { ext2.release(nd.fsi, nd.ino); }
     heap.free(nd.data);
     heap.free(nd::u64);
 }
 
 # take a file or empty directory out of the tree (and off the disk)
 pub fun unlink(nd: *Node) u64 {
-    if (nd == root) { ret e(abi.E_INVAL); }
+    if (nd == root || nd.mount_of != nil) { ret e(abi.E_BUSY); }
+    if (nd.mounted != nil) { ret e(abi.E_BUSY); }
     if (nd.kind == abi.KIND_DIR && is_empty(nd) == 0) { ret e(abi.E_NOTEMPTY); }
     if (nd.fs == FS_EXT2) {
         var is_dir: u8 = 0;
         if (nd.kind == abi.KIND_DIR) { is_dir = 1; }
-        val left: u64 = ext2.unlink(nd.parent.ino, ?nd.name[0], nd.name_len, nd.ino, is_dir);
+        val left: u64 = ext2.unlink(nd.fsi, nd.parent.ino, ?nd.name[0], nd.name_len, nd.ino, is_dir);
         if (left == 0) { nd.dead = 1; }
     }
     detach(nd);
@@ -235,22 +258,69 @@ pub fun within(a: *Node, b: *Node) u8 {
     for {
         if (n == b) { ret 1; }
         if (n == root) { ret 0; }
+        if (n.mount_of != nil) { n = n.mount_of; }
         n = n.parent;
     }
     ret 0;
 }
 
+# mount `fs` on the directory `at`; fails if something is already there
+pub fun mount(at: *Node, fs: *ext2.Fs) u64 {
+    if (at.kind != abi.KIND_DIR) { ret e(abi.E_NOTDIR); }
+    if (at.mounted != nil || at == root) { ret e(abi.E_BUSY); }
+    val r: *Node = ext2_root(fs);
+    if (r == nil) { ret e(abi.E_NOMEM); }
+    r.parent = at.parent;
+    r.mount_of = at;
+    at.mounted = r;
+    ret 0;
+}
+
+# the filesystem mounted at `at` (the mounted root itself); its cached nodes
+# are dropped. fails while anything on it is open
+pub fun unmount(r: *Node) u64 {
+    if (r.mount_of == nil) { ret e(abi.E_INVAL); }
+    if (busy(r) != 0) { ret e(abi.E_BUSY); }
+    drop_children(r);
+    r.mount_of.mounted = nil;
+    heap.free(r::u64);
+    ret 0;
+}
+
+# whether anything at or under `nd` is open or has something mounted on it
+fun busy(nd: *Node) u8 {
+    if (nd.opens > 0 || nd.mounted != nil) { ret 1; }
+    var c: *Node = nd.child;
+    for (c != nil) {
+        if (busy(c) != 0) { ret 1; }
+        c = c.next;
+    }
+    ret 0;
+}
+
+fun drop_children(nd: *Node) {
+    var c: *Node = nd.child;
+    for (c != nil) {
+        val next: *Node = c.next;
+        drop_children(c);
+        heap.free(c.data);
+        heap.free(c::u64);
+        c = next;
+    }
+    nd.child = nil;
+}
+
 # move `nd` into `dir` as `name` (which must not exist there yet)
 pub fun rename(nd: *Node, dir: *Node, name: *u8, n: u64) u64 {
     if (n > abi.NAME_MAX) { ret e(abi.E_NAMETOOLONG); }
-    if (nd == root) { ret e(abi.E_INVAL); }
+    if (nd == root || nd.mount_of != nil || nd.mounted != nil) { ret e(abi.E_BUSY); }
     if (nd.kind == abi.KIND_DIR && within(dir, nd) != 0) { ret e(abi.E_INVAL); }
-    if (nd.fs != dir.fs) { ret e(abi.E_XDEV); }
+    if (nd.fs != dir.fs || nd.fsi != dir.fsi) { ret e(abi.E_XDEV); }
     if (nd.fs == FS_EXT2) {
         load(dir);
         var is_dir: u8 = 0;
         if (nd.kind == abi.KIND_DIR) { is_dir = 1; }
-        val r: u64 = ext2.rename(nd.parent.ino, ?nd.name[0], nd.name_len, dir.ino, name, n, nd.ino, is_dir);
+        val r: u64 = ext2.rename(nd.fsi, nd.parent.ino, ?nd.name[0], nd.name_len, dir.ino, name, n, nd.ino, is_dir);
         if (abi.is_err(r) != 0) { ret r; }
     }
     detach(nd);
@@ -261,7 +331,7 @@ pub fun rename(nd: *Node, dir: *Node, name: *u8, n: u64) u64 {
 }
 
 pub fun read(nd: *Node, off: u64, buf: u64, n: u64) u64 {
-    if (nd.fs == FS_EXT2) { ret ext2.read(nd.ino, off, buf, n); }
+    if (nd.fs == FS_EXT2) { ret ext2.read(nd.fsi, nd.ino, off, buf, n); }
     if (off >= nd.size) { ret 0; }
     var k: u64 = nd.size - off;
     if (k > n) { k = n; }
@@ -289,7 +359,7 @@ fun reserve(nd: *Node, need: u64) u8 {
 pub fun write(nd: *Node, off: u64, buf: u64, n: u64) u64 {
     if (off + n < off) { ret e(abi.E_INVAL); }
     if (nd.fs == FS_EXT2) {
-        val k: u64 = ext2.write(nd.ino, off, buf, n);
+        val k: u64 = ext2.write(nd.fsi, nd.ino, off, buf, n);
         if (abi.is_err(k) == 0 && off + k > nd.size) { nd.size = off + k; }
         ret k;
     }
@@ -301,6 +371,6 @@ pub fun write(nd: *Node, off: u64, buf: u64, n: u64) u64 {
 }
 
 pub fun truncate(nd: *Node) {
-    if (nd.fs == FS_EXT2) { ext2.truncate(nd.ino); }
+    if (nd.fs == FS_EXT2) { ext2.truncate(nd.fsi, nd.ino); }
     nd.size = 0;
 }

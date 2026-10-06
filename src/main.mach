@@ -20,9 +20,7 @@ use proc:   machos.kern.proc;
 use sys:    machos.kern.sys;
 use abi:    machos.abi.sys;
 use vfs:    machos.fs.vfs;
-use blk:    machos.fs.blk;
-use gpt:    machos.fs.gpt;
-use ext2:   machos.fs.ext2;
+use mount:  machos.fs.mount;
 use initrd: machos.fs.initrd;
 use version: machos.abi.version;
 use clock:  machos.kern.clock;
@@ -30,7 +28,6 @@ use pci:    machos.dev.pci;
 use ahci:   machos.dev.ahci;
 
 var boot: info.BootInfo;
-var root_part: blk.Part;
 
 # the boot stack, in the kernel image so it stays mapped once Limine's
 # memory is no longer trusted
@@ -147,6 +144,16 @@ fun kmain() {
     make_dev(dev, "console\0", 7, vfs.DEV_CONSOLE);
     make_dev(dev, "null\0", 4, vfs.DEV_NULL);
     make_dev(dev, "zero\0", 4, vfs.DEV_ZERO);
+    var dname: [8]u8 = [8]u8{100, 105, 115, 107, 48, 0, 0, 0}; # "disk0"
+    di = 0;
+    for (di < ndisk && di < 10) {
+        dname[4] = 48 + di::u8;
+        val dn: *vfs.Node = vfs.create_ram(dev, ?dname[0], 5, abi.KIND_DEV);
+        if (dn == nil) { kprint.panic("vfs: out of memory\0"); }
+        dn.dev = vfs.DEV_DISK + di;
+        dn.size = ahci.disk(di).sectors * ahci.SECTOR;
+        di = di + 1;
+    }
     if (vfs.child(vfs.get_root(), "tmp\0", 3) == nil) {
         if (vfs.create_ram(vfs.get_root(), "tmp\0", 3, abi.KIND_DIR) == nil) { kprint.panic("vfs: out of memory\0"); }
     }
@@ -170,25 +177,18 @@ fun make_dev(dir: *vfs.Node, name: *u8, n: u64, id: u64) {
 fun mount_root(ndisk: u64) {
     var i: u64 = 0;
     for (i < ndisk) {
-        if (gpt.find_root(ahci.disk(i), ?root_part) != 0) {
-            val err: *u8 = ext2.mount(?root_part);
-            if (err == nil) {
-                if (vfs.init_ext2() == 0) { kprint.panic("vfs: out of memory\0"); }
-                kprint.puts("root: ext2 on disk \0");
-                kprint.dec(i);
-                kprint.puts(", \0");
-                kprint.dec(ext2.free_space() / 1048576);
-                kprint.puts(" of \0");
-                kprint.dec(ext2.total_space() / 1048576);
-                kprint.puts(" MiB free\n\0");
-                ret;
-            }
-            kprint.puts("root: disk \0");
+        val err: *u8 = mount.mount_root(ahci.disk(i));
+        if (err == nil) {
+            kprint.puts("root: ext2 on disk \0");
             kprint.dec(i);
-            kprint.puts(": \0");
-            kprint.puts(err);
             kprint.putc(10);
+            ret;
         }
+        kprint.puts("root: disk \0");
+        kprint.dec(i);
+        kprint.puts(": \0");
+        kprint.puts(err);
+        kprint.putc(10);
         i = i + 1;
     }
     if (vfs.init_ram() == 0) { kprint.panic("vfs: out of memory\0"); }

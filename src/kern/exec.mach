@@ -83,16 +83,77 @@ pub val IMAGE_MAX: u64 = 0x4000000; # 64 MiB
 
 # load `nd` into `p` and start it with the NUL-separated `args`
 # (args_len bytes, kernel memory). returns 0 or an error
-pub fun load(p: *proc.Proc, nd: *vfs.Node, args: u64, args_len: u64) u64 {
+# `path` (absolute) is what `nd` was found as: a "#!" script needs it to
+# hand itself to its interpreter
+pub fun load(p: *proc.Proc, nd: *vfs.Node, path: *u8, path_len: u64, args: u64, args_len: u64) u64 {
+    ret load_file(p, nd, path, path_len, args, args_len, 1);
+}
+
+fun load_file(p: *proc.Proc, nd: *vfs.Node, path: *u8, path_len: u64, args: u64, args_len: u64, scripts: u8) u64 {
     if (nd.kind != abi.KIND_FILE) { ret abi.err(abi.E_NOEXEC); }
     val len: u64 = nd.size;
     if (len == 0 || len > IMAGE_MAX) { ret abi.err(abi.E_NOEXEC); }
     val img: u64 = heap.alloc(len);
     if (img == 0) { ret abi.err(abi.E_NOMEM); }
     var r: u64 = vfs.read(nd, 0, img, len);
-    if (r == len) { r = load_image(p, img, len, args, args_len); }
-    or (abi.is_err(r) == 0) { r = abi.err(abi.E_IO); }
+    if (r == len) {
+        val b: *u8 = img::*u8;
+        if (len > 2 && b[0] == 35 && b[1] == 33) {
+            if (scripts != 0) { r = load_script(p, b, len, path, path_len, args, args_len); }
+            or                { r = abi.err(abi.E_NOEXEC); } # no scripts as interpreters
+        } or {
+            r = load_image(p, img, len, args, args_len);
+        }
+    } or (abi.is_err(r) == 0) {
+        r = abi.err(abi.E_IO);
+    }
     heap.free(img);
+    ret r;
+}
+
+# "#!/abs/interp [one-arg]": run the interpreter with argv
+#   interp [one-arg] script-path original-argv[1..]
+fun load_script(p: *proc.Proc, b: *u8, len: u64, path: *u8, path_len: u64, args: u64, args_len: u64) u64 {
+    var i: u64 = 2;
+    for (i < len && (b[i] == 32 || b[i] == 9)) { i = i + 1; }
+    val is: u64 = i;
+    for (i < len && b[i] != 10 && b[i] != 32 && b[i] != 9 && b[i] != 13) { i = i + 1; }
+    val ilen: u64 = i - is;
+    for (i < len && (b[i] == 32 || b[i] == 9)) { i = i + 1; }
+    val as: u64 = i;
+    for (i < len && b[i] != 10 && b[i] != 13) { i = i + 1; }
+    var alen: u64 = i - as;
+    for (alen > 0 && (b[as + alen - 1] == 32 || b[as + alen - 1] == 9)) { alen = alen - 1; }
+    if (ilen == 0 || ilen >= 256 || b[is] != 47) { ret abi.err(abi.E_NOEXEC); }
+    val interp: *vfs.Node = vfs.lookup(?b[is], ilen);
+    if (interp == nil) { ret abi.err(abi.E_NOENT); }
+
+    # skip the original argv[0]; the script path takes its place
+    var rest: u64 = 0;
+    for (rest < args_len && @((args + rest)::*u8) != 0) { rest = rest + 1; }
+    if (rest < args_len) { rest = rest + 1; }
+    val total: u64 = ilen + 1 + alen + 1 + path_len + 1 + (args_len - rest);
+    val na: u64 = heap.alloc(total);
+    if (na == 0) { ret abi.err(abi.E_NOMEM); }
+    var o: u64 = 0;
+    mem.copy(na, (?b[is])::u64, ilen);
+    o = ilen;
+    @((na + o)::*u8) = 0;
+    o = o + 1;
+    if (alen > 0) {
+        mem.copy(na + o, (?b[as])::u64, alen);
+        o = o + alen;
+        @((na + o)::*u8) = 0;
+        o = o + 1;
+    }
+    mem.copy(na + o, path::u64, path_len);
+    o = o + path_len;
+    @((na + o)::*u8) = 0;
+    o = o + 1;
+    mem.copy(na + o, args + rest, args_len - rest);
+    o = o + args_len - rest;
+    val r: u64 = load_file(p, interp, ?b[is], ilen, na, o, 0);
+    heap.free(na);
     ret r;
 }
 
