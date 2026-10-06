@@ -1,0 +1,102 @@
+# ACPI tables: find the MADT through the RSDP and pull out what interrupt
+# routing needs: the I/O APIC and the legacy IRQ overrides
+
+use vmm: machos.mm.vmm;
+use mem: machos.kern.mem;
+
+pub val MAX_OVERRIDES: u64 = 16;
+
+pub rec Override {
+    irq:   u8;  # legacy ISA irq
+    gsi:   u32; # global system interrupt it is wired to
+    flags: u16; # MPS INTI polarity (bits 0-1) and trigger mode (bits 2-3)
+}
+
+pub rec Madt {
+    lapic:      u64; # physical address of the local APIC registers
+    ioapic:     u64; # physical address of the first I/O APIC, 0 if none
+    ioapic_gsi: u32; # first gsi it handles
+    overrides:  [16]Override;
+    n_override: u64;
+}
+
+fun rd8(a: u64) u8 { ret @(a::*u8); }
+fun rd16(a: u64) u16 { ret @(a::*u16); }
+fun rd32(a: u64) u32 { ret @(a::*u32); }
+fun rd64(a: u64) u64 { ret @(a::*u64); }
+
+fun sum(a: u64, n: u64) u8 {
+    var s: u64 = 0;
+    var i: u64 = 0;
+    for (i < n) {
+        s = s + rd8(a + i)::u64;
+        i = i + 1;
+    }
+    ret (s & 0xFF)::u8;
+}
+
+# map a whole table given its physical address; 0 if its checksum fails
+fun table(pa: u64) u64 {
+    val hdr: u64 = vmm.map_phys(pa, 36, 0);
+    val len: u32 = rd32(hdr + 4);
+    val t: u64 = vmm.map_phys(pa, len::u64, 0);
+    if (sum(t, len::u64) != 0) { ret 0; }
+    ret t;
+}
+
+fun find(rsdp_pa: u64, sig: *u8) u64 {
+    val rsdp: u64 = vmm.map_phys(rsdp_pa, 36, 0);
+    if (mem.equal(rsdp::*u8, "RSD PTR \0", 8) == 0) { ret 0; }
+    var root: u64 = 0;
+    var entry: u64 = 4;
+    if (rd8(rsdp + 15) >= 2 && rd64(rsdp + 24) != 0) {
+        root = table(rd64(rsdp + 24)); # xsdt: 64-bit entries
+        entry = 8;
+    } or {
+        root = table(rd32(rsdp + 16)::u64); # rsdt: 32-bit entries
+    }
+    if (root == 0) { ret 0; }
+    val n: u64 = (rd32(root + 4)::u64 - 36) / entry;
+    var i: u64 = 0;
+    for (i < n) {
+        var pa: u64 = 0;
+        if (entry == 8) { pa = rd64(root + 36 + i * 8); }
+        or              { pa = rd32(root + 36 + i * 4)::u64; }
+        val t: u64 = table(pa);
+        if (t != 0 && mem.equal(t::*u8, sig, 4) != 0) { ret t; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# fill `m` from the MADT; returns an error message or nil
+pub fun madt(rsdp_pa: u64, m: *Madt) *u8 {
+    if (rsdp_pa == 0) { ret "acpi: no rsdp\0"; }
+    val t: u64 = find(rsdp_pa, "APIC\0");
+    if (t == 0) { ret "acpi: no madt\0"; }
+    m.lapic = rd32(t + 36)::u64;
+    m.ioapic = 0;
+    m.n_override = 0;
+    val end: u64 = t + rd32(t + 4)::u64;
+    var e: u64 = t + 44;
+    for (e + 2 <= end) {
+        val kind: u8 = rd8(e);
+        val len: u8 = rd8(e + 1);
+        if (len < 2) { brk; }
+        if (kind == 1 && m.ioapic == 0) {
+            m.ioapic = rd32(e + 4)::u64;
+            m.ioapic_gsi = rd32(e + 8);
+        } or (kind == 2 && m.n_override < MAX_OVERRIDES) {
+            val o: *Override = ?m.overrides[m.n_override];
+            o.irq = rd8(e + 3);
+            o.gsi = rd32(e + 4);
+            o.flags = rd16(e + 8);
+            m.n_override = m.n_override + 1;
+        } or (kind == 5) {
+            m.lapic = rd64(e + 4); # 64-bit local APIC address override
+        }
+        e = e + len::u64;
+    }
+    if (m.ioapic == 0) { ret "acpi: no i/o apic\0"; }
+    ret nil;
+}

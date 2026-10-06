@@ -131,3 +131,16 @@ pub fun init() {
     set_cr0((cr0() | (1 << 16) | (1 << 1)) & ~(1::u64 << 2)); # WP, MP, clear EM
     set_cr4(cr4() | (1 << 9) | (1 << 10));                   # OSFXSR, OSXMMEXCPT
 }
+
+# sleep until an interrupt has been handled. naked and stackless so a
+# handler running on this stack cannot clobber anything below rsp
+#[naked]
+#[symbol("cpu_wait")]
+pub fun wait() {
+    asm x86_64 {
+        sti
+        hlt
+        cli
+        ret
+    }
+}

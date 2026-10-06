@@ -11,6 +11,10 @@ use kprint: machos.kern.kprint;
 use pmm:    machos.mm.pmm;
 use vmm:    machos.mm.vmm;
 use heap:   machos.mm.heap;
+use apic:   machos.arch.x86_64.apic;
+use kbd:    machos.dev.ps2kbd;
+use tty:    machos.kern.tty;
+use trap:   machos.kern.trap;
 
 var boot: info.BootInfo;
 
@@ -86,8 +90,30 @@ fun kmain() {
     kprint.dec(heap.mapped() / 1024);
     kprint.puts(" KiB mapped\n\0");
 
+    val aerr: *u8 = apic.init(boot.rsdp);
+    if (aerr != nil) { kprint.panic(aerr); }
+    kbd.init();
+    apic.route(1, apic.IRQ_BASE + 1);
+    serial.enable_rx();
+    apic.route(4, apic.IRQ_BASE + 4);
+    kprint.puts("apic: timer at \0");
+    kprint.dec(apic.HZ);
+    kprint.puts(" Hz, keyboard and serial input routed\n\0");
+
     kprint.puts("idle\n\0");
-    cpu.halt();
+    var buf: [256]u8;
+    for {
+        cpu.wait();
+        if (tty.readable() != 0) {
+            val n: u64 = tty.read(?buf[0], 255);
+            buf[n] = 0;
+            kprint.puts("got [\0");
+            kprint.puts(?buf[0]);
+            kprint.puts("] at tick \0");
+            kprint.dec(trap.uptime_ticks());
+            kprint.putc(10);
+        }
+    }
 }
 
 #[naked]

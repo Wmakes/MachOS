@@ -1,0 +1,106 @@
+# local APIC (timer, end-of-interrupt) and I/O APIC (routing device irqs)
+
+use acpi: machos.acpi.acpi;
+use cpu:  machos.arch.x86_64.cpu;
+use vmm:  machos.mm.vmm;
+
+pub val TIMER_VECTOR:    u64 = 48;
+pub val IRQ_BASE:        u64 = 32; # legacy irq n arrives on vector 32 + n
+pub val SPURIOUS_VECTOR: u64 = 63;
+pub val HZ:              u64 = 100;
+
+#[volatile]
+rec Reg { v: u32; }
+
+val ID:        u64 = 0x020;
+val EOI:       u64 = 0x0B0;
+val SVR:       u64 = 0x0F0;
+val LVT_TIMER: u64 = 0x320;
+val INIT:      u64 = 0x380;
+val CURRENT:   u64 = 0x390;
+val DIVIDE:    u64 = 0x3E0;
+
+var lapic: u64 = 0;
+var ioapic: u64 = 0;
+var ioapic_gsi: u32 = 0;
+var madt: acpi.Madt;
+
+fun lr(off: u64) u32 { ret (@((lapic + off)::*Reg)).v; }
+fun lw(off: u64, v: u32) { (@((lapic + off)::*Reg)).v = v; }
+
+fun ior(reg: u32) u32 {
+    (@(ioapic::*Reg)).v = reg;
+    ret (@((ioapic + 16)::*Reg)).v;
+}
+
+fun iow(reg: u32, v: u32) {
+    (@(ioapic::*Reg)).v = reg;
+    (@((ioapic + 16)::*Reg)).v = v;
+}
+
+pub fun eoi() { lw(EOI, 0); }
+
+# lapic ticks (divide by 16) in 10 ms, measured against PIT channel 2
+fun calibrate() u32 {
+    cpu.outb(0x61, (cpu.inb(0x61) & 0xFD) | 1); # gate on, speaker off
+    cpu.outb(0x43, 0xB0);                        # ch 2, lo/hi, one-shot
+    val count: u64 = 1193182 / 100;
+    cpu.outb(0x42, (count & 0xFF)::u8);
+    cpu.outb(0x42, (count >> 8)::u8);
+    val g: u8 = cpu.inb(0x61) & 0xFE;
+    cpu.outb(0x61, g);                           # restart the count
+    cpu.outb(0x61, g | 1);
+    lw(DIVIDE, 3);
+    lw(INIT, 0xFFFFFFFF);
+    for ((cpu.inb(0x61) & 0x20) == 0) { }
+    val left: u32 = lr(CURRENT);
+    lw(INIT, 0);
+    ret 0xFFFFFFFF - left;
+}
+
+# route legacy irq `irq` to `vector` on this cpu, honouring MADT overrides
+pub fun route(irq: u8, vector: u64) {
+    var gsi: u32 = irq::u32;
+    var flags: u16 = 0;
+    var i: u64 = 0;
+    for (i < madt.n_override) {
+        if (madt.overrides[i].irq == irq) {
+            gsi = madt.overrides[i].gsi;
+            flags = madt.overrides[i].flags;
+        }
+        i = i + 1;
+    }
+    var lo: u32 = vector::u32;
+    if ((flags & 3) == 3) { lo = lo | (1 << 13); }    # active low
+    if ((flags & 12) == 12) { lo = lo | (1 << 15); }  # level triggered
+    val reg: u32 = 0x10 + 2 * (gsi - ioapic_gsi);
+    iow(reg + 1, (lr(ID) >> 24) << 24);               # deliver to this cpu
+    iow(reg, lo);
+}
+
+# returns an error message or nil
+pub fun init(rsdp: u64) *u8 {
+    val err: *u8 = acpi.madt(rsdp, ?madt);
+    if (err != nil) { ret err; }
+    lapic = vmm.map_phys(madt.lapic, 4096, 1);
+    ioapic = vmm.map_phys(madt.ioapic, 4096, 1);
+    ioapic_gsi = madt.ioapic_gsi;
+
+    # mask every I/O APIC input until a driver routes it
+    val n: u32 = ((ior(1) >> 16) & 0xFF) + 1;
+    var i: u32 = 0;
+    for (i < n) {
+        iow(0x10 + 2 * i, 1 << 16);
+        i = i + 1;
+    }
+
+    cpu.wrmsr(0x1B, cpu.rdmsr(0x1B) | (1 << 11)); # apic global enable
+    lw(SVR, 0x100 | SPURIOUS_VECTOR::u32);
+    lw(0x080, 0);                                 # accept every priority
+
+    val per_tick: u32 = calibrate() * 100 / HZ::u32;
+    lw(DIVIDE, 3);
+    lw(LVT_TIMER, TIMER_VECTOR::u32 | (1 << 17)); # periodic
+    lw(INIT, per_tick);
+    ret nil;
+}

@@ -1,0 +1,80 @@
+# where every interrupt and exception lands (isr_common calls isr_dispatch)
+
+use idt:    machos.arch.x86_64.idt;
+use apic:   machos.arch.x86_64.apic;
+use cpu:    machos.arch.x86_64.cpu;
+use kprint: machos.kern.kprint;
+use serial: machos.dev.serial;
+use kbd:    machos.dev.ps2kbd;
+use tty:    machos.kern.tty;
+
+var ticks: u64 = 0;
+
+pub fun uptime_ticks() u64 { ret ticks; }
+
+fun name_of(v: u64) *u8 {
+    if (v == 0)  { ret "divide error\0"; }
+    if (v == 1)  { ret "debug\0"; }
+    if (v == 2)  { ret "nmi\0"; }
+    if (v == 3)  { ret "breakpoint\0"; }
+    if (v == 4)  { ret "overflow\0"; }
+    if (v == 5)  { ret "bound range\0"; }
+    if (v == 6)  { ret "invalid opcode\0"; }
+    if (v == 7)  { ret "device not available\0"; }
+    if (v == 8)  { ret "double fault\0"; }
+    if (v == 10) { ret "invalid tss\0"; }
+    if (v == 11) { ret "segment not present\0"; }
+    if (v == 12) { ret "stack fault\0"; }
+    if (v == 13) { ret "general protection\0"; }
+    if (v == 14) { ret "page fault\0"; }
+    if (v == 16) { ret "x87 fault\0"; }
+    if (v == 17) { ret "alignment check\0"; }
+    if (v == 18) { ret "machine check\0"; }
+    if (v == 19) { ret "simd fault\0"; }
+    if (v == 20) { ret "virtualization\0"; }
+    if (v == 21) { ret "control protection\0"; }
+    ret "reserved\0";
+}
+
+pub fun exception_name(v: u64) *u8 { ret name_of(v); }
+
+fun reg(name: *u8, v: u64) {
+    kprint.puts(name);
+    kprint.hex(v);
+    kprint.putc(10);
+}
+
+pub fun dump(f: *idt.Frame) {
+    kprint.puts("\n*** exception \0");
+    kprint.dec(f.vector);
+    kprint.puts(": \0");
+    kprint.puts(name_of(f.vector));
+    kprint.putc(10);
+    reg("  error  \0", f.error);
+    reg("  rip    \0", f.rip);
+    reg("  rsp    \0", f.rsp);
+    reg("  rflags \0", f.rflags);
+    reg("  cs     \0", f.cs);
+    if (f.vector == 14) { reg("  cr2    \0", cpu.cr2()); }
+    reg("  rax    \0", f.rax);
+    reg("  rbx    \0", f.rbx);
+    reg("  rdi    \0", f.rdi);
+    reg("  rsi    \0", f.rsi);
+}
+
+#[symbol("isr_dispatch")]
+fun isr_dispatch(f: *idt.Frame) {
+    if (f.vector < 32) {
+        dump(f);
+        kprint.panic("unhandled exception\0");
+    }
+    if (f.vector == apic.SPURIOUS_VECTOR) { ret; } # no eoi for spurious
+    if (f.vector == apic.TIMER_VECTOR) {
+        ticks = ticks + 1;
+    } or (f.vector == apic.IRQ_BASE + 1) {
+        kbd.irq();
+    } or (f.vector == apic.IRQ_BASE + 4) {
+        for (serial.ready() != 0) { tty.input(serial.getc()); }
+    }
+    apic.eoi();
+}

@@ -1,0 +1,104 @@
+# the console terminal: keyboard and serial bytes come in here, get line
+# edited (echo, backspace, ^C, ^D) and wait in `ready` until a reader takes
+# whole lines
+
+use kprint: machos.kern.kprint;
+
+val LINE: u64 = 256;
+val RING: u64 = 4096;
+
+var line: [256]u8;
+var line_len: u64 = 0;
+
+var ring: [4096]u8;
+var head: u64 = 0;  # next byte to read
+var count: u64 = 0; # bytes waiting
+var eofs: u64 = 0;  # pending ^D on an empty line, each reads as end of file
+var interrupts: u64 = 0;
+
+fun push(c: u8) {
+    if (count == RING) { ret; }
+    ring[(head + count) % RING] = c;
+    count = count + 1;
+}
+
+fun commit() {
+    var i: u64 = 0;
+    for (i < line_len) {
+        push(line[i]);
+        i = i + 1;
+    }
+    line_len = 0;
+}
+
+# one input byte from a device
+pub fun input(raw: u8) {
+    var c: u8 = raw;
+    if (c == 13) { c = 10; }
+    if (c == 127) { c = 8; }
+
+    if (c == 3) {
+        kprint.puts("^C\n\0");
+        line_len = 0;
+        interrupts = interrupts + 1;
+        ret;
+    }
+    if (c == 4) {
+        if (line_len == 0) { eofs = eofs + 1; }
+        or                 { commit(); }
+        ret;
+    }
+    if (c == 8) {
+        if (line_len > 0) {
+            line_len = line_len - 1;
+            kprint.puts("\x08 \x08\0");
+        }
+        ret;
+    }
+    if (c == 10) {
+        line[line_len] = 10;
+        line_len = line_len + 1;
+        kprint.putc(10);
+        commit();
+        ret;
+    }
+    if ((c >= 32 && c < 127) || c == 9) {
+        if (line_len < LINE - 1) {
+            line[line_len] = c;
+            line_len = line_len + 1;
+            kprint.putc(c);
+        }
+    }
+}
+
+# whether a read would return right away (data or end of file)
+pub fun readable() u8 {
+    if (count > 0 || eofs > 0) { ret 1; }
+    ret 0;
+}
+
+# take up to `n` bytes, stopping after a newline; 0 means end of file.
+# call only when readable()
+pub fun read(buf: *u8, n: u64) u64 {
+    if (count == 0) {
+        if (eofs > 0) { eofs = eofs - 1; }
+        ret 0;
+    }
+    var i: u64 = 0;
+    for (i < n && count > 0) {
+        val c: u8 = ring[head];
+        head = (head + 1) % RING;
+        count = count - 1;
+        buf[i] = c;
+        i = i + 1;
+        if (c == 10) { brk; }
+    }
+    ret i;
+}
+
+# ^C presses since the last call
+pub fun take_interrupts() u64 {
+    val n: u64 = interrupts;
+    interrupts = 0;
+    ret n;
+}

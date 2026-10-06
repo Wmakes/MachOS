@@ -18,3 +18,12 @@ pub fun putc(c: u8) {
     for ((cpu.inb(COM1 + 5) & 0x20) == 0) { }
     cpu.outb(COM1, c);
 }
+
+# raise irq 4 when a byte arrives (OUT2 gates the line on PCs)
+pub fun enable_rx() {
+    cpu.outb(COM1 + 1, 0x01);
+    cpu.outb(COM1 + 4, 0x0B);
+}
+
+pub fun ready() u8 { ret cpu.inb(COM1 + 5) & 1; }
+pub fun getc() u8 { ret cpu.inb(COM1); }

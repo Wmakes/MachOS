@@ -1,7 +1,6 @@
-# IDT and the 32 cpu exception vectors
+# IDT and the low-level entry path. isr_common hands every vector to
+# isr_dispatch (kern/trap.mach) with a pointer to the saved Frame
 
-use kprint: machos.kern.kprint;
-use cpu:    machos.arch.x86_64.cpu;
 use gdt:    machos.arch.x86_64.gdt;
 
 #[packed]
@@ -32,9 +31,10 @@ var ptr: Pointer;
 
 val STUB_SIZE: u64 = 16;
 
-# 32 entry stubs, 16 bytes each: push a dummy error code where the cpu
-# pushes none, push the vector, jump to the common path. the cpu pushes an
-# error code for 8, 10-14, 17, 21, 29, 30
+# 64 entry stubs, 16 bytes each (cpu exceptions 0-31, interrupts 32-63):
+# push a dummy error code where the cpu pushes none, push the vector, jump
+# to the common path. the cpu pushes an error code for 8, 10-14, 17, 21,
+# 29, 30. `push imm8` sign-extends, so vectors stay below 0x80
 #[naked]
 #[align(16)]
 #[symbol("isr_stubs")]
@@ -136,6 +136,102 @@ fun isr_stubs() {
         .byte 0x6a, 0x00, 0x6a, 0x1f :: writes()
         jmp isr_common
         .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x20 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x21 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x22 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x23 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x24 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x25 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x26 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x27 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x28 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x29 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x2a :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x2b :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x2c :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x2d :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x2e :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x2f :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x30 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x31 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x32 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x33 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x34 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x35 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x36 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x37 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x38 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x39 :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x3a :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x3b :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x3c :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x3d :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x3e :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
+        .byte 0x6a, 0x00, 0x6a, 0x3f :: writes()
+        jmp isr_common
+        .byte 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 :: writes()
     }
 }
 
@@ -191,54 +287,6 @@ fun idt_load(p: *Pointer) {
     }
 }
 
-fun name_of(v: u64) *u8 {
-    if (v == 0)  { ret "divide error\0"; }
-    if (v == 1)  { ret "debug\0"; }
-    if (v == 2)  { ret "nmi\0"; }
-    if (v == 3)  { ret "breakpoint\0"; }
-    if (v == 4)  { ret "overflow\0"; }
-    if (v == 5)  { ret "bound range\0"; }
-    if (v == 6)  { ret "invalid opcode\0"; }
-    if (v == 7)  { ret "device not available\0"; }
-    if (v == 8)  { ret "double fault\0"; }
-    if (v == 10) { ret "invalid tss\0"; }
-    if (v == 11) { ret "segment not present\0"; }
-    if (v == 12) { ret "stack fault\0"; }
-    if (v == 13) { ret "general protection\0"; }
-    if (v == 14) { ret "page fault\0"; }
-    if (v == 16) { ret "x87 fault\0"; }
-    if (v == 17) { ret "alignment check\0"; }
-    if (v == 18) { ret "machine check\0"; }
-    if (v == 19) { ret "simd fault\0"; }
-    ret "reserved\0";
-}
-
-fun reg(name: *u8, v: u64) {
-    kprint.puts(name);
-    kprint.hex(v);
-    kprint.putc(10);
-}
-
-#[symbol("isr_dispatch")]
-fun isr_dispatch(f: *Frame) {
-    kprint.puts("\n*** exception \0");
-    kprint.dec(f.vector);
-    kprint.puts(": \0");
-    kprint.puts(name_of(f.vector));
-    kprint.putc(10);
-    reg("  error  \0", f.error);
-    reg("  rip    \0", f.rip);
-    reg("  rsp    \0", f.rsp);
-    reg("  rflags \0", f.rflags);
-    reg("  cs     \0", f.cs);
-    if (f.vector == 14) { reg("  cr2    \0", cpu.cr2()); }
-    reg("  rax    \0", f.rax);
-    reg("  rbx    \0", f.rbx);
-    reg("  rdi    \0", f.rdi);
-    reg("  rsi    \0", f.rsi);
-    kprint.panic("unhandled exception\0");
-}
-
 pub fun set_gate(v: u64, handler: u64, ist: u8) {
     gates[v].off_lo  = (handler & 0xFFFF)::u16;
     gates[v].sel     = gdt.KCODE;
@@ -249,10 +297,12 @@ pub fun set_gate(v: u64, handler: u64, ist: u8) {
     gates[v].zero    = 0;
 }
 
+pub val VECTORS: u64 = 64;
+
 pub fun init() {
     val base: u64 = isr_stubs::u64;
     var v: u64 = 0;
-    for (v < 32) {
+    for (v < VECTORS) {
         var ist: u8 = 0;
         if (v == 8) { ist = 1; }
         set_gate(v, base + v * STUB_SIZE, ist);
