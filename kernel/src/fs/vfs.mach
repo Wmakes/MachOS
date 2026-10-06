@@ -10,6 +10,7 @@ use heap: machos.mm.heap;
 use mem:  machos.kern.mem;
 use path: machos.fs.path;
 use ext2: machos.fs.ext2;
+use clock: machos.kern.clock;
 
 pub val FS_RAM:  u64 = 0;
 pub val FS_EXT2: u64 = 1;
@@ -31,6 +32,7 @@ pub rec Node {
     cap:      u64; # FS_RAM file: heap buffer `data` of `cap` bytes
     data:     u64;
     dev:      u64; # KIND_DEV: DEV_*
+    mtime:    u64; # FS_RAM: last change (ext2 keeps its own in the inode)
     parent:   *Node;
     child:    *Node; # first entry of a directory
     next:     *Node; # next entry in the parent
@@ -53,7 +55,47 @@ fun new_node(kind: u64, fs: u64, name: *u8, n: u64) *Node {
     nd.fs = fs;
     nd.name_len = n;
     mem.copy((?nd.name[0])::u64, name::u64, n);
+    nd.mtime = clock.now();
     ret nd;
+}
+
+# when `nd` last changed
+pub fun mtime_of(nd: *Node) u64 {
+    if (nd.fs == FS_EXT2) {
+        var i: ext2.Inode;
+        if (ext2.read_inode(nd.fsi, nd.ino, ?i) != 0) { ret i.mtime::u64; }
+        ret 0;
+    }
+    ret nd.mtime;
+}
+
+# the absolute path of a node (through mountpoints) into out (path MAX
+# bytes); its length, or 0 if it does not fit
+pub fun path_of(nd: *Node, out: *u8) u64 {
+    var parts: [64]*Node;
+    var n: u64 = 0;
+    var c: *Node = nd;
+    for (c != root && n < 64) {
+        if (c.mount_of != nil) { c = c.mount_of; }
+        if (c == root) { brk; }
+        parts[n] = c;
+        n = n + 1;
+        c = c.parent;
+    }
+    var len: u64 = 0;
+    if (n == 0) {
+        out[0] = 47;
+        ret 1;
+    }
+    for (n > 0) {
+        n = n - 1;
+        val p: *Node = parts[n];
+        if (len + 1 + p.name_len >= path.MAX) { ret 0; }
+        out[len] = 47;
+        mem.copy((?out[len + 1])::u64, (?p.name[0])::u64, p.name_len);
+        len = len + 1 + p.name_len;
+    }
+    ret len;
 }
 
 fun attach(dir: *Node, nd: *Node) {
@@ -367,6 +409,7 @@ pub fun write(nd: *Node, off: u64, buf: u64, n: u64) u64 {
     if (off > nd.size) { mem.fill(nd.data + nd.size, 0, off - nd.size); }
     mem.copy(nd.data + off, buf, n);
     if (off + n > nd.size) { nd.size = off + n; }
+    nd.mtime = clock.now();
     ret n;
 }
 

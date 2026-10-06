@@ -137,6 +137,28 @@ pub fun unmount_dev(b: *parts.Bdev) u64 {
     ret abi.err(abi.E_INVAL);
 }
 
+# the `idx`-th mount: device name, where it is (root = the mounted root, or
+# nil for /), and its filesystem. 0 past the end
+pub fun nth(idx: u64, disk: *u64, start: *u64, root: **vfs.Node, fs: **ext2.Fs) u8 {
+    var seen: u64 = 0;
+    var i: u64 = 0;
+    for (i < MAX) {
+        val m: *Mount = ?mounts[i];
+        if (m.used != 0) {
+            if (seen == idx) {
+                @disk = m.disk;
+                @start = m.start;
+                @root = m.root;
+                @fs = m.fs;
+                ret 1;
+            }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
 # whether `b` (or, for a whole disk, anything on it) is mounted
 pub fun busy(b: *parts.Bdev) u8 {
     var i: u64 = 0;

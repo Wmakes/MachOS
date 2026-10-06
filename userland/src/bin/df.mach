@@ -1,0 +1,37 @@
+# df: size and free space of every mounted filesystem
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+fun col(v: u64, width: u64) { io.dec_pad(v / 1024, width); }
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    io.out("Filesystem        KiB      Used     Avail Use% Mounted on\n\0");
+    var i: u64 = 0;
+    for {
+        var m: abi.MountInfo;
+        val r: u64 = sys.mounts(i, ?m);
+        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        val dl: u64 = io.len(?m.dev[0]);
+        io.out(?m.dev[0]);
+        var k: u64 = dl;
+        for (k < 12) {
+            io.putc(32);
+            k = k + 1;
+        }
+        col(m.total, 10);
+        col(m.total - m.free, 10);
+        col(m.free, 10);
+        var pct: u64 = 0;
+        if (m.total > 0) { pct = ((m.total - m.free) * 100 + m.total - 1) / m.total; }
+        io.dec_pad(pct, 4);
+        io.out("% \0");
+        io.out(?m.dir[0]);
+        io.putc(10);
+        i = i + 1;
+    }
+    ret 0;
+}

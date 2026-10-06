@@ -20,6 +20,7 @@ use blk:    machos.fs.blk;
 use clock:  machos.kern.clock;
 use mount:  machos.fs.mount;
 use parts:  machos.fs.parts;
+use ext2:   machos.fs.ext2;
 use version: machos.abi.version;
 use cpu:    machos.arch.x86_64.cpu;
 use fbcon:  machos.dev.fbcon;
@@ -248,6 +249,7 @@ fun sys_readdir(h: u64, idx: u64, out: u64) u64 {
     val en: *abi.Entry = out::*abi.Entry;
     en.kind = c.kind;
     en.size = c.size;
+    en.mtime = vfs.mtime_of(c);
     en.name_len = c.name_len;
     mem.copy((?en.name[0])::u64, (?c.name[0])::u64, c.name_len);
     ret 1;
@@ -263,6 +265,7 @@ fun sys_stat(pva: u64, plen: u64, out: u64) u64 {
     val st: *abi.Stat = out::*abi.Stat;
     st.kind = nd.kind;
     st.size = nd.size;
+    st.mtime = vfs.mtime_of(nd);
     ret 0;
 }
 
@@ -432,6 +435,36 @@ fun sys_mount(dva: u64, dlen: u64, pva: u64, plen: u64) u64 {
     ret mount.mount_at(b, at);
 }
 
+fun sys_mounts(idx: u64, out: u64) u64 {
+    if (ok(out, $size_of(abi.MountInfo)::u64, 1) == 0) { ret e(abi.E_FAULT); }
+    var disk: u64 = 0;
+    var start: u64 = 0;
+    var r: *vfs.Node = nil;
+    var fs: *ext2.Fs = nil;
+    if (mount.nth(idx, ?disk, ?start, ?r, ?fs) == 0) { ret 0; }
+    val mi: *abi.MountInfo = out::*abi.MountInfo;
+    mem.fill(out, 0, $size_of(abi.MountInfo)::u64);
+    put_str(?mi.dev[0], "/dev/sd\0");
+    mi.dev[7] = 97 + disk::u8;
+    val b: *parts.Bdev = parts.find(disk, start);
+    if (b != nil) {
+        var k: u64 = 8;
+        if (b.part >= 10) {
+            mi.dev[k] = 48 + (b.part / 10)::u8;
+            k = k + 1;
+        }
+        mi.dev[k] = 48 + (b.part % 10)::u8;
+    }
+    if (r == nil) {
+        mi.dir[0] = 47;
+    } or {
+        vfs.path_of(r, ?mi.dir[0]);
+    }
+    mi.total = ext2.total_space(fs);
+    mi.free = ext2.free_space(fs);
+    ret 1;
+}
+
 fun sys_umount(pva: u64, plen: u64) u64 {
     var full: [256]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
@@ -555,6 +588,7 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.UNAME)   { ret sys_uname(a); }
     if (n == abi.TCGETATTR) { ret sys_tcgetattr(a, b); }
     if (n == abi.TCSETATTR) { ret sys_tcsetattr(a, b); }
+    if (n == abi.MOUNTS)  { ret sys_mounts(a, b); }
     if (n == abi.SYNC) {
         if (blk.sync() == 0) { ret e(abi.E_IO); }
         ret 0;

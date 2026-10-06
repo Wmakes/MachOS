@@ -1,0 +1,71 @@
+# du [-s] [PATH...]: disk use of each directory in KiB (-s: totals only)
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+var summary: u8 = 0;
+
+fun kib(bytes: u64) u64 { ret (bytes + 1023) / 1024; }
+
+fun walk(p: *u8, n: u64, top: u8) u64 {
+    var st: abi.Stat;
+    if (abi.is_err(sys.stat(p, n, ?st)) != 0) { ret 0; }
+    if (st.kind != abi.KIND_DIR) {
+        if (top != 0) {
+            io.dec(kib(st.size));
+            io.putc(9);
+            io.outn(p, n);
+            io.putc(10);
+        }
+        ret st.size;
+    }
+    var total: u64 = 0;
+    val h: u64 = sys.open(p, n, abi.O_READ);
+    if (abi.is_err(h) != 0) { ret 0; }
+    var i: u64 = 0;
+    for {
+        var e: abi.Entry;
+        val got: u64 = sys.readdir(h, i, ?e);
+        if (abi.is_err(got) != 0 || got == 0) { brk; }
+        i = i + 1;
+        if (e.kind == abi.KIND_DEV) { cnt; }
+        if (n + 1 + e.name_len >= 256) { cnt; }
+        var c: [256]u8;
+        io.copy(?c[0], p, n);
+        var cn: u64 = n;
+        if (n == 0 || p[n - 1] != 47) {
+            c[cn] = 47;
+            cn = cn + 1;
+        }
+        io.copy(?c[cn], ?e.name[0], e.name_len);
+        total = total + walk(?c[0], cn + e.name_len, 0);
+    }
+    sys.close(h);
+    if (summary == 0 || top != 0) {
+        io.dec(kib(total));
+        io.putc(9);
+        io.outn(p, n);
+        io.putc(10);
+    }
+    ret total;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var i: u64 = 1;
+    if (i < argc && io.streq(argv[i], "-s\0") != 0) {
+        summary = 1;
+        i = i + 1;
+    }
+    if (i == argc) {
+        walk(".\0", 1, 1);
+        ret 0;
+    }
+    for (i < argc) {
+        walk(argv[i], io.len(argv[i]), 1);
+        i = i + 1;
+    }
+    ret 0;
+}

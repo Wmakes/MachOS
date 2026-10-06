@@ -145,4 +145,15 @@ pub fun find_root() *Bdev {
     ret nil;
 }
 
+# the partition of disk `disk` starting at `start`, or nil
+pub fun find(disk: u64, start: u64) *Bdev {
+    var i: u64 = 0;
+    for (i < MAX) {
+        val b: *Bdev = ?devs[i];
+        if (b.used != 0 && b.disk == disk && b.start == start && b.part != 0) { ret b; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
 pub fun slot_of(b: *Bdev) u64 { ret (b::u64 - (?devs[0])::u64) / $size_of(Bdev)::u64; }

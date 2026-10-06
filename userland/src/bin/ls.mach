@@ -4,6 +4,7 @@ use abi: sdk.abi;
 use sys: sdk.sys;
 use io:  sdk.io;
 use rt:  sdk.rt;
+use text: userland.lib.text;
 
 var long: u8 = 0;
 
@@ -13,6 +14,9 @@ fun show(e: *abi.Entry) {
         or (e.kind == abi.KIND_DEV) { io.out("c  \0"); }
         or                          { io.out("-  \0"); }
         io.dec_pad(e.size, 8);
+        io.out("  \0");
+        var t: [16]u8;
+        io.outn(?t[0], text.fmt_time(e.mtime, ?t[0]));
         io.out("  \0");
     }
     if (e.kind == abi.KIND_DIR) { io.out("\x1b[1;34m\0"); }
@@ -35,6 +39,7 @@ fun list(p: *u8) u8 {
         var e: abi.Entry;
         e.kind = st.kind;
         e.size = st.size;
+        e.mtime = st.mtime;
         var k: u64 = n;
         if (k > 59) { k = 59; }
         e.name_len = k;

@@ -1,0 +1,36 @@
+# stat PATH...: kind, size and last change of each
+
+use abi:  sdk.abi;
+use sys:  sdk.sys;
+use io:   sdk.io;
+use rt:   sdk.rt;
+use text: userland.lib.text;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var status: u64 = 0;
+    var i: u64 = 1;
+    for (i < argc) {
+        var st: abi.Stat;
+        val r: u64 = sys.stat(argv[i], io.len(argv[i]), ?st);
+        if (abi.is_err(r) != 0) {
+            io.fail("stat\0", argv[i], r);
+            status = 1;
+        } or {
+            io.out("  File: \0");
+            io.out(argv[i]);
+            io.out("\n  Type: \0");
+            if (st.kind == abi.KIND_DIR) { io.out("directory\0"); }
+            or (st.kind == abi.KIND_DEV) { io.out("device\0"); }
+            or                           { io.out("regular file\0"); }
+            io.out("\n  Size: \0");
+            io.dec(st.size);
+            io.out("\nChange: \0");
+            var t: [16]u8;
+            io.outn(?t[0], text.fmt_time(st.mtime, ?t[0]));
+            io.out(" UTC\n\0");
+        }
+        i = i + 1;
+    }
+    ret status;
+}

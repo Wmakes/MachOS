@@ -45,6 +45,17 @@ TESTS = [
      ["one", "two", "echo one\none", "tab-ok", "Welcome", "world", "junk^C", "canon\ncanon",
       "ps2 Xhist"]),
 
+    ("tools", False, False,
+     ["wait:" + P,
+      "send:printf 'pear\\\\napple\\\\nfig\\\\napple\\\\n' > /tmp/f; sort -u /tmp/f | tr a-z A-Z; seq 1 20 | sort -n -r | head -2\\n",
+      "wait:" + P,
+      "send:seq 1 6 > /tmp/a; printf '1\\\\n2\\\\nX\\\\n4\\\\n5\\\\n6\\\\n' > /tmp/b; diff /tmp/a /tmp/b; echo diff=$?\\n",
+      "wait:diff=", "wait:" + P,
+      "send:find / -name '*.conf'; ls /etc | xargs echo got; seq 1 50 | tail -2 | tee /tmp/t | wc -l; basename /a/b.txt .txt; df\\n",
+      "wait:" + P],
+     ["APPLE", "FIG", "PEAR", "20", "19", "-3", "+X", "diff=1", "/boot/limine.conf", "got motd",
+      "      2", "b", "/dev/sda2", "%"]),
+
     ("jobs-and-ctrl-c", False, False,
      ["wait:" + P, "send:sleep 1 &\\n", "wait:" + P, "send:ps\\n", "wait:" + P,
       "sleep:1.5", "send:cat\\n", "sleep:0.5", "send:\\x03", "wait:" + P,

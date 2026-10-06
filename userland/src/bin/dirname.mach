@@ -1,0 +1,21 @@
+# dirname PATH: PATH without its last part
+
+use io: sdk.io;
+use rt: sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc != 2) {
+        io.err("usage: dirname PATH\n\0");
+        ret 2;
+    }
+    val p: *u8 = argv[1];
+    var e: u64 = io.len(p);
+    for (e > 1 && p[e - 1] == 47) { e = e - 1; }
+    for (e > 0 && p[e - 1] != 47) { e = e - 1; }
+    for (e > 1 && p[e - 1] == 47) { e = e - 1; }
+    if (e == 0) { io.out(".\0"); }
+    or          { io.outn(p, e); }
+    io.putc(10);
+    ret 0;
+}

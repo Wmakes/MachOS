@@ -1,0 +1,90 @@
+# diff A B: the lines that differ, as - (only in A) and + (only in B), each
+# run under an @@ header with its line numbers. files up to 1000 lines.
+# exit 0 when they are the same, 1 when they differ
+
+use abi:  sdk.abi;
+use io:   sdk.io;
+use rt:   sdk.rt;
+use text: userland.lib.text;
+
+val MAXL: u64 = 1000;
+var abuf: [1048576]u8;
+var bbuf: [1048576]u8;
+var as: [1000]u64;
+var al: [1000]u64;
+var bs: [1000]u64;
+var bl: [1000]u64;
+var lcs: [1002001]u16; # (MAXL + 1)^2: the LCS of every pair of suffixes
+
+fun same(i: u64, j: u64) u8 { ret io.eq(?abuf[as[i]], al[i], ?bbuf[bs[j]], bl[j]); }
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc != 3) {
+        io.err("usage: diff A B\n\0");
+        ret 2;
+    }
+    val ha: u64 = text.open_in("diff\0", argv[1]);
+    if (abi.is_err(ha) != 0) { ret 2; }
+    val hb: u64 = text.open_in("diff\0", argv[2]);
+    if (abi.is_err(hb) != 0) { ret 2; }
+    val na: u64 = text.read_all(ha, ?abuf[0], 1048576);
+    val nb: u64 = text.read_all(hb, ?bbuf[0], 1048576);
+    val n: u64 = text.split_lines(?abuf[0], na, ?as[0], ?al[0], MAXL);
+    val m: u64 = text.split_lines(?bbuf[0], nb, ?bs[0], ?bl[0], MAXL);
+    if (n == MAXL || m == MAXL) {
+        io.err("diff: files over 1000 lines are not supported\n\0");
+        ret 2;
+    }
+    val w: u64 = m + 1;
+    var i: u64 = n + 1;
+    for (i > 0) {
+        i = i - 1;
+        var j: u64 = m + 1;
+        for (j > 0) {
+            j = j - 1;
+            var v: u16 = 0;
+            if (i < n && j < m) {
+                if (same(i, j) != 0) { v = lcs[(i + 1) * w + j + 1] + 1; }
+                or {
+                    v = lcs[(i + 1) * w + j];
+                    if (lcs[i * w + j + 1] > v) { v = lcs[i * w + j + 1]; }
+                }
+            }
+            lcs[i * w + j] = v;
+        }
+    }
+    var a: u64 = 0;
+    var b: u64 = 0;
+    var differ: u8 = 0;
+    var in_hunk: u8 = 0;
+    for (a < n || b < m) {
+        if (a < n && b < m && same(a, b) != 0) {
+            a = a + 1;
+            b = b + 1;
+            in_hunk = 0;
+            cnt;
+        }
+        if (in_hunk == 0) {
+            io.out("@@ -\0");
+            io.dec(a + 1);
+            io.out(" +\0");
+            io.dec(b + 1);
+            io.out(" @@\n\0");
+            in_hunk = 1;
+            differ = 1;
+        }
+        if (b >= m || (a < n && lcs[(a + 1) * w + b] >= lcs[a * w + b + 1])) {
+            io.out("\x1b[31m-\0");
+            io.outn(?abuf[as[a]], al[a]);
+            io.out("\x1b[0m\n\0");
+            a = a + 1;
+        } or {
+            io.out("\x1b[32m+\0");
+            io.outn(?bbuf[bs[b]], bl[b]);
+            io.out("\x1b[0m\n\0");
+            b = b + 1;
+        }
+    }
+    ret differ::u64;
+}

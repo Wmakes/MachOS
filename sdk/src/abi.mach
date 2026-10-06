@@ -33,7 +33,8 @@ pub val UMOUNT:  u64 = 26; # (path, len)                            a mountpoint
 pub val UNAME:   u64 = 27; # (*Uname)
 pub val TCGETATTR: u64 = 28; # (handle, *Termios)                 E_NOTTY unless it is a terminal
 pub val TCSETATTR: u64 = 29; # (handle, *Termios)
-pub val COUNT:   u64 = 30;
+pub val MOUNTS:  u64 = 30; # (index, *MountInfo)                  -> 1, or 0 past the end
+pub val COUNT:   u64 = 31;
 
 # WAIT flags
 pub val WAIT_NOHANG: u64 = 1; # E_AGAIN instead of blocking while it runs
@@ -130,15 +131,25 @@ pub val KIND_DEV:  u64 = 3;
 pub val NAME_MAX: u64 = 59;
 
 pub rec Stat {
-    kind: u64;
-    size: u64;
+    kind:  u64;
+    size:  u64;
+    mtime: u64; # last change, seconds since 1970-01-01 UTC
 }
 
 pub rec Entry {
     kind:     u64;
     size:     u64;
+    mtime:    u64;
     name_len: u64;
     name:     [60]u8;
+}
+
+# one mounted filesystem, as MOUNTS reports it (NUL-terminated strings)
+pub rec MountInfo {
+    dev:   [16]u8;  # "/dev/sda2"
+    dir:   [256]u8; # where it is mounted
+    total: u64;     # bytes
+    free:  u64;
 }
 
 pub rec Info {

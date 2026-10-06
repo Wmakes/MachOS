@@ -1,0 +1,25 @@
+# basename PATH [SUFFIX]: the last part of PATH, without SUFFIX
+
+use io: sdk.io;
+use rt: sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc < 2) {
+        io.err("usage: basename PATH [SUFFIX]\n\0");
+        ret 2;
+    }
+    val p: *u8 = argv[1];
+    var e: u64 = io.len(p);
+    for (e > 1 && p[e - 1] == 47) { e = e - 1; }
+    var s: u64 = e;
+    for (s > 0 && p[s - 1] != 47) { s = s - 1; }
+    if (e == 1 && p[0] == 47) { s = 0; }
+    if (argc > 2) {
+        val sl: u64 = io.len(argv[2]);
+        if (sl < e - s && io.eq(?p[e - sl], sl, argv[2], sl) != 0) { e = e - sl; }
+    }
+    io.outn(?p[s], e - s);
+    io.putc(10);
+    ret 0;
+}

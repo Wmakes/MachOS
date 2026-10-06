@@ -1,0 +1,55 @@
+# printf FORMAT [ARG...]: print FORMAT with \n \t \\ escapes and %s %d %c %%
+# filled from the ARGs in turn (the format repeats while ARGs are left)
+
+use io: sdk.io;
+use rt: sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc < 2) {
+        io.err("usage: printf FORMAT [ARG...]\n\0");
+        ret 2;
+    }
+    val f: *u8 = argv[1];
+    val n: u64 = io.len(f);
+    var a: u64 = 2;
+    for {
+        var used: u8 = 0;
+        var i: u64 = 0;
+        for (i < n) {
+            val c: u8 = f[i];
+            if (c == 92 && i + 1 < n) {
+                i = i + 1;
+                val e: u8 = f[i];
+                if (e == 110) { io.putc(10); }
+                or (e == 116) { io.putc(9); }
+                or (e == 101) { io.putc(27); }
+                or (e == 48) { io.putc(0); }
+                or { io.putc(e); }
+            } or (c == 37 && i + 1 < n) {
+                i = i + 1;
+                val k: u8 = f[i];
+                if (k == 37) {
+                    io.putc(37);
+                } or {
+                    var arg: *u8 = "\0";
+                    if (a < argc) {
+                        arg = argv[a];
+                        a = a + 1;
+                        used = 1;
+                    }
+                    if (k == 99) {
+                        if (arg[0] != 0) { io.putc(arg[0]); }
+                    } or {
+                        io.out(arg); # %s and %d alike: the argument as written
+                    }
+                }
+            } or {
+                io.putc(c);
+            }
+            i = i + 1;
+        }
+        if (used == 0 || a >= argc) { brk; }
+    }
+    ret 0;
+}

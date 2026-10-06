@@ -1,0 +1,124 @@
+# sort [-r] [-n] [-u] [FILE]: sort lines (-r reverse, -n by leading number,
+# -u drop repeated lines)
+
+use abi:  sdk.abi;
+use sys:  sdk.sys;
+use io:   sdk.io;
+use rt:   sdk.rt;
+use text: userland.lib.text;
+
+val CAP: u64 = 4194304;
+val MAXL: u64 = 262144;
+var buf: [4194304]u8;
+var starts: [262144]u64;
+var lens: [262144]u64;
+var order: [262144]u64;
+var tmp: [262144]u64;
+var reverse: u8 = 0;
+var numeric: u8 = 0;
+var unique: u8 = 0;
+
+fun num(i: u64) u64 {
+    var v: u64 = 0;
+    var k: u64 = 0;
+    val s: *u8 = ?buf[starts[i]];
+    for (k < lens[i] && s[k] == 32) { k = k + 1; }
+    for (k < lens[i] && s[k] >= 48 && s[k] <= 57) {
+        v = v * 10 + (s[k] - 48)::u64;
+        k = k + 1;
+    }
+    ret v;
+}
+
+# <0, 0, >0 as 0, 1, 2
+fun cmp_text(a: u64, b: u64) u64 {
+    val sa: *u8 = ?buf[starts[a]];
+    val sb: *u8 = ?buf[starts[b]];
+    var k: u64 = 0;
+    for (k < lens[a] && k < lens[b]) {
+        if (sa[k] < sb[k]) { ret 0; }
+        if (sa[k] > sb[k]) { ret 2; }
+        k = k + 1;
+    }
+    if (lens[a] < lens[b]) { ret 0; }
+    if (lens[a] > lens[b]) { ret 2; }
+    ret 1;
+}
+
+fun cmp(a: u64, b: u64) u64 {
+    var r: u64 = 1;
+    if (numeric != 0) {
+        val na: u64 = num(a);
+        val nb: u64 = num(b);
+        if (na < nb) { r = 0; }
+        or (na > nb) { r = 2; }
+    }
+    if (r == 1) { r = cmp_text(a, b); }
+    if (reverse != 0) { r = 2 - r; }
+    ret r;
+}
+
+fun merge_sort(lo: u64, hi: u64) {
+    if (hi - lo < 2) { ret; }
+    val mid: u64 = lo + (hi - lo) / 2;
+    merge_sort(lo, mid);
+    merge_sort(mid, hi);
+    var i: u64 = lo;
+    var j: u64 = mid;
+    var k: u64 = lo;
+    for (k < hi) {
+        if (j >= hi || (i < mid && cmp(order[i], order[j]) != 2)) {
+            tmp[k] = order[i];
+            i = i + 1;
+        } or {
+            tmp[k] = order[j];
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    k = lo;
+    for (k < hi) {
+        order[k] = tmp[k];
+        k = k + 1;
+    }
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var i: u64 = 1;
+    for (i < argc && argv[i][0] == 45 && argv[i][1] != 0) {
+        var k: u64 = 1;
+        for (argv[i][k] != 0) {
+            if (argv[i][k] == 114) { reverse = 1; }
+            or (argv[i][k] == 110) { numeric = 1; }
+            or (argv[i][k] == 117) { unique = 1; }
+            or {
+                io.err("usage: sort [-r] [-n] [-u] [FILE]\n\0");
+                ret 2;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    var path: *u8 = nil;
+    if (i < argc) { path = argv[i]; }
+    val h: u64 = text.open_in("sort\0", path);
+    if (abi.is_err(h) != 0) { ret 1; }
+    val n: u64 = text.read_all(h, ?buf[0], CAP);
+    val count: u64 = text.split_lines(?buf[0], n, ?starts[0], ?lens[0], MAXL);
+    var k: u64 = 0;
+    for (k < count) {
+        order[k] = k;
+        k = k + 1;
+    }
+    merge_sort(0, count);
+    k = 0;
+    for (k < count) {
+        if (unique == 0 || k == 0 || cmp_text(order[k], order[k - 1]) != 1) {
+            io.outn(?buf[starts[order[k]]], lens[order[k]]);
+            io.putc(10);
+        }
+        k = k + 1;
+    }
+    ret 0;
+}

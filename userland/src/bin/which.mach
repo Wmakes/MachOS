@@ -1,0 +1,29 @@
+# which NAME...: where each command would be found
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var status: u64 = 0;
+    var i: u64 = 1;
+    for (i < argc) {
+        var p: [256]u8;
+        val n: u64 = io.len(argv[i]);
+        if (n + 5 < 256) {
+            io.copy(?p[0], "/bin/\0", 5);
+            io.copy(?p[5], argv[i], n);
+            var st: abi.Stat;
+            if (abi.is_err(sys.stat(?p[0], n + 5, ?st)) == 0 && st.kind == abi.KIND_FILE) {
+                io.outn(?p[0], n + 5);
+                io.putc(10);
+            } or {
+                status = 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret status;
+}

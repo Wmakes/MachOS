@@ -1,4 +1,5 @@
-# wc [FILE...]: count lines, words and bytes
+# wc [-l] [-w] [-c] [FILE...]: count lines, words and bytes (all three
+# unless some are asked for)
 
 use abi: sdk.abi;
 use sys: sdk.sys;
@@ -9,6 +10,20 @@ var buf: [4096]u8;
 var tl: u64 = 0;
 var tw: u64 = 0;
 var tb: u64 = 0;
+var show_l: u8 = 1;
+var show_w: u8 = 1;
+var show_c: u8 = 1;
+
+fun report(lines: u64, words: u64, bytes: u64, name: *u8) {
+    if (show_l != 0) { io.dec_pad(lines, 7); }
+    if (show_w != 0) { io.dec_pad(words, 8); }
+    if (show_c != 0) { io.dec_pad(bytes, 8); }
+    if (name != nil) {
+        io.putc(32);
+        io.out(name);
+    }
+    io.putc(10);
+}
 
 fun count(h: u64, name: *u8) u8 {
     var lines: u64 = 0;
@@ -36,14 +51,7 @@ fun count(h: u64, name: *u8) u8 {
         }
         bytes = bytes + r;
     }
-    io.dec_pad(lines, 7);
-    io.dec_pad(words, 8);
-    io.dec_pad(bytes, 8);
-    if (name != nil) {
-        io.putc(32);
-        io.out(name);
-    }
-    io.putc(10);
+    report(lines, words, bytes, name);
     tl = tl + lines;
     tw = tw + words;
     tb = tb + bytes;
@@ -52,12 +60,34 @@ fun count(h: u64, name: *u8) u8 {
 
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
-    if (argc < 2) {
+    var first: u64 = 1;
+    var picked: u8 = 0;
+    for (first < argc && argv[first][0] == 45 && argv[first][1] != 0) {
+        if (picked == 0) {
+            show_l = 0;
+            show_w = 0;
+            show_c = 0;
+            picked = 1;
+        }
+        var k: u64 = 1;
+        for (argv[first][k] != 0) {
+            if (argv[first][k] == 108) { show_l = 1; }
+            or (argv[first][k] == 119) { show_w = 1; }
+            or (argv[first][k] == 99) { show_c = 1; }
+            or {
+                io.err("usage: wc [-l] [-w] [-c] [FILE...]\n\0");
+                ret 2;
+            }
+            k = k + 1;
+        }
+        first = first + 1;
+    }
+    if (argc - first == 0) {
         if (count(abi.STDIN, nil) == 0) { ret 1; }
         ret 0;
     }
     var status: u64 = 0;
-    var i: u64 = 1;
+    var i: u64 = first;
     for (i < argc) {
         val h: u64 = sys.open(argv[i], io.len(argv[i]), abi.O_READ);
         if (abi.is_err(h) != 0) {
@@ -69,11 +99,6 @@ fun main(argc: u64, argv: **u8) u64 {
         }
         i = i + 1;
     }
-    if (argc > 2) {
-        io.dec_pad(tl, 7);
-        io.dec_pad(tw, 8);
-        io.dec_pad(tb, 8);
-        io.out(" total\n\0");
-    }
+    if (argc - first > 1) { report(tl, tw, tb, "total\0"); }
     ret status;
 }

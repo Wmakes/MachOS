@@ -1,0 +1,74 @@
+# xargs COMMAND [ARGS...]: run COMMAND with ARGS and the words read from stdin
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+val CAP: u64 = 65536;
+var args: [65536]u8;
+var input: [65536]u8;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc < 2) {
+        io.err("usage: xargs COMMAND [ARGS...]\n\0");
+        ret 2;
+    }
+    var path: [256]u8;
+    val cn: u64 = io.len(argv[1]);
+    var pn: u64 = 0;
+    var slash: u8 = 0;
+    var k: u64 = 0;
+    for (k < cn) {
+        if (argv[1][k] == 47) { slash = 1; }
+        k = k + 1;
+    }
+    if (cn + 6 >= 256) { ret 2; }
+    if (slash == 0) {
+        io.copy(?path[0], "/bin/\0", 5);
+        pn = 5;
+    }
+    io.copy(?path[pn], argv[1], cn);
+    pn = pn + cn;
+
+    var n: u64 = 0;
+    var i: u64 = 1;
+    for (i < argc) {
+        val l: u64 = io.len(argv[i]);
+        if (n + l + 1 > CAP) { ret 2; }
+        io.copy(?args[n], argv[i], l + 1);
+        n = n + l + 1;
+        i = i + 1;
+    }
+    var got: u64 = 0;
+    for (got < CAP) {
+        val r: u64 = sys.read(abi.STDIN, ?input[got], CAP - got);
+        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        got = got + r;
+    }
+    i = 0;
+    for (i < got) {
+        for (i < got && (input[i] == 32 || input[i] == 10 || input[i] == 9)) { i = i + 1; }
+        val s: u64 = i;
+        for (i < got && input[i] != 32 && input[i] != 10 && input[i] != 9) { i = i + 1; }
+        if (i > s) {
+            if (n + (i - s) + 1 > CAP) {
+                io.err("xargs: too much input\n\0");
+                ret 1;
+            }
+            io.copy(?args[n], ?input[s], i - s);
+            n = n + (i - s);
+            args[n] = 0;
+            n = n + 1;
+        }
+    }
+    val pid: u64 = sys.spawn(?path[0], pn, ?args[0], n, nil);
+    if (abi.is_err(pid) != 0) {
+        io.fail("xargs\0", argv[1], pid);
+        ret 127;
+    }
+    val st: u64 = sys.wait(pid);
+    if (abi.is_err(st) != 0) { ret 1; }
+    ret st;
+}
