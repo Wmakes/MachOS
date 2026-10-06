@@ -7,7 +7,7 @@
 # the cache is direct mapped: block b of a partition can only live in slot
 # hash(part, b), so a lookup is one comparison
 
-use ahci: machos.dev.ahci;
+use dsk:  machos.dev.disk;
 use heap: machos.mm.heap;
 use mem:  machos.kern.mem;
 
@@ -16,7 +16,7 @@ val SPB: u64 = 8;      # sectors per block
 val CACHE: u64 = 2048; # slots, 8 MiB once all are used
 
 pub rec Part {
-    disk:    *ahci.Disk;
+    disk:    *dsk.Disk;
     start:   u64; # first sector
     sectors: u64;
 }
@@ -42,7 +42,7 @@ fun slot_of(p: *Part, b: u64) *Entry {
 
 fun flush(e: *Entry) u8 {
     if (e.dirty == 0) { ret 1; }
-    if (ahci.write(e.part.disk, e.part.start + e.block * SPB, SPB, e.data) == 0) {
+    if (dsk.write(e.part.disk, e.part.start + e.block * SPB, SPB, e.data) == 0) {
         failed = failed + 1;
         ret 0;
     }
@@ -66,7 +66,7 @@ fun entry(p: *Part, b: u64, load: u8) *Entry {
     }
     e.part = nil;
     if (load != 0) {
-        if (ahci.read(p.disk, p.start + b * SPB, SPB, e.data) == 0) { ret nil; }
+        if (dsk.read(p.disk, p.start + b * SPB, SPB, e.data) == 0) { ret nil; }
         reads = reads + 1;
     }
     e.part = p;
@@ -141,8 +141,8 @@ pub fun sync() u8 {
         i = i + 1;
     }
     i = 0;
-    for (i < ahci.disk_count()) {
-        ahci.flush(ahci.disk(i));
+    for (i < dsk.disk_count()) {
+        dsk.flush(dsk.disk(i));
         i = i + 1;
     }
     ret ok;
@@ -155,7 +155,7 @@ pub fun failed_count() u64 { ret failed; }
 
 # write back and drop every cached block of partitions on disk `d`, so raw
 # writes to the disk and later mounts see the disk as it really is
-pub fun forget_disk(d: *ahci.Disk) {
+pub fun forget_disk(d: *dsk.Disk) {
     sync();
     var i: u64 = 0;
     for (i < CACHE) {

@@ -20,6 +20,7 @@ use blk:    machos.fs.blk;
 use clock:  machos.kern.clock;
 use mount:  machos.fs.mount;
 use parts:  machos.fs.parts;
+use dsk:    machos.dev.disk;
 use ext2:   machos.fs.ext2;
 use power:  machos.kern.power;
 use exit:   machos.kern.exit;
@@ -557,6 +558,11 @@ fun sys_stat(pva: u64, plen: u64, out: u64) u64 {
 }
 
 fun fill_stat(nd: *vfs.Node, st: *abi.Stat) {
+    st.sector = 0;
+    if (nd.kind == abi.KIND_DEV) {
+        val bd: *parts.Bdev = parts.get(nd.dev);
+        if (bd != nil) { st.sector = dsk.disk(bd.disk).native; }
+    }
     st.kind = nd.kind;
     st.size = nd.size;
     st.mtime = vfs.mtime_of(nd);
@@ -921,17 +927,8 @@ fun sys_mounts(idx: u64, out: u64) u64 {
     if (mount.nth(idx, ?disk, ?start, ?r, ?fs) == 0) { ret 0; }
     val mi: *abi.MountInfo = out::*abi.MountInfo;
     mem.fill(out, 0, $size_of(abi.MountInfo)::u64);
-    put_str(?mi.dev[0], "/dev/sd\0");
-    mi.dev[7] = 97 + disk::u8;
     val b: *parts.Bdev = parts.find(disk, start);
-    if (b != nil) {
-        var k: u64 = 8;
-        if (b.part >= 10) {
-            mi.dev[k] = 48 + (b.part / 10)::u8;
-            k = k + 1;
-        }
-        mi.dev[k] = 48 + (b.part % 10)::u8;
-    }
+    if (b != nil) { parts.dev_name(b, ?mi.dev[0]); }
     if (r == nil) {
         mi.dir[0] = 47;
     } or {
@@ -1063,6 +1060,11 @@ fun sys_fstat(h: u64, out: u64) u64 {
         st.mode = f.node.mode;
         st.uid = f.node.uid;
         st.gid = f.node.gid;
+        st.sector = 0;
+        if (f.node.kind == abi.KIND_DEV) {
+            val bd: *parts.Bdev = parts.get(f.node.dev);
+            if (bd != nil) { st.sector = dsk.disk(bd.disk).native; }
+        }
     } or {
         st.kind = abi.KIND_PIPE;
         st.size = 0;

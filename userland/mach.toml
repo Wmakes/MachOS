@@ -323,6 +323,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.partname]
+kind = "bin"
+entry = "bin/partname.mach"
+out = "bin/partname"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.passwd]
 kind = "bin"
 entry = "bin/passwd.mach"

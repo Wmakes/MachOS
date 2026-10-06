@@ -1,7 +1,7 @@
 # sh: the MachOS shell.
 #   words, 'single' and "double" quotes, \escapes, # comments,
 #   $? (last status), $0-$9 and $# (script arguments), $$ (the shell's pid),
-#   $NAME and ${NAME} (variables), ~ (home)
+#   $NAME and ${NAME} (variables), ~ (home), $(command) (its output)
 #   NAME=value  set a variable; NAME=value cmd  run cmd with it in its environment
 #   builtins: cd pwd exit jobs fg bg export unset set
 #   job control: ^Z stops the foreground job; fg / bg [N] continue it
@@ -44,6 +44,8 @@ val VAR_MARK:    u8 = 3; # $NAME: VAR_MARK, the name, VAR_END
 val VAR_END:     u8 = 4;
 val PID_MARK:    u8 = 5; # $$
 val HOME_MARK:   u8 = 6; # a leading ~
+val CMD_MARK:    u8 = 7; # $(command): CMD_MARK, the command, CMD_END
+val CMD_END:     u8 = 8;
 
 var tk: [128]u8;  # token kinds
 var ts: [128]u64; # word start in wbuf
@@ -197,6 +199,14 @@ fun expand(t: u64, out: *u8, cap: u64) u64 {
             if (n + k >= cap) { ret NONE; }
             io.copy(?out[n], ?num[0], k);
             n = n + k;
+        } or (w[i] == CMD_MARK) {
+            val cs: u64 = i + 1;
+            var ce: u64 = cs;
+            for (ce < tl[t] && w[ce] != CMD_END) { ce = ce + 1; }
+            val got: u64 = substitute(?w[cs], ce - cs, ?out[n], cap - n);
+            if (got == NONE) { ret NONE; }
+            n = n + got;
+            i = ce;
         } or (w[i] == VAR_MARK) {
             val ns: u64 = i + 1;
             var ne: u64 = ns;
@@ -265,6 +275,33 @@ fun dollar(line: *u8, n: u64, i: u64) u64 {
 fun scan_dollar(line: *u8, n: u64, i: u64) u64 {
     if (i + 1 >= n) { ret i; }
     val c: u8 = line[i + 1];
+    if (c == 40) { # $(command), nested parentheses and quotes respected
+        var depth: u64 = 1;
+        var k: u64 = i + 2;
+        var quote: u8 = 0;
+        for (k < n && depth > 0) {
+            val d: u8 = line[k];
+            if (quote != 0) {
+                if (d == quote) { quote = 0; }
+            } or (d == 39 || d == 34) {
+                quote = d;
+            } or (d == 40) {
+                depth = depth + 1;
+            } or (d == 41) {
+                depth = depth - 1;
+            }
+            k = k + 1;
+        }
+        if (depth != 0) { ret i; }
+        push(CMD_MARK);
+        var j: u64 = i + 2;
+        for (j < k - 1) {
+            push(line[j]);
+            j = j + 1;
+        }
+        push(CMD_END);
+        ret k;
+    }
     if (c == 63) {
         push(STATUS_MARK);
         ret i + 2;
@@ -302,6 +339,46 @@ fun scan_dollar(line: *u8, n: u64, i: u64) u64 {
         ret k;
     }
     ret i;
+}
+
+# run `cmd` (n bytes) in a forked copy of this shell (so it sees every
+# variable and $1...), its output into out (at most cap - 1 bytes, trailing
+# newlines dropped); the length, or NONE if it does not fit
+fun substitute(cmd: *u8, n: u64, out: *u8, cap: u64) u64 {
+    var ends: [2]u64;
+    if (abi.is_err(sys.pipe(?ends)) != 0) { ret 0; }
+    val pid: u64 = sys.fork();
+    if (pid == 0) {
+        sys.close(ends[0]);
+        sys.dup2(ends[1], abi.STDOUT);
+        sys.close(ends[1]);
+        var text: [1024]u8;
+        var k: u64 = n;
+        if (k > 1024) { k = 1024; }
+        io.copy(?text[0], cmd, k);
+        interactive = 0;
+        run_string(?text[0], k);
+        sys.exit(status);
+    }
+    sys.close(ends[1]);
+    var got: u64 = 0;
+    var too_long: u8 = 0;
+    for {
+        var chunk: [512]u8;
+        val r: u64 = sys.read(ends[0], ?chunk[0], 512);
+        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        if (got + r >= cap) {
+            too_long = 1;
+            cnt; # keep draining so the child can finish
+        }
+        io.copy(?out[got], ?chunk[0], r);
+        got = got + r;
+    }
+    sys.close(ends[0]);
+    if (abi.is_err(pid) == 0) { sys.wait(pid); }
+    if (too_long != 0) { ret NONE; }
+    for (got > 0 && out[got - 1] == 10) { got = got - 1; }
+    ret got;
 }
 
 fun syntax(msg: *u8) u8 {

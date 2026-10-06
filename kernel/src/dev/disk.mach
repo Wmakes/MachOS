@@ -1,0 +1,108 @@
+# every disk, whatever drives it: AHCI (SATA) disks are sda, sdb, ...;
+# NVMe disks nvme0n1, nvme1n1, ... (their namespace 1), as on Linux. all of
+# them are read and written in 512-byte sectors
+
+use ahci: machos.dev.ahci;
+use nvme: machos.dev.nvme;
+use mem:  machos.kern.mem;
+
+pub val SECTOR: u64 = 512;
+pub val MAX: u64 = 12;
+val AHCI: u64 = 1;
+val NVME: u64 = 2;
+
+pub rec Disk {
+    kind:     u64;
+    idx:      u64;     # within its driver
+    sectors:  u64;
+    native:   u64;     # the disk's own sector size (512 or 4096)
+    model:    [40]u8;
+    name:     [16]u8;
+    name_len: u64;
+}
+
+var disks: [12]Disk;
+var count: u64 = 0;
+
+fun add(kind: u64, idx: u64, sectors: u64, model: *u8) *Disk {
+    if (count == MAX) { ret nil; }
+    val d: *Disk = ?disks[count];
+    count = count + 1;
+    d.kind = kind;
+    d.idx = idx;
+    d.sectors = sectors;
+    d.native = 512;
+    mem.copy((?d.model[0])::u64, model::u64, 40);
+    ret d;
+}
+
+# find the disks of every driver; returns how many there are
+pub fun init() u64 {
+    val na: u64 = ahci.init();
+    var i: u64 = 0;
+    for (i < na && i < 26) {
+        val a: *ahci.Disk = ahci.disk(i);
+        val d: *Disk = add(AHCI, i, a.sectors, ?a.model[0]);
+        if (d != nil) {
+            d.name[0] = 115; # "sd" + a letter
+            d.name[1] = 100;
+            d.name[2] = 97 + i::u8;
+            d.name_len = 3;
+        }
+        i = i + 1;
+    }
+    val nn: u64 = nvme.init();
+    i = 0;
+    for (i < nn && i < 10) {
+        val d: *Disk = add(NVME, i, nvme.sectors(i), nvme.model(i));
+        if (d != nil) {
+            d.native = nvme.sector_size(i);
+            mem.copy((?d.name[0])::u64, "nvme\0"::u64, 4);
+            d.name[4] = 48 + i::u8;
+            d.name[5] = 110;     # n
+            d.name[6] = 49;      # 1
+            d.name_len = 7;
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+pub fun disk_count() u64 { ret count; }
+pub fun disk(i: u64) *Disk { ret ?disks[i]; }
+
+pub fun read(d: *Disk, lba: u64, n: u64, buf: u64) u8 {
+    if (lba + n > d.sectors) { ret 0; }
+    if (d.kind == AHCI) { ret ahci.read(ahci.disk(d.idx), lba, n, buf); }
+    ret nvme.read(d.idx, lba, n, buf);
+}
+
+pub fun write(d: *Disk, lba: u64, n: u64, buf: u64) u8 {
+    if (lba + n > d.sectors) { ret 0; }
+    if (d.kind == AHCI) { ret ahci.write(ahci.disk(d.idx), lba, n, buf); }
+    ret nvme.write(d.idx, lba, n, buf);
+}
+
+pub fun flush(d: *Disk) u8 {
+    if (d.kind == AHCI) { ret ahci.flush(ahci.disk(d.idx)); }
+    ret nvme.flush(d.idx);
+}
+
+# a partition's name: sda + 1 = sda1, nvme0n1 + 1 = nvme0n1p1 (a name
+# ending in a digit takes a "p"); its length
+pub fun part_name(d: *Disk, part: u64, out: *u8) u64 {
+    mem.copy(out::u64, (?d.name[0])::u64, d.name_len);
+    var n: u64 = d.name_len;
+    if (part == 0) { ret n; }
+    val last: u8 = d.name[d.name_len - 1];
+    if (last >= 48 && last <= 57) {
+        out[n] = 112;
+        n = n + 1;
+    }
+    if (part >= 10) {
+        out[n] = 48 + (part / 10)::u8;
+        n = n + 1;
+    }
+    out[n] = 48 + (part % 10)::u8;
+    ret n + 1;
+}

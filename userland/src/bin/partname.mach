@@ -1,0 +1,20 @@
+# partname DISK N: the device of partition N of DISK, the Linux way:
+# /dev/sda 2 -> /dev/sda2, /dev/nvme0n1 2 -> /dev/nvme0n1p2
+
+use io: sdk.io;
+use rt: sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc != 3) {
+        io.err("usage: partname DISK N\n\0");
+        ret 2;
+    }
+    val d: *u8 = argv[1];
+    val n: u64 = io.len(d);
+    io.out(d);
+    if (n > 0 && d[n - 1] >= 48 && d[n - 1] <= 57) { io.putc(112); }
+    io.out(argv[2]);
+    io.putc(10);
+    ret 0;
+}

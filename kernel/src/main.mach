@@ -28,7 +28,8 @@ use initrd: machos.fs.initrd;
 use version: machos.abi.version;
 use clock:  machos.kern.clock;
 use pci:    machos.dev.pci;
-use ahci:   machos.dev.ahci;
+use xhci:   machos.dev.xhci;
+use dsk:    machos.dev.disk;
 
 var boot: info.BootInfo;
 
@@ -114,8 +115,7 @@ fun kmain() {
 
     val aerr: *u8 = apic.init(boot.rsdp);
     if (aerr != nil) { kprint.panic(aerr); }
-    kbd.init();
-    apic.route(1, apic.IRQ_BASE + 1);
+    if (kbd.init() != 0) { apic.route(1, apic.IRQ_BASE + 1); }
     serial.enable_rx();
     apic.route(4, apic.IRQ_BASE + 4);
     kprint.puts("apic: timer at \0");
@@ -130,12 +130,20 @@ fun kmain() {
     kprint.puts("pci: \0");
     kprint.dec(pci.scan());
     kprint.puts(" functions\n\0");
-    val ndisk: u64 = ahci.init();
+    val nkbd: u64 = xhci.init();
+    if (xhci.controllers() > 0) {
+        kprint.puts("usb: \0");
+        kprint.dec(xhci.controllers());
+        kprint.puts(" xhci controller(s), \0");
+        kprint.dec(nkbd);
+        kprint.puts(" keyboard(s)\n\0");
+    }
+    val ndisk: u64 = dsk.init();
     var di: u64 = 0;
     for (di < ndisk) {
-        val d: *ahci.Disk = ahci.disk(di);
-        kprint.puts("ahci: disk \0");
-        kprint.dec(di);
+        val d: *dsk.Disk = dsk.disk(di);
+        kprint.puts("disk: \0");
+        kprint.puts(?d.name[0]);
         kprint.puts(": \0");
         kprint.dec(d.sectors / 2048);
         kprint.puts(" MiB, \0");
@@ -199,10 +207,11 @@ fun mount_root() {
     if (b != nil) {
         val err: *u8 = mount.mount_root(b);
         kprint.puts("root: \0");
-        if (err == nil) { kprint.puts("ext2 on /dev/sd\0"); }
-        or              { kprint.puts("/dev/sd\0"); }
-        kprint.putc(97 + b.disk::u8);
-        kprint.dec(b.part);
+        if (err == nil) { kprint.puts("ext2 on \0"); }
+        var dn: [32]u8;
+        val dl: u64 = parts.dev_name(b, ?dn[0]);
+        dn[dl] = 0;
+        kprint.puts(?dn[0]);
         if (err == nil) {
             kprint.putc(10);
             if (mount.root_was_clean() == 0) {

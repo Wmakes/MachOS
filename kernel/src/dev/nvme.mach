@@ -1,0 +1,285 @@
+# NVMe disks. polled, like AHCI: a command is put on a submission queue,
+# the doorbell rung, and the completion queue watched until its phase bit
+# says the answer is there. one admin queue pair (identify, making queues)
+# and one I/O queue pair per controller; namespace 1 is the disk.
+# callers always speak 512-byte sectors; a 4 KiB-sector namespace is read
+# and written through a bounce buffer when a request does not line up
+
+use pci: machos.dev.pci;
+use vmm: machos.mm.vmm;
+use pmm: machos.mm.pmm;
+use mem: machos.kern.mem;
+
+pub val MAX: u64 = 4;
+val DEPTH: u64 = 64;        # entries per queue
+val MAX_BYTES: u64 = 65536; # per command: 16 pages after the first
+val PAGE: u64 = 4096;
+
+#[volatile]
+rec Reg { v: u32; }
+
+pub rec Ctrl {
+    regs:     u64;  # mapped BAR0
+    stride:   u64;  # doorbell stride in bytes
+    asq:      u64;  # physical pages of the queues
+    acq:      u64;
+    iosq:     u64;
+    iocq:     u64;
+    asq_tail: u64;
+    acq_head: u64;
+    acq_phase: u32;
+    iosq_tail: u64;
+    iocq_head: u64;
+    iocq_phase: u32;
+    cid:      u64;
+    prp:      u64;  # a page for PRP lists
+    bounce:   u64;  # physical page run for unaligned 4 KiB-sector I/O
+    lbads:    u64;  # log2 of the sector size
+    sectors:  u64;  # in 512-byte units
+    model:    [40]u8;
+}
+
+var ctrls: [4]Ctrl;
+var count: u64 = 0;
+
+fun rd(c: *Ctrl, off: u64) u32 { ret (@((c.regs + off)::*Reg)).v; }
+fun wr(c: *Ctrl, off: u64, v: u32) { (@((c.regs + off)::*Reg)).v = v; }
+fun wr64(c: *Ctrl, off: u64, v: u64) {
+    wr(c, off, (v & 0xFFFFFFFF)::u32);
+    wr(c, off + 4, (v >> 32)::u32);
+}
+
+fun doorbell(c: *Ctrl, q: u64, completion: u64) u64 { ret 0x1000 + (2 * q + completion) * c.stride; }
+
+fun wait_ready(c: *Ctrl, want: u32) u8 {
+    var spins: u64 = 0;
+    for (spins < 200000000) {
+        val st: u32 = rd(c, 0x1C);
+        if ((st & 2) != 0) { ret 0; } # controller fatal status
+        if ((st & 1) == want) { ret 1; }
+        spins = spins + 1;
+    }
+    ret 0;
+}
+
+# submit a 64-byte command (16 dwords) on the admin (q 0) or I/O (q 1)
+# queue and wait for it; the completion status (0 = success), or 0xFFFF
+fun submit(c: *Ctrl, q: u64, cmd: *u32) u32 {
+    var sq: u64 = c.asq;
+    var tail: *u64 = ?c.asq_tail;
+    var cq: u64 = c.acq;
+    var head: *u64 = ?c.acq_head;
+    var phase: *u32 = ?c.acq_phase;
+    if (q == 1) {
+        sq = c.iosq;
+        tail = ?c.iosq_tail;
+        cq = c.iocq;
+        head = ?c.iocq_head;
+        phase = ?c.iocq_phase;
+    }
+    c.cid = (c.cid + 1) & 0xFFFF;
+    cmd[0] = (cmd[0] & 0xFFFF) | (c.cid::u32 << 16);
+    mem.copy(vmm.phys_to_virt(sq) + @tail * 64, cmd::u64, 64);
+    @tail = (@tail + 1) % DEPTH;
+    wr(c, doorbell(c, q, 0), (@tail)::u32);
+    val entry: *u32 = (vmm.phys_to_virt(cq) + @head * 16)::*u32;
+    var spins: u64 = 0;
+    for (((entry[3] >> 16) & 1) != @phase) {
+        spins = spins + 1;
+        if (spins > 500000000) { ret 0xFFFF; }
+    }
+    val status: u32 = (entry[3] >> 17) & 0x7FFF;
+    @head = @head + 1;
+    if (@head == DEPTH) {
+        @head = 0;
+        @phase = @phase ^ 1;
+    }
+    wr(c, doorbell(c, q, 1), (@head)::u32);
+    ret status;
+}
+
+fun clear(cmd: *u32) {
+    var i: u64 = 0;
+    for (i < 16) {
+        cmd[i] = 0;
+        i = i + 1;
+    }
+}
+
+fun admin(c: *Ctrl, opc: u32, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32) u32 {
+    var cmd: [16]u32;
+    clear(?cmd[0]);
+    cmd[0] = opc;
+    cmd[1] = nsid;
+    cmd[6] = (prp1 & 0xFFFFFFFF)::u32;
+    cmd[7] = (prp1 >> 32)::u32;
+    cmd[10] = cdw10;
+    cmd[11] = cdw11;
+    ret submit(c, 0, ?cmd[0]);
+}
+
+fun page() u64 { ret pmm.alloc(); }
+
+fun setup(c: *Ctrl, dev: *pci.Device) u8 {
+    pci.enable(dev);
+    c.regs = vmm.map_phys(pci.bar(dev, 0), 0x4000, 1);
+    val cap_lo: u32 = rd(c, 0);
+    val cap_hi: u32 = rd(c, 4);
+    c.stride = 4::u64 << (cap_hi & 0xF)::u64;
+    if ((cap_lo & 0xFFFF) + 1 < DEPTH::u32) { ret 0; } # queues too short for us
+
+    wr(c, 0x14, rd(c, 0x14) & ~1::u32); # CC.EN = 0
+    if (wait_ready(c, 0) == 0) { ret 0; }
+    c.asq = page();
+    c.acq = page();
+    c.iosq = page();
+    c.iocq = page();
+    c.prp = page();
+    if (c.asq == 0 || c.acq == 0 || c.iosq == 0 || c.iocq == 0 || c.prp == 0) { ret 0; }
+    c.acq_phase = 1;
+    c.iocq_phase = 1;
+    wr(c, 0x0C, 0xFFFFFFFF); # INTMS: no interrupts, we poll
+    wr(c, 0x24, ((DEPTH - 1) << 16 | (DEPTH - 1))::u32);
+    wr64(c, 0x28, c.asq);
+    wr64(c, 0x30, c.acq);
+    # CC: 64-byte SQ entries (6), 16-byte CQ entries (4), 4 KiB pages, enable
+    wr(c, 0x14, (6 << 16) | (4 << 20) | 1);
+    if (wait_ready(c, 1) == 0) { ret 0; }
+
+    val id: u64 = page();
+    if (id == 0) { ret 0; }
+    val idv: *u8 = vmm.phys_to_virt(id)::*u8;
+    if (admin(c, 0x06, 0, id, 1, 0) != 0) { ret 0; } # identify controller
+    var i: u64 = 0;
+    for (i < 40) {
+        c.model[i] = idv[24 + i];
+        i = i + 1;
+    }
+    if (admin(c, 0x06, 1, id, 0, 0) != 0) { ret 0; } # identify namespace 1
+    val nsze: u64 = @((idv::u64)::*u64);
+    val flbas: u64 = (idv[26] & 0xF)::u64;
+    val lbaf: u32 = @((idv::u64 + 128 + flbas * 4)::*u32);
+    c.lbads = ((lbaf >> 16) & 0xFF)::u64;
+    pmm.free(id);
+    if (c.lbads < 9 || c.lbads > 12 || nsze == 0) { ret 0; }
+    c.sectors = nsze << (c.lbads - 9);
+
+    # I/O completion queue 1, then submission queue 1 feeding it
+    if (admin(c, 0x05, 0, c.iocq, ((DEPTH - 1) << 16 | 1)::u32, 1) != 0) { ret 0; }
+    if (admin(c, 0x01, 0, c.iosq, ((DEPTH - 1) << 16 | 1)::u32, (1 << 16) | 1) != 0) { ret 0; }
+
+    # 16 contiguous pages for bounced I/O: taken one by one, they need not
+    # be contiguous physically, the PRP list copes
+    c.bounce = 0;
+    ret 1;
+}
+
+# find every NVMe controller; returns how many disks
+pub fun init() u64 {
+    var i: u64 = 0;
+    for (i < pci.device_count() && count < MAX) {
+        val d: *pci.Device = pci.get(i);
+        if (d.class == 0x01 && d.subclass == 0x08 && d.progif == 0x02) {
+            if (setup(?ctrls[count], d) != 0) { count = count + 1; }
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+pub fun disk_count() u64 { ret count; }
+pub fun sectors(i: u64) u64 { ret ctrls[i].sectors; }
+pub fun sector_size(i: u64) u64 { ret 1::u64 << ctrls[i].lbads; }
+pub fun model(i: u64) *u8 { ret ?ctrls[i].model[0]; }
+
+# one command moving `bytes` (whole native sectors) at native lba `lba`
+# to/from kernel memory `buf`
+fun rw(c: *Ctrl, write: u8, lba: u64, buf: u64, bytes: u64) u8 {
+    val first: u64 = vmm.kernel_phys(buf);
+    if (first == 0) { ret 0; }
+    var prp2: u64 = 0;
+    val in_first: u64 = PAGE - (buf & (PAGE - 1));
+    if (bytes > in_first) {
+        val rest: u64 = bytes - in_first;
+        val pages: u64 = (rest + PAGE - 1) / PAGE;
+        if (pages == 1) {
+            prp2 = vmm.kernel_phys(buf + in_first);
+        } or {
+            # a list of the remaining pages
+            val list: *u64 = vmm.phys_to_virt(c.prp)::*u64;
+            var k: u64 = 0;
+            for (k < pages) {
+                list[k] = vmm.kernel_phys(buf + in_first + k * PAGE);
+                if (list[k] == 0) { ret 0; }
+                k = k + 1;
+            }
+            prp2 = c.prp;
+        }
+        if (prp2 == 0) { ret 0; }
+    }
+    var cmd: [16]u32;
+    clear(?cmd[0]);
+    cmd[0] = 0x02;
+    if (write != 0) { cmd[0] = 0x01; }
+    cmd[1] = 1;
+    cmd[6] = (first & 0xFFFFFFFF)::u32;
+    cmd[7] = (first >> 32)::u32;
+    cmd[8] = (prp2 & 0xFFFFFFFF)::u32;
+    cmd[9] = (prp2 >> 32)::u32;
+    cmd[10] = (lba & 0xFFFFFFFF)::u32;
+    cmd[11] = (lba >> 32)::u32;
+    cmd[12] = ((bytes >> c.lbads) - 1)::u32;
+    if (submit(c, 1, ?cmd[0]) != 0) { ret 0; }
+    ret 1;
+}
+
+# 512-byte sectors [s, s+n) to/from buf, splitting into commands and
+# bouncing through whole native sectors when they do not line up
+fun transfer(c: *Ctrl, write: u8, s: u64, n: u64, buf: u64) u8 {
+    if (s + n > c.sectors) { ret 0; }
+    val per: u64 = 1::u64 << (c.lbads - 9); # 512-byte sectors per native one
+    var done: u64 = 0;
+    for (done < n) {
+        val at: u64 = s + done;
+        if (at % per == 0 && n - done >= per) {
+            # straight through: as many whole native sectors as fit
+            var k: u64 = (n - done) / per * per;
+            if (k * 512 > MAX_BYTES) { k = MAX_BYTES / 512 / per * per; }
+            if (rw(c, write, at / per, buf + done * 512, k * 512) == 0) { ret 0; }
+            done = done + k;
+            cnt;
+        }
+        # one native sector through a bounce page (read-modify-write)
+        val bp: u64 = pmm.alloc();
+        if (bp == 0) { ret 0; }
+        val bv: u64 = vmm.phys_to_virt(bp);
+        val within: u64 = at % per;
+        var k: u64 = per - within;
+        if (k > n - done) { k = n - done; }
+        var ok: u8 = rw(c, 0, at / per, bv, per * 512);
+        if (ok != 0) {
+            if (write != 0) {
+                mem.copy(bv + within * 512, buf + done * 512, k * 512);
+                ok = rw(c, 1, at / per, bv, per * 512);
+            } or {
+                mem.copy(buf + done * 512, bv + within * 512, k * 512);
+            }
+        }
+        pmm.free(bp);
+        if (ok == 0) { ret 0; }
+        done = done + k;
+    }
+    ret 1;
+}
+
+pub fun read(i: u64, s: u64, n: u64, buf: u64) u8 { ret transfer(?ctrls[i], 0, s, n, buf); }
+pub fun write(i: u64, s: u64, n: u64, buf: u64) u8 { ret transfer(?ctrls[i], 1, s, n, buf); }
+
+pub fun flush(i: u64) u8 {
+    var cmd: [16]u32;
+    clear(?cmd[0]);
+    cmd[0] = 0x00;
+    cmd[1] = 1;
+    if (submit(?ctrls[i], 1, ?cmd[0]) != 0) { ret 0; }
+    ret 1;
+}

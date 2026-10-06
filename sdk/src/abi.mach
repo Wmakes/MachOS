@@ -250,6 +250,7 @@ pub rec Stat {
     mode:  u64; # permission bits (07777)
     uid:   u64;
     gid:   u64;
+    sector: u64; # a disk's (or partition's) sector size, 0 otherwise
 }
 
 pub rec Entry {

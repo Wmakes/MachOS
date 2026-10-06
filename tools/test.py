@@ -14,6 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 P = r"[$#] "  # the shell prompt (# for root)
 TARGET = os.path.join(ROOT, "out", "headless", "target.img")
 BROKEN = os.path.join(ROOT, "out", "headless", "broken.img")
+NVME_TARGET = os.path.join(ROOT, "out", "headless", "nvme-target.img")
 
 
 def sh(cmd):
@@ -66,6 +67,9 @@ def broken_clean_on_host():
     sh("rm -f out/headless/p.img")
     return "" if re.search(r"Fix|Popraw", out) is None else "e2fsck still finds problems"
 
+USB = ["--qemu=-machine", "--qemu=i8042=off", "--qemu=-device", "--qemu=qemu-xhci,id=xhci",
+       "--qemu=-device", "--qemu=usb-kbd,bus=xhci.0"]
+
 TESTS = [
     # name, keep previous disk, fsck, steps, expected output in order
     ("boot", False, False,
@@ -96,6 +100,16 @@ TESTS = [
       "keys:echo ps2 hist<ret>", "wait:" + P, "keys:<up><left><left><left><left>X<ret>", "wait:" + P],
      ["one", "two", "echo one\none", "tab-ok", "Welcome", "world", "junk^C", "canon\ncanon",
       "ps2 Xhist"]),
+
+    # a USB keyboard on xHCI with the PS/2 controller switched off; a key
+    # held for 900 ms repeats
+    ("usb-keyboard", False, False,
+     USB + ["wait:" + P, "keys:echo USB_kbd ok!<ret>", "wait:" + P,
+      "keys:<up><left><left><left>X<ret>", "wait:" + P,
+      "keys:junk<ctrl-c>", "wait:" + P,
+      "keys:echo [<x 900>]<ret>", "wait:" + P],
+     ["usb: 1 xhci controller(s), 1 keyboard(s)", "USB_kbd ok!", "USB_kbd Xok!", "junk^C",
+      "[xxxxxxxxxx"]),
 
     ("tools", False, False,
      ["wait:" + P,
@@ -216,6 +230,21 @@ TESTS = [
      ["sdb", "/dev/sdb2 MachOS root 446 MiB", "mkfat: FAT32", "mkext2:", "copying the system",
       "is installed on /dev/sdb", "sdb1", "sdb2", "bin/", "unmounted"]),
 
+    ("nvme-boot", False, False,
+     ["--nvme", "wait:" + P, "send:df; ls /dev; echo \"[$(partname /dev/nvme0n1 2)]\"\\n", "wait:" + P],
+     ["disk: nvme0n1", "root: ext2 on /dev/nvme0n1p2", "/dev/nvme0n1p2", "nvme0n1p1",
+      "[/dev/nvme0n1p2]"]),
+
+    ("nvme-install", False, False,
+     ["--disk2", "blank:" + NVME_TARGET, "--disk2", "nvme:" + NVME_TARGET,
+      "wait:" + P, "send:install /dev/nvme0n1\\n", "wait:continue: ", "send:yes\\n", "wait:installed on",
+      "wait:" + P],
+     ["/dev/nvme0n1p1 EFI system", "mkfat: FAT32", "copying the system", "installed on /dev/nvme0n1"]),
+
+    ("nvme-installed-boot", False, True,
+     ["--boot", NVME_TARGET, "--nvme", "wait:" + P, "send:df\\n", "wait:" + P, "sleep:1"],
+     ["root: ext2 on /dev/nvme0n1p2", "/dev/nvme0n1p2"]),
+
     ("installed-boot", False, True,
      ["--boot", TARGET, "wait:" + P,
       "send:uname; ls /boot; echo on-installed > /home/x; cat /home/x; mkdir /mnt; mount /dev/sda2 /mnt\\n", "wait:" + P,
@@ -245,6 +274,10 @@ def run(name, keep, fsck, steps, expect, profile):
             post = val
             steps = steps[2:]
             continue
+        if opt == "--nvme" or "=" in opt:  # takes no value (or has it inside)
+            cmd.append(opt)
+            steps = steps[1:]
+            continue
         if callable(val):
             val = val()
         if opt == "--rescue":
@@ -255,6 +288,9 @@ def run(name, keep, fsck, steps, expect, profile):
             val = val[len("blank:"):]
             with open(val, "wb") as f:
                 f.truncate(512 << 20)
+        if opt == "--disk2" and "--disk2" in cmd:  # a later --disk2 replaces an earlier one
+            i = cmd.index("--disk2")
+            del cmd[i:i + 2]
         cmd += [opt, val]
         steps = steps[2:]
     # every boot but rescue mode starts at a login prompt: log in as root
@@ -290,6 +326,7 @@ def main():
     ap.add_argument("-p", "--profile", default="debug")
     ap.add_argument("names", nargs="*")
     a = ap.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)  # progress shows even when logged to a file
     PROFILE[0] = a.profile
     chosen = [t for t in TESTS if not a.names or t[0] in a.names]
     failed = 0

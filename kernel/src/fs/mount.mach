@@ -4,7 +4,7 @@
 # raw
 
 use abi:   sdk.abi;
-use ahci:  machos.dev.ahci;
+use dsk:  machos.dev.disk;
 use heap:  machos.mm.heap;
 use blk:   machos.fs.blk;
 use ext2:  machos.fs.ext2;
@@ -15,7 +15,7 @@ pub val MAX: u64 = 8;
 
 rec Mount {
     used:  u8;
-    disk:  u64;      # AHCI disk index
+    disk:  u64;      # index in dev/disk
     start: u64;      # first sector of the filesystem
     part:  *blk.Part;
     fs:    *ext2.Fs;
@@ -36,7 +36,7 @@ fun free_slot() *Mount {
 # open the ext2 filesystem on `b`; *why says what is wrong with it
 fun open_fs(b: *parts.Bdev, part: **blk.Part, fs: **ext2.Fs, why: **u8) u64 {
     @why = nil;
-    val d: *ahci.Disk = parts.disk_of(b);
+    val d: *dsk.Disk = parts.disk_of(b);
     blk.forget_disk(d); # the disk may have just been written raw
     val p: *blk.Part = heap.zalloc($size_of(blk.Part)::u64)::*blk.Part;
     if (p == nil) { ret abi.err(abi.E_NOMEM); }

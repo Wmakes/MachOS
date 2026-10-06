@@ -9,7 +9,7 @@ use tty:    machos.kern.tty;
 use proc:   machos.kern.proc;
 use kprint: machos.kern.kprint;
 use mem:    machos.kern.mem;
-use ahci:   machos.dev.ahci;
+use dsk:  machos.dev.disk;
 use blk:    machos.fs.blk;
 use mount:  machos.fs.mount;
 use parts:  machos.fs.parts;
@@ -92,8 +92,8 @@ val BOUNCE: u64 = 65536;
 fun disk_io(h: *Handle, buf: u64, n: u64, write: u8) u64 {
     val b: *parts.Bdev = parts.get(h.node.dev);
     if (b == nil) { ret abi.err(abi.E_IO); }
-    val d: *ahci.Disk = parts.disk_of(b);
-    val size: u64 = b.count * ahci.SECTOR;
+    val d: *dsk.Disk = parts.disk_of(b);
+    val size: u64 = b.count * dsk.SECTOR;
     if (h.offset >= size) { ret 0; }
     var want: u64 = n;
     if (want > size - h.offset) { want = size - h.offset; }
@@ -109,19 +109,19 @@ fun disk_io(h: *Handle, buf: u64, n: u64, write: u8) u64 {
     var done: u64 = 0;
     for (done < want) {
         val at: u64 = h.offset + done;
-        val within: u64 = at % ahci.SECTOR;
+        val within: u64 = at % dsk.SECTOR;
         var k: u64 = BOUNCE - within;
         if (k > want - done) { k = want - done; }
-        val secs: u64 = (within + k + ahci.SECTOR - 1) / ahci.SECTOR;
-        val lba: u64 = b.start + at / ahci.SECTOR;
-        if (write == 0 || within != 0 || k % ahci.SECTOR != 0) {
-            if (ahci.read(d, lba, secs, bounce) == 0) { brk; }
+        val secs: u64 = (within + k + dsk.SECTOR - 1) / dsk.SECTOR;
+        val lba: u64 = b.start + at / dsk.SECTOR;
+        if (write == 0 || within != 0 || k % dsk.SECTOR != 0) {
+            if (dsk.read(d, lba, secs, bounce) == 0) { brk; }
         }
         if (write == 0) {
             mem.copy(buf + done, bounce + within, k);
         } or {
             mem.copy(bounce + within, buf + done, k);
-            if (ahci.write(d, lba, secs, bounce) == 0) { brk; }
+            if (dsk.write(d, lba, secs, bounce) == 0) { brk; }
         }
         done = done + k;
     }

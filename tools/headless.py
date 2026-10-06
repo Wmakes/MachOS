@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Boot MachOS under QEMU with no window and drive it from a script.
 
-usage: tools/headless.py [-p release] [-t SECONDS] [--keep] [--fsck] [--disk2 IMG] [--boot IMG] [--rescue] STEP...
+usage: tools/headless.py [-p release] [-t SECONDS] [--keep] [--fsck] [--disk2 [nvme:]IMG]
+                         [--boot IMG] [--rescue] [--nvme] [--qemu ARG]... STEP...
 
 The cpu is QEMU's "max" (with SMEP/SMAP) unless QEMU_CPU says otherwise.
 The disk is rebuilt fresh unless --keep is given (then files written by an
@@ -12,7 +13,8 @@ steps run in order:
   wait:REGEX     wait until the serial output (since the last wait) matches
   send:TEXT      type TEXT on the serial port (\\n is Enter, \\x03 is ^C)
   keys:TEXT      type TEXT on the PS/2 keyboard (via the QEMU monitor);
-                 <up>, <left>, <tab>, ... press named keys
+                 <up>, <left>, <tab>, ... press named keys,
+                 <x 900> holds x down for 900 ms
   sleep:SECONDS  pause
   shot:PATH      save a PNG screenshot of the framebuffer
 
@@ -46,6 +48,20 @@ def keyname(c):
     return KEYNAMES.get(c, c)
 
 
+def disk_args(path, ident, nvme):
+    """QEMU arguments attaching a raw image as a SATA (q35's AHCI) or NVMe
+    disk; an "nvme4k:" path is an NVMe disk with 4 KiB sectors"""
+    if path.startswith("nvme4k:"):
+        path = path[len("nvme4k:"):]
+        return ["-drive", f"format=raw,file={path},if=none,id={ident}",
+                "-device", f"nvme,serial=machos-{ident},drive={ident},"
+                           "logical_block_size=4096,physical_block_size=4096"]
+    if not nvme:
+        return ["-drive", f"format=raw,file={path}"]
+    return ["-drive", f"format=raw,file={path},if=none,id={ident}",
+            "-device", f"nvme,serial=machos-{ident},drive={ident}"]
+
+
 def connect(path, deadline):
     while True:
         try:
@@ -67,6 +83,8 @@ def main():
     ap.add_argument("--disk2", help="attach this raw image as a second disk")
     ap.add_argument("--boot", help="boot this image as it is instead of building one")
     ap.add_argument("--rescue", action="store_true", help="boot the rescue entry")
+    ap.add_argument("--nvme", action="store_true", help="attach the boot disk as NVMe instead of SATA")
+    ap.add_argument("--qemu", action="append", default=[], help="one more QEMU argument")
     ap.add_argument("steps", nargs="*")
     a = ap.parse_args()
 
@@ -82,17 +100,18 @@ def main():
     for p in (ser, mon):
         if os.path.exists(p):
             os.remove(p)
+    # fresh firmware variables every time: old boot entries must not decide
     vars_fd = os.path.join(out, "vars.fd")
-    if not os.path.exists(vars_fd):
-        subprocess.run(["cp", OVMF_VARS, vars_fd], check=True)
+    subprocess.run(["cp", OVMF_VARS, vars_fd], check=True)
 
     qemu = subprocess.Popen([
         "qemu-system-x86_64", "-M", "q35", "-cpu", os.environ.get("QEMU_CPU", "max"), "-m", "256M",
         "-display", "none",
         "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF_CODE}",
         "-drive", f"if=pflash,format=raw,file={vars_fd}",
-        "-drive", f"format=raw,file={img}",
-        *(["-drive", f"format=raw,file={a.disk2}"] if a.disk2 else []),
+        *disk_args(img, "boot", a.nvme),
+        *(disk_args(a.disk2.removeprefix("nvme:"), "second", a.disk2.startswith("nvme:")) if a.disk2 else []),
+        *a.qemu,
         "-chardev", f"socket,id=s0,path={ser},server=on,wait=off",
         "-serial", "chardev:s0",
         "-monitor", f"unix:{mon},server,nowait",
@@ -156,10 +175,13 @@ def main():
                     s.sendall(b"\r" if ch == "\n" else ch.encode())
                     time.sleep(0.01)
             elif kind == "keys":
-                # <name> presses a named key (<up>, <left>, <tab>, ...)
-                for tok in re.findall(r"<[a-z_0-9-]+>|.", arg.encode().decode("unicode_escape"), re.S):
+                # <name> presses a named key (<up>, <left>, <tab>, ...);
+                # <name MS> holds it down for MS milliseconds
+                for tok in re.findall(r"<[a-z_0-9-]+(?: [0-9]+)?>|.", arg.encode().decode("unicode_escape"), re.S):
                     if len(tok) > 2 and tok[0] == "<":
                         monitor("sendkey " + tok[1:-1])
+                        if " " in tok:
+                            time.sleep(int(tok[1:-1].split()[1]) / 1000 + 0.1)
                     else:
                         monitor("sendkey " + keyname(tok))
             elif kind == "sleep":
