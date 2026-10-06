@@ -70,6 +70,12 @@ def broken_clean_on_host():
 USB = ["--qemu=-machine", "--qemu=i8042=off", "--qemu=-device", "--qemu=qemu-xhci,id=xhci",
        "--qemu=-device", "--qemu=usb-kbd,bus=xhci.0"]
 
+USB_HUB = ["--qemu=-machine", "--qemu=i8042=off", "--qemu=-device", "--qemu=qemu-xhci,id=xhci",
+           "--qemu=-device", "--qemu=usb-hub,bus=xhci.0,port=2",
+           "--qemu=-device", "--qemu=usb-hub,bus=xhci.0,port=2.1",
+           "--qemu=-device", "--qemu=usb-mouse,bus=xhci.0,port=2.2",
+           "--qemu=-device", "--qemu=usb-kbd,bus=xhci.0,port=2.1.4"]
+
 TESTS = [
     # name, keep previous disk, fsck, steps, expected output in order
     ("boot", False, False,
@@ -110,6 +116,11 @@ TESTS = [
       "keys:echo [<x 900>]<ret>", "wait:" + P],
      ["usb: 1 xhci controller(s), 1 keyboard(s)", "USB_kbd ok!", "USB_kbd Xok!", "junk^C",
       "[xxxxxxxxxx"]),
+
+    # the keyboard two hubs deep, next to a mouse
+    ("usb-hub", False, False,
+     USB_HUB + ["wait:" + P, "keys:echo Behind_hubs<ret>", "wait:" + P],
+     ["usb: 1 xhci controller(s), 1 keyboard(s)", "Behind_hubs"]),
 
     ("tools", False, False,
      ["wait:" + P,
