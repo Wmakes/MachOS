@@ -1,10 +1,12 @@
 # sh: the MachOS shell.
 #   words, 'single' and "double" quotes, \escapes, # comments,
-#   $? (last status), $0-$9 and $# (script arguments)
+#   $? (last status), $0-$9 and $# (script arguments), $$ (the shell's pid),
+#   $NAME and ${NAME} (variables), ~ (home)
+#   NAME=value  set a variable; NAME=value cmd  run cmd with it in its environment
+#   builtins: cd pwd exit jobs export unset set
 #   a | b | c        pipelines
 #   < f  > f  >> f   redirections, also N< f  N> f  N>> f  N>&M  N>&-  (fds 0-9)
 #   a ; b   a && b   a || b   a &   sequencing, conditionals, background
-#   builtins: cd pwd exit jobs
 #   on a terminal: line editing, history and tab completion (sh/edit.mach)
 # usage: sh                 interactive on the console
 #        sh FILE            run the commands in FILE
@@ -15,6 +17,8 @@ use sys: sdk.sys;
 use io:  sdk.io;
 use rt:  sdk.rt;
 use edit: userland.sh.edit;
+use env:  sdk.env;
+use path: sdk.path;
 
 val T_WORD:   u8 = 1;
 val T_PIPE:   u8 = 2;
@@ -34,6 +38,10 @@ val MAX_BG:   u64 = 16;
 val NONE:     u64 = 0xFFFFFFFFFFFFFFFF;
 val STATUS_MARK: u8 = 1; # stands for $? inside a word until it runs
 val PARAM_MARK:  u8 = 2; # followed by '0'-'9' or '#': $N / $#
+val VAR_MARK:    u8 = 3; # $NAME: VAR_MARK, the name, VAR_END
+val VAR_END:     u8 = 4;
+val PID_MARK:    u8 = 5; # $$
+val HOME_MARK:   u8 = 6; # a leading ~
 
 var tk: [128]u8;  # token kinds
 var ts: [128]u64; # word start in wbuf
@@ -48,6 +56,85 @@ var bg: [16]u64;
 var nbg: u64 = 0;
 var quit: u8 = 0;
 var params: **u8 = nil; # $0 $1 ... (a script's path and arguments)
+
+# variables that are not exported (exported ones live in sdk.env)
+val NVARS: u64 = 64;
+var var_names: [64][32]u8;
+var var_name_len: [64]u64;
+var var_vals: [64][256]u8;
+var var_val_len: [64]u64;
+var nvars: u64 = 0;
+
+fun local_find(name: *u8, n: u64) u64 {
+    var i: u64 = 0;
+    for (i < nvars) {
+        if (io.eq(?var_names[i][0], var_name_len[i], name, n) != 0) { ret i; }
+        i = i + 1;
+    }
+    ret NVARS;
+}
+
+fun local_unset(name: *u8, n: u64) {
+    val i: u64 = local_find(name, n);
+    if (i == NVARS) { ret; }
+    var k: u64 = i;
+    for (k + 1 < nvars) {
+        io.copy(?var_names[k][0], ?var_names[k + 1][0], 32);
+        var_name_len[k] = var_name_len[k + 1];
+        io.copy(?var_vals[k][0], ?var_vals[k + 1][0], 256);
+        var_val_len[k] = var_val_len[k + 1];
+        k = k + 1;
+    }
+    nvars = nvars - 1;
+}
+
+# a variable's value (n bytes in *len), shell variables first, or nil
+fun var_get(name: *u8, n: u64, len: *u64) *u8 {
+    val i: u64 = local_find(name, n);
+    if (i != NVARS) {
+        @len = var_val_len[i];
+        ret ?var_vals[i][0];
+    }
+    val v: *u8 = env.getn(name, n);
+    if (v == nil) { ret nil; }
+    @len = io.len(v);
+    ret v;
+}
+
+# NAME=value: an exported variable stays exported, others are the shell's
+fun var_set(name: *u8, n: u64, val_: *u8, vn: u64) {
+    if (env.getn(name, n) != nil) {
+        env.setn(name, n, val_, vn);
+        ret;
+    }
+    var i: u64 = local_find(name, n);
+    if (i == NVARS) {
+        if (nvars == NVARS || n > 31) { ret; }
+        i = nvars;
+        nvars = nvars + 1;
+        io.copy(?var_names[i][0], name, n);
+        var_name_len[i] = n;
+    }
+    var k: u64 = vn;
+    if (k > 255) { k = 255; }
+    io.copy(?var_vals[i][0], val_, k);
+    var_val_len[i] = k;
+}
+
+fun name_char(c: u8, first: u8) u8 {
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) { ret 1; }
+    if (first == 0 && c >= 48 && c <= 57) { ret 1; }
+    ret 0;
+}
+
+# the length of NAME in a NAME=value word (raw bytes), or 0
+fun assignment(w: *u8, n: u64) u64 {
+    if (n == 0 || name_char(w[0], 1) == 0) { ret 0; }
+    var i: u64 = 1;
+    for (i < n && name_char(w[i], 0) != 0) { i = i + 1; }
+    if (i < n && w[i] == 61) { ret i; }
+    ret 0;
+}
 var nparams: u64 = 0;
 var interactive: u8 = 0;
 
@@ -94,6 +181,34 @@ fun expand(t: u64, out: *u8, cap: u64) u64 {
             if (n + k >= cap) { ret NONE; }
             io.copy(?out[n], ?num[0], k);
             n = n + k;
+        } or (w[i] == VAR_MARK) {
+            val ns: u64 = i + 1;
+            var ne: u64 = ns;
+            for (ne < tl[t] && w[ne] != VAR_END) { ne = ne + 1; }
+            var vl: u64 = 0;
+            val v: *u8 = var_get(?w[ns], ne - ns, ?vl);
+            if (v != nil) {
+                if (n + vl >= cap) { ret NONE; }
+                io.copy(?out[n], v, vl);
+                n = n + vl;
+            }
+            i = ne;
+        } or (w[i] == PID_MARK) {
+            var num: [20]u8;
+            val k: u64 = io.fmt_dec(sys.getpid(), ?num[0]);
+            if (n + k >= cap) { ret NONE; }
+            io.copy(?out[n], ?num[0], k);
+            n = n + k;
+        } or (w[i] == HOME_MARK) {
+            var vl: u64 = 0;
+            var v: *u8 = var_get("HOME\0", 4, ?vl);
+            if (v == nil) {
+                v = "/\0";
+                vl = 1;
+            }
+            if (n + vl >= cap) { ret NONE; }
+            io.copy(?out[n], v, vl);
+            n = n + vl;
         } or (w[i] == PARAM_MARK && i + 1 < tl[t]) {
             i = i + 1;
             var num: [20]u8;
@@ -119,6 +234,58 @@ fun expand(t: u64, out: *u8, cap: u64) u64 {
     }
     out[n] = 0;
     ret n;
+}
+
+var dollar_end: u64 = 0;
+
+# a $ expansion at line[i] (line[i] == '$'): pushes its markers and returns
+# the index after it (also left in dollar_end), or i when what follows is
+# not an expansion (then nothing is pushed)
+fun dollar(line: *u8, n: u64, i: u64) u64 {
+    dollar_end = scan_dollar(line, n, i);
+    ret dollar_end;
+}
+
+fun scan_dollar(line: *u8, n: u64, i: u64) u64 {
+    if (i + 1 >= n) { ret i; }
+    val c: u8 = line[i + 1];
+    if (c == 63) {
+        push(STATUS_MARK);
+        ret i + 2;
+    }
+    if (c == 36) {
+        push(PID_MARK);
+        ret i + 2;
+    }
+    if ((c >= 48 && c <= 57) || c == 35) {
+        push(PARAM_MARK);
+        push(c);
+        ret i + 2;
+    }
+    if (c == 123) { # ${NAME}
+        var k: u64 = i + 2;
+        for (k < n && line[k] != 125) { k = k + 1; }
+        if (k >= n || k == i + 2) { ret i; }
+        push(VAR_MARK);
+        var j: u64 = i + 2;
+        for (j < k) {
+            push(line[j]);
+            j = j + 1;
+        }
+        push(VAR_END);
+        ret k + 1;
+    }
+    if (name_char(c, 1) != 0) {
+        push(VAR_MARK);
+        var k: u64 = i + 1;
+        for (k < n && name_char(line[k], 0) != 0) {
+            push(line[k]);
+            k = k + 1;
+        }
+        push(VAR_END);
+        ret k;
+    }
+    ret i;
 }
 
 fun syntax(msg: *u8) u8 {
@@ -200,18 +367,18 @@ fun lex(line: *u8, n: u64) u8 {
             } or (d == 34) { # "with \escapes and $?"
                 i = i + 1;
                 for (i < n && line[i] != 34) {
-                    if (line[i] == 36 && i + 1 < n && line[i + 1] == 63) {
-                        push(STATUS_MARK);
-                        i = i + 2;
-                        cnt;
+                    if (line[i] == 36) {
+                        val after: u64 = dollar(line, n, i);
+                        if (after != i) {
+                            i = after;
+                            cnt;
+                        }
                     }
-                    if (line[i] == 36 && i + 1 < n && ((line[i + 1] >= 48 && line[i + 1] <= 57) || line[i + 1] == 35)) {
-                        push(PARAM_MARK);
-                        push(line[i + 1]);
-                        i = i + 2;
-                        cnt;
+                    # in double quotes a backslash only escapes $ ` " and \ (POSIX)
+                    if (line[i] == 92 && i + 1 < n &&
+                        (line[i + 1] == 36 || line[i + 1] == 96 || line[i + 1] == 34 || line[i + 1] == 92)) {
+                        i = i + 1;
                     }
-                    if (line[i] == 92 && i + 1 < n) { i = i + 1; }
                     push(line[i]);
                     i = i + 1;
                 }
@@ -220,13 +387,11 @@ fun lex(line: *u8, n: u64) u8 {
             } or (d == 92 && i + 1 < n) {
                 push(line[i + 1]);
                 i = i + 2;
-            } or (d == 36 && i + 1 < n && line[i + 1] == 63) { # $?, expanded when run
-                push(STATUS_MARK);
-                i = i + 2;
-            } or (d == 36 && i + 1 < n && ((line[i + 1] >= 48 && line[i + 1] <= 57) || line[i + 1] == 35)) {
-                push(PARAM_MARK);
-                push(line[i + 1]);
-                i = i + 2;
+            } or (d == 36 && dollar(line, n, i) != i) { # expanded when it runs
+                i = dollar_end;
+            } or (d == 126 && wlen == start && (i + 1 >= n || line[i + 1] == 47 || is_space(line[i + 1]) != 0)) {
+                push(HOME_MARK); # a leading ~
+                i = i + 1;
             } or {
                 push(d);
                 i = i + 1;
@@ -251,7 +416,8 @@ fun cwd(buf: *u8, cap: u64) u64 {
 # run a builtin if `name` is one; returns 0 if it is not
 fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
     if (io.streq(name, "cd\0") != 0) {
-        var dir: *u8 = "/\0";
+        var dir: *u8 = env.get("HOME\0");
+        if (dir == nil) { dir = "/\0"; }
         if (argc > 1) { dir = args[1]; }
         val r: u64 = sys.chdir(dir, io.len(dir));
         if (abi.is_err(r) != 0) {
@@ -280,6 +446,65 @@ fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
         quit = 1;
         ret 1;
     }
+    if (io.streq(name, "export\0") != 0) {
+        if (argc == 1) {
+            var i: u64 = 0;
+            for (i < env.size()) {
+                write_to(out, "export \0");
+                write_to(out, env.nth(i));
+                write_to(out, "\n\0");
+                i = i + 1;
+            }
+        }
+        var a: u64 = 1;
+        for (a < argc) {
+            val w: *u8 = args[a];
+            val wn: u64 = io.len(w);
+            val eq: u64 = assignment(w, wn);
+            if (eq != 0) {
+                local_unset(w, eq);
+                env.setn(w, eq, ?w[eq + 1], wn - eq - 1);
+            } or {
+                # export an existing shell variable as it is
+                val li: u64 = local_find(w, wn);
+                if (li != NVARS) {
+                    env.setn(w, wn, ?var_vals[li][0], var_val_len[li]);
+                    local_unset(w, wn);
+                }
+            }
+            a = a + 1;
+        }
+        status = 0;
+        ret 1;
+    }
+    if (io.streq(name, "unset\0") != 0) {
+        var a: u64 = 1;
+        for (a < argc) {
+            local_unset(args[a], io.len(args[a]));
+            env.unset(args[a]);
+            a = a + 1;
+        }
+        status = 0;
+        ret 1;
+    }
+    if (io.streq(name, "set\0") != 0) {
+        var i: u64 = 0;
+        for (i < nvars) {
+            io.write_all(out, ?var_names[i][0], var_name_len[i]);
+            write_to(out, "=\0");
+            io.write_all(out, ?var_vals[i][0], var_val_len[i]);
+            write_to(out, "\n\0");
+            i = i + 1;
+        }
+        i = 0;
+        for (i < env.size()) {
+            write_to(out, env.nth(i));
+            write_to(out, "\n\0");
+            i = i + 1;
+        }
+        status = 0;
+        ret 1;
+    }
     if (io.streq(name, "jobs\0") != 0) {
         var i: u64 = 0;
         for (i < nbg) {
@@ -297,36 +522,15 @@ fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
 
 fun is_builtin(name: *u8) u8 {
     if (io.streq(name, "cd\0") != 0 || io.streq(name, "pwd\0") != 0 ||
-        io.streq(name, "exit\0") != 0 || io.streq(name, "jobs\0") != 0) { ret 1; }
+        io.streq(name, "exit\0") != 0 || io.streq(name, "jobs\0") != 0 ||
+        io.streq(name, "export\0") != 0 || io.streq(name, "unset\0") != 0 ||
+        io.streq(name, "set\0") != 0) { ret 1; }
     ret 0;
 }
 
 # "/bin/" + name unless name already has a slash; 0 if it does not exist
-fun resolve(name: *u8, out: *u8) u64 {
-    val n: u64 = io.len(name);
-    var has_slash: u8 = 0;
-    var i: u64 = 0;
-    for (i < n) {
-        if (name[i] == 47) { has_slash = 1; }
-        i = i + 1;
-    }
-    var len: u64 = 0;
-    if (has_slash == 0) {
-        if (n + 5 >= 256) { ret 0; }
-        io.copy(out, "/bin/\0", 5);
-        io.copy(?out[5], name, n);
-        len = n + 5;
-    } or {
-        if (n >= 256) { ret 0; }
-        io.copy(out, name, n);
-        len = n;
-    }
-    out[len] = 0;
-    var st: abi.Stat;
-    val r: u64 = sys.stat(out, len, ?st);
-    if (abi.is_err(r) != 0 || st.kind != abi.KIND_FILE) { ret 0; }
-    ret len;
-}
+# where `name` runs from (see sdk.path); 0 if nowhere
+fun resolve(name: *u8, out: *u8) u64 { ret path.lookup(name, out); }
 
 fun close_if(h: u64, keep: u64) {
     if (h != NONE && h != keep) { sys.close(h); }
@@ -419,14 +623,31 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
             next_read = ends[0];
         }
 
-        # arguments and redirections
+        # arguments, NAME=value assignments before them, and redirections
         var args: [32]*u8;
         var argc: u64 = 0;
         var abuf: [2048]u8;
         var alen: u64 = 0;
         var bad: u8 = 0;
+        var nassign: u64 = 0;
+        var assign_at: [16]u64;  # where each "NAME=value" sits in abuf
+        var assign_eq: [16]u64;  # the length of its NAME
         var u: u64 = cs[c];
         for (u < ce[c] && bad == 0) {
+            if (tk[u] == T_WORD && argc == 0 && nassign < 16 && assignment(word(u), tl[u]) != 0) {
+                val wl: u64 = expand(u, ?abuf[alen], 2048 - alen);
+                if (wl == NONE) {
+                    syntax("too many arguments\0");
+                    bad = 1;
+                    brk;
+                }
+                assign_at[nassign] = alen;
+                assign_eq[nassign] = assignment(?abuf[alen], wl);
+                nassign = nassign + 1;
+                alen = alen + wl + 1;
+                u = u + 1;
+                cnt;
+            }
             if (tk[u] == T_WORD) {
                 val wl: u64 = expand(u, ?abuf[alen], 2048 - alen);
                 if (argc == 31 || wl == NONE) {
@@ -482,6 +703,20 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
             u = u + 2;
         }
         args[argc] = nil;
+        if (bad == 0 && argc == 0 && nassign > 0 && k == 1) {
+            # only assignments: they set shell variables
+            var q: u64 = 0;
+            for (q < nassign) {
+                val w: *u8 = ?abuf[assign_at[q]];
+                val eq: u64 = assign_eq[q];
+                var vl: u64 = io.len(w);
+                var_set(w, eq, ?w[eq + 1], vl - eq - 1);
+                q = q + 1;
+            }
+            status = 0;
+            opened_close();
+            ret;
+        }
         if (bad == 0 && argc == 0) {
             syntax("missing command\0");
             bad = 1;
@@ -512,7 +747,42 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
                     f = f + 1;
                 }
                 how.group = g;
-                val pid: u64 = sys.spawn(?full[0], fl, ?abuf[0], alen, ?how);
+                how.map_fds = 1;
+                how.env = nil;
+                how.env_len = 0;
+                # NAME=value before the command: in its environment only
+                var envbuf: [16384]u8;
+                if (nassign > 0) {
+                    var saved: [16][256]u8;
+                    var had: [16]u64; # old value length + 1, 0 when unset
+                    var q: u64 = 0;
+                    for (q < nassign) {
+                        val w: *u8 = ?abuf[assign_at[q]];
+                        val eq: u64 = assign_eq[q];
+                        val old: *u8 = env.getn(w, eq);
+                        had[q] = 0;
+                        if (old != nil) {
+                            var ol: u64 = io.len(old);
+                            if (ol > 255) { ol = 255; }
+                            io.copy(?saved[q][0], old, ol);
+                            had[q] = ol + 1;
+                        }
+                        env.setn(w, eq, ?w[eq + 1], io.len(w) - eq - 1);
+                        q = q + 1;
+                    }
+                    how.env_len = env.pack(?envbuf[0], 16384);
+                    how.env = ?envbuf[0];
+                    q = nassign;
+                    for (q > 0) {
+                        q = q - 1;
+                        val w: *u8 = ?abuf[assign_at[q]];
+                        if (had[q] != 0) { env.setn(w, assign_eq[q], ?saved[q][0], had[q] - 1); }
+                        or               { env.unsetn(w, assign_eq[q]); }
+                    }
+                }
+                var astart: u64 = 0;
+                if (nassign > 0) { astart = assign_at[nassign - 1] + io.len(?abuf[assign_at[nassign - 1]]) + 1; }
+                val pid: u64 = sys.spawn(?full[0], fl, ?abuf[astart], alen - astart, ?how);
                 if (abi.is_err(pid) != 0) {
                     io.fail("sh\0", args[0], pid);
                     status = 126;

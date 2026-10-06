@@ -1,6 +1,7 @@
 # system call wrappers for user programs (the interface: abi/sys.mach)
 
 use abi: sdk.abi;
+use env: sdk.env;
 
 # syscall(n, a, b, c, d, e): a plain function call, so the compiler already
 # treats rcx and r11 (which `syscall` overwrites) as clobbered
@@ -27,8 +28,24 @@ pub fun write(h: u64, buf: *u8, n: u64) u64 { ret raw(abi.WRITE, h, buf::u64, n,
 pub fun open(p: *u8, n: u64, flags: u64) u64 { ret raw(abi.OPEN, p::u64, n, flags, 0, 0); }
 pub fun close(h: u64) u64 { ret raw(abi.CLOSE, h, 0, 0, 0, 0); }
 
+var env_buf: [16384]u8;
+
+# start a program. `how` may be nil (inherit fds, same process group); its
+# env, when nil, is this process's environment
 pub fun spawn(p: *u8, n: u64, args: *u8, args_len: u64, how: *abi.Spawn) u64 {
-    ret raw(abi.SPAWN, p::u64, n, args::u64, args_len, how::u64);
+    var dflt: abi.Spawn;
+    var h: *abi.Spawn = how;
+    if (h == nil) {
+        dflt.map_fds = 0;
+        dflt.group = 0;
+        dflt.env = nil;
+        h = ?dflt;
+    }
+    if (h.env == nil) {
+        h.env_len = env.pack(?env_buf[0], 16384);
+        h.env = ?env_buf[0];
+    }
+    ret raw(abi.SPAWN, p::u64, n, args::u64, args_len, h::u64);
 }
 pub fun wait(pid: u64) u64 { ret raw(abi.WAIT, pid, 0, 0, 0, 0); }
 pub fun poll(pid: u64) u64 { ret raw(abi.WAIT, pid, abi.WAIT_NOHANG, 0, 0, 0); }

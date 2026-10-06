@@ -1,14 +1,17 @@
-# program startup: the kernel enters _start with rdi = argc, rsi = argv;
-# every program defines `#[symbol("umain")] fun main(argc: u64, argv: **u8) u64`
-# and its result becomes the exit code
+# program startup: the kernel enters _start with rdi = argc, rsi = argv,
+# rdx = envp; every program defines
+#   #[symbol("umain")] fun main(argc: u64, argv: **u8) u64
+# and its result becomes the exit code. the environment is in sdk.env
 
-use sys: sdk.sys;
+use sys:   sdk.sys;
+use boot: sdk.start; # keeps sdk_envp linked in
 
 #[naked]
 #[symbol("_start")]
-fun start() {
+fun entry() {
     asm x86_64 {
         and rsp, -16
+        mov [sdk_envp], rdx
         call umain
         mov rsi, rax
         mov rdi, 0

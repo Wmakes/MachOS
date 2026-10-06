@@ -143,9 +143,9 @@ pub fun alloc() *Proc {
 fun kstack_top(p: *Proc) u64 { ret p.kstack + KSTACK; }
 
 # make `p` runnable so that it enters user mode at `rip` with stack `rsp`
-# and rdi, rsi set. builds the frame isr_return expects, plus a switch_to
-# frame that "returns" into isr_return
-pub fun start(p: *Proc, rip: u64, rsp: u64, rdi: u64, rsi: u64) {
+# and rdi, rsi, rdx set. builds the frame isr_return expects, plus a
+# switch_to frame that "returns" into isr_return
+pub fun start(p: *Proc, rip: u64, rsp: u64, rdi: u64, rsi: u64, rdx: u64) {
     var sp: u64 = kstack_top(p);
     sp = sp - $size_of(idt.Frame)::u64;
     val f: *idt.Frame = sp::*idt.Frame;
@@ -157,6 +157,7 @@ pub fun start(p: *Proc, rip: u64, rsp: u64, rdi: u64, rsi: u64) {
     f.ss = gdt.UDATA::u64 | 3;
     f.rdi = rdi;
     f.rsi = rsi;
+    f.rdx = rdx;
 
     # a clean fxsave image: x87 control word and MXCSR at their defaults
     sp = sp - idt.FPU_AREA;

@@ -1,0 +1,5 @@
+# what the kernel hands a program at its start, kept by rt's _start before
+# main runs (a module of its own so env and sys can read it without cycles)
+
+#[symbol("sdk_envp")]
+pub var envp: u64 = 0; # **u8: the environment, "NAME=value" strings, nil-ended

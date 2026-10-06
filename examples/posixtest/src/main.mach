@@ -5,6 +5,7 @@ use abi: sdk.abi;
 use sys: sdk.sys;
 use io:  sdk.io;
 use rt:  sdk.rt;
+use env: sdk.env;
 
 var failures: u64 = 0;
 
@@ -54,9 +55,21 @@ fun fds() {
     sys.remove(path, 14);
 }
 
+fun envs() {
+    check("HOME came from the parent\0", (env.get("HOME\0") != nil)::u8);
+    env.set("POSIXTEST_X\0", "forty two\0");
+    val v: *u8 = env.get("POSIXTEST_X\0");
+    check("setenv then getenv\0", (v != nil && io.streq(v, "forty two\0") != 0)::u8);
+    env.set("POSIXTEST_X\0", "changed\0");
+    check("setenv replaces\0", io.streq(env.get("POSIXTEST_X\0"), "changed\0"));
+    env.unset("POSIXTEST_X\0");
+    check("unsetenv\0", (env.get("POSIXTEST_X\0") == nil)::u8);
+}
+
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     fds();
+    envs();
     io.out("posixtest: \0");
     io.dec(failures);
     io.out(" failures\n\0");

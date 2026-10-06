@@ -27,6 +27,7 @@ use cpu:    machos.arch.x86_64.cpu;
 use fbcon:  machos.dev.fbcon;
 
 val ARGS_MAX: u64 = 65536;
+val ENV_MAX: u64 = 65536;
 val SYNC_EVERY: u64 = 5; # seconds: dirty blocks never wait longer than this
 
 var last_sync: u64 = 0; # tick of the last periodic sync
@@ -99,7 +100,7 @@ pub fun do_exit(code: u64) {
 # create a process running `nd`. hs[i] (a Handle, or 0 for closed) becomes
 # its fd i. returns the pid or an error
 fun spawn(parent: *proc.Proc, nd: *vfs.Node, full: *u8, full_len: u64,
-          args: u64, args_len: u64, hs: *[32]u64, group: u64) u64 {
+          args: u64, args_len: u64, env: u64, env_len: u64, hs: *[32]u64, group: u64) u64 {
     val c: *proc.Proc = proc.alloc();
     if (c == nil) { ret e(abi.E_AGAIN); }
     if (parent != nil) {
@@ -116,12 +117,14 @@ fun spawn(parent: *proc.Proc, nd: *vfs.Node, full: *u8, full_len: u64,
     or { c.group = group; }
     set_name(c, full, full_len);
 
-    val r: u64 = exec.load(c, nd, full, full_len, args, args_len);
+    var st: exec.Start;
+    val r: u64 = exec.load(c, nd, full, full_len, args, args_len, env, env_len, ?st);
     if (abi.is_err(r) != 0) {
         vmm.free_space(c.pml4);
         proc.reap(c);
         ret r;
     }
+    proc.start(c, st.entry, st.rsp, st.argc, st.argv, st.envp);
     var i: u64 = 0;
     for (i < abi.MAX_HANDLES) {
         val h: *file.Handle = (@hs)[i]::*file.Handle;
@@ -129,6 +132,12 @@ fun spawn(parent: *proc.Proc, nd: *vfs.Node, full: *u8, full_len: u64,
         i = i + 1;
     }
     ret c.pid;
+}
+
+fun env_add(buf: *u8, at: u64, s: *u8) u64 {
+    val n: u64 = mem.cstrlen(s);
+    mem.copy((?buf[at])::u64, s::u64, n + 1);
+    ret at + n + 1;
 }
 
 # start pid 1 from `p` with the console as its handles 0-2
@@ -145,7 +154,14 @@ pub fun spawn_init(p: *u8) u64 {
     hs[0] = h::u64;
     hs[1] = h::u64;
     hs[2] = h::u64;
-    val pid: u64 = spawn(nil, nd, p, n, p::u64, n + 1, ?hs, 0);
+    # the first environment. built piece by piece: mach does not keep a
+    # string literal's bytes after an embedded NUL
+    var env: [64]u8;
+    var el: u64 = 0;
+    el = env_add(?env[0], el, "PATH=/bin\0");
+    el = env_add(?env[0], el, "HOME=/\0");
+    el = env_add(?env[0], el, "TERM=machos\0");
+    val pid: u64 = spawn(nil, nd, p, n, p::u64, n + 1, (?env[0])::u64, el, ?hs, 0);
     file.close(h); # the child holds its own references now
     ret pid;
 }
@@ -161,24 +177,26 @@ fun sys_spawn(pva: u64, plen: u64, ava: u64, alen: u64, sva: u64) u64 {
     if (ok(ava, alen, 0) == 0) { ret e(abi.E_FAULT); }
 
     val p: *proc.Proc = cur();
+    if (ok(sva, $size_of(abi.Spawn)::u64, 0) == 0) { ret e(abi.E_FAULT); }
+    val sp: *abi.Spawn = sva::*abi.Spawn;
+    val env_len: u64 = sp.env_len;
+    if (env_len > ENV_MAX) { ret e(abi.E_INVAL); }
+    if (env_len > 0 && ok(sp.env::u64, env_len, 0) == 0) { ret e(abi.E_FAULT); }
     var hs: [32]u64;
-    var group: u64 = 0;
+    val group: u64 = sp.group;
     var i: u64 = 0;
     for (i < abi.MAX_HANDLES) {
         hs[i] = 0;
-        if (sva == 0 && (p.fdflags[i] & abi.FD_CLOEXEC::u8) == 0) { hs[i] = p.handles[i]; }
+        if (sp.map_fds == 0 && (p.fdflags[i] & abi.FD_CLOEXEC::u8) == 0) { hs[i] = p.handles[i]; }
         i = i + 1;
     }
-    if (sva != 0) {
-        if (ok(sva, $size_of(abi.Spawn)::u64, 0) == 0) { ret e(abi.E_FAULT); }
-        val sp: *abi.Spawn = sva::*abi.Spawn;
+    if (sp.map_fds != 0) {
         i = 0;
         for (i < abi.SPAWN_FDS) {
             val idx: u64 = sp.handles[i];
             if (idx < abi.MAX_HANDLES) { hs[i] = p.handles[idx]; }
             i = i + 1;
         }
-        group = sp.group;
     }
 
     # the args, NUL-terminated even if the caller forgot; none -> the path
@@ -197,8 +215,22 @@ fun sys_spawn(pva: u64, plen: u64, ava: u64, alen: u64, sva: u64) u64 {
         if (@((ava + alen - 1)::*u8) == 0) { kn = alen; }
     }
     @((k + kn - 1)::*u8) = 0;
-    val r: u64 = spawn(p, nd, ?full[0], n, k, kn, ?hs, group);
+    # the environment, copied in; the last string must end in NUL
+    var ek: u64 = 0;
+    if (env_len > 0) {
+        ek = heap.alloc(env_len + 1);
+        if (ek == 0) {
+            heap.free(k);
+            ret e(abi.E_NOMEM);
+        }
+        mem.copy(ek, sp.env::u64, env_len);
+        @((ek + env_len)::*u8) = 0;
+    }
+    var el: u64 = env_len;
+    if (el > 0 && @((ek + el - 1)::*u8) != 0) { el = el + 1; }
+    val r: u64 = spawn(p, nd, ?full[0], n, k, kn, ek, el, ?hs, group);
     heap.free(k);
+    heap.free(ek);
     ret r;
 }
 

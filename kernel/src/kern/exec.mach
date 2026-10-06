@@ -83,13 +83,26 @@ pub val IMAGE_MAX: u64 = 0x4000000; # 64 MiB
 
 # load `nd` into `p` and start it with the NUL-separated `args`
 # (args_len bytes, kernel memory). returns 0 or an error
-# `path` (absolute) is what `nd` was found as: a "#!" script needs it to
-# hand itself to its interpreter
-pub fun load(p: *proc.Proc, nd: *vfs.Node, path: *u8, path_len: u64, args: u64, args_len: u64) u64 {
-    ret load_file(p, nd, path, path_len, args, args_len, 1);
+# where and how a loaded program starts: rip, rsp, and rdi/rsi/rdx
+pub rec Start {
+    entry: u64;
+    rsp:   u64;
+    argc:  u64;
+    argv:  u64;
+    envp:  u64;
 }
 
-fun load_file(p: *proc.Proc, nd: *vfs.Node, path: *u8, path_len: u64, args: u64, args_len: u64, scripts: u8) u64 {
+# load `nd` into p's address space (p.pml4), with the NUL-separated `args`
+# and `env` (kernel memory) on its stack; fills *st. `path` (absolute) is
+# what `nd` was found as: a "#!" script needs it to hand itself to its
+# interpreter. returns 0 or an error
+pub fun load(p: *proc.Proc, nd: *vfs.Node, path: *u8, path_len: u64,
+             args: u64, args_len: u64, env: u64, env_len: u64, st: *Start) u64 {
+    ret load_file(p, nd, path, path_len, args, args_len, env, env_len, st, 1);
+}
+
+fun load_file(p: *proc.Proc, nd: *vfs.Node, path: *u8, path_len: u64, args: u64, args_len: u64,
+              env: u64, env_len: u64, st: *Start, scripts: u8) u64 {
     if (nd.kind != abi.KIND_FILE) { ret abi.err(abi.E_NOEXEC); }
     val len: u64 = nd.size;
     if (len == 0 || len > IMAGE_MAX) { ret abi.err(abi.E_NOEXEC); }
@@ -99,10 +112,10 @@ fun load_file(p: *proc.Proc, nd: *vfs.Node, path: *u8, path_len: u64, args: u64,
     if (r == len) {
         val b: *u8 = img::*u8;
         if (len > 2 && b[0] == 35 && b[1] == 33) {
-            if (scripts != 0) { r = load_script(p, b, len, path, path_len, args, args_len); }
+            if (scripts != 0) { r = load_script(p, b, len, path, path_len, args, args_len, env, env_len, st); }
             or                { r = abi.err(abi.E_NOEXEC); } # no scripts as interpreters
         } or {
-            r = load_image(p, img, len, args, args_len);
+            r = load_image(p, img, len, args, args_len, env, env_len, st);
         }
     } or (abi.is_err(r) == 0) {
         r = abi.err(abi.E_IO);
@@ -113,7 +126,8 @@ fun load_file(p: *proc.Proc, nd: *vfs.Node, path: *u8, path_len: u64, args: u64,
 
 # "#!/abs/interp [one-arg]": run the interpreter with argv
 #   interp [one-arg] script-path original-argv[1..]
-fun load_script(p: *proc.Proc, b: *u8, len: u64, path: *u8, path_len: u64, args: u64, args_len: u64) u64 {
+fun load_script(p: *proc.Proc, b: *u8, len: u64, path: *u8, path_len: u64, args: u64, args_len: u64,
+                env: u64, env_len: u64, st: *Start) u64 {
     var i: u64 = 2;
     for (i < len && (b[i] == 32 || b[i] == 9)) { i = i + 1; }
     val is: u64 = i;
@@ -152,12 +166,39 @@ fun load_script(p: *proc.Proc, b: *u8, len: u64, path: *u8, path_len: u64, args:
     o = o + 1;
     mem.copy(na + o, args + rest, args_len - rest);
     o = o + args_len - rest;
-    val r: u64 = load_file(p, interp, ?b[is], ilen, na, o, 0);
+    val r: u64 = load_file(p, interp, ?b[is], ilen, na, o, env, env_len, st, 0);
     heap.free(na);
     ret r;
 }
 
-fun load_image(p: *proc.Proc, img: u64, len: u64, args: u64, args_len: u64) u64 {
+fun count_strings(buf: u64, n: u64) u64 {
+    var c: u64 = 0;
+    var i: u64 = 0;
+    for (i < n) {
+        if (@((buf + i)::*u8) == 0) { c = c + 1; }
+        i = i + 1;
+    }
+    ret c;
+}
+
+# write the pointer array for `count` strings packed at user address `at`
+# (their bytes are `src` in kernel memory) to user address `arr`, nil-ended
+fun pointers(p: *proc.Proc, arr: u64, at: u64, src: u64, count: u64) u8 {
+    var i: u64 = 0;
+    var k: u64 = 0;
+    for (k < count) {
+        val slot: u64 = at + i;
+        if (poke(p, arr + k * 8, (?slot)::u64, 8) == 0) { ret 0; }
+        for (@((src + i)::*u8) != 0) { i = i + 1; }
+        i = i + 1;
+        k = k + 1;
+    }
+    val zero: u64 = 0;
+    ret poke(p, arr + count * 8, (?zero)::u64, 8);
+}
+
+fun load_image(p: *proc.Proc, img: u64, len: u64, args: u64, args_len: u64,
+               env: u64, env_len: u64, st: *Start) u64 {
     if (elf.valid(img, len) == 0) { ret abi.err(abi.E_NOEXEC); }
 
     var top: u64 = 0;
@@ -182,31 +223,23 @@ fun load_image(p: *proc.Proc, img: u64, len: u64, args: u64, args_len: u64) u64 
         va = va + PAGE;
     }
 
-    # [ strings ][ pad ][ argv[0..argc] , nil ] <- rsi; rdi = argc
-    var argc: u64 = 0;
-    i = 0;
-    for (i < args_len) {
-        if (@((args + i)::*u8) == 0) { argc = argc + 1; }
-        i = i + 1;
-    }
-    if (args_len > 16 * PAGE || argc > 1024) { ret abi.err(abi.E_INVAL); }
-    val strings: u64 = (STACK_TOP - args_len) & ~15::u64;
-    if (poke(p, strings, args, args_len) == 0) { ret abi.err(abi.E_NOMEM); }
-    val argv: u64 = (strings - (argc + 1) * 8) & ~15::u64;
-    var at: u64 = strings;
-    var k: u64 = 0;
-    i = 0;
-    for (k < argc) {
-        val slot: u64 = at;
-        if (poke(p, argv + k * 8, (?slot)::u64, 8) == 0) { ret abi.err(abi.E_NOMEM); }
-        for (@((args + i)::*u8) != 0) { i = i + 1; }
-        i = i + 1;
-        at = strings + i;
-        k = k + 1;
-    }
-    val zero: u64 = 0;
-    poke(p, argv + argc * 8, (?zero)::u64, 8);
-
-    proc.start(p, entry, argv - 16, argc, argv);
+    # from the top: [ arg strings ][ env strings ] pad [ envp..., nil ]
+    # [ argv..., nil ] <- rsi; rdi = argc, rdx = envp
+    val argc: u64 = count_strings(args, args_len);
+    val envc: u64 = count_strings(env, env_len);
+    if (args_len + env_len > 32 * PAGE || argc + envc > 2048) { ret abi.err(abi.E_INVAL); }
+    val astr: u64 = (STACK_TOP - args_len) & ~15::u64;
+    val estr: u64 = (astr - env_len) & ~15::u64;
+    if (poke(p, astr, args, args_len) == 0) { ret abi.err(abi.E_NOMEM); }
+    if (env_len > 0 && poke(p, estr, env, env_len) == 0) { ret abi.err(abi.E_NOMEM); }
+    val envp: u64 = (estr - (envc + 1) * 8) & ~15::u64;
+    val argv: u64 = (envp - (argc + 1) * 8) & ~15::u64;
+    if (pointers(p, envp, estr, env, envc) == 0) { ret abi.err(abi.E_NOMEM); }
+    if (pointers(p, argv, astr, args, argc) == 0) { ret abi.err(abi.E_NOMEM); }
+    st.entry = entry;
+    st.rsp = argv - 16;
+    st.argc = argc;
+    st.argv = argv;
+    st.envp = envp;
     ret 0;
 }

@@ -131,6 +131,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.env]
+kind = "bin"
+entry = "bin/env.mach"
+out = "bin/env"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.false]
 kind = "bin"
 entry = "bin/false.mach"

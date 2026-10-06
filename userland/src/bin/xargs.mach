@@ -4,6 +4,7 @@ use abi: sdk.abi;
 use sys: sdk.sys;
 use io:  sdk.io;
 use rt:  sdk.rt;
+use path: sdk.path;
 
 val CAP: u64 = 65536;
 var args: [65536]u8;
@@ -15,23 +16,14 @@ fun main(argc: u64, argv: **u8) u64 {
         io.err("usage: xargs COMMAND [ARGS...]\n\0");
         ret 2;
     }
-    var path: [256]u8;
-    val cn: u64 = io.len(argv[1]);
-    var pn: u64 = 0;
-    var slash: u8 = 0;
-    var k: u64 = 0;
-    for (k < cn) {
-        if (argv[1][k] == 47) { slash = 1; }
-        k = k + 1;
+    var full: [256]u8;
+    val pn: u64 = path.lookup(argv[1], ?full[0]);
+    if (pn == 0) {
+        io.err("xargs: \0");
+        io.err(argv[1]);
+        io.err(": command not found\n\0");
+        ret 127;
     }
-    if (cn + 6 >= 256) { ret 2; }
-    if (slash == 0) {
-        io.copy(?path[0], "/bin/\0", 5);
-        pn = 5;
-    }
-    io.copy(?path[pn], argv[1], cn);
-    pn = pn + cn;
-
     var n: u64 = 0;
     var i: u64 = 1;
     for (i < argc) {
@@ -63,7 +55,7 @@ fun main(argc: u64, argv: **u8) u64 {
             n = n + 1;
         }
     }
-    val pid: u64 = sys.spawn(?path[0], pn, ?args[0], n, nil);
+    val pid: u64 = sys.spawn(?full[0], pn, ?args[0], n, nil);
     if (abi.is_err(pid) != 0) {
         io.fail("xargs\0", argv[1], pid);
         ret 127;

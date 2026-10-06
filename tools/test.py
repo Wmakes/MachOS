@@ -145,6 +145,16 @@ TESTS = [
      ["posixtest: 0 failures", "cat: /nope: no such file", "      1", "no such file", "motd",
       "kept"]),
 
+    ("environment", False, False,
+     ["wait:" + P,
+      "send:echo \"$HOME $PATH\"; X=1; echo x=$X ${X}y; env | grep -c X=; export X; env | grep X=\\n", "wait:" + P,
+      "send:Y=only-here env | grep Y=; echo \"[$Y]\"; unset X; echo \"[$X]\"; echo ~ $$\\n", "wait:" + P,
+      "send:mkdir /tmp/b; printf '#!/bin/sh\\\\necho via-path $1\\\\n' > /tmp/b/tool; PATH=/tmp/b:/bin; tool z; which tool\\n",
+      "wait:" + P,
+      "send:env -i K=v env; echo \"a\\\\nb \\\\$\"\\n", "wait:" + P],
+     ["/ /bin", "x=1 1y", "0", "X=1", "Y=only-here", "[]", "[]", "/ 2", "via-path z", "/tmp/b/tool",
+      "K=v", "a\\nb $"]),
+
     # repair a disk that debugfs damaged on the host
     ("fsck", False, False,
      ["--disk2", BROKEN, "--prep", make_broken, "--post", broken_clean_on_host,
