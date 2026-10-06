@@ -11,9 +11,26 @@ var ctrl: u8 = 0;
 var caps: u8 = 0;
 var extended: u8 = 0;
 
-pub fun init() {
+var present: u8 = 0;
+
+# a byte waiting? never true without a controller (its status reads 0xFF)
+fun waiting() u8 {
+    val st: u8 = cpu.inb(0x64);
+    if (st == 0xFF) { ret 0; }
+    ret ((st & 1) != 0)::u8;
+}
+
+# whether there is a PS/2 controller (USB-only machines have none)
+pub fun init() u8 {
+    if (cpu.inb(0x64) == 0xFF) { ret 0; }
     # drop whatever the firmware left in the output buffer
-    for ((cpu.inb(0x64) & 1) != 0) { cpu.inb(0x60); }
+    var i: u64 = 0;
+    for (waiting() != 0 && i < 64) {
+        cpu.inb(0x60);
+        i = i + 1;
+    }
+    present = 1;
+    ret 1;
 }
 
 fun key(code: u8) {
@@ -53,7 +70,9 @@ fun special(code: u8) {
 }
 
 pub fun irq() {
-    for ((cpu.inb(0x64) & 1) != 0) {
+    var guard: u64 = 0;
+    for (waiting() != 0 && guard < 64) {
+        guard = guard + 1;
         val code: u8 = cpu.inb(0x60);
         if (code == 0xE0) { extended = 1; cnt; }
         if (extended != 0) {

@@ -6,6 +6,7 @@ use cpu:    machos.arch.x86_64.cpu;
 use kprint: machos.kern.kprint;
 use serial: machos.dev.serial;
 use kbd:    machos.dev.ps2kbd;
+use xhci:   machos.dev.xhci;
 use tty:    machos.kern.tty;
 use proc:   machos.kern.proc;
 use sys:    machos.kern.sys;
@@ -111,6 +112,7 @@ fun isr_dispatch(f: *idt.Frame) {
     var preempt: u8 = 0;
     if (f.vector == apic.TIMER_VECTOR) {
         proc.tick();
+        xhci.poll(proc.uptime_ticks());
         preempt = from_user;
     } or (f.vector == apic.IRQ_BASE + 1) {
         kbd.irq();

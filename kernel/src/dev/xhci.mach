@@ -1,0 +1,554 @@
+# xHCI (USB 3) host controllers and the USB keyboards on their root ports.
+# polled: the command ring is waited on synchronously while setting up, and
+# the timer interrupt calls poll() to collect keyboard reports from the
+# event ring. a keyboard is driven in the HID boot protocol (8-byte
+# reports), so no report descriptor needs parsing. hubs are not supported
+# yet: a keyboard must sit on a root port
+
+use pci:  machos.dev.pci;
+use vmm:  machos.mm.vmm;
+use pmm:  machos.mm.pmm;
+use mem:  machos.kern.mem;
+use tty:  machos.kern.tty;
+
+val MAX_CTRL: u64 = 4;
+val MAX_KBD: u64 = 4;
+val RING_TRBS: u64 = 256; # one page
+
+# TRB types
+val T_NORMAL: u32 = 1;
+val T_SETUP: u32 = 2;
+val T_DATA: u32 = 3;
+val T_STATUS: u32 = 4;
+val T_LINK: u32 = 6;
+val T_ENABLE_SLOT: u32 = 9;
+val T_ADDRESS: u32 = 11;
+val T_CONFIGURE: u32 = 12;
+val T_EVALUATE: u32 = 13;
+val T_TRANSFER_EV: u32 = 32;
+val T_COMMAND_EV: u32 = 33;
+
+#[volatile]
+rec Reg { v: u32; }
+
+rec Ring {
+    phys:  u64;
+    idx:   u64;
+    cycle: u32;
+}
+
+rec Ctrl {
+    cap:    u64;  # mapped registers
+    op:     u64;
+    rt:     u64;
+    db:     u64;
+    csz:    u64;  # context size: 32 or 64
+    ports:  u64;
+    slots:  u64;
+    dcbaa:  u64;  # physical
+    cmd:    Ring;
+    ev:     u64;  # event ring segment, physical
+    ev_idx: u64;
+    ev_cycle: u32;
+}
+
+rec Kbd {
+    ctrl:    *Ctrl;
+    slot:    u64;
+    dci:     u64;   # the interrupt IN endpoint's context index
+    ring:    Ring;
+    report:  u64;   # physical page; the report is its first 8 bytes
+    prev:    [8]u8; # the last report
+    held:    u8;    # the usage held down for repeat (0 = none)
+    held_at: u64;   # tick it went down
+    next_rep: u64;  # tick of the next repeat
+}
+
+var ctrls: [4]Ctrl;
+var nctrl: u64 = 0;
+var kbds: [4]Kbd;
+var nkbd: u64 = 0;
+var caps: u8 = 0;
+
+fun rd(a: u64) u32 { ret (@(a::*Reg)).v; }
+fun wr(a: u64, v: u32) { (@(a::*Reg)).v = v; }
+fun wr64(a: u64, v: u64) {
+    wr(a, (v & 0xFFFFFFFF)::u32);
+    wr(a + 4, (v >> 32)::u32);
+}
+
+fun spin_until(a: u64, mask: u32, want: u32) u8 {
+    var i: u64 = 0;
+    for (i < 100000000) {
+        if ((rd(a) & mask) == want) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun trb(r: *Ring, i: u64) *u32 { ret (vmm.phys_to_virt(r.phys) + i * 16)::*u32; }
+
+fun ring_new(r: *Ring) u8 {
+    r.phys = pmm.alloc();
+    if (r.phys == 0) { ret 0; }
+    r.idx = 0;
+    r.cycle = 1;
+    # the last TRB links back to the start and flips the cycle
+    val link: *u32 = trb(r, RING_TRBS - 1);
+    link[0] = (r.phys & 0xFFFFFFFF)::u32;
+    link[1] = (r.phys >> 32)::u32;
+    link[2] = 0;
+    link[3] = (T_LINK << 10) | 2; # toggle cycle
+    ret 1;
+}
+
+# put a TRB on a ring; its physical address
+fun enqueue(r: *Ring, param: u64, status: u32, control: u32) u64 {
+    val t: *u32 = trb(r, r.idx);
+    val at: u64 = r.phys + r.idx * 16;
+    t[0] = (param & 0xFFFFFFFF)::u32;
+    t[1] = (param >> 32)::u32;
+    t[2] = status;
+    t[3] = control | r.cycle; # the cycle bit last: it hands the TRB over
+    r.idx = r.idx + 1;
+    if (r.idx == RING_TRBS - 1) {
+        val link: *u32 = trb(r, RING_TRBS - 1);
+        link[3] = (link[3] & ~1::u32) | r.cycle;
+        r.cycle = r.cycle ^ 1;
+        r.idx = 0;
+    }
+    ret at;
+}
+
+fun doorbell(c: *Ctrl, slot: u64, target: u32) { wr(c.db + slot * 4, target); }
+
+# the next event, if the controller has posted one: copies it into out
+fun next_event(c: *Ctrl, out: *u32) u8 {
+    val e: *u32 = (vmm.phys_to_virt(c.ev) + c.ev_idx * 16)::*u32;
+    if ((e[3] & 1) != c.ev_cycle) { ret 0; }
+    out[0] = e[0];
+    out[1] = e[1];
+    out[2] = e[2];
+    out[3] = e[3];
+    c.ev_idx = c.ev_idx + 1;
+    if (c.ev_idx == RING_TRBS) {
+        c.ev_idx = 0;
+        c.ev_cycle = c.ev_cycle ^ 1;
+    }
+    # tell the controller how far we have read (EHB cleared by writing 1)
+    wr64(c.rt + 0x20 + 0x18, (c.ev + c.ev_idx * 16) | 8);
+    ret 1;
+}
+
+# wait for an event of `type` (other events are handed to the keyboards);
+# its completion code, or 0 after a timeout. the event lands in out
+fun wait_event(c: *Ctrl, type: u32, out: *u32) u32 {
+    var spins: u64 = 0;
+    for (spins < 50000000) {
+        if (next_event(c, out) != 0) {
+            val t: u32 = (out[3] >> 10) & 0x3F;
+            if (t == type) { ret out[2] >> 24; }
+            handle(c, out);
+        }
+        spins = spins + 1;
+    }
+    ret 0;
+}
+
+fun command(c: *Ctrl, param: u64, control: u32, out: *u32) u32 {
+    enqueue(?c.cmd, param, 0, control);
+    doorbell(c, 0, 0);
+    ret wait_event(c, T_COMMAND_EV, out);
+}
+
+# --- contexts -----------------------------------------------------------------
+
+fun ctx(base: u64, c: *Ctrl, i: u64) *u32 { ret (vmm.phys_to_virt(base) + i * c.csz)::*u32; }
+
+# a control transfer on endpoint 0 of `slot`; data (if any) to/from the
+# physical page `buf`. the completion code (1 success, 13 short packet)
+fun control(c: *Ctrl, slot: u64, ep0: *Ring, rtype: u8, req: u8, value: u16, index: u16, len: u16, buf: u64) u32 {
+    val setup: u64 = rtype::u64 | (req::u64 << 8) | (value::u64 << 16) | (index::u64 << 32) | (len::u64 << 48);
+    var trt: u32 = 0;
+    if (len > 0) {
+        trt = 2;
+        if ((rtype & 0x80) != 0) { trt = 3; }
+    }
+    enqueue(ep0, setup, 8, (T_SETUP << 10) | (1 << 6) | (trt << 16));
+    var status_dir: u32 = 1 << 16; # IN status stage unless data came in
+    if (len > 0) {
+        var dir: u32 = 0;
+        if ((rtype & 0x80) != 0) {
+            dir = 1 << 16;
+            status_dir = 0;
+        }
+        enqueue(ep0, buf, len::u32, (T_DATA << 10) | dir);
+    }
+    enqueue(ep0, 0, 0, (T_STATUS << 10) | (1 << 5) | status_dir);
+    doorbell(c, slot, 1);
+    var ev: [4]u32;
+    ret wait_event(c, T_TRANSFER_EV, ?ev[0]);
+}
+
+fun ok(code: u32) u8 {
+    if (code == 1 || code == 13) { ret 1; }
+    ret 0;
+}
+
+# --- keyboards ----------------------------------------------------------------
+
+val NORMAL: *u8 = "abcdefghijklmnopqrstuvwxyz1234567890\0";
+val SHIFT_DIGITS: *u8 = "!@#$%^&*()\0";
+# usages 0x2D-0x38 unshifted and shifted
+val PUNCT: *u8 = "-=[]\\#;'`,./\0";
+val PUNCT_SHIFT: *u8 = "_+{}|~:\"~<>?\0";
+
+fun seq(final: u8) {
+    tty.input(27);
+    tty.input(91);
+    tty.input(final);
+}
+
+# one key going down: what the terminal gets
+fun press(usage: u8, mods: u8) {
+    val shift: u8 = ((mods & 0x22) != 0)::u8;
+    val ctrl: u8 = ((mods & 0x11) != 0)::u8;
+    if (usage >= 0x04 && usage <= 0x1D) {
+        var c: u8 = NORMAL[(usage - 4)::u64];
+        if ((shift ^ caps) != 0) { c = c - 32; }
+        if (ctrl != 0) { c = (c | 0x20) - 96; }
+        tty.input(c);
+    } or (usage >= 0x1E && usage <= 0x27) {
+        if (shift != 0) { tty.input(SHIFT_DIGITS[(usage - 0x1E)::u64]); }
+        or              { tty.input(NORMAL[(usage - 4)::u64]); }
+    } or (usage == 0x28 || usage == 0x58) { tty.input(10); }   # enter, keypad enter
+    or (usage == 0x29) { tty.input(27); }                       # escape
+    or (usage == 0x2A) { tty.input(127); }                      # backspace
+    or (usage == 0x2B) { tty.input(9); }
+    or (usage == 0x2C) { tty.input(32); }
+    or (usage >= 0x2D && usage <= 0x38) {
+        if (shift != 0) { tty.input(PUNCT_SHIFT[(usage - 0x2D)::u64]); }
+        or              { tty.input(PUNCT[(usage - 0x2D)::u64]); }
+    }
+    or (usage == 0x39) { caps = caps ^ 1; }
+    or (usage == 0x4F) { seq(67); }   # right
+    or (usage == 0x50) { seq(68); }   # left
+    or (usage == 0x51) { seq(66); }   # down
+    or (usage == 0x52) { seq(65); }   # up
+    or (usage == 0x4A) { seq(72); }   # home
+    or (usage == 0x4D) { seq(70); }   # end
+    or (usage == 0x4C) {              # delete
+        tty.input(27);
+        tty.input(91);
+        tty.input(51);
+        tty.input(126);
+    }
+}
+
+fun repeats(usage: u8) u8 {
+    if (usage == 0x39 || usage == 0 || usage == 1) { ret 0; } # caps lock, nothing, rollover
+    ret 1;
+}
+
+var now: u64 = 0;
+
+fun report(k: *Kbd) {
+    val r: *u8 = vmm.phys_to_virt(k.report)::*u8;
+    val mods: u8 = r[0];
+    var i: u64 = 2;
+    for (i < 8) {
+        val u: u8 = r[i];
+        if (u > 3) {
+            var was: u8 = 0;
+            var j: u64 = 2;
+            for (j < 8) {
+                if (k.prev[j] == u) { was = 1; }
+                j = j + 1;
+            }
+            if (was == 0) {
+                press(u, mods);
+                if (repeats(u) != 0) {
+                    k.held = u;
+                    k.held_at = now;
+                    k.next_rep = now + 50; # 500 ms before repeating
+                }
+            }
+        }
+        i = i + 1;
+    }
+    # the held key let go?
+    var still: u8 = 0;
+    i = 2;
+    for (i < 8) {
+        if (r[i] == k.held) { still = 1; }
+        i = i + 1;
+    }
+    if (still == 0) { k.held = 0; }
+    mem.copy((?k.prev[0])::u64, r::u64, 8);
+}
+
+fun arm(k: *Kbd) {
+    enqueue(?k.ring, k.report, 8, (T_NORMAL << 10) | (1 << 5) | (1 << 2)); # IOC, ISP
+    doorbell(k.ctrl, k.slot, k.dci::u32);
+}
+
+# an event that was not waited for: keyboard reports
+fun handle(c: *Ctrl, e: *u32) {
+    val t: u32 = (e[3] >> 10) & 0x3F;
+    if (t != T_TRANSFER_EV) { ret; }
+    val slot: u64 = (e[3] >> 24)::u64;
+    val ep: u64 = ((e[3] >> 16) & 0x1F)::u64;
+    var i: u64 = 0;
+    for (i < nkbd) {
+        val k: *Kbd = ?kbds[i];
+        if (k.ctrl == c && k.slot == slot && k.dci == ep) {
+            if (ok(e[2] >> 24) != 0) { report(k); }
+            arm(k);
+        }
+        i = i + 1;
+    }
+}
+
+# the timer calls this every tick: read reports, repeat held keys
+pub fun poll(tick: u64) {
+    now = tick;
+    var ev: [4]u32;
+    var i: u64 = 0;
+    for (i < nctrl) {
+        val c: *Ctrl = ?ctrls[i];
+        for (next_event(c, ?ev[0]) != 0) { handle(c, ?ev[0]); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < nkbd) {
+        val k: *Kbd = ?kbds[i];
+        if (k.held != 0 && now >= k.next_rep) {
+            press(k.held, k.prev[0]);
+            k.next_rep = now + 3; # about 30 a second
+        }
+        i = i + 1;
+    }
+}
+
+pub fun keyboards() u64 { ret nkbd; }
+
+# --- devices ------------------------------------------------------------------
+
+# an interval in the endpoint context's encoding (2^n x 125 us)
+fun interval(speed: u32, b: u8) u32 {
+    if (speed >= 3) { # high/super speed: bInterval is already an exponent + 1
+        if (b == 0) { ret 0; }
+        ret (b - 1)::u32;
+    }
+    # full/low speed: bInterval in ms -> the smallest 2^n x 125 us >= it
+    var frames: u32 = b::u32 * 8;
+    var n: u32 = 3;
+    for (n < 10 && (1::u32 << n) < frames) { n = n + 1; }
+    ret n;
+}
+
+# set up the device on root port `port` (1-based) at `speed`
+fun device(c: *Ctrl, port: u64, speed: u32) {
+    if (nkbd == MAX_KBD) { ret; }
+    var ev: [4]u32;
+    if (command(c, 0, T_ENABLE_SLOT << 10, ?ev[0]) != 1) { ret; }
+    val slot: u64 = (ev[3] >> 24)::u64;
+    if (slot == 0 || slot > c.slots) { ret; }
+
+    val out: u64 = pmm.alloc();
+    val input: u64 = pmm.alloc();
+    val buf: u64 = pmm.alloc();
+    var ep0: Ring;
+    if (out == 0 || input == 0 || buf == 0 || ring_new(?ep0) == 0) { ret; }
+    @((vmm.phys_to_virt(c.dcbaa) + slot * 8)::*u64) = out;
+
+    var mps: u32 = 8;
+    if (speed == 3) { mps = 64; }
+    if (speed >= 4) { mps = 512; }
+    val icc: *u32 = ctx(input, c, 0);
+    icc[1] = 3; # add slot + EP0
+    val sc: *u32 = ctx(input, c, 1);
+    sc[0] = (speed << 20) | (1 << 27);
+    sc[1] = (port::u32) << 16;
+    val e0: *u32 = ctx(input, c, 2);
+    e0[1] = (3 << 1) | (4 << 3) | (mps << 16); # CErr 3, control
+    e0[2] = ((ep0.phys & 0xFFFFFFFF) | 1)::u32;
+    e0[3] = (ep0.phys >> 32)::u32;
+    e0[4] = 8;
+    if (command(c, input, (T_ADDRESS << 10) | (slot::u32 << 24), ?ev[0]) != 1) { ret; }
+
+    # the device descriptor's first 8 bytes tell EP0's real packet size
+    if (ok(control(c, slot, ?ep0, 0x80, 6, 0x0100, 0, 8, buf)) == 0) { ret; }
+    val real: u32 = (@((vmm.phys_to_virt(buf) + 7)::*u8))::u32;
+    if (speed < 4 && real != 0 && real != mps) {
+        mem.fill(vmm.phys_to_virt(input), 0, 4096);
+        icc[1] = 2; # EP0 only
+        e0[1] = (3 << 1) | (4 << 3) | (real << 16);
+        command(c, input, (T_EVALUATE << 10) | (slot::u32 << 24), ?ev[0]);
+    }
+
+    # the configuration: find a boot keyboard interface and its IN endpoint
+    if (ok(control(c, slot, ?ep0, 0x80, 6, 0x0200, 0, 9, buf)) == 0) { ret; }
+    var total: u16 = @((vmm.phys_to_virt(buf) + 2)::*u16);
+    if (total > 1024) { total = 1024; }
+    if (ok(control(c, slot, ?ep0, 0x80, 6, 0x0200, 0, total, buf)) == 0) { ret; }
+    val d: *u8 = vmm.phys_to_virt(buf)::*u8;
+    val config: u8 = d[5];
+    var iface: u8 = 0xFF;
+    var ep_addr: u8 = 0;
+    var ep_mps: u16 = 0;
+    var ep_int: u8 = 0;
+    var in_kbd: u8 = 0;
+    var at: u64 = 0;
+    for (at + 2 <= total::u64) {
+        val len: u64 = d[at]::u64;
+        if (len < 2) { brk; }
+        val dt: u8 = d[at + 1];
+        if (dt == 4) { # interface: class 3 (HID), subclass 1 (boot), protocol 1 (keyboard)
+            in_kbd = (d[at + 5] == 3 && d[at + 6] == 1 && d[at + 7] == 1)::u8;
+            if (in_kbd != 0 && iface == 0xFF) { iface = d[at + 2]; }
+        } or (dt == 5 && in_kbd != 0 && ep_addr == 0 && (d[at + 2] & 0x80) != 0 && (d[at + 3] & 3) == 3) {
+            ep_addr = d[at + 2];
+            ep_mps = (d[at + 4]::u16 | (d[at + 5]::u16 << 8)) & 0x7FF;
+            ep_int = d[at + 6];
+        }
+        at = at + len;
+    }
+    if (iface == 0xFF || ep_addr == 0) { ret; } # not a keyboard
+
+    if (ok(control(c, slot, ?ep0, 0x00, 9, config::u16, 0, 0, 0)) == 0) { ret; }      # SET_CONFIGURATION
+    control(c, slot, ?ep0, 0x21, 0x0B, 0, iface::u16, 0, 0);                             # SET_PROTOCOL boot
+    control(c, slot, ?ep0, 0x21, 0x0A, 0, iface::u16, 0, 0);                             # SET_IDLE: only changes
+
+    val k: *Kbd = ?kbds[nkbd];
+    k.ctrl = c;
+    k.slot = slot;
+    k.dci = ((ep_addr & 0xF)::u64) * 2 + 1;
+    k.report = pmm.alloc();
+    if (k.report == 0 || ring_new(?k.ring) == 0) { ret; }
+    mem.fill(vmm.phys_to_virt(input), 0, 4096);
+    icc[1] = 1 | (1::u32 << k.dci::u32);
+    # the slot context as it stands, with enough context entries
+    mem.copy(vmm.phys_to_virt(input) + c.csz, vmm.phys_to_virt(out), c.csz);
+    sc[0] = (sc[0] & 0x07FFFFFF) | ((k.dci::u32) << 27);
+    val ec: *u32 = ctx(input, c, 1 + k.dci);
+    ec[0] = interval(speed, ep_int) << 16;
+    ec[1] = (3 << 1) | (7 << 3) | (ep_mps::u32 << 16); # CErr 3, interrupt IN
+    ec[2] = ((k.ring.phys & 0xFFFFFFFF) | 1)::u32;
+    ec[3] = (k.ring.phys >> 32)::u32;
+    ec[4] = ep_mps::u32 | (ep_mps::u32 << 16);
+    if (command(c, input, (T_CONFIGURE << 10) | (slot::u32 << 24), ?ev[0]) != 1) { ret; }
+    nkbd = nkbd + 1;
+    arm(k);
+}
+
+# take the controller from the firmware (the USB legacy support capability)
+fun handoff(c: *Ctrl) {
+    var off: u64 = ((rd(c.cap + 0x10) >> 16) & 0xFFFF)::u64 * 4;
+    var guard: u64 = 0;
+    for (off != 0 && guard < 64) {
+        val a: u64 = c.cap + off;
+        val v: u32 = rd(a);
+        if ((v & 0xFF) == 1) {
+            wr(a, v | (1 << 24));                 # OS owned
+            spin_until(a, (1 << 16), 0);          # until the BIOS lets go
+            wr(a + 4, rd(a + 4) & 0xFFFF1FEE);    # no more SMIs
+            ret;
+        }
+        val next: u64 = ((v >> 8) & 0xFF)::u64;
+        if (next == 0) { ret; }
+        off = off + next * 4;
+        guard = guard + 1;
+    }
+}
+
+fun setup(c: *Ctrl, dev: *pci.Device) u8 {
+    pci.enable(dev);
+    c.cap = vmm.map_phys(pci.bar(dev, 0), 0x10000, 1);
+    c.op = c.cap + (rd(c.cap) & 0xFF)::u64;
+    c.rt = c.cap + (rd(c.cap + 0x18) & ~0x1F::u32)::u64;
+    c.db = c.cap + (rd(c.cap + 0x14) & ~3::u32)::u64;
+    val hcs1: u32 = rd(c.cap + 0x04);
+    val hcs2: u32 = rd(c.cap + 0x08);
+    c.slots = (hcs1 & 0xFF)::u64;
+    if (c.slots > 32) { c.slots = 32; }
+    c.ports = ((hcs1 >> 24) & 0xFF)::u64;
+    c.csz = 32;
+    if ((rd(c.cap + 0x10) & 4) != 0) { c.csz = 64; }
+    handoff(c);
+
+    # stop, reset, wait until it is ready
+    wr(c.op, rd(c.op) & ~1::u32);
+    if (spin_until(c.op + 4, 1, 1) == 0) { ret 0; }
+    wr(c.op, 2);
+    if (spin_until(c.op, 2, 0) == 0) { ret 0; }
+    if (spin_until(c.op + 4, 1 << 11, 0) == 0) { ret 0; }
+
+    wr(c.op + 0x38, c.slots::u32);
+    c.dcbaa = pmm.alloc();
+    if (c.dcbaa == 0) { ret 0; }
+    val sp: u64 = (((hcs2 >> 27) & 0x1F) | (((hcs2 >> 21) & 0x1F) << 5))::u64;
+    if (sp > 0) {
+        val arr: u64 = pmm.alloc();
+        if (arr == 0 || sp > 512) { ret 0; }
+        var i: u64 = 0;
+        for (i < sp) {
+            val pg: u64 = pmm.alloc();
+            if (pg == 0) { ret 0; }
+            @((vmm.phys_to_virt(arr) + i * 8)::*u64) = pg;
+            i = i + 1;
+        }
+        @(vmm.phys_to_virt(c.dcbaa)::*u64) = arr;
+    }
+    wr64(c.op + 0x30, c.dcbaa);
+    if (ring_new(?c.cmd) == 0) { ret 0; }
+    wr64(c.op + 0x18, c.cmd.phys | 1);
+
+    # one event ring segment, described by a one-entry table
+    c.ev = pmm.alloc();
+    val erst: u64 = pmm.alloc();
+    if (c.ev == 0 || erst == 0) { ret 0; }
+    c.ev_idx = 0;
+    c.ev_cycle = 1;
+    @(vmm.phys_to_virt(erst)::*u64) = c.ev;
+    @((vmm.phys_to_virt(erst) + 8)::*u32) = RING_TRBS::u32;
+    val ir: u64 = c.rt + 0x20;
+    wr(ir + 0x08, 1);
+    wr64(ir + 0x18, c.ev);
+    wr64(ir + 0x10, erst);
+    wr(c.op, 1); # run (interrupts stay off: we poll)
+    if (spin_until(c.op + 4, 1, 0) == 0) { ret 0; }
+
+    # every connected root port: reset (USB 2) or already enabled (USB 3)
+    var p: u64 = 1;
+    for (p <= c.ports) {
+        val ps: u64 = c.op + 0x400 + (p - 1) * 0x10;
+        var v: u32 = rd(ps);
+        if ((v & 1) != 0) {
+            if ((v & 2) == 0) {
+                wr(ps, (1 << 9) | (1 << 4));        # power + reset
+                spin_until(ps, 1 << 21, 1 << 21);   # reset changed
+            }
+            wr(ps, (1 << 9) | 0x00FE0000);          # clear the change bits
+            v = rd(ps);
+            if ((v & 2) != 0) { device(c, p, (v >> 10) & 0xF); }
+        }
+        p = p + 1;
+    }
+    ret 1;
+}
+
+# every xHCI controller and the keyboards on it; how many keyboards
+pub fun init() u64 {
+    var i: u64 = 0;
+    for (i < pci.device_count() && nctrl < MAX_CTRL) {
+        val d: *pci.Device = pci.get(i);
+        if (d.class == 0x0C && d.subclass == 0x03 && d.progif == 0x30) {
+            if (setup(?ctrls[nctrl], d) != 0) { nctrl = nctrl + 1; }
+        }
+        i = i + 1;
+    }
+    ret nkbd;
+}
+
+pub fun controllers() u64 { ret nctrl; }
