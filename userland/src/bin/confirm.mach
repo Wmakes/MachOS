@@ -1,0 +1,18 @@
+# confirm PROMPT: print PROMPT, read a line; succeed only if it is "yes"
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc > 1) { io.out(argv[1]); }
+    var line: [64]u8;
+    val n: u64 = sys.read(abi.STDIN, ?line[0], 64);
+    if (abi.is_err(n) != 0 || n < 3) { ret 1; }
+    var k: u64 = n;
+    if (line[k - 1] == 10) { k = k - 1; }
+    if (io.eq(?line[0], k, "yes\0", 3) != 0) { ret 0; }
+    ret 1;
+}

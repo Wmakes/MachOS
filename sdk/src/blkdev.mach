@@ -1,0 +1,162 @@
+# helpers for programs that work on raw disks (/dev/diskN): positioned
+# reads and writes, little-endian fields, CRC32, randomness, and finding
+# partitions in the GPT
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+
+pub val SECTOR: u64 = 512;
+
+# EFI system partition and MachOS root partition type GUIDs, as on disk
+pub val ESP_TYPE: [16]u8 = [16]u8{0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11,
+                                  0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b};
+pub val ROOT_TYPE: [16]u8 = [16]u8{0x88, 0x65, 0x05, 0xa9, 0xb9, 0xc0, 0x0f, 0x47,
+                                   0xac, 0x01, 0xa8, 0x52, 0x8d, 0xca, 0x94, 0x61};
+
+pub fun pread(h: u64, off: u64, buf: *u8, n: u64) u8 {
+    if (abi.is_err(sys.seek(h, off)) != 0) { ret 0; }
+    var done: u64 = 0;
+    for (done < n) {
+        val r: u64 = sys.read(h, ?buf[done], n - done);
+        if (abi.is_err(r) != 0 || r == 0) { ret 0; }
+        done = done + r;
+    }
+    ret 1;
+}
+
+pub fun pwrite(h: u64, off: u64, buf: *u8, n: u64) u8 {
+    if (abi.is_err(sys.seek(h, off)) != 0) { ret 0; }
+    ret io.write_all(h, buf, n);
+}
+
+# write `n` zero bytes at `off`
+pub fun zero(h: u64, off: u64, n: u64) u8 {
+    var z: [4096]u8;
+    var i: u64 = 0;
+    for (i < 4096) {
+        z[i] = 0;
+        i = i + 1;
+    }
+    var done: u64 = 0;
+    for (done < n) {
+        var k: u64 = n - done;
+        if (k > 4096) { k = 4096; }
+        if (pwrite(h, off + done, ?z[0], k) == 0) { ret 0; }
+        done = done + k;
+    }
+    ret 1;
+}
+
+pub fun put16(b: *u8, off: u64, v: u64) { @((?b[off])::*u16) = (v & 0xFFFF)::u16; }
+pub fun put32(b: *u8, off: u64, v: u64) { @((?b[off])::*u32) = (v & 0xFFFFFFFF)::u32; }
+pub fun put64(b: *u8, off: u64, v: u64) { @((?b[off])::*u64) = v; }
+pub fun get32(b: *u8, off: u64) u64 { ret (@((?b[off])::*u32))::u64; }
+pub fun get64(b: *u8, off: u64) u64 { ret @((?b[off])::*u64); }
+
+pub fun clear(b: *u8, n: u64) {
+    var i: u64 = 0;
+    for (i < n) {
+        b[i] = 0;
+        i = i + 1;
+    }
+}
+
+# CRC-32 (IEEE), as GPT uses it
+pub fun crc32(b: *u8, n: u64) u64 {
+    var c: u64 = 0xFFFFFFFF;
+    var i: u64 = 0;
+    for (i < n) {
+        c = c ^ b[i]::u64;
+        var k: u64 = 0;
+        for (k < 8) {
+            if ((c & 1) != 0) { c = (c >> 1) ^ 0xEDB88320; }
+            or                { c = c >> 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret c ^ 0xFFFFFFFF;
+}
+
+var seed: u64 = 0;
+
+fun tsc() u64 {
+    var lo: u32 = 0;
+    var hi: u32 = 0;
+    asm x86_64 {
+        rdtsc
+        mov {lo}, eax
+        mov {hi}, edx
+    }
+    ret (hi::u64 << 32) | lo::u64;
+}
+
+# not cryptographic: just different every time, for GUIDs and serials
+pub fun random() u64 {
+    if (seed == 0) { seed = tsc() ^ (sys.time() << 20) ^ 0x9E3779B97F4A7C15; }
+    seed = seed ^ (seed << 13);
+    seed = seed ^ (seed >> 7);
+    seed = seed ^ (seed << 17);
+    ret seed;
+}
+
+# a random version-4 GUID into b[0..16]
+pub fun guid(b: *u8) {
+    put64(b, 0, random());
+    put64(b, 8, random());
+    b[7] = (b[7] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80;
+}
+
+# the first partition of type `kind` in the GPT on `h`: start and length in
+# sectors. 0 if there is no GPT or no such partition
+pub fun find_part(h: u64, kind: *u8, start: *u64, count: *u64) u8 {
+    var hdr: [512]u8;
+    if (pread(h, SECTOR, ?hdr[0], 512) == 0) { ret 0; }
+    if (io.eq(?hdr[0], 8, "EFI PART\0", 8) == 0) { ret 0; }
+    val lba: u64 = get64(?hdr[0], 72);
+    val n: u64 = get32(?hdr[0], 80);
+    val size: u64 = get32(?hdr[0], 84);
+    if (size < 128 || size > 512 || n > 1024) { ret 0; }
+    var e: [512]u8;
+    var i: u64 = 0;
+    for (i < n) {
+        if (pread(h, lba * SECTOR + i * size, ?e[0], size) == 0) { ret 0; }
+        if (io.eq(?e[0], 16, kind, 16) != 0) {
+            @start = get64(?e[0], 32);
+            @count = get64(?e[0], 40) - @start + 1;
+            ret 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# open a disk for raw access, or say why not
+pub fun open_disk(prog: *u8, path: *u8, write: u8) u64 {
+    var flags: u64 = abi.O_READ;
+    if (write != 0) { flags = flags | abi.O_WRITE; }
+    val h: u64 = sys.open(path, io.len(path), flags);
+    if (abi.is_err(h) != 0) {
+        io.fail(prog, path, h);
+        ret h;
+    }
+    var st: abi.Stat;
+    sys.stat(path, io.len(path), ?st);
+    if (st.kind != abi.KIND_DEV) {
+        io.err(prog);
+        io.err(": \0");
+        io.err(path);
+        io.err(": not a disk\n\0");
+        sys.close(h);
+        ret abi.err(abi.E_INVAL);
+    }
+    ret h;
+}
+
+pub fun disk_size(path: *u8) u64 {
+    var st: abi.Stat;
+    if (abi.is_err(sys.stat(path, io.len(path), ?st)) != 0) { ret 0; }
+    ret st.size;
+}

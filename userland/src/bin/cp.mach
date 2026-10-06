@@ -1,0 +1,153 @@
+# cp [-r] SRC... DEST: copy files. with several sources, or when DEST is a
+# directory, the copies go inside it. -r copies directories recursively
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+var recursive: u8 = 0;
+var buf: [8192]u8;
+
+fun is_dir(p: *u8, n: u64) u8 {
+    var st: abi.Stat;
+    if (abi.is_err(sys.stat(p, n, ?st)) != 0) { ret 0; }
+    if (st.kind == abi.KIND_DIR) { ret 1; }
+    ret 0;
+}
+
+fun complain(p: *u8, n: u64, e: u64) {
+    io.err("cp: \0");
+    io.errn(p, n);
+    io.err(": \0");
+    io.err(abi.err_name(e));
+    io.err("\n\0");
+}
+
+fun copy_file(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
+    val from: u64 = sys.open(src, sn, abi.O_READ);
+    if (abi.is_err(from) != 0) {
+        complain(src, sn, from);
+        ret 0;
+    }
+    val to: u64 = sys.open(dst, dn, abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC);
+    if (abi.is_err(to) != 0) {
+        sys.close(from);
+        complain(dst, dn, to);
+        ret 0;
+    }
+    var ok: u8 = 1;
+    for {
+        val r: u64 = sys.read(from, ?buf[0], 8192);
+        if (abi.is_err(r) != 0) {
+            complain(src, sn, r);
+            ok = 0;
+            brk;
+        }
+        if (r == 0) { brk; }
+        if (io.write_all(to, ?buf[0], r) == 0) {
+            io.err("cp: write failed: \0");
+            io.errn(dst, dn);
+            io.err("\n\0");
+            ok = 0;
+            brk;
+        }
+    }
+    sys.close(from);
+    sys.close(to);
+    ret ok;
+}
+
+fun copy(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
+    if (is_dir(src, sn) == 0) { ret copy_file(src, sn, dst, dn); }
+    if (recursive == 0) {
+        io.err("cp: \0");
+        io.errn(src, sn);
+        io.err(": is a directory (use -r)\n\0");
+        ret 0;
+    }
+    if (is_dir(dst, dn) == 0) {
+        val m: u64 = sys.mkdir(dst, dn);
+        if (abi.is_err(m) != 0) {
+            complain(dst, dn, m);
+            ret 0;
+        }
+    }
+    val h: u64 = sys.open(src, sn, abi.O_READ);
+    if (abi.is_err(h) != 0) {
+        complain(src, sn, h);
+        ret 0;
+    }
+    var ok: u8 = 1;
+    var i: u64 = 0;
+    for {
+        var e: abi.Entry;
+        val got: u64 = sys.readdir(h, i, ?e);
+        if (abi.is_err(got) != 0 || got == 0) { brk; }
+        i = i + 1;
+        var s: [256]u8;
+        var d: [256]u8;
+        if (sn + 1 + e.name_len >= 256 || dn + 1 + e.name_len >= 256) {
+            io.err("cp: path too long\n\0");
+            ok = 0;
+            cnt;
+        }
+        io.copy(?s[0], src, sn);
+        s[sn] = 47;
+        io.copy(?s[sn + 1], ?e.name[0], e.name_len);
+        io.copy(?d[0], dst, dn);
+        d[dn] = 47;
+        io.copy(?d[dn + 1], ?e.name[0], e.name_len);
+        if (copy(?s[0], sn + 1 + e.name_len, ?d[0], dn + 1 + e.name_len) == 0) { ok = 0; }
+    }
+    sys.close(h);
+    ret ok;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var i: u64 = 1;
+    if (argc > 1 && io.streq(argv[1], "-r\0") != 0) {
+        recursive = 1;
+        i = 2;
+    }
+    if (argc - i < 2) {
+        io.err("usage: cp [-r] SRC... DEST\n\0");
+        ret 2;
+    }
+    val dest: *u8 = argv[argc - 1];
+    val dl: u64 = io.len(dest);
+    val into: u8 = is_dir(dest, dl);
+    if (argc - i > 2 && into == 0) {
+        io.err("cp: \0");
+        io.err(dest);
+        io.err(": not a directory\n\0");
+        ret 1;
+    }
+    var status: u64 = 0;
+    for (i < argc - 1) {
+        val src: *u8 = argv[i];
+        val sl: u64 = io.len(src);
+        if (into == 0) {
+            if (copy(src, sl, dest, dl) == 0) { status = 1; }
+        } or {
+            # DEST/basename(SRC)
+            var b: u64 = sl;
+            for (b > 0 && src[b - 1] == 47) { b = b - 1; }
+            var s: u64 = b;
+            for (s > 0 && src[s - 1] != 47) { s = s - 1; }
+            var d: [256]u8;
+            if (dl + 1 + (b - s) >= 256) {
+                io.err("cp: path too long\n\0");
+                status = 1;
+            } or {
+                io.copy(?d[0], dest, dl);
+                d[dl] = 47;
+                io.copy(?d[dl + 1], ?src[s], b - s);
+                if (copy(src, sl, ?d[0], dl + 1 + (b - s)) == 0) { status = 1; }
+            }
+        }
+        i = i + 1;
+    }
+    ret status;
+}

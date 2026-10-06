@@ -1,0 +1,6 @@
+# false: fail
+
+use rt: sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 { ret 1; }

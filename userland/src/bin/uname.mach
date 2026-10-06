@@ -1,0 +1,22 @@
+# uname [-a]: name the system (as the running kernel reports it)
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var u: abi.Uname;
+    sys.uname(?u);
+    io.out(?u.sysname[0]);
+    if (argc > 1 && io.streq(argv[1], "-a\0") != 0) {
+        io.out(" \0");
+        io.out(?u.release[0]);
+        io.out(" \0");
+        io.out(?u.machine[0]);
+        io.out(" (kernel and userland written in mach)\0");
+    }
+    io.putc(10);
+    ret 0;
+}

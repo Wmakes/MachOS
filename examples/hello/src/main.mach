@@ -1,0 +1,30 @@
+# a standalone MachOS program: greet, show its arguments and the system
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    io.out("hello from a program built outside MachOS\n\0");
+    var i: u64 = 0;
+    for (i < argc) {
+        io.out("  argv[\0");
+        io.dec(i);
+        io.out("] = \0");
+        io.out(argv[i]);
+        io.putc(10);
+        i = i + 1;
+    }
+    var u: abi.Uname;
+    sys.uname(?u);
+    io.out("running on \0");
+    io.out(?u.sysname[0]);
+    io.putc(32);
+    io.out(?u.release[0]);
+    io.out(", pid \0");
+    io.dec(sys.getpid());
+    io.putc(10);
+    ret 0;
+}

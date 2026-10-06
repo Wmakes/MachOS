@@ -1,0 +1,87 @@
+# pipes: a 4 KiB ring between a reading and a writing handle. readers block
+# while it is empty, writers while it is full
+
+use abi:  sdk.abi;
+use heap: machos.mm.heap;
+use proc: machos.kern.proc;
+
+val CAP: u64 = 4096;
+
+pub rec Pipe {
+    buf:     u64;
+    head:    u64;
+    count:   u64;
+    readers: u64;
+    writers: u64;
+}
+
+pub fun new() *Pipe {
+    val p: *Pipe = heap.zalloc($size_of(Pipe)::u64)::*Pipe;
+    if (p == nil) { ret nil; }
+    p.buf = heap.alloc(CAP);
+    if (p.buf == 0) {
+        heap.free(p::u64);
+        ret nil;
+    }
+    p.readers = 1;
+    p.writers = 1;
+    ret p;
+}
+
+fun maybe_free(p: *Pipe) {
+    if (p.readers == 0 && p.writers == 0) {
+        heap.free(p.buf);
+        heap.free(p::u64);
+    }
+}
+
+pub fun close_reader(p: *Pipe) {
+    p.readers = p.readers - 1;
+    proc.wakeup(p::u64);
+    maybe_free(p);
+}
+
+pub fun close_writer(p: *Pipe) {
+    p.writers = p.writers - 1;
+    proc.wakeup(p::u64);
+    maybe_free(p);
+}
+
+# 0 = every writer is gone and the pipe is drained
+pub fun read(p: *Pipe, buf: u64, n: u64) u64 {
+    for (p.count == 0) {
+        if (p.writers == 0 || proc.current().killed != 0) { ret 0; }
+        proc.sleep_on(p::u64);
+    }
+    var i: u64 = 0;
+    val b: *u8 = buf::*u8;
+    val src: *u8 = p.buf::*u8;
+    for (i < n && p.count > 0) {
+        b[i] = src[p.head];
+        p.head = (p.head + 1) % CAP;
+        p.count = p.count - 1;
+        i = i + 1;
+    }
+    proc.wakeup(p::u64);
+    ret i;
+}
+
+pub fun write(p: *Pipe, buf: u64, n: u64) u64 {
+    var i: u64 = 0;
+    val b: *u8 = buf::*u8;
+    val dst: *u8 = p.buf::*u8;
+    for (i < n) {
+        if (p.readers == 0) { ret abi.err(abi.E_PIPE); }
+        if (proc.current().killed != 0) { ret abi.err(abi.E_PIPE); }
+        if (p.count == CAP) {
+            proc.wakeup(p::u64);
+            proc.sleep_on(p::u64);
+            cnt;
+        }
+        dst[(p.head + p.count) % CAP] = b[i];
+        p.count = p.count + 1;
+        i = i + 1;
+    }
+    proc.wakeup(p::u64);
+    ret n;
+}

@@ -1,0 +1,43 @@
+# cat [FILE...]: copy files (or stdin) to stdout
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+var buf: [4096]u8;
+
+fun pump(h: u64, name: *u8) u8 {
+    for {
+        val r: u64 = sys.read(h, ?buf[0], 4096);
+        if (abi.is_err(r) != 0) {
+            io.fail("cat\0", name, r);
+            ret 0;
+        }
+        if (r == 0) { ret 1; }
+        if (io.write_all(abi.STDOUT, ?buf[0], r) == 0) { ret 0; }
+    }
+    ret 1;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc < 2) {
+        if (pump(abi.STDIN, "stdin\0") == 0) { ret 1; }
+        ret 0;
+    }
+    var status: u64 = 0;
+    var i: u64 = 1;
+    for (i < argc) {
+        val h: u64 = sys.open(argv[i], io.len(argv[i]), abi.O_READ);
+        if (abi.is_err(h) != 0) {
+            io.fail("cat\0", argv[i], h);
+            status = 1;
+        } or {
+            if (pump(h, argv[i]) == 0) { status = 1; }
+            sys.close(h);
+        }
+        i = i + 1;
+    }
+    ret status;
+}

@@ -1,0 +1,67 @@
+# ELF64 headers: just enough to walk the loadable segments of an image
+
+pub val PT_LOAD: u32 = 1;
+pub val PT_INTERP: u32 = 3; # wants a dynamic linker: MachOS has none
+pub val PF_X: u32 = 1;
+pub val PF_W: u32 = 2;
+pub val PF_R: u32 = 4;
+
+pub rec Ehdr {
+    ident:     [16]u8;
+    kind:      u16;
+    machine:   u16;
+    version:   u32;
+    entry:     u64;
+    phoff:     u64;
+    shoff:     u64;
+    flags:     u32;
+    ehsize:    u16;
+    phentsize: u16;
+    phnum:     u16;
+    shentsize: u16;
+    shnum:     u16;
+    shstrndx:  u16;
+}
+
+pub rec Phdr {
+    kind:   u32;
+    flags:  u32;
+    offset: u64;
+    vaddr:  u64;
+    paddr:  u64;
+    filesz: u64;
+    memsz:  u64;
+    align:  u64;
+}
+
+# a static, 64-bit little-endian x86_64 executable (ET_EXEC, no PT_INTERP)
+# whose program headers lie inside `len` bytes; returns 0 if `img` is
+# anything else
+pub fun valid(img: u64, len: u64) u8 {
+    if (len < $size_of(Ehdr)::u64) { ret 0; }
+    val e: *Ehdr = img::*Ehdr;
+    if (e.ident[0] != 0x7F || e.ident[1] != 69 || e.ident[2] != 76 || e.ident[3] != 70) { ret 0; }
+    if (e.ident[4] != 2 || e.ident[5] != 1) { ret 0; } # 64-bit, little endian
+    if (e.kind != 2 || e.machine != 62) { ret 0; }     # ET_EXEC, x86_64
+    if (e.phentsize::u64 != $size_of(Phdr)::u64) { ret 0; }
+    if (e.phoff > len || e.phnum::u64 * $size_of(Phdr)::u64 > len - e.phoff) { ret 0; }
+    var i: u64 = 0;
+    for (i < e.phnum::u64) {
+        if (phdr(img, i).kind == PT_INTERP) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+pub fun phdr(img: u64, i: u64) *Phdr {
+    val e: *Ehdr = img::*Ehdr;
+    ret (img + e.phoff + i * $size_of(Phdr)::u64)::*Phdr;
+}
+
+pub fun phnum(img: u64) u64 {
+    ret (@(img::*Ehdr)).phnum::u64;
+}
+
+pub fun entry(img: u64) u64 {
+    ret (@(img::*Ehdr)).entry;
+}

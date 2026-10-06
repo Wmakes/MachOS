@@ -18,7 +18,7 @@ TESTS = [
     # name, keep previous disk, fsck, steps, expected output in order
     ("boot", False, False,
      ["wait:" + P, "send:uname -a; ls /\\n", "wait:" + P],
-     ["root: ext2 on disk", "MachOS", "bin/", "etc/", "dev/", "tmp/"]),
+     ["root: ext2 on /dev/sda2", "MachOS", "bin/", "etc/", "dev/", "tmp/"]),
 
     ("pipes", False, False,
      ["wait:" + P, "send:seq 1 2000 | grep 7 | wc; head -3 /etc/motd | cat | cat | wc\\n", "wait:" + P],
@@ -64,15 +64,17 @@ TESTS = [
     # install onto a blank second disk, then boot that disk on its own
     ("install", False, False,
      ["--disk2", "blank:" + TARGET,
-      "wait:" + P, "send:install /dev/disk0\\n", "wait:continue: ", "send:no\\n", "wait:" + P,
-      "send:install /dev/disk1\\n", "wait:continue: ", "send:yes\\n", "wait:" + P],
-     ["MachOS root 446 MiB", "mkfat: FAT32", "mkext2:", "copying the system", "is installed on /dev/disk1"]),
+      "wait:" + P, "send:ls /dev; install /dev/sda\\n", "wait:continue: ", "send:no\\n", "wait:" + P,
+      "send:install /dev/sdb\\n", "wait:continue: ", "send:yes\\n", "wait:" + P,
+      "send:ls /dev; mount /dev/sdb2 /mnt; ls /mnt; umount /dev/sdb2; ls /mnt; echo unmounted\\n", "wait:" + P],
+     ["sdb", "/dev/sdb2 MachOS root 446 MiB", "mkfat: FAT32", "mkext2:", "copying the system",
+      "is installed on /dev/sdb", "sdb1", "sdb2", "bin/", "unmounted"]),
 
     ("installed-boot", False, True,
      ["--boot", TARGET, "wait:" + P,
-      "send:uname; ls /boot; echo on-installed > /home/x; cat /home/x; mkdir /mnt; mount /dev/disk0 /mnt\\n", "wait:" + P,
+      "send:uname; ls /boot; echo on-installed > /home/x; cat /home/x; mkdir /mnt; mount /dev/sda2 /mnt\\n", "wait:" + P,
       "sleep:1"],
-     ["root: ext2 on disk 0", "MachOS", "kernel.elf", "on-installed", "busy"]),
+     ["root: ext2 on /dev/sda2", "MachOS", "kernel.elf", "on-installed", "busy"]),
 ]
 
 

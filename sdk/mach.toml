@@ -1,0 +1,24 @@
+# the MachOS SDK: the system call interface (abi), the program runtime (rt),
+# system call wrappers (sys) and helpers (io, blkdev). a program for MachOS
+# depends on it with  [dep.sdk] path = ".../MachOS/sdk"
+[project]
+id = "sdk"
+version = "0.1.0"
+mach = "^6.10"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = false
+float_reassoc = false

@@ -1,0 +1,46 @@
+# a MachOS program built on its own, outside the system:
+#   cd examples/hello && mach dep pull . && mach build . -t machos
+#   tools/put.sh examples/hello/out/machos/debug/hello     (onto the dev disk)
+#   then in MachOS: hello
+# any project anywhere works the same way: point [dep.sdk] at MachOS/sdk and
+# declare the machos target below
+[project]
+id = "hello"
+version = "0.1.0"
+mach = "^6.10"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+# a MachOS program: a static x86_64 ELF linked at 4 MiB
+[target.machos]
+isa  = "x86_64"
+os   = "freestanding"
+abi  = "sysv64"
+of   = "elf"
+base = 0x400000
+
+[artifact.hello]
+kind = "bin"
+entry = "main.mach"
+out = "hello"
+targets = ["machos"]
+link = []
+need = []
+
+[dep.sdk]
+path = "../../sdk"

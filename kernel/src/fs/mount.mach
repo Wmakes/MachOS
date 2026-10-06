@@ -1,0 +1,153 @@
+# what is mounted where. every mount is an ext2 filesystem on a block
+# device (fs/parts) with its own Part and ext2.Fs. a device with something
+# mounted on it, or a whole disk with a mounted partition, cannot be written
+# raw
+
+use abi:   sdk.abi;
+use ahci:  machos.dev.ahci;
+use heap:  machos.mm.heap;
+use blk:   machos.fs.blk;
+use ext2:  machos.fs.ext2;
+use vfs:   machos.fs.vfs;
+use parts: machos.fs.parts;
+
+pub val MAX: u64 = 8;
+
+rec Mount {
+    used:  u8;
+    disk:  u64;      # AHCI disk index
+    start: u64;      # first sector of the filesystem
+    part:  *blk.Part;
+    fs:    *ext2.Fs;
+    root:  *vfs.Node; # the mounted root (nil for the boot root)
+}
+
+var mounts: [8]Mount;
+
+fun free_slot() *Mount {
+    var i: u64 = 0;
+    for (i < MAX) {
+        if (mounts[i].used == 0) { ret ?mounts[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# open the ext2 filesystem on `b`; *why says what is wrong with it
+fun open_fs(b: *parts.Bdev, part: **blk.Part, fs: **ext2.Fs, why: **u8) u64 {
+    @why = nil;
+    val d: *ahci.Disk = parts.disk_of(b);
+    blk.forget_disk(d); # the disk may have just been written raw
+    val p: *blk.Part = heap.zalloc($size_of(blk.Part)::u64)::*blk.Part;
+    if (p == nil) { ret abi.err(abi.E_NOMEM); }
+    p.disk = d;
+    p.start = b.start;
+    p.sectors = b.count;
+    val f: *ext2.Fs = heap.zalloc($size_of(ext2.Fs)::u64)::*ext2.Fs;
+    if (f == nil) {
+        heap.free(p::u64);
+        ret abi.err(abi.E_NOMEM);
+    }
+    val err: *u8 = ext2.mount(f, p);
+    if (err != nil) {
+        @why = err;
+        heap.free(f::u64);
+        heap.free(p::u64);
+        ret abi.err(abi.E_INVAL);
+    }
+    @part = p;
+    @fs = f;
+    ret 0;
+}
+
+fun record(b: *parts.Bdev, p: *blk.Part, f: *ext2.Fs, root: *vfs.Node) {
+    val m: *Mount = free_slot();
+    m.used = 1;
+    m.disk = b.disk;
+    m.start = b.start;
+    m.part = p;
+    m.fs = f;
+    m.root = root;
+}
+
+# boot: make `b` the root; nil, or the reason it cannot be
+pub fun mount_root(b: *parts.Bdev) *u8 {
+    var p: *blk.Part = nil;
+    var f: *ext2.Fs = nil;
+    var why: *u8 = nil;
+    val r: u64 = open_fs(b, ?p, ?f, ?why);
+    if (abi.is_err(r) != 0) {
+        if (why != nil) { ret why; }
+        ret "out of memory\0";
+    }
+    if (vfs.init_ext2(f) == 0) { ret "out of memory\0"; }
+    record(b, p, f, nil);
+    ret nil;
+}
+
+# mount the filesystem on `b` on the directory `at`
+pub fun mount_at(b: *parts.Bdev, at: *vfs.Node) u64 {
+    if (busy(b) != 0) { ret abi.err(abi.E_BUSY); }
+    if (free_slot() == nil) { ret abi.err(abi.E_BUSY); }
+    var p: *blk.Part = nil;
+    var f: *ext2.Fs = nil;
+    var why: *u8 = nil;
+    val r: u64 = open_fs(b, ?p, ?f, ?why);
+    if (abi.is_err(r) != 0) { ret r; }
+    val vr: u64 = vfs.mount(at, f);
+    if (abi.is_err(vr) != 0) {
+        heap.free(f::u64);
+        heap.free(p::u64);
+        ret vr;
+    }
+    record(b, p, f, at.mounted);
+    ret 0;
+}
+
+fun release(m: *Mount) u64 {
+    if (m.root == nil) { ret abi.err(abi.E_BUSY); } # the root stays
+    val u: u64 = vfs.unmount(m.root);
+    if (abi.is_err(u) != 0) { ret u; }
+    blk.forget_disk(m.part.disk); # writes everything back first
+    heap.free(m.fs::u64);
+    heap.free(m.part::u64);
+    m.used = 0;
+    m.root = nil;
+    ret 0;
+}
+
+# unmount by the mounted root (what a path to the mountpoint finds)
+pub fun unmount(r: *vfs.Node) u64 {
+    var i: u64 = 0;
+    for (i < MAX) {
+        if (mounts[i].used != 0 && mounts[i].root == r) { ret release(?mounts[i]); }
+        i = i + 1;
+    }
+    ret abi.err(abi.E_INVAL);
+}
+
+# unmount by device
+pub fun unmount_dev(b: *parts.Bdev) u64 {
+    var i: u64 = 0;
+    for (i < MAX) {
+        val m: *Mount = ?mounts[i];
+        if (m.used != 0 && m.disk == b.disk && m.start == b.start) { ret release(m); }
+        i = i + 1;
+    }
+    ret abi.err(abi.E_INVAL);
+}
+
+# whether `b` (or, for a whole disk, anything on it) is mounted
+pub fun busy(b: *parts.Bdev) u8 {
+    var i: u64 = 0;
+    for (i < MAX) {
+        val m: *Mount = ?mounts[i];
+        if (m.used != 0 && m.disk == b.disk) {
+            if (b.part == 0) { ret 1; }
+            # a partition overlapping a mounted filesystem
+            if (m.start >= b.start && m.start < b.start + b.count) { ret 1; }
+        }
+        i = i + 1;
+    }
+    ret 0;
+}

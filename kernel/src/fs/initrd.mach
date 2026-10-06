@@ -1,0 +1,82 @@
+# unpack a USTAR archive (the Limine module) into an in-memory root
+
+use abi:   sdk.abi;
+use vfs:   machos.fs.vfs;
+use path:  machos.fs.path;
+
+fun octal(p: *u8, n: u64) u64 {
+    var v: u64 = 0;
+    var i: u64 = 0;
+    for (i < n && p[i] >= 48 && p[i] <= 55) {
+        v = v * 8 + (p[i] - 48)::u64;
+        i = i + 1;
+    }
+    ret v;
+}
+
+fun field_len(p: *u8, max: u64) u64 {
+    var n: u64 = 0;
+    for (n < max && p[n] != 0) { n = n + 1; }
+    ret n;
+}
+
+# make every directory along a normalized path (mkdir -p); returns the last
+fun mkdirs(p: *u8, n: u64) *vfs.Node {
+    var dir: *vfs.Node = vfs.get_root();
+    var i: u64 = 1;
+    for (i < n) {
+        val start: u64 = i;
+        for (i < n && p[i] != 47) { i = i + 1; }
+        var c: *vfs.Node = vfs.child(dir, ?p[start], i - start);
+        if (c == nil) { c = vfs.create_ram(dir, ?p[start], i - start, abi.KIND_DIR); }
+        if (c == nil || c.kind != abi.KIND_DIR) { ret nil; }
+        dir = c;
+        i = i + 1;
+    }
+    ret dir;
+}
+
+# returns the number of files unpacked
+pub fun unpack(tar: u64, len: u64) u64 {
+    var files: u64 = 0;
+    var off: u64 = 0;
+    var raw: [256]u8;
+    var norm: [256]u8;
+    for (off + 512 <= len) {
+        val h: *u8 = (tar + off)::*u8;
+        if (h[0] == 0) { brk; }
+        val size: u64 = octal(?h[124], 12);
+        val kind: u8 = h[156];
+
+        # prefix "/" name, then normalize (drops "./" and trailing slashes)
+        var n: u64 = 0;
+        val pl: u64 = field_len(?h[345], 155);
+        var i: u64 = 0;
+        for (i < pl) { raw[n] = h[345 + i]; n = n + 1; i = i + 1; }
+        if (pl > 0) { raw[n] = 47; n = n + 1; }
+        val nl: u64 = field_len(h, 100);
+        i = 0;
+        for (i < nl) { raw[n] = h[i]; n = n + 1; i = i + 1; }
+        val len_norm: u64 = path.resolve("/\0", 1, ?raw[0], n, ?norm[0]);
+
+        if (len_norm > 1) {
+            if (kind == 53) {
+                mkdirs(?norm[0], len_norm);
+            } or (kind == 48 || kind == 0) {
+                val b: u64 = path.base_index(?norm[0], len_norm);
+                var dl: u64 = 1;
+                if (b > 1) { dl = b - 1; }
+                val dir: *vfs.Node = mkdirs(?norm[0], dl);
+                if (dir != nil && off + 512 + size <= len) {
+                    val f: *vfs.Node = vfs.create_ram(dir, ?norm[b], len_norm - b, abi.KIND_FILE);
+                    if (f != nil) {
+                        vfs.write(f, 0, tar + off + 512, size);
+                        files = files + 1;
+                    }
+                }
+            }
+        }
+        off = off + 512 + ((size + 511) & ~511::u64);
+    }
+    ret files;
+}

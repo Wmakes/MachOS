@@ -1,0 +1,10 @@
+# the smallest program
+
+use io: sdk.io;
+use rt: sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    io.out("hello from user mode, written in mach!\n\0");
+    ret 0;
+}

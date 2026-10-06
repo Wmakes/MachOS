@@ -1,0 +1,17 @@
+# program startup: the kernel enters _start with rdi = argc, rsi = argv;
+# every program defines `#[symbol("umain")] fun main(argc: u64, argv: **u8) u64`
+# and its result becomes the exit code
+
+use sys: sdk.sys;
+
+#[naked]
+#[symbol("_start")]
+fun start() {
+    asm x86_64 {
+        and rsp, -16
+        call umain
+        mov rsi, rax
+        mov rdi, 0
+        call sys_call
+    }
+}

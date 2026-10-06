@@ -1,0 +1,212 @@
+# load an ELF executable from the file tree into a fresh process: map its
+# segments, a stack with the arguments on it, and say where to start
+
+use abi:   sdk.abi;
+use elf:   machos.kern.elf;
+use mem:   machos.kern.mem;
+use proc:  machos.kern.proc;
+use vfs:   machos.fs.vfs;
+use heap:  machos.mm.heap;
+use vmm:   machos.mm.vmm;
+use pmm:   machos.mm.pmm;
+
+pub val STACK_TOP:   u64 = 0x00007FFFFFFFF000;
+pub val STACK_PAGES: u64 = 32; # 128 KiB
+pub val LOAD_MIN:    u64 = 0x1000;
+val PAGE: u64 = 4096;
+
+# the kernel-visible address of user address `va` in `p`, or 0
+fun user_ptr(p: *proc.Proc, va: u64) u64 {
+    val e: u64 = vmm.lookup(p.pml4, va);
+    if ((e & vmm.P) == 0) { ret 0; }
+    ret vmm.phys_to_virt(e & 0x000FFFFFFFFFF000) + (va & (PAGE - 1));
+}
+
+# copy kernel bytes into p's (not current) address space
+fun poke(p: *proc.Proc, va: u64, src: u64, n: u64) u8 {
+    var done: u64 = 0;
+    for (done < n) {
+        val at: u64 = va + done;
+        var chunk: u64 = PAGE - (at & (PAGE - 1));
+        if (chunk > n - done) { chunk = n - done; }
+        val dst: u64 = user_ptr(p, at);
+        if (dst == 0) { ret 0; }
+        mem.copy(dst, src + done, chunk);
+        done = done + chunk;
+    }
+    ret 1;
+}
+
+# map a zeroed page at `va`, or widen the flags of the one already there
+pub fun map_user_page(p: *proc.Proc, va: u64, flags: u64) u8 {
+    val e: u64 = vmm.lookup(p.pml4, va);
+    if ((e & vmm.P) != 0) {
+        # two segments share this page: writable if either is, no-execute
+        # only if both are
+        var merged: u64 = vmm.U | (e & vmm.W) | (flags & vmm.W);
+        if ((e & vmm.NX) != 0 && (flags & vmm.NX) != 0) { merged = merged | vmm.NX; }
+        vmm.map(p.pml4, va, e & 0x000FFFFFFFFFF000, merged);
+        ret 1;
+    }
+    val pa: u64 = pmm.alloc();
+    if (pa == 0) { ret 0; }
+    if (vmm.map(p.pml4, va, pa, flags | vmm.U) == 0) {
+        pmm.free(pa);
+        ret 0;
+    }
+    p.pages = p.pages + 1;
+    ret 1;
+}
+
+fun load_segment(p: *proc.Proc, img: u64, len: u64, ph: *elf.Phdr) u64 {
+    if (ph.memsz == 0) { ret 0; }
+    if (ph.filesz > ph.memsz) { ret abi.err(abi.E_NOEXEC); }
+    if (ph.offset > len || ph.filesz > len - ph.offset) { ret abi.err(abi.E_NOEXEC); }
+    val stack_bottom: u64 = STACK_TOP - STACK_PAGES * PAGE;
+    if (ph.vaddr < LOAD_MIN || ph.vaddr >= stack_bottom || ph.memsz > stack_bottom - ph.vaddr) {
+        ret abi.err(abi.E_NOEXEC);
+    }
+    var flags: u64 = 0;
+    if ((ph.flags & elf.PF_W) != 0) { flags = flags | vmm.W; }
+    if ((ph.flags & elf.PF_X) == 0) { flags = flags | vmm.NX; }
+    var va: u64 = ph.vaddr & ~(PAGE - 1);
+    val end: u64 = ph.vaddr + ph.memsz;
+    for (va < end) {
+        if (map_user_page(p, va, flags) == 0) { ret abi.err(abi.E_NOMEM); }
+        va = va + PAGE;
+    }
+    if (poke(p, ph.vaddr, img + ph.offset, ph.filesz) == 0) { ret abi.err(abi.E_NOMEM); }
+    ret 0;
+}
+
+pub val IMAGE_MAX: u64 = 0x4000000; # 64 MiB
+
+# load `nd` into `p` and start it with the NUL-separated `args`
+# (args_len bytes, kernel memory). returns 0 or an error
+# `path` (absolute) is what `nd` was found as: a "#!" script needs it to
+# hand itself to its interpreter
+pub fun load(p: *proc.Proc, nd: *vfs.Node, path: *u8, path_len: u64, args: u64, args_len: u64) u64 {
+    ret load_file(p, nd, path, path_len, args, args_len, 1);
+}
+
+fun load_file(p: *proc.Proc, nd: *vfs.Node, path: *u8, path_len: u64, args: u64, args_len: u64, scripts: u8) u64 {
+    if (nd.kind != abi.KIND_FILE) { ret abi.err(abi.E_NOEXEC); }
+    val len: u64 = nd.size;
+    if (len == 0 || len > IMAGE_MAX) { ret abi.err(abi.E_NOEXEC); }
+    val img: u64 = heap.alloc(len);
+    if (img == 0) { ret abi.err(abi.E_NOMEM); }
+    var r: u64 = vfs.read(nd, 0, img, len);
+    if (r == len) {
+        val b: *u8 = img::*u8;
+        if (len > 2 && b[0] == 35 && b[1] == 33) {
+            if (scripts != 0) { r = load_script(p, b, len, path, path_len, args, args_len); }
+            or                { r = abi.err(abi.E_NOEXEC); } # no scripts as interpreters
+        } or {
+            r = load_image(p, img, len, args, args_len);
+        }
+    } or (abi.is_err(r) == 0) {
+        r = abi.err(abi.E_IO);
+    }
+    heap.free(img);
+    ret r;
+}
+
+# "#!/abs/interp [one-arg]": run the interpreter with argv
+#   interp [one-arg] script-path original-argv[1..]
+fun load_script(p: *proc.Proc, b: *u8, len: u64, path: *u8, path_len: u64, args: u64, args_len: u64) u64 {
+    var i: u64 = 2;
+    for (i < len && (b[i] == 32 || b[i] == 9)) { i = i + 1; }
+    val is: u64 = i;
+    for (i < len && b[i] != 10 && b[i] != 32 && b[i] != 9 && b[i] != 13) { i = i + 1; }
+    val ilen: u64 = i - is;
+    for (i < len && (b[i] == 32 || b[i] == 9)) { i = i + 1; }
+    val as: u64 = i;
+    for (i < len && b[i] != 10 && b[i] != 13) { i = i + 1; }
+    var alen: u64 = i - as;
+    for (alen > 0 && (b[as + alen - 1] == 32 || b[as + alen - 1] == 9)) { alen = alen - 1; }
+    if (ilen == 0 || ilen >= 256 || b[is] != 47) { ret abi.err(abi.E_NOEXEC); }
+    val interp: *vfs.Node = vfs.lookup(?b[is], ilen);
+    if (interp == nil) { ret abi.err(abi.E_NOENT); }
+
+    # skip the original argv[0]; the script path takes its place
+    var rest: u64 = 0;
+    for (rest < args_len && @((args + rest)::*u8) != 0) { rest = rest + 1; }
+    if (rest < args_len) { rest = rest + 1; }
+    val total: u64 = ilen + 1 + alen + 1 + path_len + 1 + (args_len - rest);
+    val na: u64 = heap.alloc(total);
+    if (na == 0) { ret abi.err(abi.E_NOMEM); }
+    var o: u64 = 0;
+    mem.copy(na, (?b[is])::u64, ilen);
+    o = ilen;
+    @((na + o)::*u8) = 0;
+    o = o + 1;
+    if (alen > 0) {
+        mem.copy(na + o, (?b[as])::u64, alen);
+        o = o + alen;
+        @((na + o)::*u8) = 0;
+        o = o + 1;
+    }
+    mem.copy(na + o, path::u64, path_len);
+    o = o + path_len;
+    @((na + o)::*u8) = 0;
+    o = o + 1;
+    mem.copy(na + o, args + rest, args_len - rest);
+    o = o + args_len - rest;
+    val r: u64 = load_file(p, interp, ?b[is], ilen, na, o, 0);
+    heap.free(na);
+    ret r;
+}
+
+fun load_image(p: *proc.Proc, img: u64, len: u64, args: u64, args_len: u64) u64 {
+    if (elf.valid(img, len) == 0) { ret abi.err(abi.E_NOEXEC); }
+
+    var top: u64 = 0;
+    var i: u64 = 0;
+    for (i < elf.phnum(img)) {
+        val ph: *elf.Phdr = elf.phdr(img, i);
+        if (ph.kind == elf.PT_LOAD) {
+            val r: u64 = load_segment(p, img, len, ph);
+            if (abi.is_err(r) != 0) { ret r; }
+            if (ph.vaddr + ph.memsz > top) { top = ph.vaddr + ph.memsz; }
+        }
+        i = i + 1;
+    }
+    val entry: u64 = elf.entry(img);
+    if (entry < LOAD_MIN || entry >= top) { ret abi.err(abi.E_NOEXEC); }
+    p.brk_base = (top + PAGE - 1) & ~(PAGE - 1);
+    p.brk = p.brk_base;
+
+    var va: u64 = STACK_TOP - STACK_PAGES * PAGE;
+    for (va < STACK_TOP) {
+        if (map_user_page(p, va, vmm.W | vmm.NX) == 0) { ret abi.err(abi.E_NOMEM); }
+        va = va + PAGE;
+    }
+
+    # [ strings ][ pad ][ argv[0..argc] , nil ] <- rsi; rdi = argc
+    var argc: u64 = 0;
+    i = 0;
+    for (i < args_len) {
+        if (@((args + i)::*u8) == 0) { argc = argc + 1; }
+        i = i + 1;
+    }
+    if (args_len > 16 * PAGE || argc > 1024) { ret abi.err(abi.E_INVAL); }
+    val strings: u64 = (STACK_TOP - args_len) & ~15::u64;
+    if (poke(p, strings, args, args_len) == 0) { ret abi.err(abi.E_NOMEM); }
+    val argv: u64 = (strings - (argc + 1) * 8) & ~15::u64;
+    var at: u64 = strings;
+    var k: u64 = 0;
+    i = 0;
+    for (k < argc) {
+        val slot: u64 = at;
+        if (poke(p, argv + k * 8, (?slot)::u64, 8) == 0) { ret abi.err(abi.E_NOMEM); }
+        for (@((args + i)::*u8) != 0) { i = i + 1; }
+        i = i + 1;
+        at = strings + i;
+        k = k + 1;
+    }
+    val zero: u64 = 0;
+    poke(p, argv + argc * 8, (?zero)::u64, 8);
+
+    proc.start(p, entry, argv - 16, argc, argv);
+    ret 0;
+}

@@ -1,0 +1,84 @@
+# ls [-l] [PATH...]: list directories (directories end in /)
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+var long: u8 = 0;
+
+fun show(e: *abi.Entry) {
+    if (long != 0) {
+        if (e.kind == abi.KIND_DIR) { io.out("d  \0"); }
+        or (e.kind == abi.KIND_DEV) { io.out("c  \0"); }
+        or                          { io.out("-  \0"); }
+        io.dec_pad(e.size, 8);
+        io.out("  \0");
+    }
+    if (e.kind == abi.KIND_DIR) { io.out("\x1b[1;34m\0"); }
+    or (e.kind == abi.KIND_DEV) { io.out("\x1b[1;33m\0"); }
+    io.outn(?e.name[0], e.name_len);
+    if (e.kind == abi.KIND_DIR) { io.out("\x1b[0m/\0"); }
+    or (e.kind == abi.KIND_DEV) { io.out("\x1b[0m\0"); }
+    io.putc(10);
+}
+
+fun list(p: *u8) u8 {
+    val n: u64 = io.len(p);
+    var st: abi.Stat;
+    val r: u64 = sys.stat(p, n, ?st);
+    if (abi.is_err(r) != 0) {
+        io.fail("ls\0", p, r);
+        ret 0;
+    }
+    if (st.kind != abi.KIND_DIR) {
+        var e: abi.Entry;
+        e.kind = st.kind;
+        e.size = st.size;
+        var k: u64 = n;
+        if (k > 59) { k = 59; }
+        e.name_len = k;
+        io.copy(?e.name[0], p, k);
+        show(?e);
+        ret 1;
+    }
+    val h: u64 = sys.open(p, n, abi.O_READ);
+    if (abi.is_err(h) != 0) {
+        io.fail("ls\0", p, h);
+        ret 0;
+    }
+    var i: u64 = 0;
+    for {
+        var e: abi.Entry;
+        val got: u64 = sys.readdir(h, i, ?e);
+        if (abi.is_err(got) != 0 || got == 0) { brk; }
+        show(?e);
+        i = i + 1;
+    }
+    sys.close(h);
+    ret 1;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var i: u64 = 1;
+    if (argc > 1 && io.streq(argv[1], "-l\0") != 0) {
+        long = 1;
+        i = 2;
+    }
+    if (i == argc) {
+        if (list(".\0") == 0) { ret 1; }
+        ret 0;
+    }
+    var status: u64 = 0;
+    val many: u8 = (argc - i > 1)::u8;
+    for (i < argc) {
+        if (many != 0) {
+            io.out(argv[i]);
+            io.out(":\n\0");
+        }
+        if (list(argv[i]) == 0) { status = 1; }
+        i = i + 1;
+    }
+    ret status;
+}

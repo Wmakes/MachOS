@@ -1,6 +1,0 @@
-# true: succeed
-
-use rt: machos.user.rt;
-
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 { ret 0; }

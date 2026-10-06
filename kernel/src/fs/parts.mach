@@ -1,0 +1,148 @@
+# block devices, named the Linux way: /dev/sda, /dev/sdb, ... for whole AHCI
+# disks and /dev/sda1, /dev/sda2, ... for the partitions in their GPT. a
+# device node's `dev` is DEV_DISK + its slot here. a disk's partitions are
+# read again when something that wrote to the whole disk closes it.
+# probe() fills the table at boot, before there is a root to put /dev in;
+# publish() makes the nodes once there is
+
+use abi:  sdk.abi;
+use ahci: machos.dev.ahci;
+use mem:  machos.kern.mem;
+use gpt:  machos.fs.gpt;
+use vfs:  machos.fs.vfs;
+
+pub val MAX: u64 = 64;
+
+pub rec Bdev {
+    used:  u8;
+    disk:  u64; # AHCI disk index
+    part:  u64; # 0 = the whole disk, else the GPT index
+    start: u64; # first sector
+    count: u64; # sectors
+    kind:  [16]u8; # partition type GUID
+    node:  *vfs.Node;
+}
+
+var devs: [64]Bdev;
+var devdir: *vfs.Node = nil;
+
+pub fun get(dev: u64) *Bdev {
+    if (dev < vfs.DEV_DISK || dev - vfs.DEV_DISK >= MAX) { ret nil; }
+    val b: *Bdev = ?devs[dev - vfs.DEV_DISK];
+    if (b.used == 0) { ret nil; }
+    ret b;
+}
+
+pub fun disk_of(b: *Bdev) *ahci.Disk { ret ahci.disk(b.disk); }
+
+fun make_node(i: u64) {
+    val b: *Bdev = ?devs[i];
+    # "sd" + letter + the partition number
+    var name: [8]u8;
+    name[0] = 115;
+    name[1] = 100;
+    name[2] = 97 + b.disk::u8;
+    var n: u64 = 3;
+    if (b.part >= 10) {
+        name[n] = 48 + (b.part / 10)::u8;
+        n = n + 1;
+    }
+    if (b.part > 0) {
+        name[n] = 48 + (b.part % 10)::u8;
+        n = n + 1;
+    }
+    val nd: *vfs.Node = vfs.create_ram(devdir, ?name[0], n, abi.KIND_DEV);
+    if (nd == nil) { ret; }
+    nd.dev = vfs.DEV_DISK + i;
+    nd.size = b.count * ahci.SECTOR;
+    b.node = nd;
+}
+
+fun add(disk: u64, part: u64, start: u64, count: u64, kind: *u8) *Bdev {
+    var i: u64 = 0;
+    for (i < MAX) {
+        val b: *Bdev = ?devs[i];
+        if (b.used == 0) {
+            b.used = 1;
+            b.disk = disk;
+            b.part = part;
+            b.start = start;
+            b.count = count;
+            if (kind != nil) { mem.copy((?b.kind[0])::u64, kind::u64, 16); }
+            or               { mem.fill((?b.kind[0])::u64, 0, 16); }
+            b.node = nil;
+            if (devdir != nil) { make_node(i); }
+            ret b;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun add_partitions(disk: u64) {
+    var entries: [32]gpt.Entry;
+    val n: u64 = gpt.scan(ahci.disk(disk), ?entries[0]);
+    var i: u64 = 0;
+    for (i < n && i < 99) {
+        val e: *gpt.Entry = ?entries[i];
+        add(disk, e.index, e.first, e.count, ?e.kind[0]);
+        i = i + 1;
+    }
+}
+
+# every disk and its partitions into the table (boot, before /dev exists)
+pub fun probe() {
+    var d: u64 = 0;
+    for (d < ahci.disk_count() && d < 26) {
+        add(d, 0, 0, ahci.disk(d).sectors, nil);
+        add_partitions(d);
+        d = d + 1;
+    }
+}
+
+# /dev/sdX and /dev/sdXN nodes under `dev` for everything probed
+pub fun publish(dev: *vfs.Node) {
+    devdir = dev;
+    var i: u64 = 0;
+    for (i < MAX) {
+        if (devs[i].used != 0 && devs[i].node == nil) { make_node(i); }
+        i = i + 1;
+    }
+}
+
+# forget disk `disk`'s partitions and read its GPT again. a partition node
+# still held open stops being a device and reads as empty
+pub fun rescan(disk: u64) {
+    var i: u64 = 0;
+    for (i < MAX) {
+        val b: *Bdev = ?devs[i];
+        if (b.used != 0 && b.disk == disk && b.part != 0) {
+            if (b.node != nil) {
+                b.node.dev = vfs.DEV_NULL;
+                vfs.unlink(b.node);
+            }
+            b.used = 0;
+        }
+        i = i + 1;
+    }
+    add_partitions(disk);
+}
+
+# the first partition with the MachOS root type, in disk order, or nil
+pub fun find_root() *Bdev {
+    var d: u64 = 0;
+    for (d < ahci.disk_count()) {
+        var i: u64 = 0;
+        for (i < MAX) {
+            val b: *Bdev = ?devs[i];
+            if (b.used != 0 && b.disk == d && b.part != 0 && mem.equal(?b.kind[0], ?gpt.ROOT_TYPE[0], 16) != 0) {
+                ret b;
+            }
+            i = i + 1;
+        }
+        d = d + 1;
+    }
+    ret nil;
+}
+
+pub fun slot_of(b: *Bdev) u64 { ret (b::u64 - (?devs[0])::u64) / $size_of(Bdev)::u64; }
