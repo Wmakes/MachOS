@@ -21,6 +21,7 @@ use sys:    machos.kern.sys;
 use abi:    machos.abi.sys;
 use ramfs:  machos.fs.ramfs;
 use initrd: machos.fs.initrd;
+use version: machos.abi.version;
 
 var boot: info.BootInfo;
 
@@ -39,7 +40,9 @@ fun kmain() {
     if (err != nil) { kprint.panic(err); }
     val have_fb: u8 = fbcon.init(?boot.fb);
 
-    kprint.puts("machos 0.1.0\n\0");
+    kprint.puts("MachOS \0");
+    kprint.puts(version.VERSION);
+    kprint.putc(10);
     if (have_fb != 0) {
         kprint.puts("fb: \0");
         kprint.dec(boot.fb.width);

@@ -1,0 +1,5 @@
+# the MachOS version: [project].version in mach.toml, the one place to bump it.
+# kernel and programs are built together, so both see the same string
+# (NUL-terminated, like every other string literal in the tree)
+
+pub val VERSION: *u8 = $project.version;
