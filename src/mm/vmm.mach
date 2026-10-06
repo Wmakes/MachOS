@@ -245,3 +245,12 @@ pub fun user_ok(pml4: u64, va: u64, len: u64, write: u8) u8 {
 
 # where physical memory is visible to the kernel
 pub fun phys_to_virt(pa: u64) u64 { ret pa + hhdm; }
+
+# physical address behind a kernel virtual address (hhdm or 4 KiB mapped),
+# 0 if it is not mapped
+pub fun kernel_phys(va: u64) u64 {
+    if (va >= hhdm && va < 0xffffc00000000000) { ret va - hhdm; }
+    val e: u64 = lookup(kernel_pml4, va);
+    if ((e & P) == 0) { ret 0; }
+    ret (e & ADDR) + (va & (PAGE - 1));
+}

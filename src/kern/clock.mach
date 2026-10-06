@@ -1,0 +1,18 @@
+# wall-clock time: the RTC reading at boot plus the timer ticks since
+
+use rtc:  machos.dev.rtc;
+use apic: machos.arch.x86_64.apic;
+use proc: machos.kern.proc;
+
+var boot_epoch: u64 = 0;
+var boot_ticks: u64 = 0;
+
+pub fun init() {
+    boot_epoch = rtc.read_epoch();
+    boot_ticks = proc.uptime_ticks();
+}
+
+# seconds since 1970-01-01 UTC
+pub fun now() u64 {
+    ret boot_epoch + (proc.uptime_ticks() - boot_ticks) / apic.HZ;
+}

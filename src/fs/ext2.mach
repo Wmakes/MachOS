@@ -1,0 +1,675 @@
+# ext2 with 4 KiB blocks on a blk.Part, read and write. works in inode
+# numbers only; fs/vfs.mach turns them into the node tree. every change goes
+# straight to the disk (blk is write-through).
+#
+# supported: direct, single and double indirect blocks (files up to ~4 GiB),
+# linear directories with file types. a filesystem with any incompatible
+# feature besides `filetype` is refused rather than risked
+
+use abi:  machos.abi.sys;
+use blk:  machos.fs.blk;
+use heap: machos.mm.heap;
+use mem:  machos.kern.mem;
+use clock: machos.kern.clock;
+
+pub val ROOT_INO: u64 = 2;
+val BS: u64 = 4096;
+val PTRS: u64 = 1024; # block numbers per block
+
+val S_IFDIR: u16 = 0x4000;
+val S_IFREG: u16 = 0x8000;
+val S_IFCHR: u16 = 0x2000;
+val S_IFMT:  u16 = 0xF000;
+val INDEX_FL: u32 = 0x1000; # hashed directory; cleared when we edit one
+
+val FT_REG: u8 = 1;
+val FT_DIR: u8 = 2;
+
+pub rec Inode {
+    mode:      u16;
+    uid:       u16;
+    size:      u32;
+    atime:     u32;
+    ctime:     u32;
+    mtime:     u32;
+    dtime:     u32;
+    gid:       u16;
+    links:     u16;
+    blocks:    u32; # 512-byte units, indirect blocks included
+    flags:     u32;
+    osd1:      u32;
+    block:     [15]u32;
+    gen:       u32;
+    file_acl:  u32;
+    size_high: u32;
+    faddr:     u32;
+    osd2:      [12]u8;
+}
+
+rec Group {
+    block_bitmap: u32;
+    inode_bitmap: u32;
+    inode_table:  u32;
+    free_blocks:  u16;
+    free_inodes:  u16;
+    used_dirs:    u16;
+    pad:          u16;
+    reserved:     [12]u8;
+}
+
+var part: *blk.Part = nil;
+var sb: [1024]u8;
+var blocks_count: u64 = 0;
+var bpg: u64 = 0;
+var ipg: u64 = 0;
+var inode_size: u64 = 128;
+var first_data: u64 = 0;
+var groups: u64 = 0;
+
+fun sb32(off: u64) u32 { ret @((?sb[off])::*u32); }
+fun sb16(off: u64) u16 { ret @((?sb[off])::*u16); }
+fun set_sb32(off: u64, v: u32) { @((?sb[off])::*u32) = v; }
+
+fun e(code: u64) u64 { ret abi.err(code); }
+
+# returns an error message, or nil once mounted
+pub fun mount(p: *blk.Part) *u8 {
+    part = p;
+    if (blk.read_bytes(p, 1024, 1024, (?sb[0])::u64) == 0) { ret "ext2: cannot read the superblock\0"; }
+    if (sb16(56) != 0xEF53) { ret "ext2: not an ext2 filesystem\0"; }
+    if (sb32(24) != 2) { ret "ext2: only 4 KiB blocks are supported\0"; }
+    if (sb32(76) >= 1) {
+        inode_size = sb16(88)::u64;
+        if ((sb32(96) & ~2::u32) != 0) { ret "ext2: unsupported incompatible features\0"; }
+        if ((sb32(100) & ~3::u32) != 0) { ret "ext2: unsupported read-only features\0"; }
+    }
+    if (inode_size < 128 || inode_size > BS) { ret "ext2: bad inode size\0"; }
+    blocks_count = sb32(4)::u64;
+    first_data = sb32(20)::u64;
+    bpg = sb32(32)::u64;
+    ipg = sb32(40)::u64;
+    if (bpg == 0 || ipg == 0 || blocks_count > blk.blocks(p)) { ret "ext2: bad superblock\0"; }
+    groups = (blocks_count - first_data + bpg - 1) / bpg;
+    ret nil;
+}
+
+fun write_sb() u8 { ret blk.write_bytes(part, 1024, 1024, (?sb[0])::u64); }
+
+fun group_off(g: u64) u64 { ret (first_data + 1) * BS + g * 32; }
+
+fun read_group(g: u64, out: *Group) u8 { ret blk.read_bytes(part, group_off(g), 32, out::u64); }
+fun write_group(g: u64, gd: *Group) u8 { ret blk.write_bytes(part, group_off(g), 32, gd::u64); }
+
+fun inode_off(ino: u64) u64 {
+    var gd: Group;
+    read_group((ino - 1) / ipg, ?gd);
+    ret gd.inode_table::u64 * BS + ((ino - 1) % ipg) * inode_size;
+}
+
+pub fun read_inode(ino: u64, out: *Inode) u8 {
+    if (ino == 0 || ino > ipg * groups) { ret 0; }
+    ret blk.read_bytes(part, inode_off(ino), 128, out::u64);
+}
+
+fun write_inode(ino: u64, i: *Inode) u8 {
+    ret blk.write_bytes(part, inode_off(ino), 128, i::u64);
+}
+
+pub fun kind_of(i: *Inode) u64 {
+    val t: u16 = i.mode & S_IFMT;
+    if (t == S_IFDIR) { ret abi.KIND_DIR; }
+    if (t == S_IFCHR) { ret abi.KIND_DEV; }
+    ret abi.KIND_FILE;
+}
+
+pub fun size_of(i: *Inode) u64 {
+    if ((i.mode & S_IFMT) == S_IFREG) { ret i.size::u64 | (i.size_high::u64 << 32); }
+    ret i.size::u64;
+}
+
+fun set_size(i: *Inode, n: u64) {
+    i.size = (n & 0xFFFFFFFF)::u32;
+    if ((i.mode & S_IFMT) == S_IFREG) { i.size_high = (n >> 32)::u32; }
+}
+
+# --- bitmaps -----------------------------------------------------------------
+
+# find, set and return a clear bit below `limit` in bitmap block `b`, or NONE
+fun take_bit(b: u64, limit: u64) u64 {
+    val buf: u64 = heap.alloc(BS);
+    if (buf == 0) { ret 0xFFFFFFFFFFFFFFFF; }
+    var found: u64 = 0xFFFFFFFFFFFFFFFF;
+    if (blk.read(part, b, buf) != 0) {
+        val bits: *u8 = buf::*u8;
+        var i: u64 = 0;
+        for (i < limit) {
+            if (bits[i / 8] == 0xFF) {
+                i = (i / 8 + 1) * 8;
+                cnt;
+            }
+            if ((bits[i / 8] & (1::u8 << (i % 8)::u8)) == 0) {
+                bits[i / 8] = bits[i / 8] | (1::u8 << (i % 8)::u8);
+                if (blk.write(part, b, buf) != 0) { found = i; }
+                brk;
+            }
+            i = i + 1;
+        }
+    }
+    heap.free(buf);
+    ret found;
+}
+
+fun clear_bit(b: u64, bit: u64) {
+    val buf: u64 = heap.alloc(BS);
+    if (buf == 0) { ret; }
+    if (blk.read(part, b, buf) != 0) {
+        val bits: *u8 = buf::*u8;
+        bits[bit / 8] = bits[bit / 8] & ~(1::u8 << (bit % 8)::u8);
+        blk.write(part, b, buf);
+    }
+    heap.free(buf);
+}
+
+fun blocks_in_group(g: u64) u64 {
+    val left: u64 = blocks_count - first_data - g * bpg;
+    if (left < bpg) { ret left; }
+    ret bpg;
+}
+
+# a zeroed block, near group `goal` if possible; 0 when the disk is full
+fun alloc_block(goal: u64) u64 {
+    var k: u64 = 0;
+    for (k < groups) {
+        val g: u64 = (goal + k) % groups;
+        var gd: Group;
+        if (read_group(g, ?gd) != 0 && gd.free_blocks > 0) {
+            val bit: u64 = take_bit(gd.block_bitmap::u64, blocks_in_group(g));
+            if (bit != 0xFFFFFFFFFFFFFFFF) {
+                gd.free_blocks = gd.free_blocks - 1;
+                write_group(g, ?gd);
+                set_sb32(12, sb32(12) - 1);
+                write_sb();
+                val b: u64 = first_data + g * bpg + bit;
+                val zero: u64 = heap.zalloc(BS);
+                if (zero != 0) {
+                    blk.write(part, b, zero);
+                    heap.free(zero);
+                }
+                ret b;
+            }
+        }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+fun free_block(b: u64) {
+    if (b < first_data || b >= blocks_count) { ret; }
+    val g: u64 = (b - first_data) / bpg;
+    var gd: Group;
+    if (read_group(g, ?gd) == 0) { ret; }
+    clear_bit(gd.block_bitmap::u64, (b - first_data) % bpg);
+    gd.free_blocks = gd.free_blocks + 1;
+    write_group(g, ?gd);
+    set_sb32(12, sb32(12) + 1);
+    write_sb();
+}
+
+fun alloc_inode(goal: u64, dir: u8) u64 {
+    var k: u64 = 0;
+    for (k < groups) {
+        val g: u64 = (goal + k) % groups;
+        var gd: Group;
+        if (read_group(g, ?gd) != 0 && gd.free_inodes > 0) {
+            val bit: u64 = take_bit(gd.inode_bitmap::u64, ipg);
+            if (bit != 0xFFFFFFFFFFFFFFFF) {
+                gd.free_inodes = gd.free_inodes - 1;
+                if (dir != 0) { gd.used_dirs = gd.used_dirs + 1; }
+                write_group(g, ?gd);
+                set_sb32(16, sb32(16) - 1);
+                write_sb();
+                ret g * ipg + bit + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+fun free_inode(ino: u64, dir: u8) {
+    val g: u64 = (ino - 1) / ipg;
+    var gd: Group;
+    if (read_group(g, ?gd) == 0) { ret; }
+    clear_bit(gd.inode_bitmap::u64, (ino - 1) % ipg);
+    gd.free_inodes = gd.free_inodes + 1;
+    if (dir != 0 && gd.used_dirs > 0) { gd.used_dirs = gd.used_dirs - 1; }
+    write_group(g, ?gd);
+    set_sb32(16, sb32(16) + 1);
+    write_sb();
+}
+
+# --- block mapping -----------------------------------------------------------
+
+# entry `idx` of indirect block `b`, allocating it when `create`; 0 = hole
+fun slot(b: u64, idx: u64, create: u8, i: *Inode, goal: u64) u64 {
+    val buf: u64 = heap.alloc(BS);
+    if (buf == 0) { ret 0; }
+    var v: u64 = 0;
+    if (blk.read(part, b, buf) != 0) {
+        val t: *u32 = buf::*u32;
+        v = t[idx]::u64;
+        if (v == 0 && create != 0) {
+            v = alloc_block(goal);
+            if (v != 0) {
+                t[idx] = v::u32;
+                blk.write(part, b, buf);
+                i.blocks = i.blocks + 8;
+            }
+        }
+    }
+    heap.free(buf);
+    ret v;
+}
+
+# a pointer held in the inode itself
+fun direct(i: *Inode, n: u64, create: u8, goal: u64) u64 {
+    var v: u64 = i.block[n]::u64;
+    if (v == 0 && create != 0) {
+        v = alloc_block(goal);
+        if (v != 0) {
+            i.block[n] = v::u32;
+            i.blocks = i.blocks + 8;
+        }
+    }
+    ret v;
+}
+
+# the disk block holding file block `lbn`; 0 for a hole (or a failed create).
+# may change `i` (the caller writes it back)
+fun bmap(ino: u64, i: *Inode, lbn: u64, create: u8) u64 {
+    val goal: u64 = (ino - 1) / ipg;
+    if (lbn < 12) { ret direct(i, lbn, create, goal); }
+    var n: u64 = lbn - 12;
+    if (n < PTRS) {
+        val ind: u64 = direct(i, 12, create, goal);
+        if (ind == 0) { ret 0; }
+        ret slot(ind, n, create, i, goal);
+    }
+    n = n - PTRS;
+    if (n < PTRS * PTRS) {
+        val dind: u64 = direct(i, 13, create, goal);
+        if (dind == 0) { ret 0; }
+        val ind: u64 = slot(dind, n / PTRS, create, i, goal);
+        if (ind == 0) { ret 0; }
+        ret slot(ind, n % PTRS, create, i, goal);
+    }
+    ret 0;
+}
+
+fun free_tree(b: u64, depth: u64) {
+    if (b == 0) { ret; }
+    if (depth > 0) {
+        val buf: u64 = heap.alloc(BS);
+        if (buf != 0) {
+            if (blk.read(part, b, buf) != 0) {
+                val t: *u32 = buf::*u32;
+                var k: u64 = 0;
+                for (k < PTRS) {
+                    free_tree(t[k]::u64, depth - 1);
+                    k = k + 1;
+                }
+            }
+            heap.free(buf);
+        }
+    }
+    free_block(b);
+}
+
+fun free_blocks(i: *Inode) {
+    var k: u64 = 0;
+    for (k < 12) {
+        free_tree(i.block[k]::u64, 0);
+        k = k + 1;
+    }
+    free_tree(i.block[12]::u64, 1);
+    free_tree(i.block[13]::u64, 2);
+    free_tree(i.block[14]::u64, 3);
+    k = 0;
+    for (k < 15) {
+        i.block[k] = 0;
+        k = k + 1;
+    }
+    i.blocks = 0;
+}
+
+# --- file data ---------------------------------------------------------------
+
+pub fun read(ino: u64, off: u64, dst: u64, n: u64) u64 {
+    var i: Inode;
+    if (read_inode(ino, ?i) == 0) { ret e(abi.E_IO); }
+    val size: u64 = size_of(?i);
+    if (off >= size) { ret 0; }
+    var want: u64 = n;
+    if (want > size - off) { want = size - off; }
+    val buf: u64 = heap.alloc(BS);
+    if (buf == 0) { ret e(abi.E_NOMEM); }
+    var done: u64 = 0;
+    for (done < want) {
+        val at: u64 = off + done;
+        var k: u64 = BS - at % BS;
+        if (k > want - done) { k = want - done; }
+        val pb: u64 = bmap(ino, ?i, at / BS, 0);
+        if (pb == 0) {
+            mem.fill(dst + done, 0, k);
+        } or {
+            if (blk.read(part, pb, buf) == 0) {
+                heap.free(buf);
+                ret e(abi.E_IO);
+            }
+            mem.copy(dst + done, buf + at % BS, k);
+        }
+        done = done + k;
+    }
+    heap.free(buf);
+    ret want;
+}
+
+pub fun write(ino: u64, off: u64, src: u64, n: u64) u64 {
+    var i: Inode;
+    if (read_inode(ino, ?i) == 0) { ret e(abi.E_IO); }
+    val buf: u64 = heap.alloc(BS);
+    if (buf == 0) { ret e(abi.E_NOMEM); }
+    var done: u64 = 0;
+    var err: u64 = 0;
+    for (done < n) {
+        val at: u64 = off + done;
+        var k: u64 = BS - at % BS;
+        if (k > n - done) { k = n - done; }
+        val pb: u64 = bmap(ino, ?i, at / BS, 1);
+        if (pb == 0) { err = e(abi.E_NOSPC); brk; }
+        if (k < BS && blk.read(part, pb, buf) == 0) { err = e(abi.E_IO); brk; }
+        mem.copy(buf + at % BS, src + done, k);
+        if (blk.write(part, pb, buf) == 0) { err = e(abi.E_IO); brk; }
+        done = done + k;
+    }
+    heap.free(buf);
+    if (off + done > size_of(?i)) { set_size(?i, off + done); }
+    i.mtime = clock.now()::u32;
+    i.ctime = i.mtime;
+    write_inode(ino, ?i);
+    if (done == 0 && err != 0) { ret err; }
+    ret done;
+}
+
+pub fun truncate(ino: u64) {
+    var i: Inode;
+    if (read_inode(ino, ?i) == 0) { ret; }
+    free_blocks(?i);
+    set_size(?i, 0);
+    i.mtime = clock.now()::u32;
+    i.ctime = i.mtime;
+    write_inode(ino, ?i);
+}
+
+# --- directories ---------------------------------------------------------------
+
+# the next entry at byte *pos of directory `dir` (skipping empty slots, "."
+# and ".."); fills name/len/ino/kind and advances *pos. 0 at the end
+pub fun dir_next(dir: u64, pos: *u64, name: *u8, len: *u64, ino: *u64, kind: *u64) u8 {
+    var hdr: [8]u8;
+    for {
+        if (read(dir, @pos, (?hdr[0])::u64, 8) != 8) { ret 0; }
+        val inum: u64 = (@((?hdr[0])::*u32))::u64;
+        val rec: u64 = (@((?hdr[4])::*u16))::u64;
+        val nl: u64 = hdr[6]::u64;
+        val ft: u8 = hdr[7];
+        if (rec < 8) { ret 0; }
+        val at: u64 = @pos;
+        @pos = at + rec;
+        if (inum == 0 || nl == 0 || nl > abi.NAME_MAX) { cnt; }
+        read(dir, at + 8, name::u64, nl);
+        if (nl == 1 && name[0] == 46) { cnt; }
+        if (nl == 2 && name[0] == 46 && name[1] == 46) { cnt; }
+        @len = nl;
+        @ino = inum;
+        if (ft == FT_DIR) { @kind = abi.KIND_DIR; }
+        or (ft == FT_REG) { @kind = abi.KIND_FILE; }
+        or {
+            var i: Inode;
+            read_inode(inum, ?i);
+            @kind = kind_of(?i);
+        }
+        ret 1;
+    }
+    ret 0;
+}
+
+fun rec_size(nl: u64) u64 { ret (8 + nl + 3) & ~3::u64; }
+
+fun put_entry(at: u64, ino: u64, rec: u64, name: *u8, nl: u64, ft: u8) {
+    @(at::*u32) = ino::u32;
+    @((at + 4)::*u16) = rec::u16;
+    @((at + 6)::*u8) = nl::u8;
+    @((at + 7)::*u8) = ft;
+    mem.copy(at + 8, name::u64, nl);
+}
+
+fun drop_index(dir: u64, i: *Inode) {
+    if ((i.flags & INDEX_FL) != 0) {
+        i.flags = i.flags & ~INDEX_FL;
+        write_inode(dir, i);
+    }
+}
+
+fun dir_add(dir: u64, name: *u8, nl: u64, ino: u64, ft: u8) u64 {
+    var i: Inode;
+    if (read_inode(dir, ?i) == 0) { ret e(abi.E_IO); }
+    drop_index(dir, ?i);
+    val need: u64 = rec_size(nl);
+    val buf: u64 = heap.alloc(BS);
+    if (buf == 0) { ret e(abi.E_NOMEM); }
+    val nblocks: u64 = size_of(?i) / BS;
+    var lbn: u64 = 0;
+    for (lbn < nblocks) {
+        val pb: u64 = bmap(dir, ?i, lbn, 0);
+        if (pb != 0 && blk.read(part, pb, buf) != 0) {
+            var off: u64 = 0;
+            for (off + 8 <= BS) {
+                val at: u64 = buf + off;
+                val rec: u64 = (@((at + 4)::*u16))::u64;
+                if (rec < 8 || off + rec > BS) { brk; }
+                var used: u64 = 0;
+                if (@(at::*u32) != 0) { used = rec_size((@((at + 6)::*u8))::u64); }
+                if (rec - used >= need) {
+                    if (used == 0) {
+                        put_entry(at, ino, rec, name, nl, ft);
+                    } or {
+                        @((at + 4)::*u16) = used::u16;
+                        put_entry(at + used, ino, rec - used, name, nl, ft);
+                    }
+                    val ok: u8 = blk.write(part, pb, buf);
+                    heap.free(buf);
+                    if (ok == 0) { ret e(abi.E_IO); }
+                    ret 0;
+                }
+                off = off + rec;
+            }
+        }
+        lbn = lbn + 1;
+    }
+    # no room: a new block holding just this entry
+    val pb: u64 = bmap(dir, ?i, nblocks, 1);
+    if (pb == 0) {
+        heap.free(buf);
+        write_inode(dir, ?i);
+        ret e(abi.E_NOSPC);
+    }
+    mem.fill(buf, 0, BS);
+    put_entry(buf, ino, BS, name, nl, ft);
+    val ok: u8 = blk.write(part, pb, buf);
+    heap.free(buf);
+    set_size(?i, (nblocks + 1) * BS);
+    write_inode(dir, ?i);
+    if (ok == 0) { ret e(abi.E_IO); }
+    ret 0;
+}
+
+# remove `name` from `dir`; returns its inode number, 0 if it was not there
+fun dir_remove(dir: u64, name: *u8, nl: u64) u64 {
+    var i: Inode;
+    if (read_inode(dir, ?i) == 0) { ret 0; }
+    drop_index(dir, ?i);
+    val buf: u64 = heap.alloc(BS);
+    if (buf == 0) { ret 0; }
+    val nblocks: u64 = size_of(?i) / BS;
+    var lbn: u64 = 0;
+    for (lbn < nblocks) {
+        val pb: u64 = bmap(dir, ?i, lbn, 0);
+        if (pb != 0 && blk.read(part, pb, buf) != 0) {
+            var off: u64 = 0;
+            var prev: u64 = 0xFFFFFFFFFFFFFFFF;
+            for (off + 8 <= BS) {
+                val at: u64 = buf + off;
+                val rec: u64 = (@((at + 4)::*u16))::u64;
+                if (rec < 8 || off + rec > BS) { brk; }
+                val inum: u64 = (@(at::*u32))::u64;
+                if (inum != 0 && (@((at + 6)::*u8))::u64 == nl && mem.equal((at + 8)::*u8, name, nl) != 0) {
+                    if (prev == 0xFFFFFFFFFFFFFFFF) {
+                        @(at::*u32) = 0;
+                    } or {
+                        val p: u64 = buf + prev;
+                        @((p + 4)::*u16) = ((@((p + 4)::*u16))::u64 + rec)::u16;
+                    }
+                    blk.write(part, pb, buf);
+                    heap.free(buf);
+                    ret inum;
+                }
+                prev = off;
+                off = off + rec;
+            }
+        }
+        lbn = lbn + 1;
+    }
+    heap.free(buf);
+    ret 0;
+}
+
+# point the ".." of directory `dir` at `parent`
+fun set_dotdot(dir: u64, parent: u64) {
+    var i: Inode;
+    if (read_inode(dir, ?i) == 0) { ret; }
+    val pb: u64 = bmap(dir, ?i, 0, 0);
+    if (pb == 0) { ret; }
+    val buf: u64 = heap.alloc(BS);
+    if (buf == 0) { ret; }
+    if (blk.read(part, pb, buf) != 0) {
+        val rec: u64 = (@((buf + 4)::*u16))::u64; # "." comes first
+        if (rec >= 12 && rec + 8 <= BS) {
+            @((buf + rec)::*u32) = parent::u32;
+            blk.write(part, pb, buf);
+        }
+    }
+    heap.free(buf);
+}
+
+fun add_links(ino: u64, up: u8) {
+    var i: Inode;
+    if (read_inode(ino, ?i) == 0) { ret; }
+    if (up != 0) { i.links = i.links + 1; }
+    or (i.links > 0) { i.links = i.links - 1; }
+    write_inode(ino, ?i);
+}
+
+# a new file or directory `name` in `dir`; returns its inode or an error
+pub fun create(dir: u64, name: *u8, nl: u64, kind: u64) u64 {
+    var is_dir: u8 = 0;
+    if (kind == abi.KIND_DIR) { is_dir = 1; }
+    val ino: u64 = alloc_inode((dir - 1) / ipg, is_dir);
+    if (ino == 0) { ret e(abi.E_NOSPC); }
+    var i: Inode;
+    mem.fill((?i)::u64, 0, 128);
+    i.atime = clock.now()::u32;
+    i.ctime = i.atime;
+    i.mtime = i.atime;
+    var ft: u8 = FT_REG;
+    if (is_dir != 0) {
+        ft = FT_DIR;
+        i.mode = S_IFDIR | 0x1ED; # 0755
+        i.links = 2;
+        val b: u64 = alloc_block((ino - 1) / ipg);
+        if (b == 0) {
+            free_inode(ino, 1);
+            ret e(abi.E_NOSPC);
+        }
+        val buf: u64 = heap.zalloc(BS);
+        if (buf == 0) {
+            free_block(b);
+            free_inode(ino, 1);
+            ret e(abi.E_NOMEM);
+        }
+        put_entry(buf, ino, 12, ".\0", 1, FT_DIR);
+        put_entry(buf + 12, dir, BS - 12, "..\0", 2, FT_DIR);
+        blk.write(part, b, buf);
+        heap.free(buf);
+        i.block[0] = b::u32;
+        i.blocks = 8;
+        i.size = BS::u32;
+    } or {
+        i.mode = S_IFREG | 0x1A4; # 0644
+        i.links = 1;
+    }
+    write_inode(ino, ?i);
+    val r: u64 = dir_add(dir, name, nl, ino, ft);
+    if (abi.is_err(r) != 0) {
+        free_blocks(?i);
+        free_inode(ino, is_dir);
+        ret r;
+    }
+    if (is_dir != 0) { add_links(dir, 1); }
+    ret ino;
+}
+
+# take `name` (inode `ino`) out of `dir`; returns the links left on it.
+# a directory must already be empty
+pub fun unlink(dir: u64, name: *u8, nl: u64, ino: u64, is_dir: u8) u64 {
+    dir_remove(dir, name, nl);
+    var i: Inode;
+    if (read_inode(ino, ?i) == 0) { ret 0; }
+    if (is_dir != 0) {
+        i.links = 0; # its own "." and the entry just removed
+        add_links(dir, 0);
+    } or (i.links > 0) {
+        i.links = i.links - 1;
+    }
+    write_inode(ino, ?i);
+    ret i.links::u64;
+}
+
+# give back the blocks and inode of something with no links left
+pub fun release(ino: u64) {
+    var i: Inode;
+    if (read_inode(ino, ?i) == 0 || i.links != 0) { ret; }
+    val is_dir: u8 = ((i.mode & S_IFMT) == S_IFDIR)::u8;
+    free_blocks(?i);
+    set_size(?i, 0);
+    i.dtime = clock.now()::u32;
+    write_inode(ino, ?i);
+    free_inode(ino, is_dir);
+}
+
+pub fun rename(odir: u64, oname: *u8, onl: u64, ndir: u64, nname: *u8, nnl: u64, ino: u64, is_dir: u8) u64 {
+    var ft: u8 = FT_REG;
+    if (is_dir != 0) { ft = FT_DIR; }
+    val r: u64 = dir_add(ndir, nname, nnl, ino, ft);
+    if (abi.is_err(r) != 0) { ret r; }
+    dir_remove(odir, oname, onl);
+    if (is_dir != 0 && odir != ndir) {
+        set_dotdot(ino, ndir);
+        add_links(odir, 0);
+        add_links(ndir, 1);
+    }
+    ret 0;
+}
+
+pub fun free_space() u64 { ret sb32(12)::u64 * BS; }
+pub fun total_space() u64 { ret blocks_count * BS; }

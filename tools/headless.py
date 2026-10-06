@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Boot MachOS under QEMU with no window and drive it from a script.
 
-usage: tools/headless.py [-p release] [-t SECONDS] STEP...
+usage: tools/headless.py [-p release] [-t SECONDS] [--keep] [--fsck] STEP...
+
+The disk is rebuilt fresh unless --keep is given (then files written by an
+earlier run are still there). --fsck runs e2fsck on the root partition after
+QEMU stops and fails if it finds problems.
 
 steps run in order:
   wait:REGEX     wait until the serial output (since the last wait) matches
@@ -11,7 +15,8 @@ steps run in order:
   shot:PATH      save a PNG screenshot of the framebuffer
 
 The whole serial log is printed at the end. Exit status is 1 if a wait
-timed out, 2 if the kernel panicked or took an unhandled exception.
+timed out, 2 if the kernel panicked or took an unhandled exception, 3 if
+e2fsck found problems.
 """
 import argparse, os, re, socket, subprocess, sys, threading, time
 
@@ -55,12 +60,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-p", "--profile", default="debug")
     ap.add_argument("-t", "--timeout", type=float, default=20.0)
+    ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--fsck", action="store_true")
     ap.add_argument("steps", nargs="*")
     a = ap.parse_args()
 
     os.chdir(ROOT)
-    img = subprocess.run(["tools/mkimage.sh", a.profile], check=True,
-                         stdout=subprocess.PIPE, text=True).stdout.strip()
+    mk = ["tools/mkimage.sh", a.profile] + ([] if a.keep else ["--fresh"])
+    img = subprocess.run(mk, check=True, stdout=subprocess.PIPE, text=True).stdout.strip().splitlines()[-1]
     out = os.path.join("out", "headless")
     os.makedirs(out, exist_ok=True)
     ser, mon = os.path.join(out, "serial.sock"), os.path.join(out, "monitor.sock")
@@ -157,6 +164,16 @@ def main():
     finally:
         qemu.kill()
         qemu.wait()
+    if a.fsck:
+        part = os.path.join(out, "root.img")
+        subprocess.run(["dd", f"if={img}", f"of={part}", "bs=512", "skip=67584",
+                        "count=188416", "status=none"], check=True)
+        fsck = subprocess.run(["e2fsck", "-fn", part], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+        os.remove(part)
+        print(fsck.stdout, file=sys.stderr, end="")
+        if fsck.returncode != 0 and status == 0:
+            status = 3
     text = log.decode("utf-8", "replace").replace("\r", "")
     text = re.sub(r"\x1b\[[0-9;=?]*[A-Za-z]", "", text)
     sys.stdout.write(text)

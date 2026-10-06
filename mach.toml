@@ -68,6 +68,14 @@ targets = ["user"]
 link = []
 need = []
 
+[artifact.date]
+kind = "bin"
+entry = "user/bin/date.mach"
+out = "bin/date"
+targets = ["user"]
+link = []
+need = []
+
 [artifact.echo]
 kind = "bin"
 entry = "user/bin/echo.mach"
@@ -192,6 +200,14 @@ need = []
 kind = "bin"
 entry = "user/bin/sleep.mach"
 out = "bin/sleep"
+targets = ["user"]
+link = []
+need = []
+
+[artifact.sync]
+kind = "bin"
+entry = "user/bin/sync.mach"
+out = "bin/sync"
 targets = ["user"]
 link = []
 need = []

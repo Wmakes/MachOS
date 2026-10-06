@@ -1,0 +1,154 @@
+# block devices for filesystems: a partition of an AHCI disk, read and
+# written in 4 KiB blocks through a write-back cache. writes land in memory
+# and are marked dirty; dirty blocks reach the disk when they are evicted,
+# when sync() runs (the scheduler calls it whenever the cpu goes idle), or
+# when a program asks with the SYNC call.
+#
+# the cache is direct mapped: block b of a partition can only live in slot
+# hash(part, b), so a lookup is one comparison
+
+use ahci: machos.dev.ahci;
+use heap: machos.mm.heap;
+use mem:  machos.kern.mem;
+
+pub val BS: u64 = 4096;
+val SPB: u64 = 8;      # sectors per block
+val CACHE: u64 = 2048; # slots, 8 MiB once all are used
+
+pub rec Part {
+    disk:    *ahci.Disk;
+    start:   u64; # first sector
+    sectors: u64;
+}
+
+rec Entry {
+    part:  *Part;
+    block: u64;
+    data:  u64; # heap buffer, 0 until the slot is first used
+    dirty: u8;
+}
+
+var cache: [2048]Entry;
+var ndirty: u64 = 0;
+var reads: u64 = 0;
+var writes: u64 = 0;
+var failed: u64 = 0;
+
+pub fun blocks(p: *Part) u64 { ret p.sectors / SPB; }
+
+fun slot_of(p: *Part, b: u64) *Entry {
+    ret ?cache[(b ^ (p::u64 >> 4)) % CACHE];
+}
+
+fun flush(e: *Entry) u8 {
+    if (e.dirty == 0) { ret 1; }
+    if (ahci.write(e.part.disk, e.part.start + e.block * SPB, SPB, e.data) == 0) {
+        failed = failed + 1;
+        ret 0;
+    }
+    writes = writes + 1;
+    e.dirty = 0;
+    ndirty = ndirty - 1;
+    ret 1;
+}
+
+# the cache slot holding block `b`, filled from the disk when `load` is set
+# (otherwise the caller is about to overwrite all of it); nil on error
+fun entry(p: *Part, b: u64, load: u8) *Entry {
+    if (b >= blocks(p)) { ret nil; }
+    val e: *Entry = slot_of(p, b);
+    if (e.data != 0 && e.part == p && e.block == b) { ret e; }
+    if (e.data == 0) {
+        e.data = heap.alloc(BS);
+        if (e.data == 0) { ret nil; }
+    } or (e.part != nil) {
+        if (flush(e) == 0) { ret nil; }
+    }
+    e.part = nil;
+    if (load != 0) {
+        if (ahci.read(p.disk, p.start + b * SPB, SPB, e.data) == 0) { ret nil; }
+        reads = reads + 1;
+    }
+    e.part = p;
+    e.block = b;
+    ret e;
+}
+
+fun mark(e: *Entry) {
+    if (e.dirty == 0) {
+        e.dirty = 1;
+        ndirty = ndirty + 1;
+    }
+}
+
+# whole block `b` into dst (BS bytes); 0 on error
+pub fun read(p: *Part, b: u64, dst: u64) u8 {
+    val e: *Entry = entry(p, b, 1);
+    if (e == nil) { ret 0; }
+    mem.copy(dst, e.data, BS);
+    ret 1;
+}
+
+pub fun write(p: *Part, b: u64, src: u64) u8 {
+    val e: *Entry = entry(p, b, 0);
+    if (e == nil) { ret 0; }
+    mem.copy(e.data, src, BS);
+    mark(e);
+    ret 1;
+}
+
+# byte ranges, for structures smaller than a block
+pub fun read_bytes(p: *Part, off: u64, n: u64, dst: u64) u8 {
+    var done: u64 = 0;
+    for (done < n) {
+        val at: u64 = off + done;
+        var k: u64 = BS - at % BS;
+        if (k > n - done) { k = n - done; }
+        val e: *Entry = entry(p, at / BS, 1);
+        if (e == nil) { ret 0; }
+        mem.copy(dst + done, e.data + at % BS, k);
+        done = done + k;
+    }
+    ret 1;
+}
+
+pub fun write_bytes(p: *Part, off: u64, n: u64, src: u64) u8 {
+    var done: u64 = 0;
+    for (done < n) {
+        val at: u64 = off + done;
+        var k: u64 = BS - at % BS;
+        if (k > n - done) { k = n - done; }
+        var load: u8 = 1;
+        if (k == BS) { load = 0; }
+        val e: *Entry = entry(p, at / BS, load);
+        if (e == nil) { ret 0; }
+        mem.copy(e.data + at % BS, src + done, k);
+        mark(e);
+        done = done + k;
+    }
+    ret 1;
+}
+
+# write every dirty block to its disk, then ask the disks to flush their own
+# caches. returns 0 if any write failed
+pub fun sync() u8 {
+    if (ndirty == 0) { ret 1; }
+    var ok: u8 = 1;
+    var i: u64 = 0;
+    for (i < CACHE && ndirty > 0) {
+        val e: *Entry = ?cache[i];
+        if (e.dirty != 0 && flush(e) == 0) { ok = 0; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < ahci.disk_count()) {
+        ahci.flush(ahci.disk(i));
+        i = i + 1;
+    }
+    ret ok;
+}
+
+pub fun dirty_count() u64 { ret ndirty; }
+pub fun read_count() u64 { ret reads; }
+pub fun write_count() u64 { ret writes; }
+pub fun failed_count() u64 { ret failed; }

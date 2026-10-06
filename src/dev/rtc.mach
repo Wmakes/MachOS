@@ -1,0 +1,72 @@
+# the CMOS real-time clock: wall-clock time at boot, as Unix seconds (UTC)
+
+use cpu: machos.arch.x86_64.cpu;
+
+fun reg(r: u8) u8 {
+    cpu.outb(0x70, r | 0x80); # bit 7 keeps NMIs masked while we look
+    ret cpu.inb(0x71);
+}
+
+fun updating() u8 { ret reg(0x0A) & 0x80; }
+
+fun bcd(v: u8) u64 { ret ((v >> 4) * 10 + (v & 15))::u64; }
+
+fun days_before_year(y: u64) u64 {
+    # days from 1970-01-01 to January 1st of year y
+    var d: u64 = 0;
+    var k: u64 = 1970;
+    for (k < y) {
+        d = d + 365;
+        if ((k % 4 == 0 && k % 100 != 0) || k % 400 == 0) { d = d + 1; }
+        k = k + 1;
+    }
+    ret d;
+}
+
+val MONTH_DAYS: [12]u64 = [12]u64{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+pub fun read_epoch() u64 {
+    # read twice until two reads agree, so we never catch it mid-update
+    var s: u8 = 0;
+    var m: u8 = 0;
+    var h: u8 = 0;
+    var d: u8 = 0;
+    var mo: u8 = 0;
+    var y: u8 = 0;
+    var tries: u64 = 0;
+    for (tries < 1000) {
+        var spin: u64 = 0;
+        for (updating() != 0 && spin < 1000000) { spin = spin + 1; }
+        s = reg(0x00); m = reg(0x02); h = reg(0x04); d = reg(0x07); mo = reg(0x08); y = reg(0x09);
+        for (updating() != 0 && spin < 2000000) { spin = spin + 1; }
+        if (s == reg(0x00) && m == reg(0x02) && h == reg(0x04) && d == reg(0x07) && mo == reg(0x08) && y == reg(0x09)) { brk; }
+        tries = tries + 1;
+    }
+    val b: u8 = reg(0x0B);
+    val pm: u8 = h & 0x80;
+    h = h & 0x7F;
+    var sec: u64 = s::u64;
+    var min: u64 = m::u64;
+    var hour: u64 = h::u64;
+    var day: u64 = d::u64;
+    var month: u64 = mo::u64;
+    var year: u64 = y::u64;
+    if ((b & 0x04) == 0) { # BCD
+        sec = bcd(s); min = bcd(m); hour = bcd(h); day = bcd(d); month = bcd(mo); year = bcd(y);
+    }
+    if ((b & 0x02) == 0) { # 12-hour clock
+        if (hour == 12) { hour = 0; }
+        if (pm != 0) { hour = hour + 12; }
+    }
+    year = year + 2000;
+    if (month < 1 || month > 12 || day < 1 || day > 31) { ret 0; }
+    var days: u64 = days_before_year(year);
+    var k: u64 = 0;
+    for (k + 1 < month) {
+        days = days + MONTH_DAYS[k];
+        if (k == 1 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) { days = days + 1; }
+        k = k + 1;
+    }
+    days = days + day - 1;
+    ret ((days * 24 + hour) * 60 + min) * 60 + sec;
+}

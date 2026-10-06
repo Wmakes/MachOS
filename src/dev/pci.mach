@@ -1,0 +1,109 @@
+# PCI: find devices through the legacy configuration ports 0xCF8/0xCFC
+
+use cpu: machos.arch.x86_64.cpu;
+
+pub val MAX: u64 = 64;
+
+pub rec Device {
+    bus:      u8;
+    slot:     u8;
+    func:     u8;
+    vendor:   u16;
+    device:   u16;
+    class:    u8;
+    subclass: u8;
+    progif:   u8;
+}
+
+var devices: [64]Device;
+var count: u64 = 0;
+
+fun addr(bus: u8, slot: u8, func: u8, off: u8) u32 {
+    ret 0x80000000 | (bus::u32 << 16) | (slot::u32 << 11) | (func::u32 << 8) | (off::u32 & 0xFC);
+}
+
+pub fun read32(d: *Device, off: u8) u32 {
+    cpu.outl(0xCF8, addr(d.bus, d.slot, d.func, off));
+    ret cpu.inl(0xCFC);
+}
+
+pub fun write32(d: *Device, off: u8, v: u32) {
+    cpu.outl(0xCF8, addr(d.bus, d.slot, d.func, off));
+    cpu.outl(0xCFC, v);
+}
+
+fun raw32(bus: u8, slot: u8, func: u8, off: u8) u32 {
+    cpu.outl(0xCF8, addr(bus, slot, func, off));
+    ret cpu.inl(0xCFC);
+}
+
+fun probe(bus: u8, slot: u8, func: u8) u8 {
+    val id: u32 = raw32(bus, slot, func, 0);
+    if ((id & 0xFFFF) == 0xFFFF) { ret 0; }
+    if (count < MAX) {
+        val d: *Device = ?devices[count];
+        d.bus = bus;
+        d.slot = slot;
+        d.func = func;
+        d.vendor = (id & 0xFFFF)::u16;
+        d.device = (id >> 16)::u16;
+        val cls: u32 = raw32(bus, slot, func, 8);
+        d.class = (cls >> 24)::u8;
+        d.subclass = ((cls >> 16) & 0xFF)::u8;
+        d.progif = ((cls >> 8) & 0xFF)::u8;
+        count = count + 1;
+    }
+    ret 1;
+}
+
+# every function on every bus; the bridges' secondary buses are covered by
+# simply trying all 256
+pub fun scan() u64 {
+    count = 0;
+    var bus: u64 = 0;
+    for (bus < 256) {
+        var slot: u64 = 0;
+        for (slot < 32) {
+            if (probe(bus::u8, slot::u8, 0) != 0) {
+                val hdr: u32 = raw32(bus::u8, slot::u8, 0, 12);
+                if ((hdr & 0x00800000) != 0) { # multi-function
+                    var f: u64 = 1;
+                    for (f < 8) {
+                        probe(bus::u8, slot::u8, f::u8);
+                        f = f + 1;
+                    }
+                }
+            }
+            slot = slot + 1;
+        }
+        bus = bus + 1;
+    }
+    ret count;
+}
+
+pub fun device_count() u64 { ret count; }
+pub fun get(i: u64) *Device { ret ?devices[i]; }
+
+# the first device of a class/subclass/prog-if, or nil
+pub fun find(class: u8, subclass: u8, progif: u8) *Device {
+    var i: u64 = 0;
+    for (i < count) {
+        val d: *Device = ?devices[i];
+        if (d.class == class && d.subclass == subclass && d.progif == progif) { ret d; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# physical address a memory BAR points at (64-bit BARs span two slots)
+pub fun bar(d: *Device, i: u8) u64 {
+    val lo: u32 = read32(d, 0x10 + 4 * i);
+    var a: u64 = (lo & 0xFFFFFFF0)::u64;
+    if (((lo >> 1) & 3) == 2) { a = a | (read32(d, 0x14 + 4 * i)::u64 << 32); }
+    ret a;
+}
+
+# let the device decode memory accesses and do DMA
+pub fun enable(d: *Device) {
+    write32(d, 4, read32(d, 4) | 0x6);
+}

@@ -1,0 +1,44 @@
+# GPT partition tables: find the MachOS root partition on a disk
+
+use ahci: machos.dev.ahci;
+use heap: machos.mm.heap;
+use mem:  machos.kern.mem;
+use blk:  machos.fs.blk;
+
+# A9056588-C0B9-470F-AC01-A8528DCA9461 as stored on disk (first three fields
+# little endian); tools/mkimage.sh uses the same type
+val ROOT_TYPE: [16]u8 = [16]u8{0x88, 0x65, 0x05, 0xa9, 0xb9, 0xc0, 0x0f, 0x47,
+                               0xac, 0x01, 0xa8, 0x52, 0x8d, 0xca, 0x94, 0x61};
+
+# fill `out` with the first MachOS root partition on `d`; 0 if there is none
+pub fun find_root(d: *ahci.Disk, out: *blk.Part) u8 {
+    val buf: u64 = heap.alloc(4096);
+    if (buf == 0) { ret 0; }
+    var found: u8 = 0;
+    if (ahci.read(d, 1, 1, buf) != 0 && mem.equal(buf::*u8, "EFI PART\0", 8) != 0) {
+        val entries: u64 = @((buf + 72)::*u64);
+        val count: u64 = (@((buf + 80)::*u32))::u64;
+        val size: u64 = (@((buf + 84)::*u32))::u64;
+        if (size >= 128 && size <= 4096 && count <= 1024) {
+            var i: u64 = 0;
+            for (i < count && found == 0) {
+                val off: u64 = i * size;
+                if (ahci.read(d, entries + off / 512, 1, buf) == 0) { brk; }
+                val e: u64 = buf + off % 512;
+                if (mem.equal(e::*u8, ?ROOT_TYPE[0], 16) != 0) {
+                    val first: u64 = @((e + 32)::*u64);
+                    val last: u64 = @((e + 40)::*u64);
+                    if (last >= first && last < d.sectors) {
+                        out.disk = d;
+                        out.start = first;
+                        out.sectors = last - first + 1;
+                        found = 1;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    }
+    heap.free(buf);
+    ret found;
+}

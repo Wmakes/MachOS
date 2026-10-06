@@ -19,11 +19,18 @@ use syscall: machos.arch.x86_64.syscall;
 use proc:   machos.kern.proc;
 use sys:    machos.kern.sys;
 use abi:    machos.abi.sys;
-use ramfs:  machos.fs.ramfs;
+use vfs:    machos.fs.vfs;
+use blk:    machos.fs.blk;
+use gpt:    machos.fs.gpt;
+use ext2:   machos.fs.ext2;
 use initrd: machos.fs.initrd;
 use version: machos.abi.version;
+use clock:  machos.kern.clock;
+use pci:    machos.dev.pci;
+use ahci:   machos.dev.ahci;
 
 var boot: info.BootInfo;
+var root_part: blk.Part;
 
 # the boot stack, in the kernel image so it stays mapped once Limine's
 # memory is no longer trusted
@@ -111,18 +118,38 @@ fun kmain() {
     if (apic.timer_calibrated() == 0) { kprint.puts("apic: no PIT to calibrate against, timer speed is a guess\n\0"); }
 
     syscall.init();
+    clock.init();
 
-    if (ramfs.init() == 0) { kprint.panic("ramfs: out of memory\0"); }
-    val dev: *ramfs.Node = ramfs.create(ramfs.get_root(), "dev\0", 3, abi.KIND_DIR);
-    make_dev(dev, "console\0", 7, ramfs.DEV_CONSOLE);
-    make_dev(dev, "null\0", 4, ramfs.DEV_NULL);
-    make_dev(dev, "zero\0", 4, ramfs.DEV_ZERO);
-    if (boot.initrd == 0) { kprint.panic("no initrd module\0"); }
-    kprint.puts("initrd: \0");
-    kprint.dec(initrd.unpack(boot.initrd, boot.initrd_len));
-    kprint.puts(" files, \0");
-    kprint.dec(boot.initrd_len / 1024);
-    kprint.puts(" KiB\n\0");
+    kprint.puts("pci: \0");
+    kprint.dec(pci.scan());
+    kprint.puts(" functions\n\0");
+    val ndisk: u64 = ahci.init();
+    var di: u64 = 0;
+    for (di < ndisk) {
+        val d: *ahci.Disk = ahci.disk(di);
+        kprint.puts("ahci: disk \0");
+        kprint.dec(di);
+        kprint.puts(": \0");
+        kprint.dec(d.sectors / 2048);
+        kprint.puts(" MiB, \0");
+        var mi: u64 = 0;
+        for (mi < 40) {
+            if (d.model[mi] != 32 || (mi + 1 < 40 && d.model[mi + 1] != 32)) { kprint.putc(d.model[mi]); }
+            mi = mi + 1;
+        }
+        kprint.putc(10);
+        di = di + 1;
+    }
+
+    mount_root(ndisk);
+    val dev: *vfs.Node = vfs.create_ram(vfs.get_root(), "dev\0", 3, abi.KIND_DIR);
+    if (dev == nil) { kprint.panic("vfs: out of memory\0"); }
+    make_dev(dev, "console\0", 7, vfs.DEV_CONSOLE);
+    make_dev(dev, "null\0", 4, vfs.DEV_NULL);
+    make_dev(dev, "zero\0", 4, vfs.DEV_ZERO);
+    if (vfs.child(vfs.get_root(), "tmp\0", 3) == nil) {
+        if (vfs.create_ram(vfs.get_root(), "tmp\0", 3, abi.KIND_DIR) == nil) { kprint.panic("vfs: out of memory\0"); }
+    }
 
     val pid: u64 = sys.spawn_init("/bin/init\0");
     if (abi.is_err(pid) != 0) {
@@ -132,10 +159,43 @@ fun kmain() {
     proc.scheduler();
 }
 
-fun make_dev(dir: *ramfs.Node, name: *u8, n: u64, id: u64) {
-    val d: *ramfs.Node = ramfs.create(dir, name, n, abi.KIND_DEV);
-    if (d == nil) { kprint.panic("ramfs: out of memory\0"); }
+fun make_dev(dir: *vfs.Node, name: *u8, n: u64, id: u64) {
+    val d: *vfs.Node = vfs.create_ram(dir, name, n, abi.KIND_DEV);
+    if (d == nil) { kprint.panic("vfs: out of memory\0"); }
     d.dev = id;
+}
+
+# the root filesystem: ext2 on the first MachOS root partition found,
+# otherwise the initrd unpacked into memory
+fun mount_root(ndisk: u64) {
+    var i: u64 = 0;
+    for (i < ndisk) {
+        if (gpt.find_root(ahci.disk(i), ?root_part) != 0) {
+            val err: *u8 = ext2.mount(?root_part);
+            if (err == nil) {
+                if (vfs.init_ext2() == 0) { kprint.panic("vfs: out of memory\0"); }
+                kprint.puts("root: ext2 on disk \0");
+                kprint.dec(i);
+                kprint.puts(", \0");
+                kprint.dec(ext2.free_space() / 1048576);
+                kprint.puts(" of \0");
+                kprint.dec(ext2.total_space() / 1048576);
+                kprint.puts(" MiB free\n\0");
+                ret;
+            }
+            kprint.puts("root: disk \0");
+            kprint.dec(i);
+            kprint.puts(": \0");
+            kprint.puts(err);
+            kprint.putc(10);
+        }
+        i = i + 1;
+    }
+    if (vfs.init_ram() == 0) { kprint.panic("vfs: out of memory\0"); }
+    if (boot.initrd == 0) { kprint.panic("no root partition and no initrd\0"); }
+    kprint.puts("root: initrd in memory (no disk root), \0");
+    kprint.dec(initrd.unpack(boot.initrd, boot.initrd_len));
+    kprint.puts(" files\n\0");
 }
 
 #[naked]

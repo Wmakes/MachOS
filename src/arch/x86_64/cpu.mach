@@ -18,6 +18,24 @@ pub fun inb(port: u16) u8 {
     ret v;
 }
 
+pub fun outl(port: u16, v: u32) {
+    asm x86_64 {
+        mov dx, {port}
+        mov eax, {v}
+        out dx, eax
+    }
+}
+
+pub fun inl(port: u16) u32 {
+    var v: u32 = 0;
+    asm x86_64 {
+        mov dx, {port}
+        in eax, dx
+        mov {v}, eax
+    }
+    ret v;
+}
+
 pub fun cr2() u64 {
     var v: u64 = 0;
     asm x86_64 {

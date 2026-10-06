@@ -3,7 +3,7 @@
 
 use abi:    machos.abi.sys;
 use heap:   machos.mm.heap;
-use ramfs:  machos.fs.ramfs;
+use vfs:    machos.fs.vfs;
 use pipe:   machos.kern.pipe;
 use tty:    machos.kern.tty;
 use proc:   machos.kern.proc;
@@ -16,7 +16,7 @@ pub val PIPE_W: u64 = 3;
 
 pub rec Handle {
     kind:   u64;
-    node:   *ramfs.Node;
+    node:   *vfs.Node;
     pipe:   *pipe.Pipe;
     offset: u64;
     flags:  u64; # abi.O_*
@@ -31,7 +31,7 @@ fun new(kind: u64) *Handle {
     ret h;
 }
 
-pub fun open_node(nd: *ramfs.Node, flags: u64) *Handle {
+pub fun open_node(nd: *vfs.Node, flags: u64) *Handle {
     val h: *Handle = new(NODE);
     if (h == nil) { ret nil; }
     h.node = nd;
@@ -65,7 +65,7 @@ pub fun dup(h: *Handle) *Handle {
 pub fun close(h: *Handle) {
     h.refs = h.refs - 1;
     if (h.refs > 0) { ret; }
-    if (h.kind == NODE) { ramfs.release(h.node); }
+    if (h.kind == NODE) { vfs.release(h.node); }
     or (h.kind == PIPE_R) { pipe.close_reader(h.pipe); }
     or (h.kind == PIPE_W) { pipe.close_writer(h.pipe); }
     heap.free(h::u64);
@@ -84,17 +84,17 @@ pub fun read(h: *Handle, buf: u64, n: u64) u64 {
     if ((h.flags & abi.O_READ) == 0) { ret abi.err(abi.E_BADF); }
     if (h.kind == PIPE_R) { ret pipe.read(h.pipe, buf, n); }
     if (h.kind != NODE) { ret abi.err(abi.E_BADF); }
-    val nd: *ramfs.Node = h.node;
+    val nd: *vfs.Node = h.node;
     if (nd.kind == abi.KIND_DIR) { ret abi.err(abi.E_ISDIR); }
     if (nd.kind == abi.KIND_DEV) {
-        if (nd.dev == ramfs.DEV_CONSOLE) { ret console_read(buf, n); }
-        if (nd.dev == ramfs.DEV_ZERO) {
+        if (nd.dev == vfs.DEV_CONSOLE) { ret console_read(buf, n); }
+        if (nd.dev == vfs.DEV_ZERO) {
             mem.fill(buf, 0, n);
             ret n;
         }
         ret 0;
     }
-    val k: u64 = ramfs.read(nd, h.offset, buf, n);
+    val k: u64 = vfs.read(nd, h.offset, buf, n);
     h.offset = h.offset + k;
     ret k;
 }
@@ -103,10 +103,10 @@ pub fun write(h: *Handle, buf: u64, n: u64) u64 {
     if ((h.flags & abi.O_WRITE) == 0) { ret abi.err(abi.E_BADF); }
     if (h.kind == PIPE_W) { ret pipe.write(h.pipe, buf, n); }
     if (h.kind != NODE) { ret abi.err(abi.E_BADF); }
-    val nd: *ramfs.Node = h.node;
+    val nd: *vfs.Node = h.node;
     if (nd.kind == abi.KIND_DIR) { ret abi.err(abi.E_ISDIR); }
     if (nd.kind == abi.KIND_DEV) {
-        if (nd.dev == ramfs.DEV_CONSOLE) {
+        if (nd.dev == vfs.DEV_CONSOLE) {
             val b: *u8 = buf::*u8;
             var i: u64 = 0;
             for (i < n) {
@@ -117,7 +117,7 @@ pub fun write(h: *Handle, buf: u64, n: u64) u64 {
         ret n;
     }
     if ((h.flags & abi.O_APPEND) != 0) { h.offset = nd.size; }
-    val k: u64 = ramfs.write(nd, h.offset, buf, n);
+    val k: u64 = vfs.write(nd, h.offset, buf, n);
     if (abi.is_err(k) == 0) { h.offset = h.offset + k; }
     ret k;
 }

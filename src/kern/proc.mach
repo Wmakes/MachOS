@@ -15,6 +15,7 @@ use syscall: machos.arch.x86_64.syscall;
 use vmm:     machos.mm.vmm;
 use heap:    machos.mm.heap;
 use mem:     machos.kern.mem;
+use blk:     machos.fs.blk;
 
 pub val MAX: u64 = 64;
 pub val KSTACK: u64 = 16384;
@@ -274,6 +275,8 @@ pub fun scheduler() {
             n = n + 1;
         }
         if (picked == nil) {
+            # nothing to run: a good moment to put dirty disk blocks on the disk
+            blk.sync();
             cpu.wait();
             cnt;
         }

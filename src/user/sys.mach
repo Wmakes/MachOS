@@ -50,3 +50,5 @@ pub fun procs(idx: u64, out: *abi.ProcInfo) u64 { ret raw(abi.PROCS, idx, out::u
 pub fun kill(pid: u64) u64 { ret raw(abi.KILL, pid, 0, 0, 0, 0); }
 pub fun sbrk(n: u64) u64 { ret raw(abi.SBRK, n, 0, 0, 0, 0); }
 pub fun setfg(group: u64) u64 { ret raw(abi.SETFG, group, 0, 0, 0, 0); }
+pub fun sync() u64 { ret raw(abi.SYNC, 0, 0, 0, 0, 0); }
+pub fun time() u64 { ret raw(abi.TIME, 0, 0, 0, 0, 0); }

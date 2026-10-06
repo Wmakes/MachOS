@@ -14,10 +14,15 @@ use pipe:   machos.kern.pipe;
 use tty:    machos.kern.tty;
 use exec:   machos.kern.exec;
 use path:   machos.fs.path;
-use ramfs:  machos.fs.ramfs;
+use vfs:    machos.fs.vfs;
 use file:   machos.fs.file;
+use blk:    machos.fs.blk;
+use clock:  machos.kern.clock;
 
 val ARGS_MAX: u64 = 65536;
+val SYNC_EVERY: u64 = 5; # seconds: dirty blocks never wait longer than this
+
+var last_sync: u64 = 0; # tick of the last periodic sync
 
 fun cur() *proc.Proc { ret proc.current(); }
 
@@ -82,7 +87,7 @@ pub fun do_exit(code: u64) {
 
 # create a process running `nd`. `hs` become its handles 0-2 (nil entries
 # stay closed). returns the pid or an error
-fun spawn(parent: *proc.Proc, nd: *ramfs.Node, full: *u8, full_len: u64,
+fun spawn(parent: *proc.Proc, nd: *vfs.Node, full: *u8, full_len: u64,
           args: u64, args_len: u64, hs: *[3]u64, group: u64) u64 {
     val c: *proc.Proc = proc.alloc();
     if (c == nil) { ret e(abi.E_AGAIN); }
@@ -118,9 +123,9 @@ fun spawn(parent: *proc.Proc, nd: *ramfs.Node, full: *u8, full_len: u64,
 # start pid 1 from `p` with the console as its handles 0-2
 pub fun spawn_init(p: *u8) u64 {
     val n: u64 = mem.cstrlen(p);
-    val nd: *ramfs.Node = ramfs.lookup(p, n);
+    val nd: *vfs.Node = vfs.lookup(p, n);
     if (nd == nil) { ret e(abi.E_NOENT); }
-    val con: *ramfs.Node = ramfs.lookup("/dev/console\0", 12);
+    val con: *vfs.Node = vfs.lookup("/dev/console\0", 12);
     if (con == nil) { ret e(abi.E_NOENT); }
     val h: *file.Handle = file.open_node(con, abi.O_READ | abi.O_WRITE);
     if (h == nil) { ret e(abi.E_NOMEM); }
@@ -134,7 +139,7 @@ fun sys_spawn(pva: u64, plen: u64, ava: u64, alen: u64, sva: u64) u64 {
     var full: [256]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
-    val nd: *ramfs.Node = ramfs.lookup(?full[0], n);
+    val nd: *vfs.Node = vfs.lookup(?full[0], n);
     if (nd == nil) { ret e(abi.E_NOENT); }
     if (nd.kind == abi.KIND_DIR) { ret e(abi.E_ISDIR); }
     if (alen > ARGS_MAX) { ret e(abi.E_INVAL); }
@@ -198,21 +203,20 @@ fun sys_open(pva: u64, plen: u64, flags: u64) u64 {
     var full: [256]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
-    var nd: *ramfs.Node = ramfs.lookup(?full[0], n);
+    var nd: *vfs.Node = vfs.lookup(?full[0], n);
     if (nd == nil) {
         if ((flags & abi.O_CREATE) == 0) { ret e(abi.E_NOENT); }
-        val dir: *ramfs.Node = ramfs.parent_dir(?full[0], n);
+        val dir: *vfs.Node = vfs.parent_dir(?full[0], n);
         if (dir == nil) { ret e(abi.E_NOENT); }
         val b: u64 = path.base_index(?full[0], n);
-        if (n - b > abi.NAME_MAX) { ret e(abi.E_NAMETOOLONG); }
-        nd = ramfs.create(dir, ?full[b], n - b, abi.KIND_FILE);
-        if (nd == nil) { ret e(abi.E_NOMEM); }
+        val cr: u64 = vfs.create(dir, ?full[b], n - b, abi.KIND_FILE, ?nd);
+        if (abi.is_err(cr) != 0) { ret cr; }
     }
     var f: u64 = flags;
     if ((f & (abi.O_READ | abi.O_WRITE)) == 0) { f = f | abi.O_READ; }
     if (nd.kind == abi.KIND_DIR && (f & abi.O_WRITE) != 0) { ret e(abi.E_ISDIR); }
     if (nd.kind == abi.KIND_FILE && (f & abi.O_TRUNC) != 0 && (f & abi.O_WRITE) != 0) {
-        ramfs.truncate(nd);
+        vfs.truncate(nd);
     }
     val h: *file.Handle = file.open_node(nd, f);
     if (h == nil) { ret e(abi.E_NOMEM); }
@@ -234,7 +238,7 @@ fun sys_readdir(h: u64, idx: u64, out: u64) u64 {
     if (f == nil || f.kind != file.NODE) { ret e(abi.E_BADF); }
     if (f.node.kind != abi.KIND_DIR) { ret e(abi.E_NOTDIR); }
     if (ok(out, $size_of(abi.Entry)::u64, 1) == 0) { ret e(abi.E_FAULT); }
-    val c: *ramfs.Node = ramfs.nth_child(f.node, idx);
+    val c: *vfs.Node = vfs.nth_child(f.node, idx);
     if (c == nil) { ret 0; }
     val en: *abi.Entry = out::*abi.Entry;
     en.kind = c.kind;
@@ -249,7 +253,7 @@ fun sys_stat(pva: u64, plen: u64, out: u64) u64 {
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     if (ok(out, $size_of(abi.Stat)::u64, 1) == 0) { ret e(abi.E_FAULT); }
-    val nd: *ramfs.Node = ramfs.lookup(?full[0], n);
+    val nd: *vfs.Node = vfs.lookup(?full[0], n);
     if (nd == nil) { ret e(abi.E_NOENT); }
     val st: *abi.Stat = out::*abi.Stat;
     st.kind = nd.kind;
@@ -261,25 +265,21 @@ fun sys_mkdir(pva: u64, plen: u64) u64 {
     var full: [256]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
-    if (ramfs.lookup(?full[0], n) != nil) { ret e(abi.E_EXIST); }
-    val dir: *ramfs.Node = ramfs.parent_dir(?full[0], n);
+    if (vfs.lookup(?full[0], n) != nil) { ret e(abi.E_EXIST); }
+    val dir: *vfs.Node = vfs.parent_dir(?full[0], n);
     if (dir == nil) { ret e(abi.E_NOENT); }
     val b: u64 = path.base_index(?full[0], n);
-    if (n - b > abi.NAME_MAX) { ret e(abi.E_NAMETOOLONG); }
-    if (ramfs.create(dir, ?full[b], n - b, abi.KIND_DIR) == nil) { ret e(abi.E_NOMEM); }
-    ret 0;
+    var made: *vfs.Node = nil;
+    ret vfs.create(dir, ?full[b], n - b, abi.KIND_DIR, ?made);
 }
 
 fun sys_remove(pva: u64, plen: u64) u64 {
     var full: [256]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
-    val nd: *ramfs.Node = ramfs.lookup(?full[0], n);
+    val nd: *vfs.Node = vfs.lookup(?full[0], n);
     if (nd == nil) { ret e(abi.E_NOENT); }
-    if (nd == ramfs.get_root()) { ret e(abi.E_INVAL); }
-    if (nd.kind == abi.KIND_DIR && nd.child != nil) { ret e(abi.E_NOTEMPTY); }
-    ramfs.unlink(nd);
-    ret 0;
+    ret vfs.unlink(nd);
 }
 
 fun sys_rename(fva: u64, flen: u64, tva: u64, tlen: u64) u64 {
@@ -289,27 +289,20 @@ fun sys_rename(fva: u64, flen: u64, tva: u64, tlen: u64) u64 {
     if (abi.is_err(fnl) != 0) { ret fnl; }
     val tnl: u64 = user_path(tva, tlen, ?to[0]);
     if (abi.is_err(tnl) != 0) { ret tnl; }
-    val src: *ramfs.Node = ramfs.lookup(?from[0], fnl);
+    val src: *vfs.Node = vfs.lookup(?from[0], fnl);
     if (src == nil) { ret e(abi.E_NOENT); }
-    if (src == ramfs.get_root()) { ret e(abi.E_INVAL); }
-    if (ramfs.lookup(?to[0], tnl) != nil) { ret e(abi.E_EXIST); }
-    val dir: *ramfs.Node = ramfs.parent_dir(?to[0], tnl);
+    if (vfs.lookup(?to[0], tnl) != nil) { ret e(abi.E_EXIST); }
+    val dir: *vfs.Node = vfs.parent_dir(?to[0], tnl);
     if (dir == nil) { ret e(abi.E_NOENT); }
-    if (ramfs.within(dir, src) != 0) { ret e(abi.E_INVAL); }
     val b: u64 = path.base_index(?to[0], tnl);
-    if (tnl - b > abi.NAME_MAX) { ret e(abi.E_NAMETOOLONG); }
-    ramfs.detach(src);
-    mem.copy((?src.name[0])::u64, (?to[b])::u64, tnl - b);
-    src.name_len = tnl - b;
-    ramfs.attach(dir, src);
-    ret 0;
+    ret vfs.rename(src, dir, ?to[b], tnl - b);
 }
 
 fun sys_chdir(pva: u64, plen: u64) u64 {
     var full: [256]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
-    val nd: *ramfs.Node = ramfs.lookup(?full[0], n);
+    val nd: *vfs.Node = vfs.lookup(?full[0], n);
     if (nd == nil) { ret e(abi.E_NOENT); }
     if (nd.kind != abi.KIND_DIR) { ret e(abi.E_NOTDIR); }
     val p: *proc.Proc = cur();
@@ -474,11 +467,22 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     }
     if (n == abi.RENAME)  { ret sys_rename(a, b, c, d); }
     if (n == abi.SEEK)    { ret sys_seek(a, b); }
+    if (n == abi.TIME)    { ret clock.now(); }
+    if (n == abi.SYNC) {
+        if (blk.sync() == 0) { ret e(abi.E_IO); }
+        ret 0;
+    }
     ret e(abi.E_NOSYS);
 }
 
 #[symbol("syscall_dispatch")]
 fun syscall_dispatch(f: *idt.Frame) {
     f.rax = call(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8);
+    # the scheduler syncs whenever the cpu idles; a busy system syncs here
+    val now: u64 = proc.uptime_ticks();
+    if (now - last_sync >= SYNC_EVERY * apic.HZ) {
+        last_sync = now;
+        if (blk.dirty_count() > 0) { blk.sync(); }
+    }
     if (cur().killed != 0) { do_exit(130); }
 }
