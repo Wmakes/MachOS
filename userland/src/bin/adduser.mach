@@ -1,0 +1,66 @@
+# adduser NAME: add a user with a group of the same name, a home in
+# /home/NAME and /bin/sh; then set a password with `passwd NAME`. root only
+
+use abi:   sdk.abi;
+use sys:   sdk.sys;
+use io:    sdk.io;
+use users: sdk.users;
+use rt:    sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc != 2) {
+        io.err("usage: adduser NAME\n\0");
+        ret 2;
+    }
+    if (sys.geteuid() != 0) {
+        io.err("adduser: only root may add users\n\0");
+        ret 1;
+    }
+    val name: *u8 = argv[1];
+    val n: u64 = io.len(name);
+    var i: u64 = 0;
+    for (i < n) {
+        val c: u8 = name[i];
+        if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57 && i > 0) || c == 95 || c == 45)) {
+            io.err("adduser: a name is lowercase letters, digits, - and _\n\0");
+            ret 1;
+        }
+        i = i + 1;
+    }
+    if (n == 0 || n > 31) {
+        io.err("adduser: bad name\n\0");
+        ret 1;
+    }
+    var u: users.User;
+    if (users.by_name(name, n, ?u) != 0) {
+        io.err("adduser: that user exists\n\0");
+        ret 1;
+    }
+    val uid: u64 = users.next_uid();
+    var home: [64]u8;
+    io.copy(?home[0], "/home/\0", 6);
+    io.copy(?home[6], name, n);
+    home[6 + n] = 0;
+    sys.mkdir_mode("/home\0", 5, 0x1ED);
+    val m: u64 = sys.mkdir_mode(?home[0], 6 + n, 0x1ED);
+    if (abi.is_err(m) != 0 && abi.err_code(m) != abi.E_EXIST) {
+        io.fail("adduser\0", ?home[0], m);
+        ret 1;
+    }
+    sys.chown(?home[0], 6 + n, uid, uid);
+    if (users.add(name, n, uid, ?home[0], "/bin/sh\0") == 0) {
+        io.err("adduser: cannot write the account files\n\0");
+        ret 1;
+    }
+    io.out("adduser: added \0");
+    io.out(name);
+    io.out(" (uid \0");
+    io.dec(uid);
+    io.out(", home \0");
+    io.out(?home[0]);
+    io.out("); set a password with `passwd \0");
+    io.out(name);
+    io.out("`\n\0");
+    ret 0;
+}

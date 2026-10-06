@@ -1,0 +1,66 @@
+# login: ask for a user name and password, then become that user and start
+# their shell (as a login shell, "-sh", which shows /etc/motd). init runs it
+# on the console; after three wrong tries it exits and init starts a new one
+
+use abi:   sdk.abi;
+use sys:   sdk.sys;
+use io:    sdk.io;
+use env:   sdk.env;
+use users: sdk.users;
+use rt:    sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    sys.setsid();
+    var tries: u64 = 0;
+    for (tries < 3) {
+        var un: abi.Uname;
+        sys.uname(?un);
+        io.out("\n\x1b[1mMachOS \0");
+        io.out(?un.release[0]);
+        io.out("\x1b[0m\n\nmachos login: \0");
+        var name: [32]u8;
+        val n: u64 = users.read_line(?name[0], 31);
+        if (n == abi.NO_ID) { ret 1; }
+        if (n == 0) { cnt; }
+        tries = tries + 1;
+        var u: users.User;
+        val known: u8 = users.by_name(?name[0], n, ?u);
+        var h: [128]u8;
+        var hn: u64 = 0;
+        if (known != 0) { hn = users.stored(?name[0], n, ?h[0]); }
+        if (known == 0 || hn == abi.NO_ID) { hn = 1; h[0] = 33; } # unknown: refuse after asking
+        var pw: [128]u8;
+        var pn: u64 = 0;
+        if (hn > 0) {
+            pn = users.read_secret("Password: \0", ?pw[0], 127);
+            if (pn == abi.NO_ID) { ret 1; }
+        }
+        if (users.locked(?h[0], hn) != 0 || users.matches(?h[0], hn, ?pw[0], pn) == 0) {
+            sys.sleep(1000);
+            io.out("Login incorrect\n\0");
+            cnt;
+        }
+        if (users.become(?u) == 0) {
+            io.out("login: cannot switch to that user\n\0");
+            ret 1;
+        }
+        var home: *u8 = ?u.home[0];
+        if (u.home_len == 0 || abi.is_err(sys.chdir(home, u.home_len)) != 0) {
+            home = "/\0";
+            sys.chdir(home, 1);
+        }
+        env.set("HOME\0", home);
+        env.set("USER\0", ?u.name[0]);
+        env.set("LOGNAME\0", ?u.name[0]);
+        var shell: *u8 = ?u.shell[0];
+        if (u.shell_len == 0) { shell = "/bin/sh\0"; }
+        env.set("SHELL\0", shell);
+        env.set("PATH\0", "/bin\0");
+        # "-sh": a login shell (it shows the message of the day)
+        val r: u64 = sys.execve(shell, io.len(shell), "-sh\0", 4);
+        io.fail("login\0", shell, r);
+        ret 1;
+    }
+    ret 1;
+}

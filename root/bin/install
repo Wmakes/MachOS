@@ -19,6 +19,8 @@ mount "$1"2 /mnt || exit 1
 echo "copying the system..."
 cp -r /bin /etc /boot /mnt || exit 1
 mkdir /mnt/home
+mkdir /mnt/root
+chmod 700 /mnt/root
 umount /mnt || exit 1
 sync
 echo "MachOS is installed on $1. Boot from that disk."

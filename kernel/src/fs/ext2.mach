@@ -588,7 +588,7 @@ fun add_links(fs: *Fs, ino: u64, up: u8) {
 }
 
 # a new file or directory `name` in `dir`; returns its inode or an error
-pub fun create(fs: *Fs, dir: u64, name: *u8, nl: u64, kind: u64) u64 {
+pub fun create(fs: *Fs, dir: u64, name: *u8, nl: u64, kind: u64, mode: u64, uid: u64, gid: u64) u64 {
     var is_dir: u8 = 0;
     if (kind == abi.KIND_DIR) { is_dir = 1; }
     val ino: u64 = alloc_inode(fs, (dir - 1) / fs.ipg, is_dir);
@@ -601,7 +601,7 @@ pub fun create(fs: *Fs, dir: u64, name: *u8, nl: u64, kind: u64) u64 {
     var ft: u8 = FT_REG;
     if (is_dir != 0) {
         ft = FT_DIR;
-        i.mode = S_IFDIR | 0x1ED; # 0755
+        i.mode = S_IFDIR | (mode & 0xFFF)::u16;
         i.links = 2;
         val b: u64 = alloc_block(fs, (ino - 1) / fs.ipg);
         if (b == 0) {
@@ -622,9 +622,11 @@ pub fun create(fs: *Fs, dir: u64, name: *u8, nl: u64, kind: u64) u64 {
         i.blocks = 8;
         i.size = BS::u32;
     } or {
-        i.mode = S_IFREG | 0x1A4; # 0644
+        i.mode = S_IFREG | (mode & 0xFFF)::u16;
         i.links = 1;
     }
+    i.uid = (uid & 0xFFFF)::u16;
+    i.gid = (gid & 0xFFFF)::u16;
     write_inode(fs, ino, ?i);
     val r: u64 = dir_add(fs, dir, name, nl, ino, ft);
     if (abi.is_err(r) != 0) {
@@ -676,6 +678,17 @@ pub fun rename(fs: *Fs, odir: u64, oname: *u8, onl: u64, ndir: u64, nname: *u8, 
         add_links(fs, ndir, 1);
     }
     ret 0;
+}
+
+# permission bits (07777), owner and group of an inode
+pub fun set_attr(fs: *Fs, ino: u64, mode: u64, uid: u64, gid: u64) u8 {
+    var i: Inode;
+    if (read_inode(fs, ino, ?i) == 0) { ret 0; }
+    i.mode = (i.mode & S_IFMT) | (mode & 0xFFF)::u16;
+    i.uid = (uid & 0xFFFF)::u16;
+    i.gid = (gid & 0xFFFF)::u16;
+    i.ctime = clock.now()::u32;
+    ret write_inode(fs, ino, ?i);
 }
 
 # the superblock's "cleanly unmounted" bit (s_state & 1): cleared while

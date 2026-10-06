@@ -1,0 +1,57 @@
+# su [USER]: become USER (root by default) in a new shell. installed
+# set-user-id root; asks for USER's password unless the caller is root
+
+use abi:   sdk.abi;
+use sys:   sdk.sys;
+use io:    sdk.io;
+use env:   sdk.env;
+use users: sdk.users;
+use rt:    sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var target: *u8 = "root\0";
+    if (argc > 1) { target = argv[1]; }
+    val tn: u64 = io.len(target);
+    var u: users.User;
+    if (users.by_name(target, tn, ?u) == 0) {
+        io.err("su: no such user: \0");
+        io.err(target);
+        io.err("\n\0");
+        ret 1;
+    }
+    if (sys.getuid() != 0) {
+        if (sys.geteuid() != 0) {
+            io.err("su: not installed set-user-id root\n\0");
+            ret 1;
+        }
+        var h: [128]u8;
+        val hn: u64 = users.stored(target, tn, ?h[0]);
+        if (hn == abi.NO_ID || users.locked(?h[0], hn) != 0) {
+            io.err("su: that account is locked\n\0");
+            ret 1;
+        }
+        if (hn > 0) {
+            var pw: [128]u8;
+            val pn: u64 = users.read_secret("Password: \0", ?pw[0], 127);
+            if (pn == abi.NO_ID || users.matches(?h[0], hn, ?pw[0], pn) == 0) {
+                sys.sleep(1000);
+                io.err("su: wrong password\n\0");
+                ret 1;
+            }
+        }
+    }
+    if (users.become(?u) == 0) {
+        io.err("su: cannot switch user\n\0");
+        ret 1;
+    }
+    env.set("USER\0", ?u.name[0]);
+    env.set("LOGNAME\0", ?u.name[0]);
+    env.set("HOME\0", ?u.home[0]);
+    var shell: *u8 = ?u.shell[0];
+    if (u.shell_len == 0) { shell = "/bin/sh\0"; }
+    env.set("SHELL\0", shell);
+    val r: u64 = sys.execve(shell, io.len(shell), "sh\0", 3);
+    io.fail("su\0", shell, r);
+    ret 1;
+}

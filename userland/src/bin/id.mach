@@ -1,0 +1,28 @@
+# id: the user and group ids of the caller, with their names
+
+use sys:   sdk.sys;
+use io:    sdk.io;
+use users: sdk.users;
+use rt:    sdk.rt;
+
+fun show(label: *u8, id: u64, group: u8) {
+    var name: [32]u8;
+    io.out(label);
+    io.dec(id);
+    io.putc(40);
+    if (group != 0) { io.outn(?name[0], users.group_name(id, ?name[0])); }
+    or              { io.outn(?name[0], users.user_name(id, ?name[0])); }
+    io.putc(41);
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    val uid: u64 = sys.getuid();
+    val gid: u64 = sys.getgid();
+    show("uid=\0", uid, 0);
+    show(" gid=\0", gid, 1);
+    if (sys.geteuid() != uid) { show(" euid=\0", sys.geteuid(), 0); }
+    if (sys.getegid() != gid) { show(" egid=\0", sys.getegid(), 1); }
+    io.putc(10);
+    ret 0;
+}

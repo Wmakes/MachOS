@@ -51,10 +51,33 @@ cp -r root/. "$ROOTFS/"
 cp "$BIN/"* "$ROOTFS/bin/"
 cp "$KERNEL" "$ROOTFS/boot/kernel.elf"
 cp "$LIMINE/BOOTX64.EFI" "$ROOTFS/boot/BOOTX64.EFI"
+# modes as MachOS should see them (tar and mke2fs -d keep them)
+mkdir -p "$ROOTFS/root" "$ROOTFS/home"
+chmod 0755 "$ROOTFS" "$ROOTFS/bin" "$ROOTFS/boot" "$ROOTFS/etc" "$ROOTFS/home"
+chmod 0700 "$ROOTFS/root"
+chmod 0644 "$ROOTFS/etc/"* "$ROOTFS/boot/"*
+chmod 0600 "$ROOTFS/etc/shadow"
+chmod 0755 "$ROOTFS/bin/"*
+chmod 4755 "$ROOTFS/bin/su" "$ROOTFS/bin/passwd"
 tar --format=ustar --owner=0 --group=0 -cf "$OUT/initrd.tar" -C "$ROOTFS" .
 # the disk root also carries the initrd, for `install` to give new disks a
 # rescue entry (the initrd itself cannot contain itself)
 cp "$OUT/initrd.tar" "$ROOTFS/boot/initrd.tar"
+
+# mke2fs -d and debugfs write keep the host's user ids: give these paths
+# (newline-separated, absolute inside the filesystem) to root
+owned_by_root() {
+    CMDS="$OUT/owner.cmds"
+    echo "$2" | while read -r p; do
+        [ -n "$p" ] || continue
+        echo "sif \"$p\" uid 0"
+        echo "sif \"$p\" gid 0"
+    done > "$CMDS"
+    echo 'sif / uid 0' >> "$CMDS"
+    echo 'sif / gid 0' >> "$CMDS"
+    debugfs -w -f "$CMDS" "$1" >/dev/null 2>&1
+    rm -f "$CMDS"
+}
 
 IMG="$OUT/disk.img"
 ROOTIMG="$OUT/root.img"
@@ -66,6 +89,7 @@ if [ "$FRESH" = 1 ] || [ ! -f "$IMG" ] || ! sgdisk -p "$IMG" 2>/dev/null | grep 
            -n "2:$ROOT_START:+${ROOT_MB}M" -t "2:$ROOT_TYPE" -c 2:"MachOS root" "$IMG" >/dev/null
     mke2fs -q -t ext2 -b 4096 -I 128 -O ^dir_index,^resize_inode,^ext_attr -L machos \
            -d "$ROOTFS" "$ROOTIMG" "${ROOT_MB}M" >&2
+    owned_by_root "$ROOTIMG" "$(cd "$ROOTFS" && find . -mindepth 1 | sed 's|^\.||')"
     dd if="$ROOTIMG" of="$IMG" bs=512 seek="$ROOT_START" conv=notrunc 2>/dev/null
     rm -f "$ROOTIMG"
 else
@@ -86,6 +110,7 @@ else
         done
     done
     debugfs -w -f "$CMDS" "$ROOTIMG" >/dev/null 2>&1
+    owned_by_root "$ROOTIMG" "$(cd "$ROOTFS" && find bin boot -mindepth 1 | sed 's|^|/|')"
     dd if="$ROOTIMG" of="$IMG" bs=512 seek="$ROOT_START" conv=notrunc 2>/dev/null
     rm -f "$ROOTIMG" "$CMDS"
 fi

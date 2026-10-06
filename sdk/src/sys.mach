@@ -25,7 +25,9 @@ pub fun exit(code: u64) { raw(abi.EXIT, code, 0, 0, 0, 0); }
 pub fun read(h: u64, buf: *u8, n: u64) u64 { ret raw(abi.READ, h, buf::u64, n, 0, 0); }
 pub fun write(h: u64, buf: *u8, n: u64) u64 { ret raw(abi.WRITE, h, buf::u64, n, 0, 0); }
 
-pub fun open(p: *u8, n: u64, flags: u64) u64 { ret raw(abi.OPEN, p::u64, n, flags, 0, 0); }
+# a new file gets mode 0666 less the umask (so 0644 usually)
+pub fun open(p: *u8, n: u64, flags: u64) u64 { ret raw(abi.OPEN, p::u64, n, flags, 0x1B6, 0); }
+pub fun open_mode(p: *u8, n: u64, flags: u64, mode: u64) u64 { ret raw(abi.OPEN, p::u64, n, flags, mode, 0); }
 pub fun close(h: u64) u64 { ret raw(abi.CLOSE, h, 0, 0, 0, 0); }
 
 var env_buf: [16384]u8;
@@ -86,7 +88,18 @@ pub fun execve(p: *u8, n: u64, args: *u8, args_len: u64) u64 {
 
 pub fun readdir(h: u64, idx: u64, out: *abi.Entry) u64 { ret raw(abi.READDIR, h, idx, out::u64, 0, 0); }
 pub fun stat(p: *u8, n: u64, out: *abi.Stat) u64 { ret raw(abi.STAT, p::u64, n, out::u64, 0, 0); }
-pub fun mkdir(p: *u8, n: u64) u64 { ret raw(abi.MKDIR, p::u64, n, 0, 0, 0); }
+pub fun mkdir(p: *u8, n: u64) u64 { ret raw(abi.MKDIR, p::u64, n, 0x1FF, 0, 0); }
+pub fun mkdir_mode(p: *u8, n: u64, mode: u64) u64 { ret raw(abi.MKDIR, p::u64, n, mode, 0, 0); }
+pub fun chmod(p: *u8, n: u64, mode: u64) u64 { ret raw(abi.CHMOD, p::u64, n, mode, 0, 0); }
+pub fun chown(p: *u8, n: u64, uid: u64, gid: u64) u64 { ret raw(abi.CHOWN, p::u64, n, uid, gid, 0); }
+pub fun access(p: *u8, n: u64, want: u64) u64 { ret raw(abi.ACCESS, p::u64, n, want, 0, 0); }
+pub fun setuid(uid: u64) u64 { ret raw(abi.SETUID, uid, 0, 0, 0, 0); }
+pub fun setgid(gid: u64) u64 { ret raw(abi.SETGID, gid, 0, 0, 0, 0); }
+pub fun getuid() u64 { ret raw(abi.GETUID, 0, 0, 0, 0, 0); }
+pub fun geteuid() u64 { ret raw(abi.GETEUID, 0, 0, 0, 0, 0); }
+pub fun getgid() u64 { ret raw(abi.GETGID, 0, 0, 0, 0, 0); }
+pub fun getegid() u64 { ret raw(abi.GETEGID, 0, 0, 0, 0, 0); }
+pub fun umask(mask: u64) u64 { ret raw(abi.UMASK, mask, 0, 0, 0, 0); }
 pub fun remove(p: *u8, n: u64) u64 { ret raw(abi.REMOVE, p::u64, n, 0, 0, 0); }
 pub fun rename(a: *u8, an: u64, b: *u8, bn: u64) u64 { ret raw(abi.RENAME, a::u64, an, b::u64, bn, 0); }
 pub fun chdir(p: *u8, n: u64) u64 { ret raw(abi.CHDIR, p::u64, n, 0, 0, 0); }

@@ -30,7 +30,9 @@ fun copy_file(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
         complain(src, sn, from);
         ret 0;
     }
-    val to: u64 = sys.open(dst, dn, abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC);
+    var st: abi.Stat;
+    sys.fstat(from, ?st);
+    val to: u64 = sys.open_mode(dst, dn, abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC, st.mode & 0x1FF);
     if (abi.is_err(to) != 0) {
         sys.close(from);
         complain(dst, dn, to);
@@ -55,6 +57,10 @@ fun copy_file(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
     }
     sys.close(from);
     sys.close(to);
+    # the copy gets the original's mode (set-id bits only when root copies)
+    var mode: u64 = st.mode & 0x1FF;
+    if (sys.geteuid() == 0) { mode = st.mode & 0xFFF; }
+    sys.chmod(dst, dn, mode);
     ret ok;
 }
 
@@ -67,7 +73,9 @@ fun copy(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
         ret 0;
     }
     if (is_dir(dst, dn) == 0) {
-        val m: u64 = sys.mkdir(dst, dn);
+        var sst: abi.Stat;
+        sys.stat(src, sn, ?sst);
+        val m: u64 = sys.mkdir_mode(dst, dn, sst.mode & 0xFFF);
         if (abi.is_err(m) != 0) {
             complain(dst, dn, m);
             ret 0;

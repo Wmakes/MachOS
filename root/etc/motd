@@ -3,4 +3,5 @@
   `ls /bin` lists the programs; arrows recall history, tab completes.
   `edit FILE` edits text, `less FILE` reads it; `shutdown` switches off.
   To install MachOS on a disk: `ls -l /dev`, then `install /dev/sdX`.
+  Accounts: `adduser NAME`, `passwd NAME`, `su`. root has no password until you set one.
 

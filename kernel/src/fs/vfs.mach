@@ -33,6 +33,9 @@ pub rec Node {
     data:     u64;
     dev:      u64; # KIND_DEV: DEV_*
     mtime:    u64; # FS_RAM: last change (ext2 keeps its own in the inode)
+    mode:     u64; # permission bits, 07777
+    uid:      u64;
+    gid:      u64;
     parent:   *Node;
     child:    *Node; # first entry of a directory
     next:     *Node; # next entry in the parent
@@ -56,7 +59,56 @@ fun new_node(kind: u64, fs: u64, name: *u8, n: u64) *Node {
     nd.name_len = n;
     mem.copy((?nd.name[0])::u64, name::u64, n);
     nd.mtime = clock.now();
+    nd.mode = 0x1A4; # 0644
+    if (kind == abi.KIND_DIR) { nd.mode = 0x1ED; } # 0755
     ret nd;
+}
+
+# --- credentials and permissions --------------------------------------------
+# the credentials path lookups and checks run with: the effective ids of the
+# process whose system call is being served (root while the kernel boots)
+
+var cred_uid: u64 = 0;
+var cred_gid: u64 = 0;
+var denied: u8 = 0; # the last lookup stopped at a directory it may not search
+
+pub fun set_cred(uid: u64, gid: u64) {
+    cred_uid = uid;
+    cred_gid = gid;
+    denied = 0;
+}
+
+pub fun was_denied() u8 { ret denied; }
+
+# whether uid/gid may `want` (R_OK|W_OK|X_OK) on nd. root may read and
+# write anything, and execute anything with an x bit (or a directory)
+pub fun allowed_as(nd: *Node, want: u64, uid: u64, gid: u64) u8 {
+    if (uid == 0) {
+        if ((want & abi.X_OK) == 0 || nd.kind == abi.KIND_DIR || (nd.mode & 0x49) != 0) { ret 1; }
+        ret 0;
+    }
+    var bits: u64 = nd.mode & 7;
+    if (nd.uid == uid) { bits = (nd.mode >> 6) & 7; }
+    or (nd.gid == gid) { bits = (nd.mode >> 3) & 7; }
+    if ((bits & want) == want) { ret 1; }
+    ret 0;
+}
+
+pub fun allowed(nd: *Node, want: u64) u8 { ret allowed_as(nd, want, cred_uid, cred_gid); }
+
+pub fun set_attr(nd: *Node, mode: u64, uid: u64, gid: u64) {
+    nd.mode = mode & 0xFFF;
+    nd.uid = uid;
+    nd.gid = gid;
+    if (nd.fs == FS_EXT2) { ext2.set_attr(nd.fsi, nd.ino, nd.mode, uid, gid); }
+    or { nd.mtime = clock.now(); }
+}
+
+fun attr_from(nd: *Node, i: *ext2.Inode) {
+    nd.size = ext2.size_of(i);
+    nd.mode = (i.mode & 0xFFF)::u64;
+    nd.uid = i.uid::u64;
+    nd.gid = i.gid::u64;
 }
 
 # when `nd` last changed
@@ -144,6 +196,8 @@ fun ext2_root(fs: *ext2.Fs) *Node {
     if (nd == nil) { ret nil; }
     nd.ino = ext2.ROOT_INO;
     nd.fsi = fs;
+    var i: ext2.Inode;
+    if (ext2.read_inode(fs, ext2.ROOT_INO, ?i) != 0) { attr_from(nd, ?i); }
     ret nd;
 }
 
@@ -164,7 +218,7 @@ fun load(dir: *Node) {
         nd.ino = ino;
         nd.fsi = dir.fsi;
         var i: ext2.Inode;
-        if (ext2.read_inode(dir.fsi, ino, ?i) != 0) { nd.size = ext2.size_of(?i); }
+        if (ext2.read_inode(dir.fsi, ino, ?i) != 0) { attr_from(nd, ?i); }
         attach(dir, nd);
     }
 }
@@ -213,6 +267,10 @@ pub fun lookup(p: *u8, n: u64) *Node {
     for (i < n) {
         val start: u64 = i;
         for (i < n && p[i] != 47) { i = i + 1; }
+        if (nd.kind == abi.KIND_DIR && allowed(nd, abi.X_OK) == 0) {
+            denied = 1;
+            ret nil;
+        }
         nd = child(nd, ?p[start], i - start);
         if (nd == nil) { ret nil; }
         i = i + 1;
@@ -241,24 +299,30 @@ pub fun create_ram(dir: *Node, name: *u8, n: u64, kind: u64) *Node {
 
 # a new file or directory in `dir`, on whatever filesystem `dir` is on.
 # returns 0 and sets *out, or an error
-pub fun create(dir: *Node, name: *u8, n: u64, kind: u64, out: **Node) u64 {
+pub fun create(dir: *Node, name: *u8, n: u64, kind: u64, mode: u64, out: **Node) u64 {
     if (n > abi.NAME_MAX) { ret e(abi.E_NAMETOOLONG); }
     if (dir.fs == FS_RAM) {
         val nd: *Node = create_ram(dir, name, n, kind);
         if (nd == nil) { ret e(abi.E_NOMEM); }
+        nd.mode = mode & 0xFFF;
+        nd.uid = cred_uid;
+        nd.gid = cred_gid;
         @out = nd;
         ret 0;
     }
     load(dir);
     val nd: *Node = new_node(kind, FS_EXT2, name, n);
     if (nd == nil) { ret e(abi.E_NOMEM); }
-    val ino: u64 = ext2.create(dir.fsi, dir.ino, name, n, kind);
+    val ino: u64 = ext2.create(dir.fsi, dir.ino, name, n, kind, mode, cred_uid, cred_gid);
     if (abi.is_err(ino) != 0) {
         heap.free(nd::u64);
         ret ino;
     }
     nd.ino = ino;
     nd.fsi = dir.fsi;
+    nd.mode = mode & 0xFFF;
+    nd.uid = cred_uid;
+    nd.gid = cred_gid;
     nd.loaded = 1; # brand new: nothing on disk to read
     if (kind == abi.KIND_DIR) { nd.size = 4096; }
     attach(dir, nd);

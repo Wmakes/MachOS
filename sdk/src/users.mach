@@ -1,0 +1,428 @@
+# user accounts, the Unix way:
+#   /etc/passwd  name:x:uid:gid:full name:home:shell   (readable by all)
+#   /etc/group   name:x:gid:members
+#   /etc/shadow  name:hash:                            (root only, 0600)
+# a hash is $sha256$ROUNDS$SALT$DIGEST (hex): SHA-256 of salt + password,
+# then ROUNDS - 1 more times of digest + salt + password. an empty hash
+# means no password; "!" or "*" means the account is locked
+
+use abi:    sdk.abi;
+use sys:    sdk.sys;
+use io:     sdk.io;
+use bd:     sdk.blkdev;
+use sha256: sdk.sha256;
+
+pub val ROUNDS: u64 = 5000;
+
+pub rec User {
+    name:      [32]u8;
+    name_len:  u64;
+    uid:       u64;
+    gid:       u64;
+    home:      [128]u8;
+    home_len:  u64;
+    shell:     [64]u8;
+    shell_len: u64;
+}
+
+val CAP: u64 = 16384;
+var file: [16384]u8;
+var flen: u64 = 0;
+
+fun load(p: *u8) u8 {
+    flen = 0;
+    val h: u64 = sys.open(p, io.len(p), abi.O_READ);
+    if (abi.is_err(h) != 0) { ret 0; }
+    for (flen < CAP) {
+        val r: u64 = sys.read(h, ?file[flen], CAP - flen);
+        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        flen = flen + r;
+    }
+    sys.close(h);
+    ret 1;
+}
+
+# field `k` (0-based, ':'-separated) of the line at file[s..e]
+fun field(s: u64, e: u64, k: u64, fs: *u64, fl: *u64) u8 {
+    var i: u64 = s;
+    var n: u64 = 0;
+    var start: u64 = s;
+    for (i <= e) {
+        if (i == e || file[i] == 58) {
+            if (n == k) {
+                @fs = start;
+                @fl = i - start;
+                ret 1;
+            }
+            n = n + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun num(s: u64, n: u64) u64 {
+    var okk: u8 = 0;
+    ret io.parse_dec(?file[s], n, ?okk);
+}
+
+# find the line whose field `k` is `want`; its bounds
+fun find_line(k: u64, want: *u8, wn: u64, ls: *u64, le: *u64) u8 {
+    var s: u64 = 0;
+    for (s < flen) {
+        var e: u64 = s;
+        for (e < flen && file[e] != 10) { e = e + 1; }
+        var fs: u64 = 0;
+        var fl: u64 = 0;
+        if (field(s, e, k, ?fs, ?fl) != 0 && io.eq(?file[fs], fl, want, wn) != 0) {
+            @ls = s;
+            @le = e;
+            ret 1;
+        }
+        s = e + 1;
+    }
+    ret 0;
+}
+
+fun fill(u: *User, s: u64, e: u64) {
+    var fs: u64 = 0;
+    var fl: u64 = 0;
+    field(s, e, 0, ?fs, ?fl);
+    if (fl > 31) { fl = 31; }
+    io.copy(?u.name[0], ?file[fs], fl);
+    u.name[fl] = 0;
+    u.name_len = fl;
+    field(s, e, 2, ?fs, ?fl);
+    u.uid = num(fs, fl);
+    field(s, e, 3, ?fs, ?fl);
+    u.gid = num(fs, fl);
+    u.home_len = 0;
+    if (field(s, e, 5, ?fs, ?fl) != 0 && fl < 127) {
+        io.copy(?u.home[0], ?file[fs], fl);
+        u.home_len = fl;
+    }
+    u.home[u.home_len] = 0;
+    u.shell_len = 0;
+    if (field(s, e, 6, ?fs, ?fl) != 0 && fl < 63) {
+        io.copy(?u.shell[0], ?file[fs], fl);
+        u.shell_len = fl;
+    }
+    u.shell[u.shell_len] = 0;
+}
+
+pub fun by_name(name: *u8, n: u64, out: *User) u8 {
+    if (load("/etc/passwd\0") == 0) { ret 0; }
+    var s: u64 = 0;
+    var e: u64 = 0;
+    if (find_line(0, name, n, ?s, ?e) == 0) { ret 0; }
+    fill(out, s, e);
+    ret 1;
+}
+
+pub fun by_uid(uid: u64, out: *User) u8 {
+    var d: [20]u8;
+    val dn: u64 = io.fmt_dec(uid, ?d[0]);
+    if (load("/etc/passwd\0") == 0) { ret 0; }
+    var s: u64 = 0;
+    var e: u64 = 0;
+    if (find_line(2, ?d[0], dn, ?s, ?e) == 0) { ret 0; }
+    fill(out, s, e);
+    ret 1;
+}
+
+# the name of user `uid` (or the number) into out (32 bytes); its length
+pub fun user_name(uid: u64, out: *u8) u64 {
+    var u: User;
+    if (by_uid(uid, ?u) != 0) {
+        io.copy(out, ?u.name[0], u.name_len + 1);
+        ret u.name_len;
+    }
+    val n: u64 = io.fmt_dec(uid, out);
+    out[n] = 0;
+    ret n;
+}
+
+# the name of group `gid` (or the number) into out (32 bytes); its length
+pub fun group_name(gid: u64, out: *u8) u64 {
+    var d: [20]u8;
+    val dn: u64 = io.fmt_dec(gid, ?d[0]);
+    if (load("/etc/group\0") != 0) {
+        var s: u64 = 0;
+        var e: u64 = 0;
+        if (find_line(2, ?d[0], dn, ?s, ?e) != 0) {
+            var fs: u64 = 0;
+            var fl: u64 = 0;
+            field(s, e, 0, ?fs, ?fl);
+            if (fl > 31) { fl = 31; }
+            io.copy(out, ?file[fs], fl);
+            out[fl] = 0;
+            ret fl;
+        }
+    }
+    io.copy(out, ?d[0], dn);
+    out[dn] = 0;
+    ret dn;
+}
+
+# the gid of group `name`, or NO_ID
+pub fun group_id(name: *u8, n: u64) u64 {
+    if (load("/etc/group\0") == 0) { ret abi.NO_ID; }
+    var s: u64 = 0;
+    var e: u64 = 0;
+    if (find_line(0, name, n, ?s, ?e) == 0) { ret abi.NO_ID; }
+    var fs: u64 = 0;
+    var fl: u64 = 0;
+    field(s, e, 2, ?fs, ?fl);
+    ret num(fs, fl);
+}
+
+val HEX: *u8 = "0123456789abcdef\0";
+
+fun hex(src: *u8, n: u64, out: *u8) {
+    var i: u64 = 0;
+    for (i < n) {
+        out[i * 2] = HEX[src[i] >> 4];
+        out[i * 2 + 1] = HEX[src[i] & 15];
+        i = i + 1;
+    }
+}
+
+fun unhex_digit(c: u8) u8 {
+    if (c >= 48 && c <= 57) { ret c - 48; }
+    if (c >= 97 && c <= 102) { ret c - 87; }
+    ret 0;
+}
+
+fun digest(salt: *u8, pw: *u8, pn: u64, rounds: u64, out: *u8) {
+    var c: sha256.Ctx;
+    sha256.init(?c);
+    sha256.update(?c, salt, 16);
+    sha256.update(?c, pw, pn);
+    sha256.finish(?c, out);
+    var r: u64 = 1;
+    for (r < rounds) {
+        sha256.init(?c);
+        sha256.update(?c, out, 32);
+        sha256.update(?c, salt, 16);
+        sha256.update(?c, pw, pn);
+        sha256.finish(?c, out);
+        r = r + 1;
+    }
+}
+
+# hash a new password with a fresh salt into out (128 bytes); its length
+pub fun hash(pw: *u8, pn: u64, out: *u8) u64 {
+    var salt: [16]u8;
+    bd.put64(?salt[0], 0, bd.random());
+    bd.put64(?salt[0], 8, bd.random());
+    var d: [32]u8;
+    digest(?salt[0], pw, pn, ROUNDS, ?d[0]);
+    var n: u64 = 0;
+    io.copy(out, "$sha256$\0", 8);
+    n = 8;
+    n = n + io.fmt_dec(ROUNDS, ?out[n]);
+    out[n] = 36;
+    n = n + 1;
+    hex(?salt[0], 16, ?out[n]);
+    n = n + 32;
+    out[n] = 36;
+    n = n + 1;
+    hex(?d[0], 32, ?out[n]);
+    n = n + 64;
+    out[n] = 0;
+    ret n;
+}
+
+# the stored hash of `name` into out (128 bytes); its length, or NO_ID
+# when there is no such user (or shadow cannot be read)
+pub fun stored(name: *u8, n: u64, out: *u8) u64 {
+    if (load("/etc/shadow\0") == 0) { ret abi.NO_ID; }
+    var s: u64 = 0;
+    var e: u64 = 0;
+    if (find_line(0, name, n, ?s, ?e) == 0) { ret abi.NO_ID; }
+    var fs: u64 = 0;
+    var fl: u64 = 0;
+    if (field(s, e, 1, ?fs, ?fl) == 0 || fl > 127) { ret 0; }
+    io.copy(out, ?file[fs], fl);
+    out[fl] = 0;
+    ret fl;
+}
+
+# whether `pw` is the password of a stored hash (an empty hash takes any)
+pub fun matches(h: *u8, hn: u64, pw: *u8, pn: u64) u8 {
+    if (hn == 0) { ret 1; }
+    if (hn < 10 || io.eq(h, 8, "$sha256$\0", 8) == 0) { ret 0; }
+    var i: u64 = 8;
+    for (i < hn && h[i] != 36) { i = i + 1; }
+    var okk: u8 = 0;
+    val rounds: u64 = io.parse_dec(?h[8], i - 8, ?okk);
+    if (okk == 0 || i + 1 + 32 + 1 + 64 != hn) { ret 0; }
+    var salt: [16]u8;
+    var k: u64 = 0;
+    for (k < 16) {
+        salt[k] = (unhex_digit(h[i + 1 + k * 2]) << 4) | unhex_digit(h[i + 2 + k * 2]);
+        k = k + 1;
+    }
+    var d: [32]u8;
+    digest(?salt[0], pw, pn, rounds, ?d[0]);
+    var x: [64]u8;
+    hex(?d[0], 32, ?x[0]);
+    ret io.eq(?x[0], 64, ?h[i + 34], 64);
+}
+
+pub fun locked(h: *u8, hn: u64) u8 {
+    if (hn > 0 && (h[0] == 33 || h[0] == 42)) { ret 1; }
+    ret 0;
+}
+
+# replace (or add) the line of `name` in `path` with `line` (no newline)
+fun put_line(path: *u8, key_field: u64, name: *u8, n: u64, line: *u8, ln: u64, mode: u64) u8 {
+    load(path);
+    var out: [16384]u8;
+    var o: u64 = 0;
+    var s: u64 = 0;
+    var done: u8 = 0;
+    for (s < flen) {
+        var e: u64 = s;
+        for (e < flen && file[e] != 10) { e = e + 1; }
+        var fs: u64 = 0;
+        var fl: u64 = 0;
+        var src: *u8 = ?file[s];
+        var sl: u64 = e - s;
+        if (field(s, e, key_field, ?fs, ?fl) != 0 && io.eq(?file[fs], fl, name, n) != 0) {
+            src = line;
+            sl = ln;
+            done = 1;
+        }
+        if (o + sl + 1 > 16384) { ret 0; }
+        io.copy(?out[o], src, sl);
+        out[o + sl] = 10;
+        o = o + sl + 1;
+        s = e + 1;
+    }
+    if (done == 0) {
+        if (o + ln + 1 > 16384) { ret 0; }
+        io.copy(?out[o], line, ln);
+        out[o + ln] = 10;
+        o = o + ln + 1;
+    }
+    val h: u64 = sys.open_mode(path, io.len(path), abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC, mode);
+    if (abi.is_err(h) != 0) { ret 0; }
+    val ok: u8 = io.write_all(h, ?out[0], o);
+    sys.close(h);
+    ret ok;
+}
+
+# store a new password for `name` (needs root: /etc/shadow is root's)
+pub fun set_password(name: *u8, n: u64, pw: *u8, pn: u64) u8 {
+    var line: [256]u8;
+    if (n > 31) { ret 0; }
+    io.copy(?line[0], name, n);
+    line[n] = 58;
+    var l: u64 = n + 1;
+    if (pn > 0) { l = l + hash(pw, pn, ?line[l]); }
+    line[l] = 58;
+    l = l + 1;
+    ret put_line("/etc/shadow\0", 0, name, n, ?line[0], l, 0x180);
+}
+
+# add a user (and its own group of the same name and number)
+pub fun add(name: *u8, n: u64, uid: u64, home: *u8, shell: *u8) u8 {
+    var line: [256]u8;
+    var l: u64 = 0;
+    var d: [20]u8;
+    val dn: u64 = io.fmt_dec(uid, ?d[0]);
+    io.copy(?line[0], name, n);
+    l = n;
+    io.copy(?line[l], ":x:\0", 3);
+    l = l + 3;
+    io.copy(?line[l], ?d[0], dn);
+    l = l + dn;
+    line[l] = 58;
+    l = l + 1;
+    io.copy(?line[l], ?d[0], dn);
+    l = l + dn;
+    line[l] = 58;
+    line[l + 1] = 58;
+    l = l + 2;
+    io.copy(?line[l], home, io.len(home));
+    l = l + io.len(home);
+    line[l] = 58;
+    l = l + 1;
+    io.copy(?line[l], shell, io.len(shell));
+    l = l + io.len(shell);
+    if (put_line("/etc/passwd\0", 0, name, n, ?line[0], l, 0x1A4) == 0) { ret 0; }
+    # name:x:gid:
+    l = n;
+    io.copy(?line[l], ":x:\0", 3);
+    l = l + 3;
+    io.copy(?line[l], ?d[0], dn);
+    l = l + dn;
+    line[l] = 58;
+    l = l + 1;
+    if (put_line("/etc/group\0", 0, name, n, ?line[0], l, 0x1A4) == 0) { ret 0; }
+    ret set_password(name, n, nil, 0);
+}
+
+# a free uid from 1000 up
+pub fun next_uid() u64 {
+    var uid: u64 = 1000;
+    var u: User;
+    for (by_uid(uid, ?u) != 0) { uid = uid + 1; }
+    ret uid;
+}
+
+# print `prompt` and read a line without echoing it (a password) into out;
+# its length (without the newline), or NO_ID at end of input
+pub fun read_secret(prompt: *u8, out: *u8, cap: u64) u64 {
+    io.out(prompt);
+    var t: abi.Termios;
+    val tty: u8 = (abi.is_err(sys.tcgetattr(abi.STDIN, ?t)) == 0)::u8;
+    if (tty != 0) {
+        t.lflag = abi.ISIG | abi.ICANON;
+        sys.tcsetattr(abi.STDIN, ?t);
+    }
+    var n: u64 = 0;
+    var got_any: u8 = 0;
+    for (n < cap) {
+        var c: u8 = 0;
+        val r: u64 = sys.read(abi.STDIN, ?c, 1);
+        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        got_any = 1;
+        if (c == 10) { brk; }
+        out[n] = c;
+        n = n + 1;
+    }
+    if (tty != 0) {
+        t.lflag = abi.ISIG | abi.ICANON | abi.ECHO;
+        sys.tcsetattr(abi.STDIN, ?t);
+        io.putc(10);
+    }
+    if (got_any == 0) { ret abi.NO_ID; }
+    ret n;
+}
+
+# read a visible line into out; its length, or NO_ID at end of input
+pub fun read_line(out: *u8, cap: u64) u64 {
+    var n: u64 = 0;
+    var got_any: u8 = 0;
+    for (n < cap) {
+        var c: u8 = 0;
+        val r: u64 = sys.read(abi.STDIN, ?c, 1);
+        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        got_any = 1;
+        if (c == 10) { brk; }
+        out[n] = c;
+        n = n + 1;
+    }
+    if (got_any == 0) { ret abi.NO_ID; }
+    ret n;
+}
+
+# switch this process to user `u`: groups first, while still allowed
+pub fun become(u: *User) u8 {
+    if (abi.is_err(sys.setgid(u.gid)) != 0) { ret 0; }
+    if (abi.is_err(sys.setuid(u.uid)) != 0) { ret 0; }
+    ret 1;
+}

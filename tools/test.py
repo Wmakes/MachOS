@@ -11,7 +11,7 @@ root partition afterwards.
 import argparse, os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-P = r"\$ "  # the shell prompt
+P = r"[$#] "  # the shell prompt (# for root)
 TARGET = os.path.join(ROOT, "out", "headless", "target.img")
 BROKEN = os.path.join(ROOT, "out", "headless", "broken.img")
 
@@ -105,7 +105,7 @@ TESTS = [
       "wait:diff=", "wait:" + P,
       "send:find / -name '*.conf'; ls /etc | xargs echo got; seq 1 50 | tail -2 | tee /tmp/t | wc -l; basename /a/b.txt .txt; df\\n",
       "wait:" + P],
-     ["APPLE", "FIG", "PEAR", "20", "19", "-3", "+X", "diff=1", "/boot/limine.conf", "got motd",
+     ["APPLE", "FIG", "PEAR", "20", "19", "-3", "+X", "diff=1", "/boot/limine.conf", "got group motd passwd shadow",
       "      2", "b", "/dev/sda2", "%"]),
 
     ("jobs-and-ctrl-c", False, False,
@@ -149,11 +149,11 @@ TESTS = [
      ["wait:" + P,
       "send:echo \"$HOME $PATH\"; X=1; echo x=$X ${X}y; env | grep -c X=; export X; env | grep X=\\n", "wait:" + P,
       "send:Y=only-here env | grep Y=; echo \"[$Y]\"; unset X; echo \"[$X]\"; echo ~ $$\\n", "wait:" + P,
-      "send:mkdir /tmp/b; printf '#!/bin/sh\\\\necho via-path $1\\\\n' > /tmp/b/tool; PATH=/tmp/b:/bin; tool z; which tool\\n",
+      "send:mkdir /tmp/b; printf '#!/bin/sh\\\\necho via-path $1\\\\n' > /tmp/b/tool; chmod +x /tmp/b/tool; PATH=/tmp/b:/bin; tool z; which tool\\n",
       "wait:" + P,
       "send:env -i K=v env; echo \"a\\\\nb \\\\$\"\\n", "wait:" + P,
       "send:set | grep -c PATH=; pwd | cat; export | grep -c HOME; cd /etc | cat; pwd\\n", "wait:" + P],
-     ["/ /bin", "x=1 1y", "0", "X=1", "Y=only-here", "[]", "[]", "/ 2", "via-path z", "/tmp/b/tool",
+     ["/root /bin", "x=1 1y", "0", "X=1", "Y=only-here", "[]", "[]", "/root ", "via-path z", "/tmp/b/tool",
       "K=v", "a\\nb $", "1", "/", "1", "/"]),
 
     ("job-control", False, False,
@@ -165,6 +165,19 @@ TESTS = [
       "send:echo status=$?; kill -l | grep -c TERM; kill -TERM 999\\n", "wait:" + P],
      ["^Z", "Stopped  sleep 3", "stopped", "Running  sleep 3", "fg-status=0", "Stopped  sleep 30",
       "^C", "status=130", "1", "no such process"]),
+
+    ("users", False, True,
+     ["wait:" + P, "send:id; adduser alice; ls -l /home\\n", "wait:" + P,
+      "send:passwd alice\\n", "wait:New password: ", "send:secret\\n", "wait:Again: ", "send:secret\\n",
+      "wait:" + P,
+      "send:su alice\\n", "wait:" + P,
+      "send:id; cat /etc/shadow; touch /x; echo hi > ~/f; cat ~/f; kill 1; exit\\n", "wait:# ",
+      "send:exit\\n", "wait:login: ", "send:alice\\n", "wait:Password: ", "send:wrong\\n",
+      "wait:incorrect", "wait:login: ", "send:alice\\n", "wait:Password: ", "send:secret\\n",
+      "wait:" + P, "send:pwd; ls -l /bin/su\\n", "wait:" + P],
+     ["uid=0(root)", "added alice (uid 1000", "alice    alice", "password changed",
+      "uid=1000(alice)", "shadow: permission denied", "/x: permission denied", "hi",
+      "operation not permitted", "Login incorrect", "alice@machos", "/home/alice", "-rwsr-xr-x root"]),
 
     # repair a disk that debugfs damaged on the host
     ("fsck", False, False,
@@ -244,6 +257,9 @@ def run(name, keep, fsck, steps, expect, profile):
                 f.truncate(512 << 20)
         cmd += [opt, val]
         steps = steps[2:]
+    # every boot but rescue mode starts at a login prompt: log in as root
+    if "--rescue" not in cmd:
+        steps = ["wait:login: ", "send:root\\n"] + steps
     r = subprocess.run(cmd + steps, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     out = r.stdout
     problems = []

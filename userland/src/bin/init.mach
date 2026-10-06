@@ -1,4 +1,5 @@
-# pid 1: keep a shell running on the console
+# pid 1: keep a login prompt on the console (in rescue mode: a root shell,
+# no password asked, for repairing the system)
 
 use abi: sdk.abi;
 use sys: sdk.sys;
@@ -7,19 +8,31 @@ use rt:  sdk.rt;
 
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
-    io.out("init: starting /bin/sh\n\0");
+    var rescue: u8 = 0;
+    if (argc > 1 && io.streq(argv[1], "rescue\0") != 0) { rescue = 1; }
     for {
-        var how: abi.Spawn = abi.Spawn{ handles: [10]u64{0, 1, 2, abi.FD_NONE, abi.FD_NONE,
-            abi.FD_NONE, abi.FD_NONE, abi.FD_NONE, abi.FD_NONE, abi.FD_NONE}, group: abi.NEW_GROUP,
-            map_fds: 1, env: nil, env_len: 0 };
-        val pid: u64 = sys.spawn("/bin/sh\0", 7, "/bin/sh\0", 8, ?how);
+        var pid: u64 = 0;
+        if (rescue != 0) {
+            io.out("init: rescue mode, root shell (fsck -y /dev/sda2 checks the disk)\n\0");
+            var how: abi.Spawn;
+            how.map_fds = 0;
+            how.group = abi.NEW_GROUP;
+            how.env = nil;
+            pid = sys.spawn("/bin/sh\0", 7, "-sh\0", 4, ?how);
+        } or {
+            pid = sys.spawn("/bin/login\0", 10, "login\0", 6, nil);
+        }
         if (abi.is_err(pid) != 0) {
-            io.fail("init\0", "/bin/sh\0", pid);
+            io.fail("init\0", "cannot start a session\0", pid);
             sys.sleep(1000);
             cnt;
         }
-        sys.wait(pid);
-        io.out("init: shell exited, starting a new one\n\0");
+        # wait for that session to end, collecting any orphans meanwhile
+        for {
+            var st: u64 = 0;
+            val r: u64 = sys.waitpid(abi.ANY_CHILD, ?st, 0);
+            if (r == pid || abi.is_err(r) != 0) { brk; }
+        }
     }
     ret 0;
 }

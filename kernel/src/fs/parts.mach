@@ -55,6 +55,7 @@ fun make_node(i: u64) {
     if (nd == nil) { ret; }
     nd.dev = vfs.DEV_DISK + i;
     nd.size = b.count * ahci.SECTOR;
+    nd.mode = 0x180; # 0600: raw disks are root's
     b.node = nd;
 }
 

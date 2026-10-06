@@ -20,6 +20,7 @@ use rt:  sdk.rt;
 use edit: userland.sh.edit;
 use env:  sdk.env;
 use path: sdk.path;
+use users: sdk.users;
 
 val T_WORD:   u8 = 1;
 val T_PIPE:   u8 = 2;
@@ -404,7 +405,7 @@ fun lex(line: *u8, n: u64) u8 {
                 i = i + 2;
             } or (d == 36 && dollar(line, n, i) != i) { # expanded when it runs
                 i = dollar_end;
-            } or (d == 126 && wlen == start && (i + 1 >= n || line[i + 1] == 47 || is_space(line[i + 1]) != 0)) {
+            } or (d == 126 && wlen == start && (i + 1 >= n || line[i + 1] == 47 || is_space(line[i + 1]) != 0 || is_special(line[i + 1]) != 0)) {
                 push(HOME_MARK); # a leading ~
                 i = i + 1;
             } or {
@@ -1060,13 +1061,20 @@ fun add_str(at: u64, s2: *u8) u64 {
     ret at + n;
 }
 
-# "machos:/cwd$ " in colour, NUL-terminated
+var me: [32]u8; # the user's name, found once
+var me_len: u64 = 0;
+
+# "user@machos:/cwd$ " in colour ("#" for root), NUL-terminated
 fun prompt() *u8 {
+    if (me_len == 0) { me_len = users.user_name(sys.geteuid(), ?me[0]); }
     var dir: [256]u8;
     val n: u64 = cwd(?dir[0], 256);
-    var at: u64 = add_str(0, "\x1b[1;32mmachos\x1b[0m:\x1b[1;34m\0");
+    var at: u64 = add_str(0, "\x1b[1;32m\0");
+    io.copy(?prompt_buf[at], ?me[0], me_len);
+    at = add_str(at + me_len, "@machos\x1b[0m:\x1b[1;34m\0");
     io.copy(?prompt_buf[at], ?dir[0], n);
-    at = add_str(at + n, "\x1b[0m$ \0");
+    if (sys.geteuid() == 0) { at = add_str(at + n, "\x1b[0m# \0"); }
+    or                      { at = add_str(at + n, "\x1b[0m$ \0"); }
     prompt_buf[at] = 0;
     ret ?prompt_buf[0];
 }
@@ -1142,7 +1150,8 @@ fun main(argc: u64, argv: **u8) u64 {
         }
     } or {
         interactive = 1;
-        motd();
+        # a login shell ("-sh", from login or init) greets with /etc/motd
+        if (argc > 0 && argv[0][0] == 45) { motd(); }
     }
 
     var line: [1024]u8;

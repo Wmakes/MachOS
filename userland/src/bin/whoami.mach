@@ -1,0 +1,14 @@
+# whoami: the name of the user running it (the effective one)
+
+use sys:   sdk.sys;
+use io:    sdk.io;
+use users: sdk.users;
+use rt:    sdk.rt;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var name: [32]u8;
+    io.outn(?name[0], users.user_name(sys.geteuid(), ?name[0]));
+    io.putc(10);
+    ret 0;
+}

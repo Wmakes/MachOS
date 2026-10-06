@@ -1,0 +1,49 @@
+# chown OWNER[:GROUP] FILE...: change owner (and group), by name or number.
+# root only
+
+use abi:   sdk.abi;
+use sys:   sdk.sys;
+use io:    sdk.io;
+use users: sdk.users;
+use rt:    sdk.rt;
+
+fun id_of(s: *u8, n: u64, group: u8) u64 {
+    var okk: u8 = 0;
+    val v: u64 = io.parse_dec(s, n, ?okk);
+    if (okk != 0) { ret v; }
+    if (group != 0) { ret users.group_id(s, n); }
+    var u: users.User;
+    if (users.by_name(s, n, ?u) == 0) { ret abi.NO_ID - 1; }
+    ret u.uid;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc < 3) {
+        io.err("usage: chown OWNER[:GROUP] FILE...\n\0");
+        ret 2;
+    }
+    val spec: *u8 = argv[1];
+    val sn: u64 = io.len(spec);
+    var colon: u64 = 0;
+    for (colon < sn && spec[colon] != 58) { colon = colon + 1; }
+    var uid: u64 = abi.NO_ID;
+    var gid: u64 = abi.NO_ID;
+    if (colon > 0) { uid = id_of(spec, colon, 0); }
+    if (colon + 1 < sn) { gid = id_of(?spec[colon + 1], sn - colon - 1, 1); }
+    if (uid == abi.NO_ID - 1 || (colon + 1 < sn && gid == abi.NO_ID)) {
+        io.err("chown: no such user or group\n\0");
+        ret 1;
+    }
+    var status: u64 = 0;
+    var i: u64 = 2;
+    for (i < argc) {
+        val r: u64 = sys.chown(argv[i], io.len(argv[i]), uid, gid);
+        if (abi.is_err(r) != 0) {
+            io.fail("chown\0", argv[i], r);
+            status = 1;
+        }
+        i = i + 1;
+    }
+    ret status;
+}

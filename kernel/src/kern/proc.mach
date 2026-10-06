@@ -47,6 +47,11 @@ pub rec Proc {
     report_stop: u8;  # a stop waitpid(WUNTRACED) has not seen yet
     alarm_at:  u64;   # tick SIGALRM is due, 0 = none
     session:   u64;
+    uid:       u64;   # real user and group
+    gid:       u64;
+    euid:      u64;   # effective: what permissions are checked with
+    egid:      u64;
+    umask:     u64;   # mode bits new files do not get
     exit_code: u64;  # the wait status: code << 8, or the signal
     ksp:       u64;  # saved kernel rsp while switched out
     kstack:    u64;  # heap block holding the kernel stack

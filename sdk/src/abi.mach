@@ -6,13 +6,13 @@
 pub val EXIT:    u64 = 0;  # (code)                                  never returns
 pub val READ:    u64 = 1;  # (handle, buf, len)                      -> bytes, 0 = end
 pub val WRITE:   u64 = 2;  # (handle, buf, len)                      -> bytes
-pub val OPEN:    u64 = 3;  # (path, path_len, O_*)                   -> handle
+pub val OPEN:    u64 = 3;  # (path, path_len, O_*, mode)             -> fd; mode (less the umask) for a new file
 pub val CLOSE:   u64 = 4;  # (handle)
 pub val SPAWN:   u64 = 5;  # (path, path_len, args, args_len, *Spawn) -> pid; the record is required
 pub val WAIT:    u64 = 6;  # (pid, *status, WNOHANG)                 -> pid (0: none ready)
 pub val READDIR: u64 = 7;  # (handle, index, *Entry)                 -> 1, or 0 past the end
 pub val STAT:    u64 = 8;  # (path, path_len, *Stat)
-pub val MKDIR:   u64 = 9;  # (path, path_len)
+pub val MKDIR:   u64 = 9;  # (path, path_len, mode)
 pub val REMOVE:  u64 = 10; # (path, path_len)                        file or empty dir
 pub val CHDIR:   u64 = 11; # (path, path_len)
 pub val GETCWD:  u64 = 12; # (buf, len)                              -> length
@@ -52,7 +52,27 @@ pub val SETSID:      u64 = 45; # ()                                -> the new se
 pub val GETSID:      u64 = 46; # (pid)
 pub val TCSETPGRP:   u64 = 47; # (fd, pgid)                        the terminal's foreground group
 pub val TCGETPGRP:   u64 = 48; # (fd)
-pub val COUNT:       u64 = 49;
+pub val CHMOD:   u64 = 49; # (path, path_len, mode)                owner or root
+pub val CHOWN:   u64 = 50; # (path, path_len, uid, gid)            root; NO_ID leaves one as it is
+pub val SETUID:  u64 = 51; # (uid)     root: any; others: back to their real uid
+pub val SETGID:  u64 = 52; # (gid)
+pub val GETUID:  u64 = 53;
+pub val GETEUID: u64 = 54;
+pub val GETGID:  u64 = 55;
+pub val GETEGID: u64 = 56;
+pub val UMASK:   u64 = 57; # (mask)                                -> the old one
+pub val ACCESS:  u64 = 58; # (path, path_len, R_OK|W_OK|X_OK)      with the real uid
+pub val COUNT:   u64 = 59;
+
+pub val NO_ID: u64 = 0xFFFFFFFFFFFFFFFF;
+pub val R_OK: u64 = 4;
+pub val W_OK: u64 = 2;
+pub val X_OK: u64 = 1;
+
+# mode bits: permissions for owner, group and others (rwx each), plus
+pub val S_ISUID: u64 = 0x800; # 04000 run with the file owner's user id
+pub val S_ISGID: u64 = 0x400; # 02000 ... and group id
+pub val S_ISVTX: u64 = 0x200; # 01000 sticky: in a directory, only owners remove entries
 
 # signal handlers and masks
 pub val SIG_DFL: u64 = 0;
@@ -146,6 +166,7 @@ pub val E_BUSY:     u64 = 21; # in use
 pub val E_NOTTY:    u64 = 22; # not a terminal
 pub val E_INTR:     u64 = 23; # interrupted by a signal
 pub val E_PERM:     u64 = 24; # not allowed
+pub val E_ACCES:    u64 = 25; # permission denied
 
 pub val ERR_MIN: u64 = 0xFFFFFFFFFFFFF000;
 
@@ -184,6 +205,7 @@ pub fun err_name(v: u64) *u8 {
     if (e == E_NOTTY)    { ret "not a terminal\0"; }
     if (e == E_INTR)     { ret "interrupted\0"; }
     if (e == E_PERM)     { ret "operation not permitted\0"; }
+    if (e == E_ACCES)    { ret "permission denied\0"; }
     ret "unknown error\0";
 }
 
@@ -225,12 +247,18 @@ pub rec Stat {
     kind:  u64;
     size:  u64;
     mtime: u64; # last change, seconds since 1970-01-01 UTC
+    mode:  u64; # permission bits (07777)
+    uid:   u64;
+    gid:   u64;
 }
 
 pub rec Entry {
     kind:     u64;
     size:     u64;
     mtime:    u64;
+    mode:     u64;
+    uid:      u64;
+    gid:      u64;
     name_len: u64;
     name:     [60]u8;
 }
@@ -278,6 +306,7 @@ pub val STATE_STOPPED:  u64 = 5;
 
 pub rec ProcInfo {
     pid:      u64;
+    uid:      u64;
     ppid:     u64;
     group:    u64;
     state:    u64;

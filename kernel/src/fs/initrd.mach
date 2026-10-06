@@ -47,6 +47,9 @@ pub fun unpack(tar: u64, len: u64) u64 {
         if (h[0] == 0) { brk; }
         val size: u64 = octal(?h[124], 12);
         val kind: u8 = h[156];
+        val mode: u64 = octal(?h[100], 8) & 0xFFF;
+        val uid: u64 = octal(?h[108], 8);
+        val gid: u64 = octal(?h[116], 8);
 
         # prefix "/" name, then normalize (drops "./" and trailing slashes)
         var n: u64 = 0;
@@ -61,7 +64,12 @@ pub fun unpack(tar: u64, len: u64) u64 {
 
         if (len_norm > 1) {
             if (kind == 53) {
-                mkdirs(?norm[0], len_norm);
+                val d: *vfs.Node = mkdirs(?norm[0], len_norm);
+                if (d != nil) {
+                    d.mode = mode;
+                    d.uid = uid;
+                    d.gid = gid;
+                }
             } or (kind == 48 || kind == 0) {
                 val b: u64 = path.base_index(?norm[0], len_norm);
                 var dl: u64 = 1;
@@ -70,6 +78,9 @@ pub fun unpack(tar: u64, len: u64) u64 {
                 if (dir != nil && off + 512 + size <= len) {
                     val f: *vfs.Node = vfs.create_ram(dir, ?norm[b], len_norm - b, abi.KIND_FILE);
                     if (f != nil) {
+                        f.mode = mode;
+                        f.uid = uid;
+                        f.gid = gid;
                         vfs.write(f, 0, tar + off + 512, size);
                         files = files + 1;
                     }

@@ -1,0 +1,89 @@
+# chmod MODE FILE...: MODE is octal (755) or symbolic: [ugoa]*[+-=][rwxst]*
+# with several parts separated by commas (u+x,go-w)
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+# apply MODE to `old`; NO_ID if MODE makes no sense
+fun apply(m: *u8, n: u64, old: u64) u64 {
+    if (n > 0 && m[0] >= 48 && m[0] <= 55) {
+        var v: u64 = 0;
+        var i: u64 = 0;
+        for (i < n) {
+            if (m[i] < 48 || m[i] > 55) { ret abi.NO_ID; }
+            v = v * 8 + (m[i] - 48)::u64;
+            i = i + 1;
+        }
+        ret v & 0xFFF;
+    }
+    var mode: u64 = old;
+    var i: u64 = 0;
+    for (i < n) {
+        var who: u64 = 0;
+        for (i < n && (m[i] == 117 || m[i] == 103 || m[i] == 111 || m[i] == 97)) {
+            if (m[i] == 117) { who = who | 0x9C0; }       # u: rwx + setuid
+            or (m[i] == 103) { who = who | 0x438; }       # g: rwx + setgid
+            or (m[i] == 111) { who = who | 0x207; }       # o: rwx + sticky
+            or { who = who | 0xFFF; }
+            i = i + 1;
+        }
+        if (who == 0) { who = 0xFFF; }
+        if (i >= n) { ret abi.NO_ID; }
+        val op: u8 = m[i];
+        if (op != 43 && op != 45 && op != 61) { ret abi.NO_ID; }
+        i = i + 1;
+        var bits: u64 = 0;
+        for (i < n && m[i] != 44) {
+            val c: u8 = m[i];
+            if (c == 114) { bits = bits | 0x124; }      # r
+            or (c == 119) { bits = bits | 0x92; }       # w
+            or (c == 120) { bits = bits | 0x49; }       # x
+            or (c == 115) { bits = bits | 0xC00; }      # s
+            or (c == 116) { bits = bits | 0x200; }      # t
+            or { ret abi.NO_ID; }
+            i = i + 1;
+        }
+        bits = bits & who;
+        if (op == 43) { mode = mode | bits; }
+        or (op == 45) { mode = mode & ~bits; }
+        or { mode = (mode & ~who) | bits; }
+        if (i < n) { i = i + 1; } # the comma
+    }
+    ret mode & 0xFFF;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc < 3) {
+        io.err("usage: chmod MODE FILE...\n\0");
+        ret 2;
+    }
+    var status: u64 = 0;
+    var i: u64 = 2;
+    for (i < argc) {
+        var st: abi.Stat;
+        val sr: u64 = sys.stat(argv[i], io.len(argv[i]), ?st);
+        if (abi.is_err(sr) != 0) {
+            io.fail("chmod\0", argv[i], sr);
+            status = 1;
+            i = i + 1;
+            cnt;
+        }
+        val mode: u64 = apply(argv[1], io.len(argv[1]), st.mode);
+        if (mode == abi.NO_ID) {
+            io.err("chmod: bad mode: \0");
+            io.err(argv[1]);
+            io.err("\n\0");
+            ret 2;
+        }
+        val r: u64 = sys.chmod(argv[i], io.len(argv[i]), mode);
+        if (abi.is_err(r) != 0) {
+            io.fail("chmod\0", argv[i], r);
+            status = 1;
+        }
+        i = i + 1;
+    }
+    ret status;
+}
