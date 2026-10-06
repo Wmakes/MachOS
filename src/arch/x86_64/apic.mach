@@ -40,7 +40,13 @@ fun iow(reg: u32, v: u32) {
 
 pub fun eoi() { lw(EOI, 0); }
 
-# lapic ticks (divide by 16) in 10 ms, measured against PIT channel 2
+var calibrated: u8 = 1;
+
+pub fun timer_calibrated() u8 { ret calibrated; }
+
+# lapic ticks (divide by 16) in 10 ms, measured against PIT channel 2.
+# some machines have no working PIT; then give up after ~5 million port
+# reads (well over 10 ms) and fall back to a typical value
 fun calibrate() u32 {
     cpu.outb(0x61, (cpu.inb(0x61) & 0xFD) | 1); # gate on, speaker off
     cpu.outb(0x43, 0xB0);                        # ch 2, lo/hi, one-shot
@@ -52,9 +58,14 @@ fun calibrate() u32 {
     cpu.outb(0x61, g | 1);
     lw(DIVIDE, 3);
     lw(INIT, 0xFFFFFFFF);
-    for ((cpu.inb(0x61) & 0x20) == 0) { }
+    var spins: u64 = 0;
+    for ((cpu.inb(0x61) & 0x20) == 0 && spins < 5000000) { spins = spins + 1; }
     val left: u32 = lr(CURRENT);
     lw(INIT, 0);
+    if (spins == 5000000) {
+        calibrated = 0;
+        ret 62500; # 100 MHz bus / 16, per 10 ms
+    }
     ret 0xFFFFFFFF - left;
 }
 

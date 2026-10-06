@@ -105,6 +105,7 @@ fun kmain() {
     kprint.puts("apic: timer at \0");
     kprint.dec(apic.HZ);
     kprint.puts(" Hz, keyboard and serial input routed\n\0");
+    if (apic.timer_calibrated() == 0) { kprint.puts("apic: no PIT to calibrate against, timer speed is a guess\n\0"); }
 
     syscall.init();
 
