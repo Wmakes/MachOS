@@ -459,6 +459,30 @@ fun sys_uname(out: u64) u64 {
     ret 0;
 }
 
+# the terminal behind handle `h`, or an error (E_NOTTY)
+fun tty_handle(h: u64) u64 {
+    val f: *file.Handle = handle(h);
+    if (f == nil) { ret e(abi.E_BADF); }
+    if (f.kind != file.NODE || f.node.kind != abi.KIND_DEV || f.node.dev != vfs.DEV_CONSOLE) { ret e(abi.E_NOTTY); }
+    ret 0;
+}
+
+fun sys_tcgetattr(h: u64, out: u64) u64 {
+    val r: u64 = tty_handle(h);
+    if (abi.is_err(r) != 0) { ret r; }
+    if (ok(out, $size_of(abi.Termios)::u64, 1) == 0) { ret e(abi.E_FAULT); }
+    (@(out::*abi.Termios)).lflag = tty.get_lflag();
+    ret 0;
+}
+
+fun sys_tcsetattr(h: u64, in: u64) u64 {
+    val r: u64 = tty_handle(h);
+    if (abi.is_err(r) != 0) { ret r; }
+    if (ok(in, $size_of(abi.Termios)::u64, 0) == 0) { ret e(abi.E_FAULT); }
+    tty.set_lflag((@(in::*abi.Termios)).lflag);
+    ret 0;
+}
+
 fun sys_seek(h: u64, off: u64) u64 {
     val f: *file.Handle = handle(h);
     if (f == nil) { ret e(abi.E_BADF); }
@@ -520,6 +544,8 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.MOUNT)   { ret sys_mount(a, b, c, d); }
     if (n == abi.UMOUNT)  { ret sys_umount(a, b); }
     if (n == abi.UNAME)   { ret sys_uname(a); }
+    if (n == abi.TCGETATTR) { ret sys_tcgetattr(a, b); }
+    if (n == abi.TCSETATTR) { ret sys_tcsetattr(a, b); }
     if (n == abi.SYNC) {
         if (blk.sync() == 0) { ret e(abi.E_IO); }
         ret 0;

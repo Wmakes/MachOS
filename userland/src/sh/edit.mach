@@ -1,0 +1,343 @@
+# the shell's line editor, used when stdin is a terminal. the terminal is in
+# raw mode (no ICANON/ECHO/ISIG) only while a line is being typed.
+#   left/right, home/end (^A ^E), backspace, delete      move and erase
+#   up/down                                              history
+#   tab                                                  complete commands (first
+#                                                        word, from /bin) and paths
+#   ^U ^K  clear before / after the cursor   ^L  clear the screen
+#   ^C     drop the line                     ^D  end of input on an empty line
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+
+pub val MAX: u64 = 1024;
+val HIST: u64 = 100;
+pub val EOF: u64 = 0xFFFFFFFFFFFFFFFF;
+
+var hist: [100][1024]u8;
+var hist_len: [100]u64;
+var hist_count: u64 = 0;   # entries kept, at most HIST
+var hist_next: u64 = 0;    # slot the next entry goes into
+
+var buf: [1024]u8;
+var len: u64 = 0;
+var cur: u64 = 0;
+var prompt_text: *u8 = nil;
+var draft: [1024]u8;       # the line being typed while browsing history
+var draft_len: u64 = 0;
+
+fun raw(on: u8) {
+    var t: abi.Termios;
+    if (on != 0) { t.lflag = 0; }
+    or           { t.lflag = abi.ISIG | abi.ICANON | abi.ECHO; }
+    sys.tcsetattr(abi.STDIN, ?t);
+}
+
+fun getc() u64 {
+    var c: u8 = 0;
+    val r: u64 = sys.read(abi.STDIN, ?c, 1);
+    if (abi.is_err(r) != 0 || r == 0) { ret EOF; }
+    ret c::u64;
+}
+
+# move the cursor `n` columns left or right
+fun cursor_move(n: u64, right: u8) {
+    if (n == 0) { ret; }
+    io.out("\x1b[\0");
+    io.dec(n);
+    if (right != 0) { io.putc(67); }
+    or              { io.putc(68); }
+}
+
+# redraw the whole line: prompt, text, clear the rest, put the cursor back
+fun redraw() {
+    io.putc(13);
+    io.out(prompt_text);
+    io.outn(?buf[0], len);
+    io.out("\x1b[K\0");
+    cursor_move(len - cur, 0);
+}
+
+fun insert(c: u8) {
+    if (len + 1 >= MAX) { ret; }
+    var i: u64 = len;
+    for (i > cur) {
+        buf[i] = buf[i - 1];
+        i = i - 1;
+    }
+    buf[cur] = c;
+    len = len + 1;
+    cur = cur + 1;
+    if (cur == len) { io.putc(c); }     # typing at the end: no redraw needed
+    or              { redraw(); }
+}
+
+fun erase(at: u64) {
+    var i: u64 = at;
+    for (i + 1 < len) {
+        buf[i] = buf[i + 1];
+        i = i + 1;
+    }
+    len = len - 1;
+}
+
+fun set_line(src: *u8, n: u64) {
+    io.copy(?buf[0], src, n);
+    len = n;
+    cur = n;
+    redraw();
+}
+
+# `back` steps into the past (0 = the line being typed)
+fun show_history(back: u64) {
+    if (back == 0) {
+        set_line(?draft[0], draft_len);
+        ret;
+    }
+    val slot: u64 = (hist_next + HIST - back) % HIST;
+    set_line(?hist[slot][0], hist_len[slot]);
+}
+
+pub fun remember(line: *u8, n: u64) {
+    if (n == 0) { ret; }
+    if (hist_count > 0) {
+        val last: u64 = (hist_next + HIST - 1) % HIST;
+        if (io.eq(?hist[last][0], hist_len[last], line, n) != 0) { ret; }
+    }
+    io.copy(?hist[hist_next][0], line, n);
+    hist_len[hist_next] = n;
+    hist_next = (hist_next + 1) % HIST;
+    if (hist_count < HIST) { hist_count = hist_count + 1; }
+}
+
+# --- tab completion -------------------------------------------------------
+
+var match_names: [64][64]u8;
+var match_lens: [64]u64;
+var match_dirs: [64]u8;
+var nmatches: u64 = 0;
+
+fun collect(dir: *u8, dn: u64, prefix: *u8, pn: u64, dirs_too: u8) {
+    nmatches = 0;
+    val h: u64 = sys.open(dir, dn, abi.O_READ);
+    if (abi.is_err(h) != 0) { ret; }
+    var i: u64 = 0;
+    for (nmatches < 64) {
+        var e: abi.Entry;
+        val got: u64 = sys.readdir(h, i, ?e);
+        if (abi.is_err(got) != 0 || got == 0) { brk; }
+        i = i + 1;
+        if (e.name_len < pn || e.name_len > 63) { cnt; }
+        if (io.eq(?e.name[0], pn, prefix, pn) == 0) { cnt; }
+        if (pn == 0 && e.name[0] == 46) { cnt; } # hide dotfiles unless asked
+        if (dirs_too == 0 && e.kind == abi.KIND_DIR) { cnt; }
+        io.copy(?match_names[nmatches][0], ?e.name[0], e.name_len);
+        match_lens[nmatches] = e.name_len;
+        match_dirs[nmatches] = (e.kind == abi.KIND_DIR)::u8;
+        nmatches = nmatches + 1;
+    }
+    sys.close(h);
+}
+
+fun complete() {
+    # the word under the cursor
+    var ws: u64 = cur;
+    for (ws > 0 && buf[ws - 1] != 32) { ws = ws - 1; }
+    var first: u8 = 1;
+    var k: u64 = 0;
+    for (k < ws) {
+        if (buf[k] != 32) { first = 0; }
+        k = k + 1;
+    }
+    val word: *u8 = ?buf[ws];
+    val wn: u64 = cur - ws;
+    var slash: u64 = wn;
+    for (slash > 0 && word[slash - 1] != 47) { slash = slash - 1; }
+
+    if (first != 0 && slash == 0) {
+        collect("/bin\0", 4, word, wn, 0);
+    } or {
+        var dir: [256]u8;
+        var dn: u64 = 0;
+        if (slash == 0) {
+            dir[0] = 46;
+            dn = 1;
+        } or {
+            if (slash >= 256) { ret; }
+            io.copy(?dir[0], word, slash);
+            dn = slash;
+        }
+        collect(?dir[0], dn, ?word[slash], wn - slash, 1);
+    }
+    if (nmatches == 0) { ret; }
+
+    # the longest prefix every match shares
+    var common: u64 = match_lens[0];
+    var m: u64 = 1;
+    for (m < nmatches) {
+        var j: u64 = 0;
+        for (j < common && j < match_lens[m] && match_names[m][j] == match_names[0][j]) { j = j + 1; }
+        common = j;
+        m = m + 1;
+    }
+    val have: u64 = wn - slash;
+    if (common > have) {
+        var j: u64 = have;
+        for (j < common) {
+            insert(match_names[0][j]);
+            j = j + 1;
+        }
+    }
+    if (nmatches == 1) {
+        if (match_dirs[0] != 0) { insert(47); }
+        or                      { insert(32); }
+        ret;
+    }
+    if (common == have) {
+        # nothing to add: list the choices under the line
+        io.putc(10);
+        m = 0;
+        for (m < nmatches) {
+            io.outn(?match_names[m][0], match_lens[m]);
+            if (match_dirs[m] != 0) { io.putc(47); }
+            io.out("  \0");
+            m = m + 1;
+        }
+        io.putc(10);
+        redraw();
+    }
+}
+
+# --- the editor -------------------------------------------------------------
+
+# read one line after printing `p`; its length (without the newline) is
+# returned and the text is at text(), or EOF
+pub fun read_line(p: *u8) u64 {
+    prompt_text = p;
+    len = 0;
+    cur = 0;
+    draft_len = 0;
+    var back: u64 = 0;
+    io.out(p);
+    raw(1);
+    var result: u64 = 0;
+    for {
+        val c: u64 = getc();
+        if (c == EOF) {
+            result = EOF;
+            brk;
+        }
+        if (c == 13 || c == 10) {
+            io.putc(10);
+            result = len;
+            brk;
+        }
+        if (c == 4) { # ^D
+            if (len == 0) {
+                result = EOF;
+                brk;
+            }
+            if (cur < len) {
+                erase(cur);
+                redraw();
+            }
+            cnt;
+        }
+        if (c == 3) { # ^C
+            io.out("^C\n\0");
+            len = 0;
+            cur = 0;
+            back = 0;
+            io.out(p);
+            cnt;
+        }
+        if (c == 127 || c == 8) {
+            if (cur > 0) {
+                cur = cur - 1;
+                erase(cur);
+                redraw();
+            }
+            cnt;
+        }
+        if (c == 1) { cursor_move(cur, 0); cur = 0; cnt; }
+        if (c == 5) { cursor_move(len - cur, 1); cur = len; cnt; }
+        if (c == 21) { # ^U
+            var i: u64 = 0;
+            for (cur + i < len) {
+                buf[i] = buf[cur + i];
+                i = i + 1;
+            }
+            len = len - cur;
+            cur = 0;
+            redraw();
+            cnt;
+        }
+        if (c == 11) { # ^K
+            len = cur;
+            redraw();
+            cnt;
+        }
+        if (c == 12) { # ^L
+            io.out("\x1b[2J\x1b[H\0");
+            redraw();
+            cnt;
+        }
+        if (c == 9) {
+            complete();
+            cnt;
+        }
+        if (c == 27) {
+            var c2: u64 = getc();
+            if (c2 != 91 && c2 != 79) { cnt; }
+            var num: u64 = 0;
+            var f: u64 = getc();
+            for (f >= 48 && f <= 57) {
+                num = num * 10 + f - 48;
+                f = getc();
+            }
+            if (f == 65) { # up
+                if (back < hist_count) {
+                    if (back == 0) {
+                        io.copy(?draft[0], ?buf[0], len);
+                        draft_len = len;
+                    }
+                    back = back + 1;
+                    show_history(back);
+                }
+            } or (f == 66) { # down
+                if (back > 0) {
+                    back = back - 1;
+                    show_history(back);
+                }
+            } or (f == 67) { # right
+                if (cur < len) {
+                    cur = cur + 1;
+                    cursor_move(1, 1);
+                }
+            } or (f == 68) { # left
+                if (cur > 0) {
+                    cur = cur - 1;
+                    cursor_move(1, 0);
+                }
+            } or (f == 72 || (f == 126 && (num == 1 || num == 7))) { # home
+                cursor_move(cur, 0);
+                cur = 0;
+            } or (f == 70 || (f == 126 && (num == 4 || num == 8))) { # end
+                cursor_move(len - cur, 1);
+                cur = len;
+            } or (f == 126 && num == 3) { # delete
+                if (cur < len) {
+                    erase(cur);
+                    redraw();
+                }
+            }
+            cnt;
+        }
+        if (c >= 32 && c < 127) { insert(c::u8); }
+    }
+    raw(0);
+    ret result;
+}
+
+pub fun text() *u8 { ret ?buf[0]; }

@@ -4,7 +4,8 @@
 #   a | b | c        pipelines
 #   < f  > f  >> f   redirections
 #   a ; b   a && b   a || b   a &   sequencing, conditionals, background
-#   builtins: cd pwd exit help jobs
+#   builtins: cd pwd exit jobs
+#   on a terminal: line editing, history and tab completion (sh/edit.mach)
 # usage: sh                 interactive on the console
 #        sh FILE            run the commands in FILE
 #        sh -c 'COMMANDS'   run COMMANDS
@@ -13,6 +14,7 @@ use abi: sdk.abi;
 use sys: sdk.sys;
 use io:  sdk.io;
 use rt:  sdk.rt;
+use edit: userland.sh.edit;
 
 val T_WORD:   u8 = 1;
 val T_PIPE:   u8 = 2;
@@ -225,17 +227,6 @@ fun cwd(buf: *u8, cap: u64) u64 {
     ret n;
 }
 
-fun help(out: u64) {
-    write_to(out, "MachOS shell. builtins:\n\0");
-    write_to(out, "  cd [DIR]    change directory (default /)\n\0");
-    write_to(out, "  pwd         print the current directory\n\0");
-    write_to(out, "  exit [N]    leave the shell\n\0");
-    write_to(out, "  jobs        list background jobs\n\0");
-    write_to(out, "  help        this text\n\0");
-    write_to(out, "syntax: a | b, < f, > f, >> f, a ; b, a && b, a || b, a &, 'q', \"q\", $?\n\0");
-    write_to(out, "programs live in /bin: try `ls /bin`\n\0");
-}
-
 # run a builtin if `name` is one; returns 0 if it is not
 fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
     if (io.streq(name, "cd\0") != 0) {
@@ -268,11 +259,6 @@ fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
         quit = 1;
         ret 1;
     }
-    if (io.streq(name, "help\0") != 0) {
-        help(out);
-        status = 0;
-        ret 1;
-    }
     if (io.streq(name, "jobs\0") != 0) {
         var i: u64 = 0;
         for (i < nbg) {
@@ -290,8 +276,7 @@ fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
 
 fun is_builtin(name: *u8) u8 {
     if (io.streq(name, "cd\0") != 0 || io.streq(name, "pwd\0") != 0 ||
-        io.streq(name, "exit\0") != 0 || io.streq(name, "help\0") != 0 ||
-        io.streq(name, "jobs\0") != 0) { ret 1; }
+        io.streq(name, "exit\0") != 0 || io.streq(name, "jobs\0") != 0) { ret 1; }
     ret 0;
 }
 
@@ -544,12 +529,23 @@ fun reap_jobs() {
     }
 }
 
-fun prompt() {
-    var buf: [256]u8;
-    val n: u64 = cwd(?buf[0], 256);
-    io.out("\x1b[1;32mmachos\x1b[0m:\x1b[1;34m\0");
-    io.outn(?buf[0], n);
-    io.out("\x1b[0m$ \0");
+var prompt_buf: [512]u8;
+
+fun add_str(at: u64, s2: *u8) u64 {
+    val n: u64 = io.len(s2);
+    io.copy(?prompt_buf[at], s2, n);
+    ret at + n;
+}
+
+# "machos:/cwd$ " in colour, NUL-terminated
+fun prompt() *u8 {
+    var dir: [256]u8;
+    val n: u64 = cwd(?dir[0], 256);
+    var at: u64 = add_str(0, "\x1b[1;32mmachos\x1b[0m:\x1b[1;34m\0");
+    io.copy(?prompt_buf[at], ?dir[0], n);
+    at = add_str(at + n, "\x1b[0m$ \0");
+    prompt_buf[at] = 0;
+    ret ?prompt_buf[0];
 }
 
 # lines from a handle: the console gives one per read, files get split
@@ -623,10 +619,22 @@ fun main(argc: u64, argv: **u8) u64 {
     }
 
     var line: [1024]u8;
+    val editing: u8 = interactive & sys.isatty(abi.STDIN);
     for (quit == 0) {
+        if (editing != 0) {
+            reap_jobs();
+            val en: u64 = edit.read_line(prompt());
+            if (en == edit.EOF) {
+                io.out("exit\n\0");
+                brk;
+            }
+            edit.remember(edit.text(), en);
+            run_string(edit.text(), en);
+            cnt;
+        }
         if (interactive != 0) {
             reap_jobs();
-            prompt();
+            io.out(prompt());
         }
         val n: u64 = getline(src, ?line[0], 1024);
         if (n == NONE) {

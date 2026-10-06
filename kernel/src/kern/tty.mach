@@ -1,7 +1,10 @@
-# the console terminal: keyboard and serial bytes come in here, get line
-# edited (echo, backspace, ^C, ^D) and wait in `ready` until a reader takes
-# whole lines. ^C kills the foreground process group
+# the console terminal: keyboard and serial bytes come in here. modes are
+# POSIX's local flags (sdk abi): with ICANON, input is line edited (backspace,
+# ^D) and readers get whole lines; without it every byte is readable as it
+# arrives. ECHO shows what is typed, ISIG makes ^C kill the foreground
+# process group. in line mode escape sequences (arrow keys) are dropped
 
+use abi:    sdk.abi;
 use kprint: machos.kern.kprint;
 use proc:   machos.kern.proc;
 
@@ -16,6 +19,8 @@ var head: u64 = 0;  # next byte to read
 var count: u64 = 0; # bytes waiting
 var eofs: u64 = 0;  # pending ^D on an empty line, each reads as end of file
 var fg: u64 = 0;    # process group ^C is delivered to, 0 = nobody
+var lflag: u64 = 11; # ISIG | ICANON | ECHO
+var esc: u8 = 0;    # line mode, inside an escape sequence: 1 after ESC, 2 after ESC [
 
 fun push(c: u8) {
     if (count == RING) { ret; }
@@ -33,16 +38,23 @@ fun commit() {
     proc.wakeup(proc.CHAN_TTY);
 }
 
-# one input byte from a device
-pub fun input(raw: u8) {
-    var c: u8 = raw;
-    if (c == 13) { c = 10; }
-    if (c == 127) { c = 8; }
+fun echo(c: u8) {
+    if ((lflag & abi.ECHO) != 0) { kprint.putc(c); }
+}
 
-    if (c == 3) {
-        kprint.puts("^C\n\0");
-        line_len = 0;
-        if (fg != 0) { proc.kill_group(fg); }
+fun canonical(c: u8) {
+    # skip ESC [ ... final, or ESC O x
+    if (esc == 1) {
+        if (c == 91 || c == 79) { esc = 2; }
+        or                      { esc = 0; }
+        ret;
+    }
+    if (esc == 2) {
+        if (c >= 64 && c <= 126) { esc = 0; }
+        ret;
+    }
+    if (c == 27) {
+        esc = 1;
         ret;
     }
     if (c == 4) {
@@ -57,14 +69,21 @@ pub fun input(raw: u8) {
     if (c == 8) {
         if (line_len > 0) {
             line_len = line_len - 1;
-            kprint.puts("\x08 \x08\0");
+            if ((lflag & abi.ECHO) != 0) { kprint.puts("\x08 \x08\0"); }
+        }
+        ret;
+    }
+    if (c == 21) { # ^U: kill the line
+        for (line_len > 0) {
+            line_len = line_len - 1;
+            if ((lflag & abi.ECHO) != 0) { kprint.puts("\x08 \x08\0"); }
         }
         ret;
     }
     if (c == 10) {
         line[line_len] = 10;
         line_len = line_len + 1;
-        kprint.putc(10);
+        echo(10);
         commit();
         ret;
     }
@@ -72,9 +91,31 @@ pub fun input(raw: u8) {
         if (line_len < LINE - 1) {
             line[line_len] = c;
             line_len = line_len + 1;
-            kprint.putc(c);
+            echo(c);
         }
     }
+}
+
+# one input byte from a device
+pub fun input(raw: u8) {
+    var c: u8 = raw;
+    if (c == 13) { c = 10; }
+    if (c == 127) { c = 8; }
+
+    if (c == 3 && (lflag & abi.ISIG) != 0) {
+        kprint.puts("^C\n\0");
+        line_len = 0;
+        esc = 0;
+        if (fg != 0) { proc.kill_group(fg); }
+        ret;
+    }
+    if ((lflag & abi.ICANON) != 0) {
+        canonical(c);
+        ret;
+    }
+    push(c);
+    echo(c);
+    proc.wakeup(proc.CHAN_TTY);
 }
 
 # whether a read would return right away (data or end of file)
@@ -83,8 +124,8 @@ pub fun readable() u8 {
     ret 0;
 }
 
-# take up to `n` bytes, stopping after a newline; 0 means end of file.
-# call only when readable()
+# take up to `n` bytes (in line mode, stopping after a newline); 0 means
+# end of file. call only when readable()
 pub fun read(buf: *u8, n: u64) u64 {
     if (count == 0) {
         if (eofs > 0) { eofs = eofs - 1; }
@@ -97,9 +138,18 @@ pub fun read(buf: *u8, n: u64) u64 {
         count = count - 1;
         buf[i] = c;
         i = i + 1;
-        if (c == 10) { brk; }
+        if (c == 10 && (lflag & abi.ICANON) != 0) { brk; }
     }
     ret i;
 }
 
 pub fun set_foreground(group: u64) { fg = group; }
+
+pub fun get_lflag() u64 { ret lflag; }
+
+pub fun set_lflag(f: u64) {
+    # leaving line mode hands over whatever was half typed
+    if ((lflag & abi.ICANON) != 0 && (f & abi.ICANON) == 0 && line_len > 0) { commit(); }
+    lflag = f & (abi.ISIG | abi.ICANON | abi.ECHO);
+    esc = 0;
+}

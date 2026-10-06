@@ -10,7 +10,8 @@ QEMU stops and fails if it finds problems.
 steps run in order:
   wait:REGEX     wait until the serial output (since the last wait) matches
   send:TEXT      type TEXT on the serial port (\\n is Enter, \\x03 is ^C)
-  keys:TEXT      type TEXT on the PS/2 keyboard (via the QEMU monitor)
+  keys:TEXT      type TEXT on the PS/2 keyboard (via the QEMU monitor);
+                 <up>, <left>, <tab>, ... press named keys
   sleep:SECONDS  pause
   shot:PATH      save a PNG screenshot of the framebuffer
 
@@ -152,8 +153,12 @@ def main():
                     s.sendall(b"\r" if ch == "\n" else ch.encode())
                     time.sleep(0.01)
             elif kind == "keys":
-                for ch in arg.encode().decode("unicode_escape"):
-                    monitor("sendkey " + keyname(ch))
+                # <name> presses a named key (<up>, <left>, <tab>, ...)
+                for tok in re.findall(r"<[a-z_0-9-]+>|.", arg.encode().decode("unicode_escape"), re.S):
+                    if len(tok) > 2 and tok[0] == "<":
+                        monitor("sendkey " + tok[1:-1])
+                    else:
+                        monitor("sendkey " + keyname(tok))
             elif kind == "sleep":
                 time.sleep(float(arg))
             elif kind == "shot":

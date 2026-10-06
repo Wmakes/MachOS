@@ -172,6 +172,21 @@ fun csi(final: u8) {
         if (c > cols) { c = cols; }
         cy = r - 1;
         cx = c - 1;
+    } or (final == 67 || final == 68) { # C / D: n columns right / left
+        var k: u64 = 1;
+        if (nparams > 0 && params[0] > 0) { k = params[0]; }
+        if (final == 67) {
+            cx = cx + k;
+            if (cx >= cols) { cx = cols - 1; }
+        } or {
+            if (k > cx) { cx = 0; }
+            or          { cx = cx - k; }
+        }
+    } or (final == 71) { # G: column n, 1-based
+        var k: u64 = 1;
+        if (nparams > 0 && params[0] > 0) { k = params[0]; }
+        if (k > cols) { k = cols; }
+        cx = k - 1;
     } or (final == 75) { # K: to the end of the line
         clear_from(cursor_cell(), (cy + 1) * cols);
     }

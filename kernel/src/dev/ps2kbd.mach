@@ -29,6 +29,29 @@ fun key(code: u8) {
     if (c != 0) { tty.input(c); }
 }
 
+fun seq(final: u8) {
+    tty.input(27);
+    tty.input(91);
+    tty.input(final);
+}
+
+# keys behind the 0xE0 prefix: what a VT100-style terminal would send
+fun special(code: u8) {
+    if (code == 0x48) { seq(65); }          # up     ESC [ A
+    or (code == 0x50) { seq(66); }          # down   ESC [ B
+    or (code == 0x4D) { seq(67); }          # right  ESC [ C
+    or (code == 0x4B) { seq(68); }          # left   ESC [ D
+    or (code == 0x47) { seq(72); }          # home   ESC [ H
+    or (code == 0x4F) { seq(70); }          # end    ESC [ F
+    or (code == 0x53) {                     # delete ESC [ 3 ~
+        tty.input(27);
+        tty.input(91);
+        tty.input(51);
+        tty.input(126);
+    }
+    or (code == 0x1C) { tty.input(10); }    # keypad enter
+}
+
 pub fun irq() {
     for ((cpu.inb(0x64) & 1) != 0) {
         val code: u8 = cpu.inb(0x60);
@@ -36,6 +59,7 @@ pub fun irq() {
         if (extended != 0) {
             extended = 0;
             if ((code & 0x7F) == 0x1D) { ctrl = (code & 0x80) ^ 0x80; } # right ctrl
+            if ((code & 0x80) == 0) { special(code); }
             cnt;
         }
         if ((code & 0x80) != 0) {

@@ -21,8 +21,8 @@ TESTS = [
      ["root: ext2 on /dev/sda2", "MachOS", "bin/", "etc/", "dev/", "tmp/"]),
 
     ("pipes", False, False,
-     ["wait:" + P, "send:seq 1 2000 | grep 7 | wc; head -3 /etc/motd | cat | cat | wc\\n", "wait:" + P],
-     ["542     542    2419", "3      21     127"]),
+     ["wait:" + P, "send:seq 1 2000 | grep 7 | wc; seq 1 3 | cat | cat | wc\\n", "wait:" + P],
+     ["542     542    2419", "3       3       6"]),
 
     ("shell", False, False,
      ["wait:" + P,
@@ -32,6 +32,18 @@ TESTS = [
       "wait:" + P],
      ["command not found", "status 127", "or-ok", "and-ok",
       "single $? quotes a   b", "/etc", "from-script"]),
+
+    ("line-editing", False, False,
+     ["wait:" + P, "send:echo one\\n", "wait:" + P, "send:echo two\\n", "wait:" + P,
+      "send:\\x1b[A\\x1b[A", "sleep:0.3", "send:\\n", "wait:" + P,
+      "send:ech\\t", "sleep:0.3", "send:tab-ok\\n", "wait:" + P,
+      "send:cat /etc/mo\\t", "sleep:0.3", "send:\\n", "wait:" + P,
+      "send:echo wrld\\x1b[D\\x1b[D\\x1b[Do\\n", "wait:" + P,
+      "send:junk\\x03", "wait:" + P,
+      "send:cat\\n", "sleep:0.3", "send:canon\\n", "sleep:0.3", "send:\\x03", "wait:" + P,
+      "keys:echo ps2 hist<ret>", "wait:" + P, "keys:<up><left><left><left><left>X<ret>", "wait:" + P],
+     ["one", "two", "echo one\none", "tab-ok", "Welcome", "world", "junk^C", "canon\ncanon",
+      "ps2 Xhist"]),
 
     ("jobs-and-ctrl-c", False, False,
      ["wait:" + P, "send:sleep 1 &\\n", "wait:" + P, "send:ps\\n", "wait:" + P,

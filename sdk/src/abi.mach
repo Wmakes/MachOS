@@ -31,7 +31,9 @@ pub val TIME:    u64 = 24; # ()                                      -> seconds 
 pub val MOUNT:   u64 = 25; # (dev, dev_len, dir, dir_len)            the ext2 on /dev/sdXN on dir
 pub val UMOUNT:  u64 = 26; # (path, len)                            a mountpoint or a mounted device
 pub val UNAME:   u64 = 27; # (*Uname)
-pub val COUNT:   u64 = 28;
+pub val TCGETATTR: u64 = 28; # (handle, *Termios)                 E_NOTTY unless it is a terminal
+pub val TCSETATTR: u64 = 29; # (handle, *Termios)
+pub val COUNT:   u64 = 30;
 
 # WAIT flags
 pub val WAIT_NOHANG: u64 = 1; # E_AGAIN instead of blocking while it runs
@@ -65,6 +67,7 @@ pub val E_NOSPC:    u64 = 18; # disk full
 pub val E_IO:       u64 = 19; # the disk failed
 pub val E_XDEV:     u64 = 20; # across filesystems
 pub val E_BUSY:     u64 = 21; # in use
+pub val E_NOTTY:    u64 = 22; # not a terminal
 
 pub val ERR_MIN: u64 = 0xFFFFFFFFFFFFF000;
 
@@ -100,6 +103,7 @@ pub fun err_name(v: u64) *u8 {
     if (e == E_IO)       { ret "input/output error\0"; }
     if (e == E_XDEV)     { ret "cannot move across filesystems\0"; }
     if (e == E_BUSY)     { ret "busy\0"; }
+    if (e == E_NOTTY)    { ret "not a terminal\0"; }
     ret "unknown error\0";
 }
 
@@ -143,6 +147,16 @@ pub rec Info {
     heap_used: u64;
     uptime_ms: u64;
     procs:     u64;
+}
+
+# the terminal's modes (POSIX termios, local flags only). the default is
+# ISIG | ICANON | ECHO: ^C interrupts, input arrives a line at a time, echoed
+pub val ISIG:   u64 = 1; # ^C kills the foreground group instead of being read
+pub val ICANON: u64 = 2; # line editing; read returns whole lines
+pub val ECHO:   u64 = 8; # typed characters are shown
+
+pub rec Termios {
+    lflag: u64;
 }
 
 # what UNAME fills in: NUL-terminated strings
