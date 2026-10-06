@@ -2,7 +2,7 @@
 #   words, 'single' and "double" quotes, \escapes, # comments,
 #   $? (last status), $0-$9 and $# (script arguments)
 #   a | b | c        pipelines
-#   < f  > f  >> f   redirections
+#   < f  > f  >> f   redirections, also N< f  N> f  N>> f  N>&M  N>&-  (fds 0-9)
 #   a ; b   a && b   a || b   a &   sequencing, conditionals, background
 #   builtins: cd pwd exit jobs
 #   on a terminal: line editing, history and tab completion (sh/edit.mach)
@@ -25,6 +25,7 @@ val T_SEMI:   u8 = 6;
 val T_AND:    u8 = 7;
 val T_OR:     u8 = 8;
 val T_BG:     u8 = 9;
+val T_DUP:    u8 = 10; # N>&M or N<&M (ts holds N; the next word is M or -)
 
 val MAX_TOK:  u64 = 128;
 val WBUF:     u64 = 4096;
@@ -141,6 +142,22 @@ fun lex(line: *u8, n: u64) u8 {
             cnt;
         }
         if (c == 35) { brk; } # comment
+        # a redirection's fd: digits right before < or >
+        var c2: u8 = c;
+        var fd: u64 = NONE;
+        if (c >= 48 && c <= 57) {
+            var k: u64 = i;
+            var num: u64 = 0;
+            for (k < n && line[k] >= 48 && line[k] <= 57) {
+                num = num * 10 + (line[k] - 48)::u64;
+                k = k + 1;
+            }
+            if (k < n && (line[k] == 60 || line[k] == 62) && num < 10) {
+                fd = num;
+                i = k;
+                c2 = line[i];
+            }
+        }
         var next: u8 = 0;
         if (i + 1 < n) { next = line[i + 1]; }
         var op: u8 = 0;
@@ -153,14 +170,18 @@ fun lex(line: *u8, n: u64) u8 {
             if (next == 38) { op = T_AND; oplen = 2; }
         } or (c == 59) {
             op = T_SEMI;
-        } or (c == 60) {
+        } or (c2 == 60) {
             op = T_IN;
-        } or (c == 62) {
+            if (fd == NONE) { fd = 0; }
+            if (next == 38) { op = T_DUP; oplen = 2; }
+        } or (c2 == 62) {
             op = T_OUT;
+            if (fd == NONE) { fd = 1; }
             if (next == 62) { op = T_APPEND; oplen = 2; }
+            or (next == 38) { op = T_DUP; oplen = 2; }
         }
         if (op != 0) {
-            if (add(op, 0, 0) == 0) { ret syntax("too many words\0"); }
+            if (add(op, fd, 0) == 0) { ret syntax("too many words\0"); }
             i = i + oplen;
             cnt;
         }
@@ -311,6 +332,26 @@ fun close_if(h: u64, keep: u64) {
     if (h != NONE && h != keep) { sys.close(h); }
 }
 
+# fds the shell opened for the command being set up, closed once it runs
+var opened: [24]u64;
+var nopened: u64 = 0;
+
+fun opened_add(h: u64) {
+    if (nopened < 24) {
+        opened[nopened] = h;
+        nopened = nopened + 1;
+    }
+}
+
+fun opened_close() {
+    var i: u64 = 0;
+    for (i < nopened) {
+        sys.close(opened[i]);
+        i = i + 1;
+    }
+    nopened = 0;
+}
+
 # the handle a redirection opens, or NONE after saying why
 fun redirect(kind: u8, f: *u8) u64 {
     var flags: u64 = abi.O_READ;
@@ -349,19 +390,32 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
     var prev_read: u64 = NONE;
     var c: u64 = 0;
     for (c < k) {
-        var in: u64 = abi.STDIN;
-        if (prev_read != NONE) { in = prev_read; }
-        var out: u64 = abi.STDOUT;
+        # the command's fds 0-9, as shell fds: start from the shell's own 0-2
+        var fds: [10]u64;
+        var f: u64 = 0;
+        for (f < 10) {
+            fds[f] = abi.FD_NONE;
+            f = f + 1;
+        }
+        fds[0] = abi.STDIN;
+        fds[1] = abi.STDOUT;
+        fds[2] = abi.STDERR;
+        nopened = 0;
+        if (prev_read != NONE) {
+            fds[0] = prev_read;
+            opened_add(prev_read);
+        }
         var next_read: u64 = NONE;
         if (c + 1 < k) {
             var ends: [2]u64;
             val r: u64 = sys.pipe(?ends);
             if (abi.is_err(r) != 0) {
                 io.fail("sh\0", "pipe\0", r);
-                close_if(prev_read, NONE);
+                opened_close();
                 brk;
             }
-            out = ends[1];
+            fds[1] = ends[1];
+            opened_add(ends[1]);
             next_read = ends[0];
         }
 
@@ -387,7 +441,7 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
                 cnt;
             }
             if (u + 1 >= ce[c] || tk[u + 1] != T_WORD) {
-                syntax("redirection needs a file name\0");
+                syntax("redirection needs a file name or fd\0");
                 bad = 1;
                 brk;
             }
@@ -397,19 +451,34 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
                 bad = 1;
                 brk;
             }
+            val target: u64 = ts[u];
+            if (tk[u] == T_DUP) {
+                if (fname[0] == 45 && fname[1] == 0) { # N>&-  closes N
+                    fds[target] = abi.FD_NONE;
+                } or {
+                    var okk: u8 = 0;
+                    val from: u64 = io.parse_dec(?fname[0], io.len(?fname[0]), ?okk);
+                    if (okk == 0 || from >= 10 || fds[from] == abi.FD_NONE) {
+                        io.err("sh: \0");
+                        io.err(?fname[0]);
+                        io.err(": bad file descriptor\n\0");
+                        status = 1;
+                        bad = 1;
+                        brk;
+                    }
+                    fds[target] = fds[from];
+                }
+                u = u + 2;
+                cnt;
+            }
             val h: u64 = redirect(tk[u], ?fname[0]);
             if (h == NONE) {
                 status = 1;
                 bad = 1;
                 brk;
             }
-            if (tk[u] == T_IN) {
-                close_if(in, abi.STDIN);
-                in = h;
-            } or {
-                close_if(out, abi.STDOUT);
-                out = h;
-            }
+            opened_add(h);
+            fds[target] = h;
             u = u + 2;
         }
         args[argc] = nil;
@@ -419,9 +488,10 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
         }
 
         if (bad == 0 && k == 1 && background == 0 && is_builtin(args[0]) != 0) {
+            var out: u64 = fds[1];
+            if (out == abi.FD_NONE) { out = abi.STDOUT; }
             builtin(args[0], argc, ?args[0], out);
-            close_if(in, abi.STDIN);
-            close_if(out, abi.STDOUT);
+            opened_close();
             ret;
         }
 
@@ -435,7 +505,13 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
             } or {
                 var g: u64 = group;
                 if (g == 0) { g = abi.NEW_GROUP; }
-                var how: abi.Spawn = abi.Spawn{ handles: [3]u64{in, out, abi.STDERR}, group: g };
+                var how: abi.Spawn;
+                f = 0;
+                for (f < 10) {
+                    how.handles[f] = fds[f];
+                    f = f + 1;
+                }
+                how.group = g;
                 val pid: u64 = sys.spawn(?full[0], fl, ?abuf[0], alen, ?how);
                 if (abi.is_err(pid) != 0) {
                     io.fail("sh\0", args[0], pid);
@@ -448,8 +524,7 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
             }
         }
         # the children hold their own references now
-        close_if(in, abi.STDIN);
-        close_if(out, abi.STDOUT);
+        opened_close();
         prev_read = next_read;
         c = c + 1;
     }

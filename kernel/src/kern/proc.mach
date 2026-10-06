@@ -47,7 +47,8 @@ pub rec Proc {
     brk:       u64;  # end of the user heap
     brk_base:  u64;
     pages:     u64;  # user pages mapped
-    handles:   [16]u64;
+    handles:   [32]u64;
+    fdflags:   [32]u8; # FD_CLOEXEC per fd
     cwd:       [256]u8;
     cwd_len:   u64;
     name:      [32]u8;

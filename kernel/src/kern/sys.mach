@@ -56,18 +56,22 @@ fun handle(h: u64) *file.Handle {
     ret cur().handles[h]::*file.Handle;
 }
 
-fun install(h: *file.Handle) u64 {
+# put `h` in the lowest free fd at or above `from`
+fun install_from(h: *file.Handle, from: u64) u64 {
     val p: *proc.Proc = cur();
-    var i: u64 = 0;
+    var i: u64 = from;
     for (i < abi.MAX_HANDLES) {
         if (p.handles[i] == 0) {
             p.handles[i] = h::u64;
+            p.fdflags[i] = 0;
             ret i;
         }
         i = i + 1;
     }
     ret e(abi.E_MFILE);
 }
+
+fun install(h: *file.Handle) u64 { ret install_from(h, 0); }
 
 fun set_name(p: *proc.Proc, full: *u8, n: u64) {
     val b: u64 = path.base_index(full, n);
@@ -92,10 +96,10 @@ pub fun do_exit(code: u64) {
     proc.exit(code);
 }
 
-# create a process running `nd`. `hs` become its handles 0-2 (nil entries
-# stay closed). returns the pid or an error
+# create a process running `nd`. hs[i] (a Handle, or 0 for closed) becomes
+# its fd i. returns the pid or an error
 fun spawn(parent: *proc.Proc, nd: *vfs.Node, full: *u8, full_len: u64,
-          args: u64, args_len: u64, hs: *[3]u64, group: u64) u64 {
+          args: u64, args_len: u64, hs: *[32]u64, group: u64) u64 {
     val c: *proc.Proc = proc.alloc();
     if (c == nil) { ret e(abi.E_AGAIN); }
     if (parent != nil) {
@@ -119,7 +123,7 @@ fun spawn(parent: *proc.Proc, nd: *vfs.Node, full: *u8, full_len: u64,
         ret r;
     }
     var i: u64 = 0;
-    for (i < 3) {
+    for (i < abi.MAX_HANDLES) {
         val h: *file.Handle = (@hs)[i]::*file.Handle;
         if (h != nil) { c.handles[i] = file.dup(h)::u64; }
         i = i + 1;
@@ -136,7 +140,11 @@ pub fun spawn_init(p: *u8) u64 {
     if (con == nil) { ret e(abi.E_NOENT); }
     val h: *file.Handle = file.open_node(con, abi.O_READ | abi.O_WRITE);
     if (h == nil) { ret e(abi.E_NOMEM); }
-    var hs: [3]u64 = [3]u64{h::u64, h::u64, h::u64};
+    var hs: [32]u64;
+    mem.fill((?hs[0])::u64, 0, 256);
+    hs[0] = h::u64;
+    hs[1] = h::u64;
+    hs[2] = h::u64;
     val pid: u64 = spawn(nil, nd, p, n, p::u64, n + 1, ?hs, 0);
     file.close(h); # the child holds its own references now
     ret pid;
@@ -153,16 +161,21 @@ fun sys_spawn(pva: u64, plen: u64, ava: u64, alen: u64, sva: u64) u64 {
     if (ok(ava, alen, 0) == 0) { ret e(abi.E_FAULT); }
 
     val p: *proc.Proc = cur();
-    var hs: [3]u64 = [3]u64{p.handles[0], p.handles[1], p.handles[2]};
+    var hs: [32]u64;
     var group: u64 = 0;
+    var i: u64 = 0;
+    for (i < abi.MAX_HANDLES) {
+        hs[i] = 0;
+        if (sva == 0 && (p.fdflags[i] & abi.FD_CLOEXEC::u8) == 0) { hs[i] = p.handles[i]; }
+        i = i + 1;
+    }
     if (sva != 0) {
         if (ok(sva, $size_of(abi.Spawn)::u64, 0) == 0) { ret e(abi.E_FAULT); }
         val sp: *abi.Spawn = sva::*abi.Spawn;
-        var i: u64 = 0;
-        for (i < 3) {
+        i = 0;
+        for (i < abi.SPAWN_FDS) {
             val idx: u64 = sp.handles[i];
             if (idx < abi.MAX_HANDLES) { hs[i] = p.handles[idx]; }
-            or                         { hs[i] = 0; }
             i = i + 1;
         }
         group = sp.group;
@@ -229,6 +242,7 @@ fun sys_open(pva: u64, plen: u64, flags: u64) u64 {
     if (h == nil) { ret e(abi.E_NOMEM); }
     val idx: u64 = install(h);
     if (abi.is_err(idx) != 0) { file.close(h); }
+    or ((flags & abi.O_CLOEXEC) != 0) { cur().fdflags[idx] = abi.FD_CLOEXEC::u8; }
     ret idx;
 }
 
@@ -236,6 +250,7 @@ fun sys_close(h: u64) u64 {
     val f: *file.Handle = handle(h);
     if (f == nil) { ret e(abi.E_BADF); }
     cur().handles[h] = 0;
+    cur().fdflags[h] = 0;
     file.close(f);
     ret 0;
 }
@@ -526,12 +541,69 @@ fun sys_tcsetattr(h: u64, in: u64) u64 {
     ret 0;
 }
 
-fun sys_seek(h: u64, off: u64) u64 {
+fun sys_seek(h: u64, off: u64, whence: u64) u64 {
     val f: *file.Handle = handle(h);
     if (f == nil) { ret e(abi.E_BADF); }
-    if (f.kind != file.NODE) { ret e(abi.E_INVAL); }
-    f.offset = off;
-    ret off;
+    if (f.kind != file.NODE) { ret e(abi.E_INVAL); } # pipes cannot seek (ESPIPE)
+    var base: u64 = 0;
+    if (whence == abi.SEEK_CUR) { base = f.offset; }
+    or (whence == abi.SEEK_END) { base = f.node.size; }
+    or (whence != abi.SEEK_SET) { ret e(abi.E_INVAL); }
+    val to: u64 = base + off; # wraps for negative offsets
+    if (to >= abi.ERR_MIN) { ret e(abi.E_INVAL); }
+    f.offset = to;
+    ret to;
+}
+
+fun sys_dup2(h: u64, to: u64) u64 {
+    val f: *file.Handle = handle(h);
+    if (f == nil || to >= abi.MAX_HANDLES) { ret e(abi.E_BADF); }
+    if (h == to) { ret to; }
+    val p: *proc.Proc = cur();
+    if (p.handles[to] != 0) { file.close(p.handles[to]::*file.Handle); }
+    p.handles[to] = file.dup(f)::u64;
+    p.fdflags[to] = 0;
+    ret to;
+}
+
+fun sys_fcntl(h: u64, cmd: u64, arg: u64) u64 {
+    val f: *file.Handle = handle(h);
+    if (f == nil) { ret e(abi.E_BADF); }
+    val p: *proc.Proc = cur();
+    if (cmd == abi.F_DUPFD) {
+        if (arg >= abi.MAX_HANDLES) { ret e(abi.E_INVAL); }
+        val r: u64 = install_from(file.dup(f), arg);
+        if (abi.is_err(r) != 0) { file.close(f); }
+        ret r;
+    }
+    if (cmd == abi.F_GETFD) { ret p.fdflags[h]::u64; }
+    if (cmd == abi.F_SETFD) {
+        p.fdflags[h] = (arg & abi.FD_CLOEXEC)::u8;
+        ret 0;
+    }
+    if (cmd == abi.F_GETFL) { ret f.flags; }
+    if (cmd == abi.F_SETFL) {
+        f.flags = (f.flags & ~abi.O_APPEND) | (arg & abi.O_APPEND);
+        ret 0;
+    }
+    ret e(abi.E_INVAL);
+}
+
+fun sys_fstat(h: u64, out: u64) u64 {
+    val f: *file.Handle = handle(h);
+    if (f == nil) { ret e(abi.E_BADF); }
+    if (ok(out, $size_of(abi.Stat)::u64, 1) == 0) { ret e(abi.E_FAULT); }
+    val st: *abi.Stat = out::*abi.Stat;
+    if (f.kind == file.NODE) {
+        st.kind = f.node.kind;
+        st.size = f.node.size;
+        st.mtime = vfs.mtime_of(f.node);
+    } or {
+        st.kind = abi.KIND_PIPE;
+        st.size = 0;
+        st.mtime = 0;
+    }
+    ret 0;
 }
 
 fun sys_sleep(ms: u64) u64 {
@@ -582,7 +654,17 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
         ret 0;
     }
     if (n == abi.RENAME)  { ret sys_rename(a, b, c, d); }
-    if (n == abi.SEEK)    { ret sys_seek(a, b); }
+    if (n == abi.SEEK)    { ret sys_seek(a, b, c); }
+    if (n == abi.DUP) {
+        val f: *file.Handle = handle(a);
+        if (f == nil) { ret e(abi.E_BADF); }
+        val r: u64 = install(file.dup(f));
+        if (abi.is_err(r) != 0) { file.close(f); }
+        ret r;
+    }
+    if (n == abi.DUP2)    { ret sys_dup2(a, b); }
+    if (n == abi.FCNTL)   { ret sys_fcntl(a, b, c); }
+    if (n == abi.FSTAT)   { ret sys_fstat(a, b); }
     if (n == abi.TIME)    { ret clock.now(); }
     if (n == abi.MOUNT)   { ret sys_mount(a, b, c, d); }
     if (n == abi.UMOUNT)  { ret sys_umount(a, b); }

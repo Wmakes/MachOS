@@ -1,0 +1,64 @@
+# posixtest: exercise the POSIX-style system calls; every check prints
+# "ok NAME" or "FAIL NAME", and the exit code is the number of failures
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+var failures: u64 = 0;
+
+fun check(name: *u8, good: u8) {
+    if (good != 0) { io.out("ok \0"); }
+    or {
+        io.out("FAIL \0");
+        failures = failures + 1;
+    }
+    io.out(name);
+    io.putc(10);
+}
+
+fun fds() {
+    val path: *u8 = "/tmp/posixtest\0";
+    val h: u64 = sys.open(path, 14, abi.O_READ | abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC);
+    check("open\0", (abi.is_err(h) == 0)::u8);
+    io.write_all(h, "0123456789\0", 10);
+
+    check("lseek end\0", (sys.lseek(h, 0, abi.SEEK_END) == 10)::u8);
+    check("lseek set\0", (sys.lseek(h, 3, abi.SEEK_SET) == 3)::u8);
+    check("lseek cur back\0", (sys.lseek(h, 0 - 1, abi.SEEK_CUR) == 2)::u8);
+    var c: [4]u8;
+    sys.read(h, ?c[0], 2);
+    check("read after lseek\0", (c[0] == 50 && c[1] == 51)::u8);
+
+    var st: abi.Stat;
+    check("fstat\0", (sys.fstat(h, ?st) == 0 && st.size == 10 && st.kind == abi.KIND_FILE)::u8);
+
+    val d: u64 = sys.dup(h);
+    check("dup gives a new fd\0", (abi.is_err(d) == 0 && d != h)::u8);
+    check("dup shares the offset\0", (sys.lseek(d, 0, abi.SEEK_CUR) == 4)::u8);
+
+    check("dup2\0", (sys.dup2(h, 9) == 9)::u8);
+    check("dup2 onto itself\0", (sys.dup2(9, 9) == 9)::u8);
+    check("F_GETFD starts 0\0", (sys.fcntl(9, abi.F_GETFD, 0) == 0)::u8);
+    sys.fcntl(9, abi.F_SETFD, abi.FD_CLOEXEC);
+    check("F_SETFD cloexec\0", (sys.fcntl(9, abi.F_GETFD, 0) == abi.FD_CLOEXEC)::u8);
+    check("F_GETFL\0", ((sys.fcntl(9, abi.F_GETFL, 0) & abi.O_WRITE) != 0)::u8);
+    check("F_DUPFD\0", (sys.fcntl(h, abi.F_DUPFD, 20) == 20)::u8);
+
+    var ends: [2]u64;
+    sys.pipe(?ends);
+    check("lseek on a pipe fails\0", abi.is_err(sys.lseek(ends[0], 0, abi.SEEK_SET)));
+    check("fstat on a pipe\0", (sys.fstat(ends[0], ?st) == 0 && st.kind == abi.KIND_PIPE)::u8);
+    check("close a bad fd fails\0", abi.is_err(sys.close(31)));
+    sys.remove(path, 14);
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    fds();
+    io.out("posixtest: \0");
+    io.dec(failures);
+    io.out(" failures\n\0");
+    ret failures;
+}

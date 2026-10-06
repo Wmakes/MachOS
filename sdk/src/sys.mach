@@ -40,7 +40,12 @@ pub fun remove(p: *u8, n: u64) u64 { ret raw(abi.REMOVE, p::u64, n, 0, 0, 0); }
 pub fun rename(a: *u8, an: u64, b: *u8, bn: u64) u64 { ret raw(abi.RENAME, a::u64, an, b::u64, bn, 0); }
 pub fun chdir(p: *u8, n: u64) u64 { ret raw(abi.CHDIR, p::u64, n, 0, 0, 0); }
 pub fun getcwd(buf: *u8, n: u64) u64 { ret raw(abi.GETCWD, buf::u64, n, 0, 0, 0); }
-pub fun seek(h: u64, off: u64) u64 { ret raw(abi.SEEK, h, off, 0, 0, 0); }
+pub fun lseek(h: u64, off: u64, whence: u64) u64 { ret raw(abi.SEEK, h, off, whence, 0, 0); }
+pub fun seek(h: u64, off: u64) u64 { ret raw(abi.SEEK, h, off, abi.SEEK_SET, 0, 0); }
+pub fun dup(h: u64) u64 { ret raw(abi.DUP, h, 0, 0, 0, 0); }
+pub fun dup2(h: u64, to: u64) u64 { ret raw(abi.DUP2, h, to, 0, 0, 0); }
+pub fun fcntl(h: u64, cmd: u64, arg: u64) u64 { ret raw(abi.FCNTL, h, cmd, arg, 0, 0); }
+pub fun fstat(h: u64, out: *abi.Stat) u64 { ret raw(abi.FSTAT, h, out::u64, 0, 0, 0); }
 
 pub fun pipe(ends: *[2]u64) u64 { ret raw(abi.PIPE, ends::u64, 0, 0, 0, 0); }
 pub fun sleep(ms: u64) u64 { ret raw(abi.SLEEP, ms, 0, 0, 0, 0); }

@@ -32,6 +32,21 @@ def root_state(img):
     return st
 
 
+PROFILE = ["debug"]
+
+
+def disk():
+    return os.path.join(ROOT, "out", PROFILE[0], "disk.img")
+
+
+def with_posixtest():
+    """a fresh dev disk with examples/posixtest on it as /bin/posixtest"""
+    p = PROFILE[0]
+    sh(f"tools/mkimage.sh {p} --fresh")
+    sh(f"cd examples/posixtest && mach dep pull . && mach build . -t machos -p {p}")
+    sh(f"tools/put.sh examples/posixtest/out/machos/{p}/posixtest /bin/posixtest {disk()}")
+
+
 def make_broken():
     """a copy of a fresh dev disk with three faults put in by debugfs"""
     sh("tools/mkimage.sh --fresh")
@@ -121,6 +136,15 @@ TESTS = [
       "wait:" + P, "sleep:1"],
      ["kept across reboots", "1000000 1000000 6888896", "19"]),
 
+    ("posix-fds", False, False,
+     ["--prep", with_posixtest, "--boot", disk,
+      "wait:" + P, "send:posixtest\\n", "wait:failures",
+      "send:cat /nope 2>/tmp/e; cat /tmp/e; cat /nope 2>&1 | wc -l; ls /etc /nope > /tmp/o 2>&1; cat /tmp/o\\n",
+      "wait:" + P,
+      "send:echo to-stderr >&2 2>/dev/null; echo kept 3>/tmp/three; cat < /etc/motd 0<&- | wc -c\\n", "wait:" + P],
+     ["posixtest: 0 failures", "cat: /nope: no such file", "      1", "no such file", "motd",
+      "kept"]),
+
     # repair a disk that debugfs damaged on the host
     ("fsck", False, False,
      ["--disk2", BROKEN, "--prep", make_broken, "--post", broken_clean_on_host,
@@ -187,6 +211,8 @@ def run(name, keep, fsck, steps, expect, profile):
             post = val
             steps = steps[2:]
             continue
+        if callable(val):
+            val = val()
         if opt == "--rescue":
             cmd.append("--rescue")
             steps = steps[2:]
@@ -227,6 +253,7 @@ def main():
     ap.add_argument("-p", "--profile", default="debug")
     ap.add_argument("names", nargs="*")
     a = ap.parse_args()
+    PROFILE[0] = a.profile
     chosen = [t for t in TESTS if not a.names or t[0] in a.names]
     failed = 0
     for name, keep, fsck, steps, expect in chosen:

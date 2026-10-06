@@ -1,0 +1,42 @@
+# checks of the POSIX-style system calls, run by tools/test.py (it builds
+# this and copies it onto the test disk); prints "ok NAME" or "FAIL NAME"
+[project]
+id = "posixtest"
+version = "0.1.0"
+mach = "^6.10"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+# a MachOS program: a static x86_64 ELF linked at 4 MiB
+[target.machos]
+isa  = "x86_64"
+os   = "freestanding"
+abi  = "sysv64"
+of   = "elf"
+base = 0x400000
+
+[artifact.posixtest]
+kind = "bin"
+entry = "main.mach"
+out = "posixtest"
+targets = ["machos"]
+link = []
+need = []
+
+[dep.sdk]
+path = "../../sdk"
