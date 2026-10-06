@@ -82,7 +82,11 @@ fun set_name(p: *proc.Proc, full: *u8, n: u64) {
     p.name_len = k;
 }
 
-# the end of every process: release its handles, then let proc tear it down
+# the end of every process: release its handles, then let proc tear it down.
+# `status` is the wait status (exit_with / killed_by make one)
+pub fun exit_with(code: u64) { do_exit((code & 0xFF) << 8); }
+pub fun killed_by(sig: u64) { do_exit(sig & 0x7F); }
+
 pub fun do_exit(code: u64) {
     val p: *proc.Proc = cur();
     var i: u64 = 0;
@@ -234,20 +238,170 @@ fun sys_spawn(pva: u64, plen: u64, ava: u64, alen: u64, sva: u64) u64 {
     ret r;
 }
 
-fun sys_wait(pid: u64, flags: u64) u64 {
+# waitpid: pid > 0 that child, ANY_CHILD any. returns the pid (and the
+# status), 0 under WNOHANG while they all still run, or E_CHILD
+fun sys_wait(pid: u64, status: u64, flags: u64) u64 {
+    if (status != 0 && ok(status, 8, 1) == 0) { ret e(abi.E_FAULT); }
     val p: *proc.Proc = cur();
     for {
-        val c: *proc.Proc = proc.find(pid);
-        if (c == nil || c.ppid != p.pid) { ret e(abi.E_CHILD); }
-        if (c.state == proc.ZOMBIE) {
-            val code: u64 = c.exit_code;
-            proc.reap(c);
-            ret code;
+        var any: u8 = 0;
+        var i: u64 = 0;
+        for (i < proc.MAX) {
+            val c: *proc.Proc = proc.slot(i);
+            if (c.state != proc.FREE && c.ppid == p.pid && (pid == abi.ANY_CHILD || c.pid == pid)) {
+                any = 1;
+                if (c.state == proc.ZOMBIE) {
+                    val got: u64 = c.pid;
+                    if (status != 0) { @(status::*u64) = c.exit_code; }
+                    proc.reap(c);
+                    ret got;
+                }
+            }
+            i = i + 1;
         }
-        if ((flags & abi.WAIT_NOHANG) != 0) { ret e(abi.E_AGAIN); }
+        if (any == 0) { ret e(abi.E_CHILD); }
+        if ((flags & abi.WNOHANG) != 0) { ret 0; }
         if (p.killed != 0) { ret e(abi.E_CHILD); }
         proc.sleep_on(p::u64);
     }
+    ret 0;
+}
+
+# the frame of the system call being served (fork and execve rewrite it)
+var frame: *idt.Frame = nil;
+
+fun sys_fork() u64 {
+    val p: *proc.Proc = cur();
+    val c: *proc.Proc = proc.alloc();
+    if (c == nil) { ret e(abi.E_AGAIN); }
+    vmm.free_space(c.pml4); # alloc's empty space is replaced by the copy
+    c.pml4 = vmm.fork_space(p.pml4);
+    cpu.set_cr3(p.pml4); # the parent's pages just turned read-only
+    if (c.pml4 == 0) {
+        proc.reap(c);
+        ret e(abi.E_NOMEM);
+    }
+    c.ppid = p.pid;
+    c.group = p.group;
+    c.brk = p.brk;
+    c.brk_base = p.brk_base;
+    c.pages = p.pages;
+    mem.copy((?c.cwd[0])::u64, (?p.cwd[0])::u64, p.cwd_len);
+    c.cwd_len = p.cwd_len;
+    mem.copy((?c.name[0])::u64, (?p.name[0])::u64, p.name_len);
+    c.name_len = p.name_len;
+    var i: u64 = 0;
+    for (i < abi.MAX_HANDLES) {
+        if (p.handles[i] != 0) { c.handles[i] = file.dup(p.handles[i]::*file.Handle)::u64; }
+        c.fdflags[i] = p.fdflags[i];
+        i = i + 1;
+    }
+    proc.start_copy(c, frame);
+    ret c.pid;
+}
+
+# copy user bytes in, NUL-terminating (one more byte when the last is not NUL)
+fun copy_in(va: u64, n: u64, out: *u64, out_len: *u64) u64 {
+    @out = 0;
+    @out_len = 0;
+    if (n == 0) { ret 0; }
+    if (ok(va, n, 0) == 0) { ret e(abi.E_FAULT); }
+    val k: u64 = heap.alloc(n + 1);
+    if (k == 0) { ret e(abi.E_NOMEM); }
+    mem.copy(k, va, n);
+    var kn: u64 = n;
+    if (@((k + n - 1)::*u8) != 0) {
+        @((k + n)::*u8) = 0;
+        kn = n + 1;
+    }
+    @out = k;
+    @out_len = kn;
+    ret 0;
+}
+
+fun sys_execve(pva: u64, plen: u64, ava: u64, alen: u64, eva: u64) u64 {
+    var full: [256]u8;
+    val n: u64 = user_path(pva, plen, ?full[0]);
+    if (abi.is_err(n) != 0) { ret n; }
+    val nd: *vfs.Node = vfs.lookup(?full[0], n);
+    if (nd == nil) { ret e(abi.E_NOENT); }
+    if (nd.kind == abi.KIND_DIR) { ret e(abi.E_ISDIR); }
+    if (alen > ARGS_MAX) { ret e(abi.E_INVAL); }
+    # the environment is NUL-separated strings ending in an empty one
+    var elen: u64 = 0;
+    if (eva != 0) {
+        for (elen < ENV_MAX) {
+            if (ok(eva + elen, 1, 0) == 0) { ret e(abi.E_FAULT); }
+            if (@((eva + elen)::*u8) == 0 && (elen == 0 || @((eva + elen - 1)::*u8) == 0)) { brk; }
+            elen = elen + 1;
+        }
+    }
+    var args: u64 = 0;
+    var args_len: u64 = 0;
+    var r: u64 = copy_in(ava, alen, ?args, ?args_len);
+    if (abi.is_err(r) != 0) { ret r; }
+    if (args_len == 0) { # no arguments: the path is argv[0]
+        args = heap.alloc(n + 1);
+        if (args == 0) { ret e(abi.E_NOMEM); }
+        mem.copy(args, (?full[0])::u64, n);
+        @((args + n)::*u8) = 0;
+        args_len = n + 1;
+    }
+    var env: u64 = 0;
+    var env_len: u64 = 0;
+    r = copy_in(eva, elen, ?env, ?env_len);
+    if (abi.is_err(r) != 0) {
+        heap.free(args);
+        ret r;
+    }
+
+    # load into a fresh address space; the old one stays until that worked
+    val p: *proc.Proc = cur();
+    val old: u64 = p.pml4;
+    val old_pages: u64 = p.pages;
+    val fresh: u64 = vmm.new_space();
+    if (fresh == 0) {
+        heap.free(args);
+        heap.free(env);
+        ret e(abi.E_NOMEM);
+    }
+    p.pml4 = fresh;
+    p.pages = 0;
+    var st: exec.Start;
+    r = exec.load(p, nd, ?full[0], n, args, args_len, env, env_len, ?st);
+    heap.free(args);
+    heap.free(env);
+    if (abi.is_err(r) != 0) {
+        p.pml4 = old;
+        p.pages = old_pages;
+        vmm.free_space(fresh);
+        ret r;
+    }
+    cpu.set_cr3(fresh);
+    vmm.free_space(old);
+    set_name(p, ?full[0], n);
+    var i: u64 = 0;
+    for (i < abi.MAX_HANDLES) {
+        if (p.handles[i] != 0 && (p.fdflags[i] & abi.FD_CLOEXEC::u8) != 0) {
+            file.close(p.handles[i]::*file.Handle);
+            p.handles[i] = 0;
+            p.fdflags[i] = 0;
+        }
+        i = i + 1;
+    }
+    # start over: the frame now returns into the new program
+    val f: *idt.Frame = frame;
+    mem.fill(f::u64, 0, 15 * 8); # r15 ... rax
+    f.rip = st.entry;
+    f.rsp = st.rsp;
+    f.rdi = st.argc;
+    f.rsi = st.argv;
+    f.rdx = st.envp;
+    f.rflags = 0x202;
+    val fpu: u64 = f::u64 - idt.FPU_AREA;
+    mem.fill(fpu, 0, idt.FPU_AREA);
+    @(fpu::*u16) = 0x037F;
+    @((fpu + 24)::*u32) = 0x1F80;
     ret 0;
 }
 
@@ -647,7 +801,7 @@ fun sys_sleep(ms: u64) u64 {
 
 fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.EXIT) {
-        do_exit(a);
+        exit_with(a);
         ret 0;
     }
     if (n == abi.READ) {
@@ -667,7 +821,10 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.OPEN)    { ret sys_open(a, b, c); }
     if (n == abi.CLOSE)   { ret sys_close(a); }
     if (n == abi.SPAWN)   { ret sys_spawn(a, b, c, d, f5); }
-    if (n == abi.WAIT)    { ret sys_wait(a, b); }
+    if (n == abi.WAIT)    { ret sys_wait(a, b, c); }
+    if (n == abi.FORK)    { ret sys_fork(); }
+    if (n == abi.EXECVE)  { ret sys_execve(a, b, c, d, f5); }
+    if (n == abi.GETPPID) { ret cur().ppid; }
     if (n == abi.READDIR) { ret sys_readdir(a, b, c); }
     if (n == abi.STAT)    { ret sys_stat(a, b, c); }
     if (n == abi.MKDIR)   { ret sys_mkdir(a, b); }
@@ -718,6 +875,7 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
 
 #[symbol("syscall_dispatch")]
 fun syscall_dispatch(f: *idt.Frame) {
+    frame = f;
     # user memory is reachable (SMAP) only while the call runs; every user
     # pointer it uses has been checked with ok() first
     val smap: u8 = cpu.has_smap();
@@ -730,5 +888,5 @@ fun syscall_dispatch(f: *idt.Frame) {
         last_sync = now;
         if (blk.dirty_count() > 0) { blk.sync(); }
     }
-    if (cur().killed != 0) { do_exit(130); }
+    if (cur().killed != 0) { killed_by(abi.SIGINT); }
 }

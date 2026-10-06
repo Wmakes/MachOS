@@ -17,6 +17,7 @@ pub val PCD: u64 = 16;      # cache disable
 pub val PS:  u64 = 0x80;    # 2 MiB page at the pd level
 pub val G:   u64 = 0x100;   # global: survives cr3 reloads
 pub val NX:  u64 = 0x8000000000000000;
+pub val COW: u64 = 0x200;   # software bit: shared after fork, copy on write
 
 pub val USER_END: u64 = 0x0000800000000000; # first address past the lower half
 
@@ -210,7 +211,7 @@ fun free_level(t: u64, level: u64) {
     for (i < 512) {
         if ((e[i] & P) != 0) {
             if (level > 1) { free_level(e[i] & ADDR, level - 1); }
-            or             { pmm.free(e[i] & ADDR); }
+            or             { pmm.release(e[i] & ADDR); } # shared pages just lose an owner
         }
         i = i + 1;
     }
@@ -229,7 +230,9 @@ pub fun free_space(pml4: u64) {
     pmm.free(pml4);
 }
 
-# whether [va, va+len) is mapped user-accessible (and writable if `write`)
+# whether [va, va+len) is mapped user-accessible (and writable if `write`).
+# a copy-on-write page about to be written gets its own copy first, so the
+# kernel never takes a copy-on-write fault itself
 pub fun user_ok(pml4: u64, va: u64, len: u64, write: u8) u8 {
     if (len == 0) { ret 1; }
     if (va >= USER_END || len > USER_END - va) { ret 0; }
@@ -237,10 +240,80 @@ pub fun user_ok(pml4: u64, va: u64, len: u64, write: u8) u8 {
     if (write != 0) { need = need | W; }
     var p: u64 = va & ~(PAGE - 1);
     for (p < va + len) {
-        if ((lookup(pml4, p) & need) != need) { ret 0; }
+        var e: u64 = lookup(pml4, p);
+        if (write != 0 && (e & (P | U | COW)) == (P | U | COW)) {
+            if (cow_break(pml4, p) == 0) { ret 0; }
+            e = lookup(pml4, p);
+        }
+        if ((e & need) != need) { ret 0; }
         p = p + PAGE;
     }
     ret 1;
+}
+
+# give a copy-on-write page at `va` its own writable copy (or just make it
+# writable when nobody else shares it any more); 0 if `va` is not such a
+# page or memory ran out
+pub fun cow_break(pml4: u64, va: u64) u8 {
+    val e: *u64 = walk(pml4, va & ~(PAGE - 1), 0);
+    if (e == nil || (@e & (P | COW)) != (P | COW)) { ret 0; }
+    val old: u64 = @e & ADDR;
+    val flags: u64 = (@e & ~ADDR & ~COW) | W;
+    if (pmm.shared(old) != 0) {
+        val fresh: u64 = pmm.alloc_raw();
+        if (fresh == 0) { ret 0; }
+        val src: *u64 = tab(old);
+        val dst: *u64 = tab(fresh);
+        var i: u64 = 0;
+        for (i < 512) {
+            dst[i] = src[i];
+            i = i + 1;
+        }
+        pmm.release(old);
+        @e = fresh | flags;
+    } or {
+        @e = old | flags;
+    }
+    cpu.invlpg(va & ~(PAGE - 1));
+    ret 1;
+}
+
+fun fork_level(src: u64, dst: u64, level: u64, base: u64) u8 {
+    val e: *u64 = tab(src);
+    var i: u64 = 0;
+    for (i < 512) {
+        if (level == 3 && i >= 256) { brk; } # the kernel half is shared as it is
+        val va: u64 = base | (i << (12 + 9 * level));
+        if ((e[i] & P) != 0) {
+            if (level > 0) {
+                if (fork_level(e[i] & ADDR, dst, level - 1, va) == 0) { ret 0; }
+            } or {
+                var ent: u64 = e[i];
+                if ((ent & (W | COW)) != 0) {
+                    ent = (ent & ~W) | COW; # both sides copy on their first write
+                    e[i] = ent;
+                }
+                pmm.share(ent & ADDR);
+                val d: *u64 = walk(dst, va, 1);
+                if (d == nil) { ret 0; }
+                @d = ent;
+            }
+        }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# a new address space whose lower half shares every page of `src`,
+# copy-on-write; 0 when memory ran out. the caller flushes src's TLB
+pub fun fork_space(src: u64) u64 {
+    val dst: u64 = new_space();
+    if (dst == 0) { ret 0; }
+    if (fork_level(src, dst, 3, 0) == 0) {
+        free_space(dst);
+        ret 0;
+    }
+    ret dst;
 }
 
 # where physical memory is visible to the kernel

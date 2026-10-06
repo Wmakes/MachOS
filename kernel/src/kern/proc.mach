@@ -38,7 +38,7 @@ pub rec Proc {
     group:     u64;
     state:     u64;
     killed:    u8;
-    exit_code: u64;
+    exit_code: u64;  # the wait status: code << 8, or the signal
     ksp:       u64;  # saved kernel rsp while switched out
     kstack:    u64;  # heap block holding the kernel stack
     pml4:      u64;
@@ -167,6 +167,26 @@ pub fun start(p: *Proc, rip: u64, rsp: u64, rdi: u64, rsi: u64, rdx: u64) {
 
     # switch_to pops rflags, r15 r14 r13 r12 rbx rbp, then returns into
     # isr_return; rflags 0x2: interrupts off, AC clear
+    sp = sp - 8;
+    @(sp::*u64) = idt.isr_return::u64;
+    sp = sp - 48;
+    mem.fill(sp, 0, 48);
+    sp = sp - 8;
+    @(sp::*u64) = 0x2;
+    p.ksp = sp;
+    p.state = RUNNABLE;
+}
+
+# make `p` runnable as a copy of the process whose saved frame is `f` (with
+# the fxsave image right below it): it resumes where that one will, with
+# rax = 0, which is how a forked child sees fork() return
+pub fun start_copy(p: *Proc, f: *idt.Frame) {
+    var sp: u64 = kstack_top(p);
+    val fsize: u64 = $size_of(idt.Frame)::u64;
+    sp = sp - fsize - idt.FPU_AREA;
+    mem.copy(sp, f::u64 - idt.FPU_AREA, fsize + idt.FPU_AREA);
+    val cf: *idt.Frame = (sp + idt.FPU_AREA)::*idt.Frame;
+    cf.rax = 0;
     sp = sp - 8;
     @(sp::*u64) = idt.isr_return::u64;
     sp = sp - 48;

@@ -9,7 +9,7 @@ pub val WRITE:   u64 = 2;  # (handle, buf, len)                      -> bytes
 pub val OPEN:    u64 = 3;  # (path, path_len, O_*)                   -> handle
 pub val CLOSE:   u64 = 4;  # (handle)
 pub val SPAWN:   u64 = 5;  # (path, path_len, args, args_len, *Spawn) -> pid; the record is required
-pub val WAIT:    u64 = 6;  # (pid, WAIT_*)                           -> exit code
+pub val WAIT:    u64 = 6;  # (pid, *status, WNOHANG)                 -> pid (0: none ready)
 pub val READDIR: u64 = 7;  # (handle, index, *Entry)                 -> 1, or 0 past the end
 pub val STAT:    u64 = 8;  # (path, path_len, *Stat)
 pub val MKDIR:   u64 = 9;  # (path, path_len)
@@ -39,7 +39,10 @@ pub val DUP:     u64 = 32; # (fd)                                    -> the lowe
 pub val DUP2:    u64 = 33; # (fd, newfd)                             -> newfd (closed first if open)
 pub val FCNTL:   u64 = 34; # (fd, F_*, arg)
 pub val FSTAT:   u64 = 35; # (fd, *Stat)
-pub val COUNT:   u64 = 36;
+pub val FORK:    u64 = 36; # ()                                      -> child pid, 0 in the child
+pub val EXECVE:  u64 = 37; # (path, path_len, args, args_len, env, env_len)  replaces the program
+pub val GETPPID: u64 = 38; # ()                                      -> parent pid
+pub val COUNT:   u64 = 39;
 
 # SEEK whence
 pub val SEEK_SET: u64 = 0;
@@ -57,8 +60,37 @@ pub val FD_CLOEXEC: u64 = 1;
 pub val REBOOT_POWEROFF: u64 = 0;
 pub val REBOOT_RESTART:  u64 = 1;
 
-# WAIT flags
-pub val WAIT_NOHANG: u64 = 1; # E_AGAIN instead of blocking while it runs
+# WAIT: pid > 0 that child, ANY_CHILD any of them. the status is POSIX's:
+# exit code << 8 for an exit, the signal number for a kill
+pub val ANY_CHILD: u64 = 0xFFFFFFFFFFFFFFFF;
+pub val WNOHANG:   u64 = 1; # return 0 instead of waiting while children run
+
+pub fun wifexited(st: u64) u8 { ret ((st & 0x7F) == 0)::u8; }
+pub fun wexitstatus(st: u64) u64 { ret (st >> 8) & 0xFF; }
+pub fun wifsignaled(st: u64) u8 { ret ((st & 0x7F) != 0 && (st & 0x7F) != 0x7F)::u8; }
+pub fun wtermsig(st: u64) u64 { ret st & 0x7F; }
+
+# signal numbers (the kernel uses them for exit statuses already)
+pub val SIGHUP:  u64 = 1;
+pub val SIGINT:  u64 = 2;
+pub val SIGQUIT: u64 = 3;
+pub val SIGILL:  u64 = 4;
+pub val SIGTRAP: u64 = 5;
+pub val SIGABRT: u64 = 6;
+pub val SIGBUS:  u64 = 7;
+pub val SIGFPE:  u64 = 8;
+pub val SIGKILL: u64 = 9;
+pub val SIGUSR1: u64 = 10;
+pub val SIGSEGV: u64 = 11;
+pub val SIGUSR2: u64 = 12;
+pub val SIGPIPE: u64 = 13;
+pub val SIGALRM: u64 = 14;
+pub val SIGTERM: u64 = 15;
+pub val SIGCHLD: u64 = 17;
+pub val SIGCONT: u64 = 18;
+pub val SIGSTOP: u64 = 19;
+pub val SIGTSTP: u64 = 20;
+pub val NSIG:    u64 = 32;
 
 # OPEN flags
 pub val O_READ:   u64 = 1;

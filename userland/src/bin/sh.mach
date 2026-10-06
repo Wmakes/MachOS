@@ -730,6 +730,33 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
             ret;
         }
 
+        # a builtin in a pipeline or the background runs in a forked copy of
+        # the shell, with its fds put in place by dup2
+        if (bad == 0 && is_builtin(args[0]) != 0) {
+            val pid: u64 = sys.fork();
+            if (pid == 0) {
+                f = 0;
+                for (f < 10) {
+                    if (fds[f] == abi.FD_NONE) { sys.close(f); }
+                    or (fds[f] != f) { sys.dup2(fds[f], f); }
+                    f = f + 1;
+                }
+                builtin(args[0], argc, ?args[0], abi.STDOUT);
+                sys.exit(status);
+            }
+            if (abi.is_err(pid) != 0) {
+                io.fail("sh\0", args[0], pid);
+                status = 126;
+            } or {
+                pids[spawned] = pid;
+                spawned = spawned + 1;
+            }
+            opened_close();
+            prev_read = next_read;
+            c = c + 1;
+            cnt;
+        }
+
         if (bad == 0) {
             var full: [256]u8;
             val fl: u64 = resolve(args[0], ?full[0]);

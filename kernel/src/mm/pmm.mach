@@ -20,6 +20,15 @@ pub fun free(phys: u64) {
     free_count = free_count + 1;
 }
 
+# one 4 KiB page as it is (not zeroed), or 0 when out of memory
+pub fun alloc_raw() u64 {
+    if (head == 0) { ret 0; }
+    val phys: u64 = head;
+    head = @link_of(phys);
+    free_count = free_count - 1;
+    ret phys;
+}
+
 # one zeroed 4 KiB page, or 0 when out of memory
 pub fun alloc() u64 {
     if (head == 0) { ret 0; }
@@ -38,9 +47,63 @@ pub fun alloc() u64 {
 pub fun free_pages() u64 { ret free_count; }
 pub fun total_pages() u64 { ret total_count; }
 
+# sharing counts for pages mapped by several address spaces (copy-on-write
+# after fork): refs[pfn] = owners - 1, so 0 means "only one". kept in a run
+# of physical memory set aside at init, reached through the hhdm
+var refs: u64 = 0;    # virtual address of the u16 array
+var ref_pages: u64 = 0;
+
+fun ref_of(pa: u64) *u16 { ret (refs + (pa / PAGE) * 2)::*u16; }
+
+pub fun share(pa: u64) {
+    val r: *u16 = ref_of(pa);
+    @r = @r + 1;
+}
+
+pub fun shared(pa: u64) u8 {
+    if (@ref_of(pa) != 0) { ret 1; }
+    ret 0;
+}
+
+# drop one owner of a page; it is freed when it was the last
+pub fun release(pa: u64) {
+    val r: *u16 = ref_of(pa);
+    if (@r != 0) {
+        @r = @r - 1;
+        ret;
+    }
+    free(pa);
+}
+
 pub fun init(bi: *info.BootInfo) {
     hhdm = bi.hhdm;
+    # room for the sharing counts: one u16 per page up to the highest one
+    var top: u64 = 0;
     var i: u64 = 0;
+    for (i < bi.mem_len) {
+        val r: *info.MemRegion = ?bi.mem[i];
+        if (r.kind == info.MEM_USABLE && r.base + r.len > top) { top = r.base + r.len; }
+        i = i + 1;
+    }
+    ref_pages = ((top / PAGE) * 2 + PAGE - 1) / PAGE;
+    var ref_at: u64 = 0;
+    i = 0;
+    for (i < bi.mem_len && ref_at == 0) {
+        val r: *info.MemRegion = ?bi.mem[i];
+        var p: u64 = (r.base + PAGE - 1) & ~(PAGE - 1);
+        if (p == 0) { p = PAGE; }
+        val end: u64 = (r.base + r.len) & ~(PAGE - 1);
+        if (r.kind == info.MEM_USABLE && end > p && end - p >= ref_pages * PAGE) { ref_at = p; }
+        i = i + 1;
+    }
+    refs = ref_at + hhdm;
+    var z: u64 = 0;
+    for (z < ref_pages * PAGE / 8) {
+        @((refs + z * 8)::*u64) = 0;
+        z = z + 1;
+    }
+
+    i = 0;
     for (i < bi.mem_len) {
         val r: *info.MemRegion = ?bi.mem[i];
         if (r.kind == info.MEM_USABLE) {
@@ -48,6 +111,7 @@ pub fun init(bi: *info.BootInfo) {
             var p: u64 = (r.base + PAGE - 1) & ~(PAGE - 1);
             val end: u64 = (r.base + r.len) & ~(PAGE - 1);
             if (p == 0) { p = PAGE; }
+            if (p == ref_at) { p = p + ref_pages * PAGE; } # the counts live here
             for (p < end) {
                 free(p);
                 total_count = total_count + 1;

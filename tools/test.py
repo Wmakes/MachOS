@@ -142,7 +142,7 @@ TESTS = [
       "send:cat /nope 2>/tmp/e; cat /tmp/e; cat /nope 2>&1 | wc -l; ls /etc /nope > /tmp/o 2>&1; cat /tmp/o\\n",
       "wait:" + P,
       "send:echo to-stderr >&2 2>/dev/null; echo kept 3>/tmp/three; cat < /etc/motd 0<&- | wc -c\\n", "wait:" + P],
-     ["posixtest: 0 failures", "cat: /nope: no such file", "      1", "no such file", "motd",
+     ["exec-works", "posixtest: 0 failures", "cat: /nope: no such file", "      1", "no such file", "motd",
       "kept"]),
 
     ("environment", False, False,
@@ -151,9 +151,10 @@ TESTS = [
       "send:Y=only-here env | grep Y=; echo \"[$Y]\"; unset X; echo \"[$X]\"; echo ~ $$\\n", "wait:" + P,
       "send:mkdir /tmp/b; printf '#!/bin/sh\\\\necho via-path $1\\\\n' > /tmp/b/tool; PATH=/tmp/b:/bin; tool z; which tool\\n",
       "wait:" + P,
-      "send:env -i K=v env; echo \"a\\\\nb \\\\$\"\\n", "wait:" + P],
+      "send:env -i K=v env; echo \"a\\\\nb \\\\$\"\\n", "wait:" + P,
+      "send:set | grep -c PATH=; pwd | cat; export | grep -c HOME; cd /etc | cat; pwd\\n", "wait:" + P],
      ["/ /bin", "x=1 1y", "0", "X=1", "Y=only-here", "[]", "[]", "/ 2", "via-path z", "/tmp/b/tool",
-      "K=v", "a\\nb $"]),
+      "K=v", "a\\nb $", "1", "/", "1", "/"]),
 
     # repair a disk that debugfs damaged on the host
     ("fsck", False, False,

@@ -66,10 +66,85 @@ fun envs() {
     check("unsetenv\0", (env.get("POSIXTEST_X\0") == nil)::u8);
 }
 
+var shared_x: u64 = 1;
+
+fun processes() {
+    val me: u64 = sys.getpid();
+    # fork: the child sees 0, the parent the child's pid
+    val pid: u64 = sys.fork();
+    if (pid == 0) {
+        shared_x = 2; # copy-on-write: the parent must not see this
+        var code: u64 = 7;
+        if (sys.getppid() != me) { code = 99; }
+        sys.exit(code);
+    }
+    check("fork returns a pid\0", (abi.is_err(pid) == 0 && pid != me)::u8);
+    var st: u64 = 0;
+    check("waitpid returns the pid\0", (sys.waitpid(pid, ?st, 0) == pid)::u8);
+    check("exit status 7 (and getppid)\0", (abi.wifexited(st) != 0 && abi.wexitstatus(st) == 7)::u8);
+    check("memory is copied on write\0", (shared_x == 1)::u8);
+    check("no children left\0", (abi.err_code(sys.waitpid(abi.ANY_CHILD, ?st, 0)) == abi.E_CHILD)::u8);
+
+    # a child killed by a fault reports the signal
+    val bad: u64 = sys.fork();
+    if (bad == 0) {
+        val nowhere: *u64 = 16::*u64;
+        @nowhere = 1;
+        sys.exit(0);
+    }
+    sys.waitpid(bad, ?st, 0);
+    check("a segfault is SIGSEGV\0", (abi.wifsignaled(st) != 0 && abi.wtermsig(st) == abi.SIGSEGV)::u8);
+
+    # WNOHANG while the child still runs, then ANY_CHILD
+    val slow: u64 = sys.fork();
+    if (slow == 0) {
+        sys.sleep(300);
+        sys.exit(3);
+    }
+    check("WNOHANG returns 0\0", (sys.waitpid(slow, ?st, abi.WNOHANG) == 0)::u8);
+    check("ANY_CHILD waits\0", (sys.waitpid(abi.ANY_CHILD, ?st, 0) == slow && abi.wexitstatus(st) == 3)::u8);
+
+    # fds are inherited: a pipe across fork
+    var ends: [2]u64;
+    sys.pipe(?ends);
+    val w: u64 = sys.fork();
+    if (w == 0) {
+        sys.close(ends[0]);
+        io.write_all(ends[1], "through the pipe\0", 16);
+        sys.exit(0);
+    }
+    sys.close(ends[1]);
+    var buf: [32]u8;
+    var got: u64 = 0;
+    for {
+        val r: u64 = sys.read(ends[0], ?buf[got], 32 - got);
+        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        got = got + r;
+    }
+    sys.close(ends[0]);
+    sys.waitpid(w, ?st, 0);
+    check("a pipe across fork\0", io.eq(?buf[0], got, "through the pipe\0", 16));
+
+    # fork + execve: the child becomes echo
+    val ex: u64 = sys.fork();
+    if (ex == 0) {
+        # args built piece by piece: mach cuts string literals at an embedded NUL
+        var args: [16]u8;
+        io.copy(?args[0], "echo\0", 5);
+        io.copy(?args[5], "exec-works\0", 11);
+        val r: u64 = sys.execve("/bin/echo\0", 9, ?args[0], 16);
+        sys.exit(100 + abi.err_code(r));
+    }
+    sys.waitpid(ex, ?st, 0);
+    check("execve ran echo\0", (abi.wifexited(st) != 0 && abi.wexitstatus(st) == 0)::u8);
+    check("execve of nothing fails\0", (abi.err_code(sys.execve("/nope\0", 5, nil, 0)) == abi.E_NOENT)::u8);
+}
+
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     fds();
     envs();
+    processes();
     io.out("posixtest: \0");
     io.dec(failures);
     io.out(" failures\n\0");

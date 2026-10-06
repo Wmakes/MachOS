@@ -47,8 +47,42 @@ pub fun spawn(p: *u8, n: u64, args: *u8, args_len: u64, how: *abi.Spawn) u64 {
     }
     ret raw(abi.SPAWN, p::u64, n, args::u64, args_len, h::u64);
 }
-pub fun wait(pid: u64) u64 { ret raw(abi.WAIT, pid, 0, 0, 0, 0); }
-pub fun poll(pid: u64) u64 { ret raw(abi.WAIT, pid, abi.WAIT_NOHANG, 0, 0, 0); }
+pub fun waitpid(pid: u64, status: *u64, flags: u64) u64 { ret raw(abi.WAIT, pid, status::u64, flags, 0, 0); }
+
+# the status as a shell shows it: the exit code, or 128 + the signal
+fun shell_status(st: u64) u64 {
+    if (abi.wifexited(st) != 0) { ret abi.wexitstatus(st); }
+    ret 128 + abi.wtermsig(st);
+}
+
+# wait for `pid`; its exit code (128 + signal when killed) or an error
+pub fun wait(pid: u64) u64 {
+    var st: u64 = 0;
+    val r: u64 = waitpid(pid, ?st, 0);
+    if (abi.is_err(r) != 0) { ret r; }
+    ret shell_status(st);
+}
+
+# like wait, but E_AGAIN while it still runs
+pub fun poll(pid: u64) u64 {
+    var st: u64 = 0;
+    val r: u64 = waitpid(pid, ?st, abi.WNOHANG);
+    if (abi.is_err(r) != 0) { ret r; }
+    if (r == 0) { ret abi.err(abi.E_AGAIN); }
+    ret shell_status(st);
+}
+
+pub fun fork() u64 { ret raw(abi.FORK, 0, 0, 0, 0, 0); }
+pub fun getppid() u64 { ret raw(abi.GETPPID, 0, 0, 0, 0, 0); }
+
+# replace this program with `p` (args: NUL-separated strings); returns only
+# on failure. the environment is this process's
+pub fun execve(p: *u8, n: u64, args: *u8, args_len: u64) u64 {
+    # NUL-separated strings, then an empty one to end the list
+    val el: u64 = env.pack(?env_buf[0], 16383);
+    env_buf[el] = 0;
+    ret raw(abi.EXECVE, p::u64, n, args::u64, args_len, (?env_buf[0])::u64);
+}
 
 pub fun readdir(h: u64, idx: u64, out: *abi.Entry) u64 { ret raw(abi.READDIR, h, idx, out::u64, 0, 0); }
 pub fun stat(p: *u8, n: u64, out: *abi.Stat) u64 { ret raw(abi.STAT, p::u64, n, out::u64, 0, 0); }
