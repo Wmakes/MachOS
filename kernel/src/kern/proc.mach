@@ -86,8 +86,10 @@ pub fun count() u64 {
     ret n;
 }
 
-# save callee-saved registers on this stack, park rsp in *from, and resume
-# whatever was parked at `to` (switch_to(from: *u64, to: u64))
+# save callee-saved registers and rflags on this stack, park rsp in *from,
+# and resume whatever was parked at `to` (switch_to(from: *u64, to: u64)).
+# rflags travels with each stack so a process blocked inside a system call
+# gets its SMAP state (AC) back, and nobody else inherits it
 #[naked]
 #[symbol("switch_to")]
 fun switch_to(from: *u64, to: u64) {
@@ -98,8 +100,10 @@ fun switch_to(from: *u64, to: u64) {
         push r13
         push r14
         push r15
+        pushfq
         mov [rdi], rsp
         mov rsp, rsi
+        popfq
         pop r15
         pop r14
         pop r13
@@ -159,11 +163,14 @@ pub fun start(p: *Proc, rip: u64, rsp: u64, rdi: u64, rsi: u64) {
     @(sp::*u16) = 0x037F;
     @((sp + 24)::*u32) = 0x1F80;
 
-    # switch_to pops r15 r14 r13 r12 rbx rbp, then returns into isr_return
+    # switch_to pops rflags, r15 r14 r13 r12 rbx rbp, then returns into
+    # isr_return; rflags 0x2: interrupts off, AC clear
     sp = sp - 8;
     @(sp::*u64) = idt.isr_return::u64;
     sp = sp - 48;
     mem.fill(sp, 0, 48);
+    sp = sp - 8;
+    @(sp::*u64) = 0x2;
     p.ksp = sp;
     p.state = RUNNABLE;
 }

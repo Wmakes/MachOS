@@ -143,11 +143,70 @@ pub fun invlpg(va: u64) {
 
 pub val MSR_EFER: u32 = 0xC0000080;
 
-# no-execute pages, write protection in ring 0, SSE usable everywhere
+# cpuid leaf 7 (structured extended features): ebx and ecx
+fun cpuid7(ecx_out: *u32) u32 {
+    var b: u32 = 0;
+    var c: u32 = 0;
+    asm x86_64 {
+        mov eax, 7
+        mov ecx, 0
+        cpuid
+        mov {b}, ebx
+        mov {c}, ecx
+    }
+    @ecx_out = c;
+    ret b;
+}
+
+fun max_leaf() u32 {
+    var a: u32 = 0;
+    asm x86_64 {
+        mov eax, 0
+        cpuid
+        mov {a}, eax
+    }
+    ret a;
+}
+
+var smep: u8 = 0;
+var smap: u8 = 0;
+var umip: u8 = 0;
+
+pub fun has_smep() u8 { ret smep; }
+pub fun has_smap() u8 { ret smap; }
+pub fun has_umip() u8 { ret umip; }
+
+# no-execute pages, write protection in ring 0, SSE usable everywhere, and
+# where the cpu has them: SMEP (ring 0 never runs user pages), SMAP (ring 0
+# touches user pages only between stac and clac) and UMIP (no sgdt/sidt
+# etc. from user mode)
 pub fun init() {
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | (1 << 11));           # EFER.NXE
     set_cr0((cr0() | (1 << 16) | (1 << 1)) & ~(1::u64 << 2)); # WP, MP, clear EM
-    set_cr4(cr4() | (1 << 9) | (1 << 10));                   # OSFXSR, OSXMMEXCPT
+    var cr: u64 = cr4() | (1 << 9) | (1 << 10);              # OSFXSR, OSXMMEXCPT
+    if (max_leaf() >= 7) {
+        var c: u32 = 0;
+        val b: u32 = cpuid7(?c);
+        if ((b & (1 << 7)) != 0) { smep = 1; cr = cr | (1 << 20); }
+        if ((b & (1 << 20)) != 0) { smap = 1; cr = cr | (1 << 21); }
+        if ((c & (1 << 2)) != 0) { umip = 1; cr = cr | (1 << 11); }
+    }
+    set_cr4(cr);
+    if (smap != 0) { clac(); }
+}
+
+# allow / forbid ring-0 access to user pages (SMAP); only call when has_smap()
+# (stac/clac as bytes: mach's assembler does not know them)
+pub fun stac() {
+    asm x86_64 {
+        .byte 0x0f, 0x01, 0xcb :: writes()
+    }
+}
+
+pub fun clac() {
+    asm x86_64 {
+        .byte 0x0f, 0x01, 0xca :: writes()
+    }
 }
 
 # sleep until an interrupt has been handled. naked and stackless so a

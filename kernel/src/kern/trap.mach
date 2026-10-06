@@ -83,6 +83,8 @@ fun user_fault(f: *idt.Frame) {
 
 #[symbol("isr_dispatch")]
 fun isr_dispatch(f: *idt.Frame) {
+    # user mode can set AC itself; never let it carry into the kernel (SMAP)
+    if (cpu.has_smap() != 0) { cpu.clac(); }
     val from_user: u8 = ((f.cs & 3) == 3)::u8;
     if (f.vector < 32) {
         if (from_user != 0) { user_fault(f); }

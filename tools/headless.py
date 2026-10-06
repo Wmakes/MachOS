@@ -3,6 +3,7 @@
 
 usage: tools/headless.py [-p release] [-t SECONDS] [--keep] [--fsck] [--disk2 IMG] [--boot IMG] STEP...
 
+The cpu is QEMU's "max" (with SMEP/SMAP) unless QEMU_CPU says otherwise.
 The disk is rebuilt fresh unless --keep is given (then files written by an
 earlier run are still there). --fsck runs e2fsck on the root partition after
 QEMU stops and fails if it finds problems.
@@ -85,7 +86,8 @@ def main():
         subprocess.run(["cp", OVMF_VARS, vars_fd], check=True)
 
     qemu = subprocess.Popen([
-        "qemu-system-x86_64", "-M", "q35", "-m", "256M", "-display", "none",
+        "qemu-system-x86_64", "-M", "q35", "-cpu", os.environ.get("QEMU_CPU", "max"), "-m", "256M",
+        "-display", "none",
         "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF_CODE}",
         "-drive", f"if=pflash,format=raw,file={vars_fd}",
         "-drive", f"format=raw,file={img}",

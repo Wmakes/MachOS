@@ -77,6 +77,12 @@ fun kmain() {
     val verr: *u8 = vmm.init(?boot);
     if (verr != nil) { kprint.panic(verr); }
     kprint.puts("vmm: own page tables live\n\0");
+    kprint.puts("cpu: \0");
+    if (cpu.has_smep() != 0) { kprint.puts("smep \0"); }
+    if (cpu.has_smap() != 0) { kprint.puts("smap \0"); }
+    if (cpu.has_umip() != 0) { kprint.puts("umip \0"); }
+    if (cpu.has_smep() == 0 && cpu.has_smap() == 0) { kprint.puts("no smep/smap on this cpu\0"); }
+    kprint.putc(10);
     kprint.puts("pmm: \0");
     kprint.dec(pmm.free_pages() * pmm.PAGE / 1024 / 1024);
     kprint.puts(" MiB free\n\0");

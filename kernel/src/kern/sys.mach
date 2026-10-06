@@ -21,6 +21,7 @@ use clock:  machos.kern.clock;
 use mount:  machos.fs.mount;
 use parts:  machos.fs.parts;
 use version: machos.abi.version;
+use cpu:    machos.arch.x86_64.cpu;
 
 val ARGS_MAX: u64 = 65536;
 val SYNC_EVERY: u64 = 5; # seconds: dirty blocks never wait longer than this
@@ -555,7 +556,12 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
 
 #[symbol("syscall_dispatch")]
 fun syscall_dispatch(f: *idt.Frame) {
+    # user memory is reachable (SMAP) only while the call runs; every user
+    # pointer it uses has been checked with ok() first
+    val smap: u8 = cpu.has_smap();
+    if (smap != 0) { cpu.stac(); }
     f.rax = call(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8);
+    if (smap != 0) { cpu.clac(); }
     # the scheduler syncs whenever the cpu idles; a busy system syncs here
     val now: u64 = proc.uptime_ticks();
     if (now - last_sync >= SYNC_EVERY * apic.HZ) {
