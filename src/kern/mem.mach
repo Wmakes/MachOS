@@ -1,0 +1,35 @@
+# byte copies and fills
+
+pub fun copy(dst: u64, src: u64, n: u64) {
+    asm x86_64 {
+        mov rdi, {dst}
+        mov rsi, {src}
+        mov rcx, {n}
+        rep movsb
+    }
+}
+
+pub fun fill(dst: u64, v: u8, n: u64) {
+    asm x86_64 {
+        mov rdi, {dst}
+        mov al, {v}
+        mov rcx, {n}
+        rep stosb
+    }
+}
+
+pub fun equal(a: *u8, b: *u8, n: u64) u8 {
+    var i: u64 = 0;
+    for (i < n) {
+        if (a[i] != b[i]) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# length of a NUL-terminated string
+pub fun cstrlen(s: *u8) u64 {
+    var n: u64 = 0;
+    for (s[n] != 0) { n = n + 1; }
+    ret n;
+}

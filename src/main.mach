@@ -10,6 +10,7 @@ use fbcon:  machos.dev.fbcon;
 use kprint: machos.kern.kprint;
 use pmm:    machos.mm.pmm;
 use vmm:    machos.mm.vmm;
+use heap:   machos.mm.heap;
 
 var boot: info.BootInfo;
 
@@ -67,6 +68,23 @@ fun kmain() {
     pmm.free(a);
     val c: u64 = pmm.alloc();
     if (a == 0 || b == 0 || c != a) { kprint.panic("pmm self-test failed\0"); }
+    pmm.free(b);
+    pmm.free(c);
+
+    val h1: u64 = heap.alloc(100);
+    val h2: u64 = heap.alloc(5000);
+    val h3: u64 = heap.zalloc(40);
+    if (h1 == 0 || h2 == 0 || h3 == 0 || (h1 & 15) != 0) { kprint.panic("heap self-test failed\0"); }
+    heap.free(h2);
+    heap.free(h1);
+    val h4: u64 = heap.alloc(5100); # fits the merged h1+h2 hole
+    if (h4 != h1) { kprint.panic("heap did not merge free blocks\0"); }
+    heap.free(h4);
+    heap.free(h3);
+    if (heap.used() != 0) { kprint.panic("heap leaked\0"); }
+    kprint.puts("heap: ok, \0");
+    kprint.dec(heap.mapped() / 1024);
+    kprint.puts(" KiB mapped\n\0");
 
     kprint.puts("idle\n\0");
     cpu.halt();

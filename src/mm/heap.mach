@@ -1,0 +1,125 @@
+# kernel heap: a virtually contiguous region that grows a page run at a time.
+# free blocks sit on one address-ordered list so neighbours merge on free.
+# every block starts with a 16-byte header; payloads are 16-byte aligned
+
+use vmm:    machos.mm.vmm;
+use pmm:    machos.mm.pmm;
+use mem:    machos.kern.mem;
+use kprint: machos.kern.kprint;
+
+val BASE:  u64 = 0xffffc00000000000;
+val LIMIT: u64 = 0xffffc04000000000;   # 256 GiB of address space, plenty
+val GROW:  u64 = 16;                   # pages mapped per growth step, at least
+val USED:  u64 = 0x5553454455534544;   # tag of an allocated block
+val HDR:   u64 = 16;
+val MIN:   u64 = 32;
+
+rec Block {
+    size: u64; # whole block, header included
+    tag:  u64; # USED, or the next free block's address (0 ends the list)
+}
+
+var top: u64 = 0xffffc00000000000;     # end of the mapped region
+var free_head: u64 = 0;
+var in_use: u64 = 0;
+
+fun blk(a: u64) *Block { ret a::*Block; }
+
+# put a free block on the list, merging it with its neighbours
+fun release(a: u64) {
+    var prev: u64 = 0;
+    var cur: u64 = free_head;
+    for (cur != 0 && cur < a) {
+        prev = cur;
+        cur = blk(cur).tag;
+    }
+    blk(a).tag = cur;
+    if (prev == 0) { free_head = a; }
+    or             { blk(prev).tag = a; }
+
+    if (cur != 0 && a + blk(a).size == cur) {
+        blk(a).size = blk(a).size + blk(cur).size;
+        blk(a).tag = blk(cur).tag;
+    }
+    if (prev != 0 && prev + blk(prev).size == a) {
+        blk(prev).size = blk(prev).size + blk(a).size;
+        blk(prev).tag = blk(a).tag;
+    }
+}
+
+fun grow(need: u64) u8 {
+    var pages: u64 = (need + 4095) / 4096;
+    if (pages < GROW) { pages = GROW; }
+    if (top + pages * 4096 > LIMIT) { ret 0; }
+    val start: u64 = top;
+    var i: u64 = 0;
+    for (i < pages) {
+        val pa: u64 = pmm.alloc();
+        if (pa == 0) { brk; }
+        if (vmm.map(vmm.kernel_space(), top, pa, vmm.W | vmm.G | vmm.NX) == 0) {
+            pmm.free(pa);
+            brk;
+        }
+        top = top + 4096;
+        i = i + 1;
+    }
+    if (top == start) { ret 0; }
+    blk(start).size = top - start;
+    release(start);
+    ret 1;
+}
+
+# `n` bytes, 16-byte aligned, contents undefined; nil when out of memory
+pub fun alloc(n: u64) u64 {
+    var size: u64 = (n + HDR + 15) & ~15::u64;
+    if (size < MIN) { size = MIN; }
+    for {
+        var prev: u64 = 0;
+        var cur: u64 = free_head;
+        for (cur != 0) {
+            val b: *Block = blk(cur);
+            if (b.size >= size) {
+                var next: u64 = b.tag;
+                if (b.size - size >= MIN) {
+                    # split: the tail stays free in this block's list slot
+                    val rest: u64 = cur + size;
+                    blk(rest).size = b.size - size;
+                    blk(rest).tag = next;
+                    next = rest;
+                    b.size = size;
+                }
+                if (prev == 0) { free_head = next; }
+                or             { blk(prev).tag = next; }
+                b.tag = USED;
+                in_use = in_use + b.size;
+                ret cur + HDR;
+            }
+            prev = cur;
+            cur = b.tag;
+        }
+        if (grow(size) == 0) { ret 0; }
+    }
+    ret 0;
+}
+
+# like alloc, zero-filled
+pub fun zalloc(n: u64) u64 {
+    val p: u64 = alloc(n);
+    if (p != 0) { mem.fill(p, 0, n); }
+    ret p;
+}
+
+pub fun free(p: u64) {
+    if (p == 0) { ret; }
+    val a: u64 = p - HDR;
+    if (a < BASE || a >= top || blk(a).tag != USED) {
+        kprint.puts("heap: bad free \0");
+        kprint.hex(p);
+        kprint.panic("heap corrupted\0");
+    }
+    in_use = in_use - blk(a).size;
+    release(a);
+}
+
+pub fun used() u64 { ret in_use; }
+pub fun mapped() u64 { ret top - BASE; }
