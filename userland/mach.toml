@@ -83,6 +83,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.edit]
+kind = "bin"
+entry = "bin/edit.mach"
+out = "bin/edit"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.false]
 kind = "bin"
 entry = "bin/false.mach"
@@ -143,6 +151,14 @@ need = []
 kind = "bin"
 entry = "bin/kill.mach"
 out = "bin/kill"
+targets = ["machos"]
+link = []
+need = []
+
+[artifact.less]
+kind = "bin"
+entry = "bin/less.mach"
+out = "bin/less"
 targets = ["machos"]
 link = []
 need = []

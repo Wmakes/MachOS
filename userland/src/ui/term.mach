@@ -1,0 +1,97 @@
+# full-screen terminal programs: raw mode, the screen size, cursor control,
+# and keys (escape sequences decoded into KEY_* codes)
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+
+pub val KEY_UP:    u64 = 0x101;
+pub val KEY_DOWN:  u64 = 0x102;
+pub val KEY_RIGHT: u64 = 0x103;
+pub val KEY_LEFT:  u64 = 0x104;
+pub val KEY_HOME:  u64 = 0x105;
+pub val KEY_END:   u64 = 0x106;
+pub val KEY_DEL:   u64 = 0x107;
+pub val KEY_PGUP:  u64 = 0x108;
+pub val KEY_PGDN:  u64 = 0x109;
+pub val KEY_EOF:   u64 = 0xFFFFFFFFFFFFFFFF;
+
+var tty: u64 = 0;     # where keys come from (a terminal handle)
+var rows: u64 = 24;
+var cols: u64 = 80;
+
+# take over the terminal `h`: raw mode, and learn its size
+pub fun start(h: u64) u8 {
+    tty = h;
+    var t: abi.Termios;
+    if (abi.is_err(sys.tcgetattr(h, ?t)) != 0) { ret 0; }
+    rows = t.rows;
+    cols = t.cols;
+    t.lflag = 0;
+    sys.tcsetattr(h, ?t);
+    io.out("\x1b[2J\x1b[H\0");
+    ret 1;
+}
+
+# hand the terminal back: line mode, a clean screen
+pub fun stop() {
+    var t: abi.Termios;
+    t.lflag = abi.ISIG | abi.ICANON | abi.ECHO;
+    sys.tcsetattr(tty, ?t);
+    io.out("\x1b[0m\x1b[2J\x1b[H\0");
+}
+
+pub fun height() u64 { ret rows; }
+pub fun width() u64 { ret cols; }
+
+# row and col count from 0
+pub fun go(row: u64, col: u64) {
+    io.out("\x1b[\0");
+    io.dec(row + 1);
+    io.putc(59);
+    io.dec(col + 1);
+    io.putc(72);
+}
+
+pub fun clear_eol() { io.out("\x1b[K\0"); }
+pub fun reverse(on: u8) {
+    if (on != 0) { io.out("\x1b[7m\0"); }
+    or           { io.out("\x1b[0m\0"); }
+}
+
+fun byte() u64 {
+    var c: u8 = 0;
+    val r: u64 = sys.read(tty, ?c, 1);
+    if (abi.is_err(r) != 0 || r == 0) { ret KEY_EOF; }
+    ret c::u64;
+}
+
+pub fun key() u64 {
+    val c: u64 = byte();
+    if (c != 27) {
+        if (c == 13) { ret 10; }
+        ret c;
+    }
+    val c2: u64 = byte();
+    if (c2 != 91 && c2 != 79) { ret 27; }
+    var num: u64 = 0;
+    var f: u64 = byte();
+    for (f >= 48 && f <= 57) {
+        num = num * 10 + f - 48;
+        f = byte();
+    }
+    if (f == 65) { ret KEY_UP; }
+    if (f == 66) { ret KEY_DOWN; }
+    if (f == 67) { ret KEY_RIGHT; }
+    if (f == 68) { ret KEY_LEFT; }
+    if (f == 72) { ret KEY_HOME; }
+    if (f == 70) { ret KEY_END; }
+    if (f == 126) {
+        if (num == 1 || num == 7) { ret KEY_HOME; }
+        if (num == 4 || num == 8) { ret KEY_END; }
+        if (num == 3) { ret KEY_DEL; }
+        if (num == 5) { ret KEY_PGUP; }
+        if (num == 6) { ret KEY_PGDN; }
+    }
+    ret 0;
+}

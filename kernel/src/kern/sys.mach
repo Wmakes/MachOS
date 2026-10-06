@@ -22,6 +22,7 @@ use mount:  machos.fs.mount;
 use parts:  machos.fs.parts;
 use version: machos.abi.version;
 use cpu:    machos.arch.x86_64.cpu;
+use fbcon:  machos.dev.fbcon;
 
 val ARGS_MAX: u64 = 65536;
 val SYNC_EVERY: u64 = 5; # seconds: dirty blocks never wait longer than this
@@ -472,7 +473,14 @@ fun sys_tcgetattr(h: u64, out: u64) u64 {
     val r: u64 = tty_handle(h);
     if (abi.is_err(r) != 0) { ret r; }
     if (ok(out, $size_of(abi.Termios)::u64, 1) == 0) { ret e(abi.E_FAULT); }
-    (@(out::*abi.Termios)).lflag = tty.get_lflag();
+    val t: *abi.Termios = out::*abi.Termios;
+    t.lflag = tty.get_lflag();
+    t.rows = fbcon.rows_of();
+    t.cols = fbcon.cols_of();
+    if (t.rows == 0 || t.cols == 0) { # serial only: assume the classic size
+        t.rows = 24;
+        t.cols = 80;
+    }
     ret 0;
 }
 

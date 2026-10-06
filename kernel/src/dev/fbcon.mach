@@ -29,6 +29,7 @@ var cx: u64 = 0;
 var cy: u64 = 0;
 var attr: u8 = 0x07;
 var bold: u8 = 0;
+var reverse: u8 = 0;
 var palette: [16]u32;
 var cells: [32768]u8;
 var attrs: [32768]u8;
@@ -126,9 +127,20 @@ fun sgr(p: u64) {
     if (p == 0) {
         attr = DEFAULT;
         bold = 0;
+        reverse = 0;
     } or (p == 1) {
         bold = 1;
         attr = attr | 0x08;
+    } or (p == 7) { # reverse video
+        if (reverse == 0) {
+            reverse = 1;
+            attr = (attr << 4) | (attr >> 4);
+        }
+    } or (p == 27) {
+        if (reverse != 0) {
+            reverse = 0;
+            attr = (attr << 4) | (attr >> 4);
+        }
     } or (p == 22) {
         bold = 0;
         attr = attr & 0xF7;

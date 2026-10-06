@@ -157,6 +157,8 @@ pub val ECHO:   u64 = 8; # typed characters are shown
 
 pub rec Termios {
     lflag: u64;
+    rows:  u64; # the screen size (filled in by TCGETATTR, ignored by TCSETATTR)
+    cols:  u64;
 }
 
 # what UNAME fills in: NUL-terminated strings

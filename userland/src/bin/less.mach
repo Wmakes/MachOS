@@ -1,0 +1,186 @@
+# less [FILE]: page through FILE (or stdin), keys from the terminal
+#   space, f, pgdn  next page      b, pgup        previous page
+#   enter, j, down  next line      k, up          previous line
+#   g, home         top            G, end         bottom
+#   /TEXT           find           n              find again      q  quit
+# when stdout is not a terminal it just copies its input
+
+use abi:  sdk.abi;
+use sys:  sdk.sys;
+use io:   sdk.io;
+use rt:   sdk.rt;
+use term: userland.ui.term;
+
+val CAP: u64 = 4194304; # 4 MiB
+var text: [4194304]u8;
+var len: u64 = 0;
+var starts: [262144]u64; # where each line starts
+var nlines: u64 = 0;
+var top: u64 = 0;
+var name: *u8 = nil;
+var pattern: [128]u8;
+var plen: u64 = 0;
+var note: *u8 = nil;
+
+fun slurp(h: u64) {
+    for (len < CAP) {
+        val r: u64 = sys.read(h, ?text[len], CAP - len);
+        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        len = len + r;
+    }
+}
+
+fun index_lines() {
+    nlines = 0;
+    starts[0] = 0;
+    nlines = 1;
+    var i: u64 = 0;
+    for (i < len && nlines < 262144) {
+        if (text[i] == 10 && i + 1 < len) {
+            starts[nlines] = i + 1;
+            nlines = nlines + 1;
+        }
+        i = i + 1;
+    }
+    if (len == 0) { nlines = 0; }
+}
+
+fun page() u64 { ret term.height() - 1; }
+
+fun last_top() u64 {
+    if (nlines <= page()) { ret 0; }
+    ret nlines - page();
+}
+
+fun draw() {
+    val w: u64 = term.width();
+    var r: u64 = 0;
+    for (r < page()) {
+        term.go(r, 0);
+        val ln: u64 = top + r;
+        if (ln < nlines) {
+            var i: u64 = starts[ln];
+            var n: u64 = 0;
+            for (i < len && text[i] != 10 && n < w) {
+                var c: u8 = text[i];
+                if (c == 9 || c < 32 || c >= 127) { c = 32; }
+                io.putc(c);
+                n = n + 1;
+                i = i + 1;
+            }
+        } or {
+            io.putc(126);
+        }
+        term.clear_eol();
+        r = r + 1;
+    }
+    term.go(page(), 0);
+    term.reverse(1);
+    io.out(" \0");
+    io.out(name);
+    io.out("  lines \0");
+    io.dec(top + 1);
+    io.putc(45);
+    var bottom: u64 = top + page();
+    if (bottom > nlines) { bottom = nlines; }
+    io.dec(bottom);
+    io.putc(47);
+    io.dec(nlines);
+    if (note != nil) {
+        io.out("  \0");
+        io.out(note);
+    }
+    io.out("  (q quits) \0");
+    term.reverse(0);
+    term.clear_eol();
+}
+
+fun search() {
+    var ln: u64 = top + 1;
+    for (ln < nlines) {
+        val s: u64 = starts[ln];
+        var e: u64 = s;
+        for (e < len && text[e] != 10) { e = e + 1; }
+        var i: u64 = s;
+        for (i + plen <= e) {
+            if (io.eq(?text[i], plen, ?pattern[0], plen) != 0) {
+                top = ln;
+                if (top > last_top()) { top = last_top(); }
+                ret;
+            }
+            i = i + 1;
+        }
+        ln = ln + 1;
+    }
+    note = "not found\0";
+}
+
+fun ask() {
+    plen = 0;
+    for {
+        term.go(page(), 0);
+        io.putc(47);
+        io.outn(?pattern[0], plen);
+        term.clear_eol();
+        val k: u64 = term.key();
+        if (k == 10) { brk; }
+        if (k == 27 || k == 3 || k == term.KEY_EOF) {
+            plen = 0;
+            ret;
+        }
+        if ((k == 127 || k == 8) && plen > 0) { plen = plen - 1; }
+        if (k >= 32 && k < 127 && plen < 128) {
+            pattern[plen] = k::u8;
+            plen = plen + 1;
+        }
+    }
+    if (plen > 0) { search(); }
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    name = "stdin\0";
+    if (argc > 1) {
+        name = argv[1];
+        val h: u64 = sys.open(name, io.len(name), abi.O_READ);
+        if (abi.is_err(h) != 0) {
+            io.fail("less\0", name, h);
+            ret 1;
+        }
+        slurp(h);
+        sys.close(h);
+    } or {
+        slurp(abi.STDIN);
+    }
+    if (sys.isatty(abi.STDOUT) == 0) {
+        io.write_all(abi.STDOUT, ?text[0], len);
+        ret 0;
+    }
+    # keys come from the terminal even when the text came through a pipe
+    val tty: u64 = sys.open("/dev/console\0", 12, abi.O_READ);
+    if (abi.is_err(tty) != 0 || term.start(tty) == 0) {
+        io.err("less: no terminal\n\0");
+        ret 1;
+    }
+    index_lines();
+    for {
+        draw();
+        note = nil;
+        val k: u64 = term.key();
+        if (k == 113 || k == 81 || k == term.KEY_EOF) { brk; }
+        if (k == 32 || k == 102 || k == term.KEY_PGDN) { top = top + page(); }
+        or (k == 98 || k == term.KEY_PGUP) {
+            if (top > page()) { top = top - page(); }
+            or                { top = 0; }
+        }
+        or (k == 10 || k == 106 || k == term.KEY_DOWN) { top = top + 1; }
+        or ((k == 107 || k == term.KEY_UP) && top > 0) { top = top - 1; }
+        or (k == 103 || k == term.KEY_HOME) { top = 0; }
+        or (k == 71 || k == term.KEY_END) { top = last_top(); }
+        or (k == 47) { ask(); }
+        or (k == 110 && plen > 0) { search(); }
+        if (top > last_top()) { top = last_top(); }
+    }
+    term.stop();
+    ret 0;
+}
