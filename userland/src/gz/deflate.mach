@@ -1,0 +1,473 @@
+# deflate (RFC 1951) and the gzip format (RFC 1952) around it, for gzip and
+# gunzip. inflate reads every block type; deflate finds repeats with hash
+# chains over a 32 KiB window and codes them with the fixed Huffman tables.
+# whole inputs and outputs live in big mmap'ed regions: only what is used
+# takes memory
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+
+pub val NONE: u64 = 0xFFFFFFFFFFFFFFFF;
+
+val LBASE: [29]u16 = [29]u16{3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+val LEXTRA: [29]u8 = [29]u8{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+val DBASE: [30]u16 = [30]u16{1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+val DEXTRA: [30]u8 = [30]u8{0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+val CLORDER: [19]u8 = [19]u8{16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+
+# --- buffers --------------------------------------------------------------
+
+# a growable region: reserved big, paid for as it is written
+pub rec Buf {
+    base: u64;
+    len:  u64;
+    cap:  u64;
+}
+
+pub fun buf_new(b: *Buf, cap: u64) u8 {
+    val a: u64 = sys.mmap(0, cap, abi.PROT_READ | abi.PROT_WRITE, abi.MAP_PRIVATE | abi.MAP_ANONYMOUS, 0, 0);
+    if (abi.is_err(a) != 0) { ret 0; }
+    b.base = a;
+    b.len = 0;
+    b.cap = cap;
+    ret 1;
+}
+
+pub fun buf_free(b: *Buf) {
+    if (b.base != 0) { sys.munmap(b.base, b.cap); }
+    b.base = 0;
+}
+
+# all of handle h into b; 0 when it does not fit or reading failed
+pub fun read_all(h: u64, b: *Buf) u8 {
+    for {
+        if (b.len == b.cap) { ret 0; }
+        var want: u64 = b.cap - b.len;
+        if (want > 1048576) { want = 1048576; }
+        val r: u64 = sys.read(h, (b.base + b.len)::*u8, want);
+        if (abi.is_err(r) != 0) { ret 0; }
+        if (r == 0) { ret 1; }
+        b.len = b.len + r;
+    }
+    ret 1;
+}
+
+fun put(b: *Buf, c: u8) u8 {
+    if (b.len == b.cap) { ret 0; }
+    @((b.base + b.len)::*u8) = c;
+    b.len = b.len + 1;
+    ret 1;
+}
+
+# --- crc32 ----------------------------------------------------------------
+
+var crc_table: [256]u32;
+var crc_ready: u8 = 0;
+
+pub fun crc32(p: *u8, n: u64) u32 {
+    if (crc_ready == 0) {
+        var i: u32 = 0;
+        for (i < 256) {
+            var c: u32 = i;
+            var k: u64 = 0;
+            for (k < 8) {
+                if ((c & 1) != 0) { c = 0xEDB88320 ^ (c >> 1); }
+                or { c = c >> 1; }
+                k = k + 1;
+            }
+            crc_table[i::u64] = c;
+            i = i + 1;
+        }
+        crc_ready = 1;
+    }
+    var crc: u32 = 0xFFFFFFFF;
+    var j: u64 = 0;
+    for (j < n) {
+        crc = crc_table[((crc ^ p[j]::u32) & 0xFF)::u64] ^ (crc >> 8);
+        j = j + 1;
+    }
+    ret crc ^ 0xFFFFFFFF;
+}
+
+# --- inflate --------------------------------------------------------------
+
+var in_p: *u8 = nil;
+var in_len: u64 = 0;
+var in_pos: u64 = 0;
+var bitbuf: u64 = 0;
+var bitcnt: u64 = 0;
+var broken: u8 = 0;
+
+fun bits(n: u64) u64 {
+    for (bitcnt < n) {
+        if (in_pos >= in_len) {
+            broken = 1;
+            ret 0;
+        }
+        bitbuf = bitbuf | (in_p[in_pos]::u64 << bitcnt);
+        in_pos = in_pos + 1;
+        bitcnt = bitcnt + 8;
+    }
+    val v: u64 = bitbuf & ((1::u64 << n) - 1);
+    bitbuf = bitbuf >> n;
+    bitcnt = bitcnt - n;
+    ret v;
+}
+
+# a canonical Huffman code: how many codes of each length, and the symbols
+# in code order
+rec Huff {
+    count:  [16]u16;
+    symbol: [320]u16;
+}
+
+var lencode: Huff;
+var distcode: Huff;
+
+# build h from code lengths; 0 when they do not make a code
+fun build(h: *Huff, lengths: *u8, n: u64) u8 {
+    var len: u64 = 0;
+    for (len < 16) {
+        h.count[len] = 0;
+        len = len + 1;
+    }
+    var s: u64 = 0;
+    for (s < n) {
+        h.count[lengths[s]::u64] = h.count[lengths[s]::u64] + 1;
+        s = s + 1;
+    }
+    var offs: [16]u16;
+    offs[1] = 0;
+    len = 1;
+    for (len < 15) {
+        offs[len + 1] = offs[len] + h.count[len];
+        len = len + 1;
+    }
+    s = 0;
+    for (s < n) {
+        if (lengths[s] != 0) {
+            h.symbol[offs[lengths[s]::u64]::u64] = s::u16;
+            offs[lengths[s]::u64] = offs[lengths[s]::u64] + 1;
+        }
+        s = s + 1;
+    }
+    ret 1;
+}
+
+fun decode(h: *Huff) u64 {
+    var code: u64 = 0;
+    var first: u64 = 0;
+    var index: u64 = 0;
+    var len: u64 = 1;
+    for (len < 16) {
+        code = code | bits(1);
+        if (broken != 0) { ret NONE; }
+        val count: u64 = h.count[len]::u64;
+        if (code < first + count) { ret h.symbol[(index + code - first)]::u64; }
+        index = index + count;
+        first = (first + count) << 1;
+        code = code << 1;
+        len = len + 1;
+    }
+    broken = 1;
+    ret NONE;
+}
+
+fun codes(out: *Buf) u8 {
+    for {
+        val sym: u64 = decode(?lencode);
+        if (sym == NONE) { ret 0; }
+        if (sym < 256) {
+            if (put(out, sym::u8) == 0) { ret 0; }
+            cnt;
+        }
+        if (sym == 256) { ret 1; }
+        val li: u64 = sym - 257;
+        if (li >= 29) { ret 0; }
+        val length: u64 = LBASE[li]::u64 + bits(LEXTRA[li]::u64);
+        val ds: u64 = decode(?distcode);
+        if (ds == NONE || ds >= 30) { ret 0; }
+        val dist: u64 = DBASE[ds]::u64 + bits(DEXTRA[ds]::u64);
+        if (broken != 0 || dist > out.len) { ret 0; }
+        if (out.len + length > out.cap) { ret 0; }
+        var k: u64 = 0;
+        val o: *u8 = out.base::*u8;
+        for (k < length) {
+            o[out.len] = o[out.len - dist];
+            out.len = out.len + 1;
+            k = k + 1;
+        }
+    }
+    ret 1;
+}
+
+fun fixed_tables() {
+    var l: [288]u8;
+    var s: u64 = 0;
+    for (s < 144) { l[s] = 8; s = s + 1; }
+    for (s < 256) { l[s] = 9; s = s + 1; }
+    for (s < 280) { l[s] = 7; s = s + 1; }
+    for (s < 288) { l[s] = 8; s = s + 1; }
+    build(?lencode, ?l[0], 288);
+    var d: [30]u8;
+    s = 0;
+    for (s < 30) { d[s] = 5; s = s + 1; }
+    build(?distcode, ?d[0], 30);
+}
+
+fun dynamic_tables() u8 {
+    val nlen: u64 = bits(5) + 257;
+    val ndist: u64 = bits(5) + 1;
+    val ncode: u64 = bits(4) + 4;
+    if (broken != 0 || nlen > 286 || ndist > 30) { ret 0; }
+    var lengths: [320]u8;
+    var i: u64 = 0;
+    for (i < 19) {
+        lengths[CLORDER[i]::u64] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < ncode) {
+        lengths[CLORDER[i]::u64] = bits(3)::u8;
+        i = i + 1;
+    }
+    build(?lencode, ?lengths[0], 19);
+    i = 0;
+    for (i < nlen + ndist) {
+        val sym: u64 = decode(?lencode);
+        if (sym == NONE) { ret 0; }
+        if (sym < 16) {
+            lengths[i] = sym::u8;
+            i = i + 1;
+            cnt;
+        }
+        var rep: u64 = 0;
+        var v: u8 = 0;
+        if (sym == 16) {
+            if (i == 0) { ret 0; }
+            v = lengths[i - 1];
+            rep = 3 + bits(2);
+        } or (sym == 17) { rep = 3 + bits(3); }
+        or { rep = 11 + bits(7); }
+        if (i + rep > nlen + ndist) { ret 0; }
+        for (rep > 0) {
+            lengths[i] = v;
+            i = i + 1;
+            rep = rep - 1;
+        }
+    }
+    build(?lencode, ?lengths[0], nlen);
+    build(?distcode, ?lengths[nlen], ndist);
+    ret 1;
+}
+
+# inflate in[0..n) onto the end of out; how many input bytes it used, or NONE
+pub fun inflate(inp: *u8, n: u64, out: *Buf) u64 {
+    in_p = inp;
+    in_len = n;
+    in_pos = 0;
+    bitbuf = 0;
+    bitcnt = 0;
+    broken = 0;
+    for {
+        val last: u64 = bits(1);
+        val kind: u64 = bits(2);
+        if (broken != 0) { ret NONE; }
+        if (kind == 0) { # stored
+            bitbuf = 0;
+            bitcnt = 0;
+            if (in_pos + 4 > in_len) { ret NONE; }
+            val len: u64 = in_p[in_pos]::u64 | (in_p[in_pos + 1]::u64 << 8);
+            in_pos = in_pos + 4;
+            if (in_pos + len > in_len || out.len + len > out.cap) { ret NONE; }
+            io.copy((out.base + out.len)::*u8, ?in_p[in_pos], len);
+            out.len = out.len + len;
+            in_pos = in_pos + len;
+        } or (kind == 1) {
+            fixed_tables();
+            if (codes(out) == 0) { ret NONE; }
+        } or (kind == 2) {
+            if (dynamic_tables() == 0 || codes(out) == 0) { ret NONE; }
+        } or { ret NONE; }
+        if (last != 0) { brk; }
+    }
+    ret in_pos;
+}
+
+# --- deflate --------------------------------------------------------------
+
+var obits: u64 = 0;
+var ocnt: u64 = 0;
+var ofull: u8 = 0;
+
+fun put_bits(out: *Buf, v: u64, n: u64) {
+    obits = obits | (v << ocnt);
+    ocnt = ocnt + n;
+    for (ocnt >= 8) {
+        if (put(out, (obits & 0xFF)::u8) == 0) { ofull = 1; }
+        obits = obits >> 8;
+        ocnt = ocnt - 8;
+    }
+}
+
+# a Huffman code goes out most significant bit first
+fun put_code(out: *Buf, code: u64, n: u64) {
+    var r: u64 = 0;
+    var k: u64 = 0;
+    for (k < n) {
+        r = (r << 1) | ((code >> k) & 1);
+        k = k + 1;
+    }
+    put_bits(out, r, n);
+}
+
+fun put_lit(out: *Buf, s: u64) {
+    if (s < 144) { put_code(out, 0x30 + s, 8); }
+    or (s < 256) { put_code(out, 0x190 + s - 144, 9); }
+    or (s < 280) { put_code(out, s - 256, 7); }
+    or { put_code(out, 0xC0 + s - 280, 8); }
+}
+
+fun put_match(out: *Buf, len: u64, dist: u64) {
+    var li: u64 = 28;
+    for (li > 0 && LBASE[li]::u64 > len) { li = li - 1; }
+    put_lit(out, 257 + li);
+    put_bits(out, len - LBASE[li]::u64, LEXTRA[li]::u64);
+    var di: u64 = 29;
+    for (di > 0 && DBASE[di]::u64 > dist) { di = di - 1; }
+    put_code(out, di, 5);
+    put_bits(out, dist - DBASE[di]::u64, DEXTRA[di]::u64);
+}
+
+val WIN: u64 = 32768;
+val HASH: u64 = 65536;
+val CHAIN: u64 = 128;  # candidates tried per position
+
+var head: [65536]u64;  # position + 1 of the latest string with this hash
+var prevpos: [32768]u64;
+
+fun hash3(p: *u8, i: u64) u64 {
+    ret ((p[i]::u64 << 10) ^ (p[i + 1]::u64 << 5) ^ p[i + 2]::u64) & (HASH - 1);
+}
+
+fun insert(p: *u8, i: u64) {
+    val h: u64 = hash3(p, i);
+    prevpos[i % WIN] = head[h];
+    head[h] = i + 1;
+}
+
+# deflate p[0..n) onto the end of out (one fixed-Huffman block); 0 when out
+# filled up
+pub fun deflate(p: *u8, n: u64, out: *Buf) u8 {
+    obits = 0;
+    ocnt = 0;
+    ofull = 0;
+    var k: u64 = 0;
+    for (k < HASH) {
+        head[k] = 0;
+        k = k + 1;
+    }
+    put_bits(out, 1, 1); # the last block
+    put_bits(out, 1, 2); # fixed codes
+    var i: u64 = 0;
+    for (i < n && ofull == 0) {
+        var best: u64 = 0;
+        var bdist: u64 = 0;
+        if (i + 3 <= n) {
+            var cand: u64 = head[hash3(p, i)];
+            var tries: u64 = 0;
+            for (cand != 0 && tries < CHAIN) {
+                val c: u64 = cand - 1;
+                if (i - c > WIN - 262) { brk; }
+                var m: u64 = 0;
+                var lim: u64 = n - i;
+                if (lim > 258) { lim = 258; }
+                for (m < lim && p[c + m] == p[i + m]) { m = m + 1; }
+                if (m > best) {
+                    best = m;
+                    bdist = i - c;
+                    if (m == lim) { brk; }
+                }
+                cand = prevpos[c % WIN];
+                if (cand != 0 && cand - 1 >= c) { brk; } # stale link
+                tries = tries + 1;
+            }
+        }
+        if (best >= 3) {
+            put_match(out, best, bdist);
+            var s: u64 = 0;
+            for (s < best) {
+                if (i + s + 3 <= n) { insert(p, i + s); }
+                s = s + 1;
+            }
+            i = i + best;
+        } or {
+            put_lit(out, p[i]::u64);
+            if (i + 3 <= n) { insert(p, i); }
+            i = i + 1;
+        }
+    }
+    put_lit(out, 256);
+    if (ocnt > 0) { put_bits(out, 0, 8 - ocnt); }
+    ret (ofull == 0)::u8;
+}
+
+# --- gzip -----------------------------------------------------------------
+
+fun put32(out: *Buf, v: u32) {
+    put(out, (v & 0xFF)::u8);
+    put(out, ((v >> 8) & 0xFF)::u8);
+    put(out, ((v >> 16) & 0xFF)::u8);
+    put(out, (v >> 24)::u8);
+}
+
+# a whole gzip file of p[0..n) into out; 0 when out filled up
+pub fun gzip(p: *u8, n: u64, out: *Buf) u8 {
+    put(out, 0x1F);
+    put(out, 0x8B);
+    put(out, 8);   # deflate
+    put(out, 0);   # no flags
+    put32(out, 0); # no time
+    put(out, 0);
+    put(out, 3);   # "unix"
+    if (deflate(p, n, out) == 0) { ret 0; }
+    put32(out, crc32(p, n));
+    put32(out, (n & 0xFFFFFFFF)::u32);
+    ret (out.len < out.cap)::u8;
+}
+
+fun get32(p: *u8) u32 { ret p[0]::u32 | (p[1]::u32 << 8) | (p[2]::u32 << 16) | (p[3]::u32 << 24); }
+
+# a gzip file (one or more members) p[0..n) into out; nil, or what is wrong
+pub fun gunzip(p: *u8, n: u64, out: *Buf) *u8 {
+    var at: u64 = 0;
+    var members: u64 = 0;
+    for (at < n) {
+        if (n - at < 18 || p[at] != 0x1F || p[at + 1] != 0x8B) {
+            if (members > 0) { brk; } # trailing zeros some tools add
+            ret "not in gzip format\0";
+        }
+        if (p[at + 2] != 8) { ret "unknown compression method\0"; }
+        val flags: u8 = p[at + 3];
+        var i: u64 = at + 10;
+        if ((flags & 4) != 0) { # extra field
+            if (i + 2 > n) { ret "damaged header\0"; }
+            i = i + 2 + (p[i]::u64 | (p[i + 1]::u64 << 8));
+        }
+        if ((flags & 8) != 0) { for (i < n && p[i] != 0) { i = i + 1; } i = i + 1; }  # name
+        if ((flags & 16) != 0) { for (i < n && p[i] != 0) { i = i + 1; } i = i + 1; } # comment
+        if ((flags & 2) != 0) { i = i + 2; }
+        if (i >= n) { ret "damaged header\0"; }
+        val start: u64 = out.len;
+        val used: u64 = inflate(?p[i], n - i, out);
+        if (used == NONE) { ret "damaged data (or too big)\0"; }
+        i = i + used;
+        if (i + 8 > n) { ret "unexpected end of file\0"; }
+        if (crc32((out.base + start)::*u8, out.len - start) != get32(?p[i])) { ret "crc error: the data is damaged\0"; }
+        if (((out.len - start) & 0xFFFFFFFF)::u32 != get32(?p[i + 4])) { ret "length error: the data is damaged\0"; }
+        at = i + 8;
+        members = members + 1;
+    }
+    ret nil;
+}

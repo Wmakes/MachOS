@@ -3,7 +3,7 @@
 #   $? (last status), $0-$9 and $# (script arguments), $$ (the shell's pid),
 #   $NAME and ${NAME} (variables), ~ (home), $(command) (its output)
 #   NAME=value  set a variable; NAME=value cmd  run cmd with it in its environment
-#   builtins: cd pwd exit jobs fg bg wait export unset set
+#   builtins: cd pwd exit jobs fg bg wait export unset set history time
 #   job control: ^Z stops the foreground job; fg / bg [N] continue it
 #   a | b | c        pipelines
 #   < f  > f  >> f   redirections, also N< f  N> f  N>> f  N>&M  N>&-  (fds 0-9)
@@ -598,6 +598,70 @@ fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
         status = 0;
         ret 1;
     }
+    if (io.streq(name, "history\0") != 0) {
+        val total: u64 = edit.history_count();
+        var i: u64 = 0;
+        for (i < total) {
+            var n: u64 = 0;
+            val e: *u8 = edit.history_entry(i, ?n);
+            var num: [20]u8;
+            val k: u64 = io.fmt_dec(i + 1, ?num[0]);
+            var pad: u64 = k;
+            for (pad < 5) {
+                write_to(out, " \0");
+                pad = pad + 1;
+            }
+            io.write_all(out, ?num[0], k);
+            write_to(out, "  \0");
+            io.write_all(out, e, n);
+            write_to(out, "\n\0");
+            i = i + 1;
+        }
+        status = 0;
+        ret 1;
+    }
+    if (io.streq(name, "time\0") != 0) { # time COMMAND...: how long it took
+        if (argc < 2) {
+            status = 0;
+            ret 1;
+        }
+        var text: [1024]u8;
+        var tl: u64 = 0;
+        var a: u64 = 1;
+        for (a < argc) {
+            val n: u64 = io.len(args[a]);
+            if (tl + n + 1 >= 1024) { brk; }
+            io.copy(?text[tl], args[a], n);
+            tl = tl + n;
+            text[tl] = 32;
+            tl = tl + 1;
+            a = a + 1;
+        }
+        var inf: abi.Info;
+        sys.info(?inf);
+        val t0: u64 = inf.uptime_ms;
+        val pid: u64 = sys.fork();
+        if (pid == 0) {
+            interactive = 0;
+            run_string(?text[0], tl);
+            sys.exit(status);
+        }
+        if (abi.is_err(pid) == 0) { status = sys.wait(pid); }
+        sys.info(?inf);
+        val ms: u64 = inf.uptime_ms - t0;
+        # on stderr, so it does not mix with the command's output
+        var tb: [40]u8;
+        var tk: u64 = io.fmt_dec(ms / 1000, ?tb[0]);
+        tb[tk] = 46;
+        tb[tk + 1] = 48 + ((ms / 100) % 10)::u8;
+        tb[tk + 2] = 48 + ((ms / 10) % 10)::u8;
+        tb[tk + 3] = 48 + (ms % 10)::u8;
+        tb[tk + 4] = 115;
+        tb[tk + 5] = 10;
+        io.err("\nreal  \0");
+        io.errn(?tb[0], tk + 6);
+        ret 1;
+    }
     if (io.streq(name, "wait\0") != 0) { # every background job (not the stopped)
         var i: u64 = 0;
         status = 0;
@@ -768,6 +832,7 @@ fun wait_job(j: *Job) {
 fun is_builtin(name: *u8) u8 {
     if (io.streq(name, "cd\0") != 0 || io.streq(name, "pwd\0") != 0 ||
         io.streq(name, "exit\0") != 0 || io.streq(name, "jobs\0") != 0 || io.streq(name, "wait\0") != 0 ||
+        io.streq(name, "history\0") != 0 || io.streq(name, "time\0") != 0 ||
         io.streq(name, "fg\0") != 0 || io.streq(name, "bg\0") != 0 ||
         io.streq(name, "export\0") != 0 || io.streq(name, "unset\0") != 0 ||
         io.streq(name, "set\0") != 0) { ret 1; }

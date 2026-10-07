@@ -27,6 +27,29 @@ pub fun add(lapic: u32) u64 {
     ret count - 1;
 }
 
+var idle: [16]u8;     # cpus halted with nothing to run
+
+pub fun set_idle(c: u64, v: u8) { idle[c] = v; }
+
+# something became runnable: wake one idle cpu (not this one) at once
+# instead of at its next timer tick
+pub fun kick() {
+    var i: u64 = 0;
+    for (i < count) {
+        if (idle[i] != 0 && i != holder && ready_or_first(i) != 0) {
+            idle[i] = 0;
+            apic.send_ipi(lapic_ids[i], apic.WAKE_VECTOR);
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+fun ready_or_first(i: u64) u8 {
+    if (i == 0) { ret 1; }
+    ret ready[i];
+}
+
 pub fun online() u64 {
     var n: u64 = 1;
     var i: u64 = 1;

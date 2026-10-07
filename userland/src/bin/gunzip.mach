@@ -1,0 +1,7 @@
+# gunzip: see userland/src/gz/cli.mach
+
+use rt: sdk.rt;
+use gz: userland.gz.cli;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 { ret gz.main(argc, argv, "gunzip\0", 1); }

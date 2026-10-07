@@ -5,8 +5,28 @@ use cpu:    machos.arch.x86_64.cpu;
 use serial: machos.dev.serial;
 use fbcon:  machos.dev.fbcon;
 
-# kernel messages: tty1 (and the serial port)
-pub fun putc(c: u8) { putc_to(0, c); }
+val LOG: u64 = 65536;
+var log: [65536]u8;  # the last LOG bytes of kernel messages, for dmesg
+var logged: u64 = 0; # bytes ever logged
+
+# kernel messages: tty1 (and the serial port), and the log
+pub fun putc(c: u8) {
+    log[logged % LOG] = c;
+    logged = logged + 1;
+    putc_to(0, c);
+}
+
+# copy the log (oldest first) into dst, at most n bytes; how many
+pub fun read_log(dst: *u8, n: u64) u64 {
+    var start: u64 = 0;
+    if (logged > LOG) { start = logged - LOG; }
+    var k: u64 = 0;
+    for (start + k < logged && k < n) {
+        dst[k] = log[(start + k) % LOG];
+        k = k + 1;
+    }
+    ret k;
+}
 
 # a byte for terminal `n`'s screen; tty1 is mirrored on the serial port
 pub fun putc_to(n: u64, c: u8) {

@@ -7,6 +7,7 @@ use vmm:  machos.mm.vmm;
 pub val TIMER_VECTOR:    u64 = 48;
 pub val IRQ_BASE:        u64 = 32; # legacy irq n arrives on vector 32 + n
 pub val SPURIOUS_VECTOR: u64 = 63;
+pub val WAKE_VECTOR:     u64 = 49; # an idle cpu is told there is work
 pub val HZ:              u64 = 100;
 
 #[volatile]
@@ -42,6 +43,14 @@ pub fun eoi() { lw(EOI, 0); }
 
 var calibrated: u8 = 1;
 var per_tick: u32 = 0;
+
+# send a fixed interrupt `vector` to the cpu with APIC id `id`
+pub fun send_ipi(id: u32, vector: u64) {
+    var spins: u64 = 0;
+    for ((lr(0x300) & (1 << 12)) != 0 && spins < 100000) { spins = spins + 1; } # last one delivered
+    lw(0x310, id << 24);
+    lw(0x300, vector::u32 | (1 << 14)); # fixed, assert
+}
 
 # this cpu's local APIC id
 pub fun id() u32 { ret lr(ID) >> 24; }

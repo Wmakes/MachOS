@@ -99,6 +99,14 @@ fun show_history(back: u64) {
     set_line(?hist[slot][0], hist_len[slot]);
 }
 
+# history entry `i` (0 = the oldest kept) and its length
+pub fun history_count() u64 { ret hist_count; }
+pub fun history_entry(i: u64, n: *u64) *u8 {
+    val at: u64 = (hist_next + HIST - hist_count + i) % HIST;
+    @n = hist_len[at];
+    ret ?hist[at][0];
+}
+
 pub fun remember(line: *u8, n: u64) {
     if (n == 0) { ret; }
     if (hist_count > 0) {

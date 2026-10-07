@@ -65,6 +65,7 @@ pub rec Proc {
     nmaps:     u64;
     mmap_next: u64;  # the next mapping goes below this
     pages:     u64;  # user pages mapped
+    cpu_ticks: u64;  # timer ticks spent running
     handles:   [64]u64;
     fdflags:   [64]u8; # FD_CLOEXEC per fd
     cwd:       [256]u8;
@@ -92,6 +93,22 @@ var sched_ksp: [16]u64;
 var running: [16]*Proc;
 
 pub fun current() *Proc { ret cur; }
+
+var busy: [16]u64;
+var all: [16]u64;
+
+# a timer tick on cpu `c`: whoever runs there gets it
+pub fun account(c: u64) {
+    all[c] = all[c] + 1;
+    val p: *Proc = running[c];
+    if (p != nil) {
+        p.cpu_ticks = p.cpu_ticks + 1;
+        busy[c] = busy[c] + 1;
+    }
+}
+
+pub fun busy_ticks(c: u64) u64 { ret busy[c]; }
+pub fun all_ticks(c: u64) u64 { ret all[c]; }
 
 # a cpu just entered the kernel (and holds the lock)
 pub fun entered() { cur = running[smp.me()]; }
@@ -216,6 +233,7 @@ pub fun start(p: *Proc, rip: u64, rsp: u64, rdi: u64, rsi: u64, rdx: u64) {
     @(sp::*u64) = 0x2;
     p.ksp = sp;
     p.state = RUNNABLE;
+    smp.kick();
 }
 
 # make `p` runnable as a copy of the process whose saved frame is `f` (with
@@ -236,6 +254,7 @@ pub fun start_copy(p: *Proc, f: *idt.Frame) {
     @(sp::*u64) = 0x2;
     p.ksp = sp;
     p.state = RUNNABLE;
+    smp.kick();
 }
 
 # give the cpu back to the scheduler loop; returns when picked again
@@ -257,11 +276,16 @@ pub fun sleep_on(chan: u64) {
 }
 
 pub fun wakeup(chan: u64) {
+    var woke: u8 = 0;
     var i: u64 = 0;
     for (i < MAX) {
-        if (table[i].state == BLOCKED && table[i].chan == chan) { table[i].state = RUNNABLE; }
+        if (table[i].state == BLOCKED && table[i].chan == chan) {
+            table[i].state = RUNNABLE;
+            woke = 1;
+        }
         i = i + 1;
     }
+    if (woke != 0) { smp.kick(); }
 }
 
 pub fun sleep_ticks(n: u64) {
@@ -275,7 +299,10 @@ pub fun tick() {
     var i: u64 = 0;
     for (i < MAX) {
         val p: *Proc = ?table[i];
-        if (p.state == BLOCKED && p.chan == CHAN_TIMER && p.wake_at <= ticks) { p.state = RUNNABLE; }
+        if (p.state == BLOCKED && p.chan == CHAN_TIMER && p.wake_at <= ticks) {
+            p.state = RUNNABLE;
+            smp.kick();
+        }
         if (p.alarm_at != 0 && p.alarm_at <= ticks && p.state != FREE) {
             p.alarm_at = 0;
             send(p, abi.SIGALRM);
@@ -400,9 +427,11 @@ pub fun scheduler(me: u64) {
         if (picked == nil) {
             # nothing to run: a good moment to put dirty disk blocks on the disk
             if (me == 0) { blk.sync(); }
+            smp.set_idle(me, 1);
             smp.unlock();
             cpu.wait();
             smp.lock();
+            smp.set_idle(me, 0);
             cur = nil;
             cnt;
         }

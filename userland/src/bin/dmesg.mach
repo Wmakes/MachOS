@@ -1,0 +1,14 @@
+# dmesg: the kernel's messages since boot (the last 64 KiB)
+
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+var buf: [65536]u8;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    val n: u64 = sys.klog(?buf[0], 65536);
+    io.outn(?buf[0], n);
+    ret 0;
+}

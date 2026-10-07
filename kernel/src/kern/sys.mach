@@ -771,6 +771,12 @@ fun sys_info(out: u64) u64 {
     i.screen_w = fbcon.width_of();
     i.screen_h = fbcon.height_of();
     cpu.brand(?i.cpu_name[0]);
+    var c: u64 = 0;
+    for (c < 16) {
+        i.cpu_busy[c] = proc.busy_ticks(c);
+        i.cpu_ticks[c] = proc.all_ticks(c);
+        c = c + 1;
+    }
     ret 0;
 }
 
@@ -789,6 +795,7 @@ fun sys_procs(idx: u64, out: u64) u64 {
                 pi.group = p.group;
                 pi.state = p.state;
                 pi.pages = p.pages;
+                pi.cpu_ticks = p.cpu_ticks;
                 pi.name_len = p.name_len;
                 mem.copy((?pi.name[0])::u64, (?p.name[0])::u64, p.name_len);
                 ret 1;
@@ -1179,6 +1186,10 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
         ret mmap.mmap(cur(), a, b, c & 0xFF, c >> 8, fh, f5);
     }
     if (n == abi.MUNMAP)  { ret mmap.munmap(cur(), a, b); }
+    if (n == abi.KLOG) {
+        if (ok(a, b, 1) == 0) { ret e(abi.E_FAULT); }
+        ret kprint.read_log(a::*u8, b);
+    }
     if (n == abi.MPROTECT) { ret mmap.mprotect(cur(), a, b, c); }
     if (n == abi.SETFG) {
         tty.set_foreground(0, a);

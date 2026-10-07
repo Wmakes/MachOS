@@ -129,6 +129,9 @@ pub fun tty_number(h: u64) u64 {
     ret 0;
 }
 
+# the kernel's messages (the last 64 KiB) into buf; how many bytes
+pub fun klog(buf: *u8, n: u64) u64 { ret raw(abi.KLOG, buf::u64, n, 0, 0, 0); }
+
 pub fun info(out: *abi.Info) u64 { ret raw(abi.INFO, out::u64, 0, 0, 0, 0); }
 pub fun getpid() u64 { ret raw(abi.GETPID, 0, 0, 0, 0, 0); }
 pub fun procs(idx: u64, out: *abi.ProcInfo) u64 { ret raw(abi.PROCS, idx, out::u64, 0, 0, 0); }

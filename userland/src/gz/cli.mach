@@ -1,0 +1,166 @@
+# the gzip and gunzip commands (one program, two names)
+#   gzip [-d] [-c] [-k] [FILE...]   FILE -> FILE.gz (the original goes, unless -k)
+#   gunzip [-c] [-k] [FILE...]      FILE.gz -> FILE
+# -c writes to standard output and keeps the file; with no FILE, standard
+# input goes to standard output
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use dfl: userland.gz.deflate;
+
+val IN_MAX: u64 = 0x100000000;   # 4 GiB reserved for an input
+val OUT_MAX: u64 = 0x400000000;  # 16 GiB for an output (pages only as used)
+
+var prog: *u8 = nil;
+var decompress: u8 = 0;
+var to_stdout: u8 = 0;
+var keep: u8 = 0;
+
+fun complain(path: *u8, what: *u8) {
+    io.err(prog);
+    io.err(": \0");
+    if (path != nil) {
+        io.err(path);
+        io.err(": \0");
+    }
+    io.err(what);
+    io.err("\n\0");
+}
+
+# transform handle `h` into handle `o`; whether it worked
+fun run(h: u64, o: u64, name: *u8) u8 {
+    var inb: dfl.Buf;
+    var outb: dfl.Buf;
+    if (dfl.buf_new(?inb, IN_MAX) == 0 || dfl.buf_new(?outb, OUT_MAX) == 0) {
+        complain(name, "out of memory\0");
+        ret 0;
+    }
+    var ok: u8 = 1;
+    if (dfl.read_all(h, ?inb) == 0) {
+        complain(name, "cannot read it (or it is over 4 GiB)\0");
+        ok = 0;
+    } or (decompress != 0) {
+        val why: *u8 = dfl.gunzip(inb.base::*u8, inb.len, ?outb);
+        if (why != nil) {
+            complain(name, why);
+            ok = 0;
+        }
+    } or {
+        if (dfl.gzip(inb.base::*u8, inb.len, ?outb) == 0) {
+            complain(name, "out of memory\0");
+            ok = 0;
+        }
+    }
+    if (ok != 0 && io.write_all(o, outb.base::*u8, outb.len) == 0) {
+        complain(name, "writing failed\0");
+        ok = 0;
+    }
+    dfl.buf_free(?inb);
+    dfl.buf_free(?outb);
+    ret ok;
+}
+
+fun ends_gz(p: *u8, n: u64) u8 {
+    if (n < 4) { ret 0; }
+    ret io.eq(?p[n - 3], 3, ".gz\0", 3);
+}
+
+fun one(path: *u8) u8 {
+    val n: u64 = io.len(path);
+    var st: abi.Stat;
+    val sr: u64 = sys.stat(path, n, ?st);
+    if (abi.is_err(sr) != 0) {
+        complain(path, abi.err_name(sr));
+        ret 0;
+    }
+    if (st.kind != abi.KIND_FILE) {
+        complain(path, "not a regular file\0");
+        ret 0;
+    }
+    var target: [256]u8;
+    var tn: u64 = 0;
+    if (to_stdout == 0) {
+        if (decompress != 0) {
+            if (ends_gz(path, n) == 0) {
+                complain(path, "does not end in .gz\0");
+                ret 0;
+            }
+            tn = n - 3;
+            io.copy(?target[0], path, tn);
+        } or {
+            if (ends_gz(path, n) != 0) {
+                complain(path, "already has the .gz suffix\0");
+                ret 0;
+            }
+            if (n + 4 > 255) {
+                complain(path, "name too long\0");
+                ret 0;
+            }
+            io.copy(?target[0], path, n);
+            io.copy(?target[n], ".gz\0", 3);
+            tn = n + 3;
+        }
+        target[tn] = 0;
+    }
+    val h: u64 = sys.open(path, n, abi.O_READ);
+    if (abi.is_err(h) != 0) {
+        complain(path, abi.err_name(h));
+        ret 0;
+    }
+    var o: u64 = abi.STDOUT;
+    if (to_stdout == 0) {
+        o = sys.open_mode(?target[0], tn, abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC, st.mode & 0xFFF);
+        if (abi.is_err(o) != 0) {
+            complain(?target[0], abi.err_name(o));
+            sys.close(h);
+            ret 0;
+        }
+    }
+    val worked: u8 = run(h, o, path);
+    sys.close(h);
+    if (to_stdout == 0) {
+        sys.close(o);
+        if (worked == 0) { sys.remove(?target[0], tn); }
+        or (keep == 0) { sys.remove(path, n); }
+    }
+    ret worked;
+}
+
+pub fun main(argc: u64, argv: **u8, name: *u8, unzip: u8) u64 {
+    prog = name;
+    decompress = unzip;
+    var i: u64 = 1;
+    for (i < argc && argv[i][0] == 45 && argv[i][1] != 0) {
+        var k: u64 = 1;
+        for (argv[i][k] != 0) {
+            val c: u8 = argv[i][k];
+            if (c == 100) { decompress = 1; }
+            or (c == 99) { to_stdout = 1; }
+            or (c == 107) { keep = 1; }
+            or {
+                io.err("usage: \0");
+                io.err(prog);
+                io.err(" [-d] [-c] [-k] [FILE...]\n\0");
+                ret 2;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    if (i == argc) {
+        if (decompress == 0 && sys.isatty(abi.STDOUT) != 0) {
+            complain(nil, "compressed data not written to a terminal (use -c, or redirect)\0");
+            ret 1;
+        }
+        if (run(abi.STDIN, abi.STDOUT, "stdin\0") == 0) { ret 1; }
+        ret 0;
+    }
+    var failed: u64 = 0;
+    for (i < argc) {
+        if (one(argv[i]) == 0) { failed = failed + 1; }
+        i = i + 1;
+    }
+    if (failed > 0) { ret 1; }
+    ret 0;
+}

@@ -65,7 +65,8 @@ pub val ACCESS:  u64 = 58; # (path, path_len, R_OK|W_OK|X_OK)      with the real
 pub val MMAP:    u64 = 59; # (addr, len, prot | flags << 8, handle, offset) -> the address
 pub val MUNMAP:  u64 = 60; # (addr, len)
 pub val MPROTECT: u64 = 61; # (addr, len, prot)
-pub val COUNT:   u64 = 62;
+pub val KLOG:    u64 = 62; # (buf, len)                           -> bytes: the kernel's messages
+pub val COUNT:   u64 = 63;
 
 # mmap: what the pages allow, and what kind of mapping. anonymous pages
 # start zeroed and only take memory once touched; a file mapping is a
@@ -305,6 +306,8 @@ pub rec Info {
     screen_w:  u64;     # the console's pixels, 0 without a framebuffer
     screen_h:  u64;
     cpu_name:  [48]u8;  # the processor's name, NUL padded
+    cpu_busy:  [16]u64; # per core: timer ticks spent running a program
+    cpu_ticks: [16]u64; # per core: timer ticks in all
 }
 
 # the terminal's modes (POSIX termios, local flags only). the default is
@@ -339,6 +342,7 @@ pub rec ProcInfo {
     group:    u64;
     state:    u64;
     pages:    u64; # user pages mapped
+    cpu_ticks: u64; # timer ticks it was running on a core (100 a second)
     name_len: u64;
     name:     [32]u8;
 }

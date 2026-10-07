@@ -74,12 +74,62 @@ fun entry(p: *Part, b: u64, load: u8) *Entry {
     }
     e.part = nil;
     if (load != 0) {
-        if (dsk.read(p.disk, p.start + b * SPB, SPB, e.data) == 0) { ret nil; }
+        if (read_ahead(p, b, e) == 0) {
+            if (dsk.read(p.disk, p.start + b * SPB, SPB, e.data) == 0) { ret nil; }
+        }
         reads = reads + 1;
     }
     e.part = p;
     e.block = b;
     ret e;
+}
+
+val AHEAD: u64 = 8; # blocks fetched by one disk command
+var ahead_buf: u64 = 0;
+
+# fetch `b` and the blocks after it in one command: `b` into `e`, the
+# others into their own slots when those hold nothing that needs writing.
+# 0 when it could not (the caller reads `b` alone)
+fun read_ahead(p: *Part, b: u64, e: *Entry) u8 {
+    var n: u64 = AHEAD;
+    if (b + n > blocks(p)) { n = blocks(p) - b; }
+    if (n < 2) { ret 0; }
+    if (ahead_buf == 0) {
+        ahead_buf = heap.alloc(AHEAD * BS);
+        if (ahead_buf == 0) { ret 0; }
+    }
+    if (dsk.read(p.disk, p.start + b * SPB, n * SPB, ahead_buf) == 0) { ret 0; }
+    mem.copy(e.data, ahead_buf, BS);
+    var k: u64 = 1;
+    for (k < n) {
+        val o: *Entry = slot_of(p, b + k);
+        val same: u8 = (o.data != 0 && o.part == p && o.block == b + k)::u8;
+        # never overwrite a cached copy (it may be newer) or a dirty block
+        if (o != e && same == 0 && o.dirty == 0) {
+            if (o.data == 0) { o.data = heap.alloc(BS); }
+            if (o.data != 0) {
+                mem.copy(o.data, ahead_buf + k * BS, BS);
+                o.part = p;
+                o.block = b + k;
+            }
+        }
+        k = k + 1;
+    }
+    ret 1;
+}
+
+# block `b`'s bytes in the cache, to read or change in place (then call
+# changed()); valid only until the next block operation. 0 on error
+pub fun peek(p: *Part, b: u64) u64 {
+    val e: *Entry = entry(p, b, 1);
+    if (e == nil) { ret 0; }
+    ret e.data;
+}
+
+# the block peek() returned was changed
+pub fun changed(p: *Part, b: u64) {
+    val e: *Entry = slot_of(p, b);
+    if (e.data != 0 && e.part == p && e.block == b) { mark(e); }
 }
 
 fun mark(e: *Entry) {

@@ -260,22 +260,20 @@ fun free_inode(fs: *Fs, ino: u64, dir: u8) {
 
 # entry `idx` of indirect block `b`, allocating it when `create`; 0 = hole
 fun slot(fs: *Fs, b: u64, idx: u64, create: u8, i: *Inode, goal: u64) u64 {
-    val buf: u64 = heap.alloc(BS);
-    if (buf == 0) { ret 0; }
-    var v: u64 = 0;
-    if (blk.read(fs.part, b, buf) != 0) {
-        val t: *u32 = buf::*u32;
-        v = t[idx]::u64;
-        if (v == 0 && create != 0) {
-            v = alloc_block(fs, goal);
-            if (v != 0) {
-                t[idx] = v::u32;
-                blk.write(fs.part, b, buf);
-                i.blocks = i.blocks + 8;
-            }
+    val d: u64 = blk.peek(fs.part, b); # read in place: no copy
+    if (d == 0) { ret 0; }
+    var v: u64 = (@((d + idx * 4)::*u32))::u64;
+    if (v == 0 && create != 0) {
+        v = alloc_block(fs, goal);
+        if (v != 0) {
+            # allocating touched other blocks: look the cached one up again
+            val d2: u64 = blk.peek(fs.part, b);
+            if (d2 == 0) { ret 0; }
+            @((d2 + idx * 4)::*u32) = v::u32;
+            blk.changed(fs.part, b);
+            i.blocks = i.blocks + 8;
         }
     }
-    heap.free(buf);
     ret v;
 }
 

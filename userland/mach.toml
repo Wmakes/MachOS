@@ -51,6 +51,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.calc]
+kind = "bin"
+entry = "bin/calc.mach"
+out = "bin/calc"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.cat]
 kind = "bin"
 entry = "bin/cat.mach"
@@ -131,6 +139,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.dmesg]
+kind = "bin"
+entry = "bin/dmesg.mach"
+out = "bin/dmesg"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.du]
 kind = "bin"
 entry = "bin/du.mach"
@@ -207,6 +223,22 @@ need = []
 kind = "bin"
 entry = "bin/grep.mach"
 out = "bin/grep"
+targets = ["machos"]
+link = []
+need = []
+
+[artifact.gunzip]
+kind = "bin"
+entry = "bin/gunzip.mach"
+out = "bin/gunzip"
+targets = ["machos"]
+link = []
+need = []
+
+[artifact.gzip]
+kind = "bin"
+entry = "bin/gzip.mach"
+out = "bin/gzip"
 targets = ["machos"]
 link = []
 need = []
@@ -475,6 +507,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.tar]
+kind = "bin"
+entry = "bin/tar.mach"
+out = "bin/tar"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.tee]
 kind = "bin"
 entry = "bin/tee.mach"
@@ -487,6 +527,14 @@ need = []
 kind = "bin"
 entry = "bin/test.mach"
 out = "bin/test"
+targets = ["machos"]
+link = []
+need = []
+
+[artifact.top]
+kind = "bin"
+entry = "bin/top.mach"
+out = "bin/top"
 targets = ["machos"]
 link = []
 need = []

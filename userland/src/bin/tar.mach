@@ -1,0 +1,426 @@
+# tar -c|-x|-t [-v] -f ARCHIVE [PATH...]: ustar archives.
+#   -c  create ARCHIVE from the PATHs (directories with all inside)
+#   -x  extract it here (leading / is dropped from names)
+#   -t  list what is in it
+#   -v  name each file on the way
+# ARCHIVE `-` is standard input / output, so `tar -cf - dir | gzip > d.tgz`
+# and `gunzip -c d.tgz | tar -xf -` work. options may be joined: -cvf
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+var mode: u8 = 0;      # 99 c, 120 x, 116 t
+var verbose: u8 = 0;
+var arch: u64 = 0;     # the archive's handle
+var failures: u64 = 0;
+
+var hdr: [512]u8;
+var blockbuf: [65536]u8;
+
+fun complain(what: *u8, path: *u8, e: u64) {
+    io.err("tar: \0");
+    io.err(path);
+    io.err(": \0");
+    if (e != 0) { io.err(abi.err_name(e)); }
+    or          { io.err(what); }
+    io.err("\n\0");
+    failures = failures + 1;
+}
+
+# --- writing --------------------------------------------------------------
+
+fun write_all(buf: *u8, n: u64) u8 { ret io.write_all(arch, buf, n); }
+
+fun octal(at: *u8, width: u64, v: u64) {
+    # width-1 digits, then NUL
+    var k: u64 = width - 1;
+    var x: u64 = v;
+    at[k] = 0;
+    for (k > 0) {
+        k = k - 1;
+        at[k] = 48 + (x & 7)::u8;
+        x = x >> 3;
+    }
+}
+
+fun header(name: *u8, nlen: u64, kind: u8, size: u64, st: *abi.Stat) u8 {
+    var i: u64 = 0;
+    for (i < 512) {
+        hdr[i] = 0;
+        i = i + 1;
+    }
+    # names up to 100 bytes go in name; longer ones split at a / into prefix
+    if (nlen <= 100) {
+        io.copy(?hdr[0], name, nlen);
+    } or {
+        var cut: u64 = nlen;
+        for (cut > 0 && (name[cut - 1] != 47 || nlen - cut > 100 || cut - 1 > 155)) { cut = cut - 1; }
+        if (cut == 0) { ret 0; }
+        io.copy(?hdr[345], name, cut - 1);
+        io.copy(?hdr[0], ?name[cut], nlen - cut);
+    }
+    octal(?hdr[100], 8, st.mode & 0xFFF);
+    octal(?hdr[108], 8, st.uid);
+    octal(?hdr[116], 8, st.gid);
+    octal(?hdr[124], 12, size);
+    octal(?hdr[136], 12, st.mtime);
+    hdr[156] = kind;
+    io.copy(?hdr[257], "ustar\0", 6);
+    hdr[263] = 48;
+    hdr[264] = 48;
+    # the checksum counts its own field as spaces
+    i = 148;
+    for (i < 156) {
+        hdr[i] = 32;
+        i = i + 1;
+    }
+    var sum: u64 = 0;
+    i = 0;
+    for (i < 512) {
+        sum = sum + hdr[i]::u64;
+        i = i + 1;
+    }
+    octal(?hdr[148], 7, sum);
+    hdr[155] = 32;
+    ret write_all(?hdr[0], 512);
+}
+
+fun add(path: *u8, plen: u64) {
+    var st: abi.Stat;
+    val r: u64 = sys.stat(path, plen, ?st);
+    if (abi.is_err(r) != 0) {
+        complain("\0", path, r);
+        ret;
+    }
+    # names in the archive never start with /
+    var name: *u8 = path;
+    var nlen: u64 = plen;
+    for (nlen > 1 && name[0] == 47) {
+        name = ?name[1];
+        nlen = nlen - 1;
+    }
+    if (st.kind == abi.KIND_DIR) {
+        var dn: [256]u8;
+        io.copy(?dn[0], name, nlen);
+        var dl: u64 = nlen;
+        if (dl > 0 && dn[dl - 1] != 47) {
+            dn[dl] = 47;
+            dl = dl + 1;
+        }
+        if (dl != 1 || dn[0] != 47) {
+            if (header(?dn[0], dl, 53, 0, ?st) == 0) { complain("name too long\0", path, 0); ret; }
+            if (verbose != 0) { io.errn(?dn[0], dl); io.err("\n\0"); }
+        }
+        val h: u64 = sys.open(path, plen, abi.O_READ);
+        if (abi.is_err(h) != 0) {
+            complain("\0", path, h);
+            ret;
+        }
+        var i: u64 = 0;
+        for {
+            var e: abi.Entry;
+            val got: u64 = sys.readdir(h, i, ?e);
+            if (abi.is_err(got) != 0 || got == 0) { brk; }
+            i = i + 1;
+            if ((e.name_len == 1 && e.name[0] == 46) || (e.name_len == 2 && e.name[0] == 46 && e.name[1] == 46)) { cnt; }
+            var child: [256]u8;
+            var cl: u64 = plen;
+            if (cl + e.name_len + 2 > 255) {
+                complain("path too long\0", path, 0);
+                cnt;
+            }
+            io.copy(?child[0], path, plen);
+            if (cl > 0 && child[cl - 1] != 47) {
+                child[cl] = 47;
+                cl = cl + 1;
+            }
+            io.copy(?child[cl], ?e.name[0], e.name_len);
+            cl = cl + e.name_len;
+            child[cl] = 0;
+            add(?child[0], cl);
+        }
+        sys.close(h);
+        ret;
+    }
+    if (st.kind != abi.KIND_FILE) { ret; } # devices are not archived
+    val h: u64 = sys.open(path, plen, abi.O_READ);
+    if (abi.is_err(h) != 0) {
+        complain("\0", path, h);
+        ret;
+    }
+    if (header(name, nlen, 48, st.size, ?st) == 0) {
+        complain("name too long\0", path, 0);
+        sys.close(h);
+        ret;
+    }
+    if (verbose != 0) { io.errn(name, nlen); io.err("\n\0"); }
+    var left: u64 = st.size;
+    for (left > 0) {
+        var want: u64 = 65536;
+        if (want > left) { want = left; }
+        val got: u64 = sys.read(h, ?blockbuf[0], want);
+        if (abi.is_err(got) != 0 || got == 0) { brk; }
+        write_all(?blockbuf[0], got);
+        left = left - got;
+    }
+    # a file that shrank meanwhile is padded with zeros to its stated size
+    var k: u64 = 0;
+    for (k < 65536) {
+        blockbuf[k] = 0;
+        k = k + 1;
+    }
+    for (left > 0) {
+        var n: u64 = 65536;
+        if (n > left) { n = left; }
+        write_all(?blockbuf[0], n);
+        left = left - n;
+    }
+    val pad: u64 = (512 - st.size % 512) % 512;
+    write_all(?blockbuf[0], pad);
+    sys.close(h);
+}
+
+# --- reading --------------------------------------------------------------
+
+# exactly n bytes from the archive (pipes come in pieces); whether all came
+fun read_exact(buf: *u8, n: u64) u8 {
+    var got: u64 = 0;
+    for (got < n) {
+        val r: u64 = sys.read(arch, ?buf[got], n - got);
+        if (abi.is_err(r) != 0 || r == 0) { ret 0; }
+        got = got + r;
+    }
+    ret 1;
+}
+
+fun parse_octal(at: *u8, width: u64) u64 {
+    var v: u64 = 0;
+    var i: u64 = 0;
+    for (i < width && (at[i] == 32 || at[i] == 0)) { i = i + 1; }
+    for (i < width && at[i] >= 48 && at[i] <= 55) {
+        v = v * 8 + (at[i] - 48)::u64;
+        i = i + 1;
+    }
+    ret v;
+}
+
+fun cstr_len(at: *u8, max: u64) u64 {
+    var n: u64 = 0;
+    for (n < max && at[n] != 0) { n = n + 1; }
+    ret n;
+}
+
+# make the directories leading to `p` (all but its last part)
+fun make_parents(p: *u8, n: u64) {
+    var i: u64 = 1;
+    for (i < n) {
+        if (p[i] == 47) { sys.mkdir(p, i); }
+        i = i + 1;
+    }
+}
+
+fun skip_bytes(n: u64) u8 {
+    var left: u64 = n;
+    for (left > 0) {
+        var k: u64 = 65536;
+        if (k > left) { k = left; }
+        if (read_exact(?blockbuf[0], k) == 0) { ret 0; }
+        left = left - k;
+    }
+    ret 1;
+}
+
+fun extract() {
+    var zeros: u64 = 0;
+    for {
+        if (read_exact(?hdr[0], 512) == 0) { brk; }
+        var empty: u8 = 1;
+        var i: u64 = 0;
+        for (i < 512) {
+            if (hdr[i] != 0) { empty = 0; brk; }
+            i = i + 1;
+        }
+        if (empty != 0) {
+            zeros = zeros + 1;
+            if (zeros == 2) { brk; }
+            cnt;
+        }
+        zeros = 0;
+        # check the header's sum before trusting it
+        var sum: u64 = 0;
+        i = 0;
+        for (i < 512) {
+            if (i >= 148 && i < 156) { sum = sum + 32; }
+            or { sum = sum + hdr[i]::u64; }
+            i = i + 1;
+        }
+        if (sum != parse_octal(?hdr[148], 8)) {
+            io.err("tar: this is not a tar archive (or it is damaged)\n\0");
+            failures = failures + 1;
+            brk;
+        }
+        var name: [260]u8;
+        var nl: u64 = 0;
+        val pl: u64 = cstr_len(?hdr[345], 155);
+        if (pl > 0 && io.eq(?hdr[257], 5, "ustar\0", 5) != 0) {
+            io.copy(?name[0], ?hdr[345], pl);
+            name[pl] = 47;
+            nl = pl + 1;
+        }
+        val bl: u64 = cstr_len(?hdr[0], 100);
+        io.copy(?name[nl], ?hdr[0], bl);
+        nl = nl + bl;
+        # no absolute paths, no climbing out with ..
+        var start: u64 = 0;
+        for (start < nl && name[start] == 47) { start = start + 1; }
+        var unsafe: u8 = 0;
+        i = start;
+        for (i + 1 < nl) {
+            if (name[i] == 46 && name[i + 1] == 46 && (i == start || name[i - 1] == 47) && (i + 2 == nl || name[i + 2] == 47)) { unsafe = 1; }
+            i = i + 1;
+        }
+        val p: *u8 = ?name[start];
+        var pn: u64 = nl - start;
+        name[nl] = 0;
+        val size: u64 = parse_octal(?hdr[124], 12);
+        val fmode: u64 = parse_octal(?hdr[100], 8) & 0xFFF;
+        val kind: u8 = hdr[156];
+        val padded: u64 = (size + 511) & ~511::u64;
+
+        if (mode == 116) { # list
+            if (verbose != 0) {
+                io.dec_pad(size, 10);
+                io.out("  \0");
+            }
+            io.outn(p, pn);
+            io.putc(10);
+            if (skip_bytes(padded) == 0) { brk; }
+            cnt;
+        }
+        if (unsafe != 0 || pn == 0) {
+            io.err("tar: skipping unsafe name \0");
+            io.errn(?name[0], nl);
+            io.err("\n\0");
+            if (skip_bytes(padded) == 0) { brk; }
+            cnt;
+        }
+        if (verbose != 0) {
+            io.outn(p, pn);
+            io.putc(10);
+        }
+        if (kind == 53) { # directory
+            for (pn > 1 && p[pn - 1] == 47) { pn = pn - 1; }
+            make_parents(p, pn);
+            sys.mkdir_mode(p, pn, fmode);
+            if (skip_bytes(padded) == 0) { brk; }
+            cnt;
+        }
+        if (kind != 48 && kind != 0) { # links and the like: not supported
+            if (skip_bytes(padded) == 0) { brk; }
+            cnt;
+        }
+        make_parents(p, pn);
+        val h: u64 = sys.open_mode(p, pn, abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC, fmode);
+        if (abi.is_err(h) != 0) {
+            complain("\0", p, h);
+            if (skip_bytes(padded) == 0) { brk; }
+            cnt;
+        }
+        var left: u64 = padded;
+        var data: u64 = size;
+        var broken: u8 = 0;
+        for (left > 0) {
+            var k: u64 = 65536;
+            if (k > left) { k = left; }
+            if (read_exact(?blockbuf[0], k) == 0) { broken = 1; brk; }
+            var w: u64 = k;
+            if (w > data) { w = data; }
+            io.write_all(h, ?blockbuf[0], w);
+            data = data - w;
+            left = left - k;
+        }
+        sys.close(h);
+        sys.chmod(p, pn, fmode);
+        if (broken != 0) {
+            io.err("tar: the archive ends too early\n\0");
+            failures = failures + 1;
+            brk;
+        }
+    }
+}
+
+fun usage() u64 {
+    io.err("usage: tar -c|-x|-t [-v] -f ARCHIVE [PATH...]\n\0");
+    ret 2;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var file: *u8 = nil;
+    var i: u64 = 1;
+    var want_file: u8 = 0;
+    for (i < argc && argv[i][0] == 45 && argv[i][1] != 0) {
+        val a: *u8 = argv[i];
+        var k: u64 = 1;
+        for (a[k] != 0) {
+            val c: u8 = a[k];
+            if (c == 99 || c == 120 || c == 116) {
+                if (mode != 0 && mode != c) { ret usage(); }
+                mode = c;
+            } or (c == 118) { verbose = 1; }
+            or (c == 102) { want_file = 1; }
+            or (c == 122) {
+                io.err("tar: no -z: pipe through gzip / gunzip instead\n\0");
+                ret 2;
+            } or { ret usage(); }
+            k = k + 1;
+        }
+        i = i + 1;
+        if (want_file != 0) {
+            if (i >= argc) { ret usage(); }
+            file = argv[i];
+            want_file = 0;
+            i = i + 1;
+        }
+    }
+    if (mode == 0 || file == nil) { ret usage(); }
+    val stdio: u8 = io.streq(file, "-\0");
+    if (mode == 99) {
+        if (i >= argc) { ret usage(); }
+        arch = abi.STDOUT;
+        if (stdio == 0) {
+            arch = sys.open(file, io.len(file), abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC);
+            if (abi.is_err(arch) != 0) {
+                complain("\0", file, arch);
+                ret 1;
+            }
+        }
+        for (i < argc) {
+            add(argv[i], io.len(argv[i]));
+            i = i + 1;
+        }
+        # the end: two zero blocks, padded to 10 KiB records
+        var z: u64 = 0;
+        for (z < 1024) {
+            blockbuf[z] = 0;
+            z = z + 1;
+        }
+        write_all(?blockbuf[0], 1024);
+        if (stdio == 0) { sys.close(arch); }
+    } or {
+        arch = abi.STDIN;
+        if (stdio == 0) {
+            arch = sys.open(file, io.len(file), abi.O_READ);
+            if (abi.is_err(arch) != 0) {
+                complain("\0", file, arch);
+                ret 1;
+            }
+        }
+        extract();
+        if (stdio == 0) { sys.close(arch); }
+    }
+    if (failures > 0) { ret 1; }
+    ret 0;
+}

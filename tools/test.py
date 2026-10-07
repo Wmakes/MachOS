@@ -151,6 +151,17 @@ TESTS = [
       "keys:echo again<ret>", "wait:" + P],
      ["usb: 1 xhci controller(s), 0 keyboard(s)", "plugged_in\nroot", "via_hub\nroot", "again\nroot"]),
 
+    # 0.7.1's programs on four cores: tar and gzip round trip, calc, dmesg,
+    # top, time, history
+    ("new-tools", False, True,
+     ["--qemu=-smp", "--qemu=4", "wait:" + P,
+      "send:calc 2+3*4; calc '(1<<40) / 3'; calc 7 % -3\\n", "wait:" + P,
+      "send:cp -r /etc /tmp/e; tar -cf /tmp/e.tar /tmp/e; gzip /tmp/e.tar; ls /tmp\\n", "wait:" + P,
+      "send:mkdir /root/x; cd /root/x; gunzip -c /tmp/e.tar.gz | tar -xvf -; diff /etc/motd tmp/e/motd && echo same\\n", "wait:" + P,
+      "send:gzip -c /bin/ls > /root/ls.gz; gunzip /root/ls.gz; test \"$(sha256sum < /bin/ls)\" = \"$(sha256sum < /root/ls)\" && echo binsame\\n", "wait:" + P,
+      "send:dmesg | grep smp; top -n 1 | grep cpu3; time true; history | grep -c calc\\n", "wait:" + P],
+     ["14", "366503875925", "1\n", "e.tar.gz", "tmp/e/motd", "same", "binsame", "smp: 4 cpu(s)", "cpu3", "real", "\n1\n"]),
+
     ("tools", False, False,
      ["wait:" + P,
       "send:printf 'pear\\\\napple\\\\nfig\\\\napple\\\\n' > /tmp/f; sort -u /tmp/f | tr a-z A-Z; seq 1 20 | sort -n -r | head -2\\n",

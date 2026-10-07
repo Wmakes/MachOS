@@ -1,0 +1,255 @@
+# calc [EXPRESSION...]: integer arithmetic. with no expression, reads one
+# per line (an empty line or ^D ends). 64-bit signed integers;
+#   + - * / % **   & | ^ ~ << >>   ( )   123  0x7f  0b101
+# prints the result in decimal, and in hex too when it is not small
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+var src: [1024]u8;
+var len: u64 = 0;
+var pos: u64 = 0;
+var bad: *u8 = nil;   # the first error, nil while fine
+
+val MIN: u64 = 0x8000000000000000;
+
+fun neg(v: u64) u64 { ret 0 - v; }
+fun is_neg(v: u64) u8 { ret ((v & MIN) != 0)::u8; }
+fun abs(v: u64) u64 {
+    if (is_neg(v) != 0) { ret neg(v); }
+    ret v;
+}
+
+fun fail(why: *u8) {
+    if (bad == nil) { bad = why; }
+}
+
+fun skip() {
+    for (pos < len && (src[pos] == 32 || src[pos] == 9)) { pos = pos + 1; }
+}
+
+fun peek() u8 {
+    skip();
+    if (pos < len) { ret src[pos]; }
+    ret 0;
+}
+
+fun digit(c: u8, base: u64) u64 {
+    var d: u64 = 99;
+    if (c >= 48 && c <= 57) { d = (c - 48)::u64; }
+    or (c >= 97 && c <= 102) { d = (c - 87)::u64; }
+    or (c >= 65 && c <= 70) { d = (c - 55)::u64; }
+    if (d >= base) { ret 99; }
+    ret d;
+}
+
+fun number() u64 {
+    var base: u64 = 10;
+    if (pos + 1 < len && src[pos] == 48 && (src[pos + 1] == 120 || src[pos + 1] == 88)) {
+        base = 16;
+        pos = pos + 2;
+    } or (pos + 1 < len && src[pos] == 48 && (src[pos + 1] == 98 || src[pos + 1] == 66)) {
+        base = 2;
+        pos = pos + 2;
+    }
+    var v: u64 = 0;
+    var any: u8 = 0;
+    for (pos < len && digit(src[pos], base) != 99) {
+        v = v * base + digit(src[pos], base);
+        pos = pos + 1;
+        any = 1;
+    }
+    if (any == 0) { fail("expected a number\0"); }
+    ret v;
+}
+
+fun primary() u64 {
+    val c: u8 = peek();
+    if (c == 40) {
+        pos = pos + 1;
+        val v: u64 = expr();
+        if (peek() != 41) { fail("missing )\0"); }
+        or { pos = pos + 1; }
+        ret v;
+    }
+    if (c == 45) { pos = pos + 1; ret neg(unary()); }
+    if (c == 43) { pos = pos + 1; ret unary(); }
+    if (c == 126) { pos = pos + 1; ret ~unary(); }
+    if (c >= 48 && c <= 57) { ret number(); }
+    if (c == 0) { fail("unexpected end\0"); }
+    or { fail("unexpected character\0"); }
+    pos = len;
+    ret 0;
+}
+
+fun unary() u64 { ret power(); }
+
+# ** binds tightest and to the right
+fun power() u64 {
+    val b: u64 = primary();
+    if (peek() == 42 && pos + 1 < len && src[pos + 1] == 42) {
+        pos = pos + 2;
+        val e: u64 = unary();
+        if (is_neg(e) != 0) {
+            fail("negative exponent\0");
+            ret 0;
+        }
+        var r: u64 = 1;
+        var k: u64 = 0;
+        for (k < e && k < 4096) {
+            r = r * b;
+            k = k + 1;
+        }
+        ret r;
+    }
+    ret b;
+}
+
+fun term() u64 {
+    var v: u64 = unary();
+    for {
+        val c: u8 = peek();
+        if (c == 42 && (pos + 1 >= len || src[pos + 1] != 42)) {
+            pos = pos + 1;
+            v = v * unary();
+        } or (c == 47 || c == 37) {
+            pos = pos + 1;
+            val d: u64 = unary();
+            if (d == 0) {
+                fail("division by zero\0");
+                ret 0;
+            }
+            var q: u64 = abs(v) / abs(d);
+            var r: u64 = abs(v) % abs(d);
+            if (is_neg(v) != is_neg(d)) { q = neg(q); }
+            if (is_neg(v) != 0) { r = neg(r); }
+            if (c == 47) { v = q; } or { v = r; }
+        } or { brk; }
+    }
+    ret v;
+}
+
+fun sum() u64 {
+    var v: u64 = term();
+    for {
+        val c: u8 = peek();
+        if (c == 43) { pos = pos + 1; v = v + term(); }
+        or (c == 45) { pos = pos + 1; v = v - term(); }
+        or { brk; }
+    }
+    ret v;
+}
+
+fun shift() u64 {
+    var v: u64 = sum();
+    for {
+        val c: u8 = peek();
+        if (c == 60 && pos + 1 < len && src[pos + 1] == 60) {
+            pos = pos + 2;
+            v = v << (sum() & 63);
+        } or (c == 62 && pos + 1 < len && src[pos + 1] == 62) {
+            pos = pos + 2;
+            v = v >> (sum() & 63);
+        } or { brk; }
+    }
+    ret v;
+}
+
+fun bit_and() u64 {
+    var v: u64 = shift();
+    for (peek() == 38) { pos = pos + 1; v = v & shift(); }
+    ret v;
+}
+
+fun bit_xor() u64 {
+    var v: u64 = bit_and();
+    for (peek() == 94) { pos = pos + 1; v = v ^ bit_and(); }
+    ret v;
+}
+
+fun expr() u64 {
+    var v: u64 = bit_xor();
+    for (peek() == 124) { pos = pos + 1; v = v | bit_xor(); }
+    ret v;
+}
+
+fun show(v: u64) {
+    if (is_neg(v) != 0) {
+        io.putc(45);
+        io.dec(neg(v));
+    } or {
+        io.dec(v);
+    }
+    if (abs(v) >= 16) {
+        io.out("  (0x\0");
+        var d: [16]u8;
+        var n: u64 = 0;
+        var x: u64 = v;
+        for {
+            val h: u64 = x & 15;
+            if (h < 10) { d[n] = 48 + h::u8; } or { d[n] = 87 + h::u8; }
+            n = n + 1;
+            x = x >> 4;
+            if (x == 0) { brk; }
+        }
+        for (n > 0) {
+            n = n - 1;
+            io.putc(d[n]);
+        }
+        io.putc(41);
+    }
+    io.putc(10);
+}
+
+# evaluate src[0..len); whether it worked
+fun eval() u8 {
+    pos = 0;
+    bad = nil;
+    val v: u64 = expr();
+    if (peek() != 0) { fail("unexpected character\0"); }
+    if (bad != nil) {
+        io.err("calc: \0");
+        io.err(bad);
+        io.err("\n\0");
+        ret 0;
+    }
+    show(v);
+    ret 1;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc > 1) {
+        len = 0;
+        var i: u64 = 1;
+        for (i < argc) {
+            val n: u64 = io.len(argv[i]);
+            if (len + n + 1 > 1024) { brk; }
+            io.copy(?src[len], argv[i], n);
+            len = len + n;
+            src[len] = 32;
+            len = len + 1;
+            i = i + 1;
+        }
+        if (eval() == 0) { ret 1; }
+        ret 0;
+    }
+    # one expression per line
+    for {
+        if (sys.isatty(abi.STDIN) != 0) { io.out("> \0"); }
+        len = 0;
+        for (len < 1023) {
+            var c: u8 = 0;
+            val r: u64 = sys.read(abi.STDIN, ?c, 1);
+            if (abi.is_err(r) != 0 || r == 0) { brk; }
+            if (c == 10) { brk; }
+            src[len] = c;
+            len = len + 1;
+        }
+        if (len == 0) { brk; }
+        eval();
+    }
+    ret 0;
+}
