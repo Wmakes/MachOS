@@ -7,13 +7,15 @@
 # the cache is direct mapped: block b of a partition can only live in slot
 # hash(part, b), so a lookup is one comparison
 
+use pmm:  machos.mm.pmm;
 use dsk:  machos.dev.disk;
 use heap: machos.mm.heap;
 use mem:  machos.kern.mem;
 
 pub val BS: u64 = 4096;
 val SPB: u64 = 8;      # sectors per block
-val CACHE: u64 = 2048; # slots, 8 MiB once all are used
+val MAX_SLOTS: u64 = 65536; # up to 256 MiB of cached blocks
+val MIN_SLOTS: u64 = 2048;  # 8 MiB
 
 pub rec Part {
     disk:    *dsk.Disk;
@@ -28,7 +30,8 @@ rec Entry {
     dirty: u8;
 }
 
-var cache: [2048]Entry;
+var cache: [65536]Entry;
+var slots: u64 = 0;     # in use: an eighth of memory, within MIN/MAX_SLOTS
 var ndirty: u64 = 0;
 var reads: u64 = 0;
 var writes: u64 = 0;
@@ -37,7 +40,12 @@ var failed: u64 = 0;
 pub fun blocks(p: *Part) u64 { ret p.sectors / SPB; }
 
 fun slot_of(p: *Part, b: u64) *Entry {
-    ret ?cache[(b ^ (p::u64 >> 4)) % CACHE];
+    if (slots == 0) {
+        slots = pmm.total_pages() / 8;
+        if (slots < MIN_SLOTS) { slots = MIN_SLOTS; }
+        if (slots > MAX_SLOTS) { slots = MAX_SLOTS; }
+    }
+    ret ?cache[(b ^ (p::u64 >> 4)) % slots];
 }
 
 fun flush(e: *Entry) u8 {
@@ -135,7 +143,7 @@ pub fun sync() u8 {
     if (ndirty == 0) { ret 1; }
     var ok: u8 = 1;
     var i: u64 = 0;
-    for (i < CACHE && ndirty > 0) {
+    for (i < slots && ndirty > 0) {
         val e: *Entry = ?cache[i];
         if (e.dirty != 0 && flush(e) == 0) { ok = 0; }
         i = i + 1;
@@ -158,7 +166,7 @@ pub fun failed_count() u64 { ret failed; }
 pub fun forget_disk(d: *dsk.Disk) {
     sync();
     var i: u64 = 0;
-    for (i < CACHE) {
+    for (i < slots) {
         val e: *Entry = ?cache[i];
         if (e.part != nil && e.part.disk == d) { e.part = nil; }
         i = i + 1;

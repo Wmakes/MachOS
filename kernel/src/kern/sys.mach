@@ -119,7 +119,7 @@ pub fun killed_by(sig: u64) { exit.killed_by(sig); }
 # create a process running `nd`. hs[i] (a Handle, or 0 for closed) becomes
 # its fd i. returns the pid or an error
 fun spawn(parent: *proc.Proc, nd: *vfs.Node, full: *u8, full_len: u64,
-          args: u64, args_len: u64, env: u64, env_len: u64, hs: *[32]u64, group: u64) u64 {
+          args: u64, args_len: u64, env: u64, env_len: u64, hs: *[64]u64, group: u64) u64 {
     if (nd.kind != abi.KIND_FILE || vfs.allowed(nd, abi.X_OK) == 0) { ret e(abi.E_ACCES); }
     val c: *proc.Proc = proc.alloc();
     if (c == nil) { ret e(abi.E_AGAIN); }
@@ -189,8 +189,8 @@ pub fun spawn_init(p: *u8, rescue: u8) u64 {
     if (con == nil) { ret e(abi.E_NOENT); }
     val h: *file.Handle = file.open_node(con, abi.O_READ | abi.O_WRITE);
     if (h == nil) { ret e(abi.E_NOMEM); }
-    var hs: [32]u64;
-    mem.fill((?hs[0])::u64, 0, 256);
+    var hs: [64]u64;
+    mem.fill((?hs[0])::u64, 0, 512);
     hs[0] = h::u64;
     hs[1] = h::u64;
     hs[2] = h::u64;
@@ -226,7 +226,7 @@ fun sys_spawn(pva: u64, plen: u64, ava: u64, alen: u64, sva: u64) u64 {
     val env_len: u64 = sp.env_len;
     if (env_len > ENV_MAX) { ret e(abi.E_INVAL); }
     if (env_len > 0 && ok(sp.env::u64, env_len, 0) == 0) { ret e(abi.E_FAULT); }
-    var hs: [32]u64;
+    var hs: [64]u64;
     val group: u64 = sp.group;
     var i: u64 = 0;
     for (i < abi.MAX_HANDLES) {

@@ -2,7 +2,8 @@
 # numbers only; fs/vfs.mach turns them into the node tree. every change goes
 # straight to the disk (blk is write-through).
 #
-# supported: direct, single and double indirect blocks (files up to ~4 GiB),
+# supported: direct, single, double and triple indirect blocks (files up to
+# 2 TiB; past 2 GiB the large_file feature is switched on),
 # linear directories with file types. a filesystem with any incompatible
 # feature besides `filetype` is refused rather than risked
 
@@ -310,6 +311,16 @@ fun bmap(fs: *Fs, ino: u64, i: *Inode, lbn: u64, create: u8) u64 {
         if (ind == 0) { ret 0; }
         ret slot(fs, ind, n % PTRS, create, i, goal);
     }
+    n = n - PTRS * PTRS;
+    if (n < PTRS * PTRS * PTRS) {
+        val tind: u64 = direct(fs, i, 14, create, goal);
+        if (tind == 0) { ret 0; }
+        val dind: u64 = slot(fs, tind, n / (PTRS * PTRS), create, i, goal);
+        if (dind == 0) { ret 0; }
+        val ind: u64 = slot(fs, dind, (n / PTRS) % PTRS, create, i, goal);
+        if (ind == 0) { ret 0; }
+        ret slot(fs, ind, n % PTRS, create, i, goal);
+    }
     ret 0;
 }
 
@@ -400,7 +411,13 @@ pub fun write(fs: *Fs, ino: u64, off: u64, src: u64, n: u64) u64 {
         done = done + k;
     }
     heap.free(buf);
-    if (off + done > size_of(?i)) { set_size(?i, off + done); }
+    if (off + done > size_of(?i)) {
+        set_size(?i, off + done);
+        if (off + done >= 0x80000000 && (sb32(fs, 100) & 2) == 0) { # large_file
+            set_sb32(fs, 100, sb32(fs, 100) | 2);
+            write_sb(fs);
+        }
+    }
     i.mtime = clock.now()::u32;
     i.ctime = i.mtime;
     write_inode(fs, ino, ?i);

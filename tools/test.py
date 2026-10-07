@@ -190,7 +190,7 @@ TESTS = [
       "wait:" + P, "sleep:1"],
      ["kept across reboots", "1000000 1000000 6888896", "19"]),
 
-    ("posix-fds", False, False,
+    ("posix-fds", False, True,
      ["--prep", with_posixtest, "--boot", disk,
       "wait:" + P, "send:posixtest\\n", "wait:failures",
       "send:cat /nope 2>/tmp/e; cat /tmp/e; cat /nope 2>&1 | wc -l; ls /etc /nope > /tmp/o 2>&1; cat /tmp/o\\n",

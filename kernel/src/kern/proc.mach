@@ -17,7 +17,7 @@ use heap:    machos.mm.heap;
 use mem:     machos.kern.mem;
 use blk:     machos.fs.blk;
 
-pub val MAX: u64 = 64;
+pub val MAX: u64 = 256;
 pub val KSTACK: u64 = 16384;
 
 pub val FREE:     u64 = 0;
@@ -64,8 +64,8 @@ pub rec Proc {
     nmaps:     u64;
     mmap_next: u64;  # the next mapping goes below this
     pages:     u64;  # user pages mapped
-    handles:   [32]u64;
-    fdflags:   [32]u8; # FD_CLOEXEC per fd
+    handles:   [64]u64;
+    fdflags:   [64]u8; # FD_CLOEXEC per fd
     cwd:       [256]u8;
     cwd_len:   u64;
     name:      [32]u8;
@@ -78,7 +78,7 @@ pub rec Region {
     prot:  u64;  # abi.PROT_*
 }
 
-var table: [64]Proc;
+var table: [256]Proc;
 var next_pid: u64 = 1;
 var cur: *Proc = nil;
 var last: u64 = 0;      # round robin position

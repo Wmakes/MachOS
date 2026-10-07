@@ -38,7 +38,7 @@ IMG="$(tools/mkimage.sh "$PROFILE" $FRESH)"
 [ -f "$OUT/vars.fd" ] || cp "$OVMF_VARS" "$OUT/vars.fd"
 
 # shellcheck disable=SC2086 # DISKS is a list of qemu arguments
-exec qemu-system-x86_64 -M q35 -cpu max -m 256M \
+exec qemu-system-x86_64 -M q35 -cpu max -m 1G \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$OUT/vars.fd" \
     -drive format=raw,file="$IMG" $DISKS \

@@ -329,6 +329,24 @@ fun mappings() {
     check("mmap of 0 bytes fails\0", abi.is_err(sys.mmap(0, 0, abi.PROT_READ, abi.MAP_PRIVATE | abi.MAP_ANONYMOUS, 0, 0)));
 }
 
+fun big_files() {
+    # a file past 4 GiB (sparse: only the last block is written), which
+    # needs ext2's triple indirect blocks
+    val h: u64 = sys.open("/root/big\0", 9, abi.O_READ | abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC);
+    check("create /root/big\0", (abi.is_err(h) == 0)::u8);
+    val far: u64 = 5 * 1024 * 1024 * 1024;
+    check("seek past 4 GiB\0", (sys.lseek(h, far, abi.SEEK_SET) == far)::u8);
+    check("write past 4 GiB\0", (sys.write(h, "far away\0", 8) == 8)::u8);
+    var st: abi.Stat;
+    check("size past 4 GiB\0", (sys.fstat(h, ?st) == 0 && st.size == far + 8)::u8);
+    var buf: [8]u8;
+    sys.lseek(h, far, abi.SEEK_SET);
+    check("read back past 4 GiB\0", (sys.read(h, ?buf[0], 8) == 8 && io.eq(?buf[0], 8, "far away\0", 8) != 0)::u8);
+    sys.lseek(h, 1024 * 1024, abi.SEEK_SET);
+    check("the hole reads as zeros\0", (sys.read(h, ?buf[0], 8) == 8 && buf[0] == 0 && buf[7] == 0)::u8);
+    sys.close(h);
+}
+
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     fds();
@@ -337,6 +355,7 @@ fun main(argc: u64, argv: **u8) u64 {
     signals();
     permissions();
     mappings();
+    big_files();
     io.out("posixtest: \0");
     io.dec(failures);
     io.out(" failures\n\0");

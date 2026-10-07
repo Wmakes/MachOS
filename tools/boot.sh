@@ -29,7 +29,7 @@ mkdir -p out
 VARS="out/boot-vars.fd"
 [ -f "$VARS" ] || cp "$OVMF_VARS" "$VARS"
 
-exec qemu-system-x86_64 -M q35 -cpu max -m 256M \
+exec qemu-system-x86_64 -M q35 -cpu max -m 1G \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$VARS" \
     -drive format=raw,file="$DISK" \
