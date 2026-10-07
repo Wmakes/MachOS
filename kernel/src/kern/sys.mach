@@ -756,6 +756,10 @@ fun sys_info(out: u64) u64 {
     i.heap_used = heap.used();
     i.uptime_ms = proc.uptime_ticks() * 1000 / apic.HZ;
     i.procs = proc.count();
+    i.cpus = 1;
+    i.screen_w = fbcon.width_of();
+    i.screen_h = fbcon.height_of();
+    cpu.brand(?i.cpu_name[0]);
     ret 0;
 }
 

@@ -1,0 +1,34 @@
+# the MachOS logo, drawn in the mach colour (#fe01ff: the console's bright
+# magenta, ESC[95m)
+
+use io: sdk.io;
+
+pub val LINES: u64 = 5;
+pub val WIDTH: u64 = 37;
+pub val COLOR: *u8 = "\x1b[95m\0";
+pub val RESET: *u8 = "\x1b[0m\0";
+
+pub fun line(i: u64) *u8 {
+    if (i == 0) { ret " __  __            _      ___  ____\0"; }
+    if (i == 1) { ret "|  \\/  | __ _  ___| |__  / _ \\/ ___|\0"; }
+    if (i == 2) { ret "| |\\/| |/ _` |/ __| '_ \\| | | \\___ \\\0"; }
+    if (i == 3) { ret "| |  | | (_| | (__| | | | |_| |___) |\0"; }
+    ret "|_|  |_|\\__,_|\\___|_| |_|\\___/|____/\0";
+}
+
+# the whole logo in colour, each line indented by `indent`
+pub fun show(indent: u64) {
+    io.out(COLOR);
+    var i: u64 = 0;
+    for (i < LINES) {
+        var k: u64 = 0;
+        for (k < indent) {
+            io.putc(32);
+            k = k + 1;
+        }
+        io.out(line(i));
+        io.putc(10);
+        i = i + 1;
+    }
+    io.out(RESET);
+}

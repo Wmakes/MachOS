@@ -8,6 +8,7 @@ use io:    sdk.io;
 use env:   sdk.env;
 use users: sdk.users;
 use rt:    sdk.rt;
+use logo:  userland.lib.logo;
 
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
@@ -16,9 +17,11 @@ fun main(argc: u64, argv: **u8) u64 {
     for (tries < 3) {
         var un: abi.Uname;
         sys.uname(?un);
-        io.out("\n\x1b[1mMachOS \0");
+        io.putc(10);
+        logo.show(2);
+        io.out("\n  \x1b[1mMachOS \0");
         io.out(?un.release[0]);
-        io.out("\x1b[0m\n\nmachos login: \0");
+        io.out("\x1b[0m  (alt+F1..F6: more terminals)\n\nmachos login: \0");
         var name: [32]u8;
         val n: u64 = users.read_line(?name[0], 31);
         if (n == abi.NO_ID) { ret 1; }

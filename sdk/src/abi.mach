@@ -283,6 +283,10 @@ pub rec Info {
     heap_used: u64;
     uptime_ms: u64;
     procs:     u64;
+    cpus:      u64;     # processor cores in use
+    screen_w:  u64;     # the console's pixels, 0 without a framebuffer
+    screen_h:  u64;
+    cpu_name:  [48]u8;  # the processor's name, NUL padded
 }
 
 # the terminal's modes (POSIX termios, local flags only). the default is

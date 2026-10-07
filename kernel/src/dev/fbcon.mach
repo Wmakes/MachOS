@@ -45,12 +45,15 @@ var screens: [6]Screen;
 var s: *Screen = nil;      # the screen being written
 var shown: u64 = 0;        # the screen on display
 
-val PAL_R: [16]u8 = [16]u8{0x00, 0xAA, 0x00, 0xAA, 0x00, 0xAA, 0x00, 0xAA, 0x55, 0xFF, 0x55, 0xFF, 0x55, 0xFF, 0x55, 0xFF};
-val PAL_G: [16]u8 = [16]u8{0x00, 0x00, 0xAA, 0x55, 0x00, 0x00, 0xAA, 0xAA, 0x55, 0x55, 0xFF, 0xFF, 0x55, 0x55, 0xFF, 0xFF};
+# bright magenta (13) is the mach colour, #fe01ff
+val PAL_R: [16]u8 = [16]u8{0x00, 0xAA, 0x00, 0xAA, 0x00, 0xAA, 0x00, 0xAA, 0x55, 0xFF, 0x55, 0xFF, 0x55, 0xFE, 0x55, 0xFF};
+val PAL_G: [16]u8 = [16]u8{0x00, 0x00, 0xAA, 0x55, 0x00, 0x00, 0xAA, 0xAA, 0x55, 0x55, 0xFF, 0xFF, 0x55, 0x01, 0xFF, 0xFF};
 val PAL_B: [16]u8 = [16]u8{0x00, 0x00, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0x55, 0x55, 0x55, 0x55, 0xFF, 0xFF, 0xFF, 0xFF};
 
 var base: u64 = 0; # virtual address of pixel (0,0), 0 = no console
 var pitch: u64 = 0;
+var width_px: u64 = 0;
+var height_px: u64 = 0;
 var cols: u64 = 0;
 var rows: u64 = 0;
 var palette: [16]u32;
@@ -196,6 +199,8 @@ fun sgr(p: u64) {
         s.attr = (s.attr & 0x0F) | ((p - 40)::u8 << 4);
     } or (p == 49) {
         s.attr = s.attr & 0x0F;
+    } or (p >= 100 && p <= 107) { # bright backgrounds
+        s.attr = (s.attr & 0x0F) | (((p - 100)::u8 | 0x08) << 4);
     } or (p >= 90 && p <= 97) {
         s.attr = (s.attr & 0xF0) | (p - 90)::u8 | 0x08;
     }
@@ -250,6 +255,8 @@ fun csi(final: u8) {
 pub fun init(f: *info.Framebuffer) u8 {
     if (f.addr == 0 || f.bpp != 32) { ret 0; }
     if (f.r_size > 8 || f.g_size > 8 || f.b_size > 8) { ret 0; }
+    width_px = f.width;
+    height_px = f.height;
     base  = f.addr;
     pitch = f.pitch;
     cols  = f.width / GW;
@@ -345,6 +352,8 @@ pub fun view_down() {
 }
 
 pub fun cols_of() u64 { ret cols; }
+pub fun width_of() u64 { ret width_px; }
+pub fun height_of() u64 { ret height_px; }
 pub fun rows_of() u64 { ret rows; }
 
 fun put(c: u8) {

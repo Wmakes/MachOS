@@ -176,6 +176,55 @@ fun max_leaf() u32 {
     ret a;
 }
 
+# cpuid leaf `leaf`: eax, ebx, ecx, edx into out[0..4]
+fun cpuid(leaf: u32, out: *u32) {
+    var a: u32 = 0;
+    var b: u32 = 0;
+    var c: u32 = 0;
+    var d: u32 = 0;
+    asm x86_64 {
+        mov eax, {leaf}
+        mov ecx, 0
+        cpuid
+        mov {a}, eax
+        mov {b}, ebx
+        mov {c}, ecx
+        mov {d}, edx
+    }
+    out[0] = a;
+    out[1] = b;
+    out[2] = c;
+    out[3] = d;
+}
+
+# the processor's name (48 bytes, NUL padded; "" if it does not say)
+pub fun brand(out: *u8) {
+    var r: [4]u32;
+    var i: u64 = 0;
+    for (i < 48) {
+        out[i] = 0;
+        i = i + 1;
+    }
+    cpuid(0x80000000, ?r[0]);
+    if (r[0] < 0x80000004) { ret; }
+    var leaf: u32 = 0x80000002;
+    var at: u64 = 0;
+    for (leaf <= 0x80000004) {
+        cpuid(leaf, ?r[0]);
+        var k: u64 = 0;
+        for (k < 4) {
+            var j: u64 = 0;
+            for (j < 4) {
+                out[at] = ((r[k] >> (j * 8)::u32) & 0xFF)::u8;
+                at = at + 1;
+                j = j + 1;
+            }
+            k = k + 1;
+        }
+        leaf = leaf + 1;
+    }
+}
+
 var smep: u8 = 0;
 var smap: u8 = 0;
 var umip: u8 = 0;

@@ -331,6 +331,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.neofetch]
+kind = "bin"
+entry = "bin/neofetch.mach"
+out = "bin/neofetch"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.partname]
 kind = "bin"
 entry = "bin/partname.mach"
