@@ -8,6 +8,7 @@ use text: userland.lib.text;
 use users: sdk.users;
 
 var long: u8 = 0;
+var color: u8 = 0; # only on a terminal: pipes get plain names
 
 # names of the last uid and gid looked up (ls lists many of the same)
 var last_uid: u64 = 0xFFFFFFFFFFFFFFFF;
@@ -71,11 +72,15 @@ fun show(e: *abi.Entry) {
         io.outn(?t[0], text.fmt_time(e.mtime, ?t[0]));
         io.out("  \0");
     }
-    if (e.kind == abi.KIND_DIR) { io.out("\x1b[1;34m\0"); }
-    or (e.kind == abi.KIND_DEV) { io.out("\x1b[1;33m\0"); }
+    # directories blue, devices yellow, programs green
+    var paint: *u8 = nil;
+    if (e.kind == abi.KIND_DIR) { paint = "\x1b[1;34m\0"; }
+    or (e.kind == abi.KIND_DEV) { paint = "\x1b[1;33m\0"; }
+    or ((e.mode & 0x49) != 0)   { paint = "\x1b[1;32m\0"; }
+    if (color != 0 && paint != nil) { io.out(paint); }
     io.outn(?e.name[0], e.name_len);
-    if (e.kind == abi.KIND_DIR) { io.out("\x1b[0m/\0"); }
-    or (e.kind == abi.KIND_DEV) { io.out("\x1b[0m\0"); }
+    if (color != 0 && paint != nil) { io.out("\x1b[0m\0"); }
+    if (e.kind == abi.KIND_DIR) { io.putc(47); }
     io.putc(10);
 }
 
@@ -121,6 +126,7 @@ fun list(p: *u8) u8 {
 
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
+    color = sys.isatty(abi.STDOUT);
     var i: u64 = 1;
     if (argc > 1 && io.streq(argv[1], "-l\0") != 0) {
         long = 1;

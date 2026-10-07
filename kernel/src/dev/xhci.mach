@@ -11,6 +11,7 @@ use pmm:  machos.mm.pmm;
 use mem:  machos.kern.mem;
 use tty:  machos.kern.tty;
 use cpu:  machos.arch.x86_64.cpu;
+use fbcon: machos.dev.fbcon;
 
 val MAX_CTRL: u64 = 4;
 val MAX_KBD: u64 = 4;
@@ -222,6 +223,13 @@ fun seq(final: u8) {
     tty.input(final);
 }
 
+fun tilde(n: u8) {
+    tty.input(27);
+    tty.input(91);
+    tty.input(n);
+    tty.input(126);
+}
+
 # one key going down: what the terminal gets
 fun press(usage: u8, mods: u8) {
     val shift: u8 = ((mods & 0x22) != 0)::u8;
@@ -250,6 +258,14 @@ fun press(usage: u8, mods: u8) {
     or (usage == 0x52) { seq(65); }   # up
     or (usage == 0x4A) { seq(72); }   # home
     or (usage == 0x4D) { seq(70); }   # end
+    or (usage == 0x4B) {              # page up; shift: scroll the console back
+        if (shift != 0) { fbcon.view_up(); }
+        or              { tilde(53); }
+    }
+    or (usage == 0x4E) {              # page down
+        if (shift != 0) { fbcon.view_down(); }
+        or              { tilde(54); }
+    }
     or (usage == 0x4C) {              # delete
         tty.input(27);
         tty.input(91);

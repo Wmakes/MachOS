@@ -113,17 +113,19 @@ pub fun remember(line: *u8, n: u64) {
 
 # --- tab completion -------------------------------------------------------
 
-var match_names: [64][64]u8;
-var match_lens: [64]u64;
-var match_dirs: [64]u8;
+var match_names: [128][64]u8;
+var match_lens: [128]u64;
+var match_dirs: [128]u8;
 var nmatches: u64 = 0;
+var nmore: u64 = 0;     # matches that did not fit
 
 fun collect(dir: *u8, dn: u64, prefix: *u8, pn: u64, dirs_too: u8) {
     nmatches = 0;
+    nmore = 0;
     val h: u64 = sys.open(dir, dn, abi.O_READ);
     if (abi.is_err(h) != 0) { ret; }
     var i: u64 = 0;
-    for (nmatches < 64) {
+    for {
         var e: abi.Entry;
         val got: u64 = sys.readdir(h, i, ?e);
         if (abi.is_err(got) != 0 || got == 0) { brk; }
@@ -132,23 +134,113 @@ fun collect(dir: *u8, dn: u64, prefix: *u8, pn: u64, dirs_too: u8) {
         if (io.eq(?e.name[0], pn, prefix, pn) == 0) { cnt; }
         if (pn == 0 && e.name[0] == 46) { cnt; } # hide dotfiles unless asked
         if (dirs_too == 0 && e.kind == abi.KIND_DIR) { cnt; }
+        if (pn == 1 && e.name_len == 1 && e.name[0] == 46) { cnt; } # not . for .
+        if (nmatches == 128) {
+            nmore = nmore + 1;
+            cnt;
+        }
         io.copy(?match_names[nmatches][0], ?e.name[0], e.name_len);
         match_lens[nmatches] = e.name_len;
         match_dirs[nmatches] = (e.kind == abi.KIND_DIR)::u8;
         nmatches = nmatches + 1;
     }
     sys.close(h);
+    sort();
+}
+
+fun before(a: u64, b: u64) u8 {
+    var j: u64 = 0;
+    for (j < match_lens[a] && j < match_lens[b]) {
+        if (match_names[a][j] != match_names[b][j]) { ret (match_names[a][j] < match_names[b][j])::u8; }
+        j = j + 1;
+    }
+    ret (match_lens[a] < match_lens[b])::u8;
+}
+
+# alphabetical, by insertion (there are few)
+fun sort() {
+    var tmp: [64]u8;
+    var i: u64 = 1;
+    for (i < nmatches) {
+        var j: u64 = i;
+        for (j > 0 && before(j, j - 1) != 0) {
+            io.copy(?tmp[0], ?match_names[j][0], 64);
+            io.copy(?match_names[j][0], ?match_names[j - 1][0], 64);
+            io.copy(?match_names[j - 1][0], ?tmp[0], 64);
+            val l: u64 = match_lens[j];
+            match_lens[j] = match_lens[j - 1];
+            match_lens[j - 1] = l;
+            val d: u8 = match_dirs[j];
+            match_dirs[j] = match_dirs[j - 1];
+            match_dirs[j - 1] = d;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+# the choices in columns under the line
+fun list_matches() {
+    var wide: u64 = 1;
+    var m: u64 = 0;
+    for (m < nmatches) {
+        if (match_lens[m] + 1 > wide) { wide = match_lens[m] + 1; }
+        m = m + 1;
+    }
+    wide = wide + 2;
+    var t: abi.Termios;
+    var screen: u64 = 80;
+    if (abi.is_err(sys.tcgetattr(abi.STDIN, ?t)) == 0 && t.cols > 0) { screen = t.cols; }
+    var per: u64 = screen / wide;
+    if (per == 0) { per = 1; }
+    val nrows: u64 = (nmatches + per - 1) / per;
+    io.putc(10);
+    var r: u64 = 0;
+    for (r < nrows) {
+        var c: u64 = 0;
+        for (c < per) {
+            val i: u64 = c * nrows + r; # down the columns, like ls
+            if (i < nmatches) {
+                io.outn(?match_names[i][0], match_lens[i]);
+                var w: u64 = match_lens[i];
+                if (match_dirs[i] != 0) {
+                    io.putc(47);
+                    w = w + 1;
+                }
+                if (c + 1 < per && (c + 1) * nrows + r < nmatches) {
+                    for (w < wide) {
+                        io.putc(32);
+                        w = w + 1;
+                    }
+                }
+            }
+            c = c + 1;
+        }
+        io.putc(10);
+        r = r + 1;
+    }
+    if (nmore > 0) {
+        io.out("...and \0");
+        io.dec(nmore);
+        io.out(" more\n\0");
+    }
 }
 
 fun complete() {
     # the word under the cursor
     var ws: u64 = cur;
-    for (ws > 0 && buf[ws - 1] != 32) { ws = ws - 1; }
+    for (ws > 0 && buf[ws - 1] != 32 && buf[ws - 1] != 124 && buf[ws - 1] != 59 && buf[ws - 1] != 38 && buf[ws - 1] != 40) { ws = ws - 1; }
+    # a command word: the first on the line or after | ; & && || ( $(
     var first: u8 = 1;
-    var k: u64 = 0;
-    for (k < ws) {
-        if (buf[k] != 32) { first = 0; }
-        k = k + 1;
+    var k: u64 = ws;
+    for (k > 0) {
+        val b: u8 = buf[k - 1];
+        if (b == 32) {
+            k = k - 1;
+            cnt;
+        }
+        if (b != 124 && b != 59 && b != 38 && b != 40) { first = 0; }
+        brk;
     }
     val word: *u8 = ?buf[ws];
     val wn: u64 = cur - ws;
@@ -196,15 +288,7 @@ fun complete() {
     }
     if (common == have) {
         # nothing to add: list the choices under the line
-        io.putc(10);
-        m = 0;
-        for (m < nmatches) {
-            io.outn(?match_names[m][0], match_lens[m]);
-            if (match_dirs[m] != 0) { io.putc(47); }
-            io.out("  \0");
-            m = m + 1;
-        }
-        io.putc(10);
+        list_matches();
         redraw();
     }
 }

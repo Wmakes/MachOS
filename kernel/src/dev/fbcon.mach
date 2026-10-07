@@ -3,7 +3,9 @@
 # `attrs`, so scrolling redraws only the cells that change and never reads
 # video memory back. understands the ANSI sequences a shell needs:
 # SGR colours (ESC[...m), clear screen (ESC[2J), home (ESC[H), and clear to
-# end of line (ESC[K)
+# end of line (ESC[K). lines scrolled off the top are kept in a history
+# ring that shift+pgup/pgdn page back through (view_up / view_down); any
+# output jumps back to the live screen
 
 use info: machos.boot.info;
 
@@ -34,6 +36,14 @@ var palette: [16]u32;
 var cells: [32768]u8;
 var attrs: [32768]u8;
 
+val HIST_CELLS: u64 = 196608;
+var hist_c: [196608]u8;  # lines that scrolled off, a ring of hist_max lines
+var hist_a: [196608]u8;
+var hist_max: u64 = 0;
+var hist_head: u64 = 0;  # where the next line goes
+var hist_n: u64 = 0;     # lines kept
+var view: u64 = 0;       # lines scrolled back, 0 = live
+
 var esc: u8 = 0;         # 0 normal, 1 after ESC, 2 inside ESC[
 var params: [8]u64;
 var nparams: u64 = 0;
@@ -49,8 +59,10 @@ fun rgb(f: *info.Framebuffer, r: u32, g: u32, b: u32) u32 {
       | channel(b, f.b_size, f.b_shift);
 }
 
-fun paint(i: u64, a: u8) {
-    val c: u64 = cells[i]::u64;
+fun paint(i: u64, a: u8) { paint_char(i, cells[i], a); }
+
+fun paint_char(i: u64, ch: u8, a: u8) {
+    val c: u64 = ch::u64;
     val fg: u32 = palette[a & 15];
     val bg: u32 = palette[a >> 4];
     val px: u64 = base + (i / cols) * GH * pitch + (i % cols) * GW * 4;
@@ -74,7 +86,7 @@ fun set(i: u64, c: u8, a: u8) {
     if (cells[i] != c || attrs[i] != a) {
         cells[i] = c;
         attrs[i] = a;
-        draw(i);
+        if (view == 0) { draw(i); }
     }
 }
 
@@ -85,9 +97,10 @@ fun cursor_cell() u64 {
     ret cy * cols + x;
 }
 
-fun hide() { draw(cursor_cell()); }
+fun hide() { if (view == 0) { draw(cursor_cell()); } }
 
 fun show() {
+    if (view != 0) { ret; }
     val i: u64 = cursor_cell();
     val a: u8 = attrs[i];
     paint(i, (a << 4) | (a >> 4));
@@ -96,7 +109,22 @@ fun show() {
 # an empty cell: the current background, a visible foreground for the cursor
 fun blank() u8 { ret (attr & 0xF0) | 0x07; }
 
+# keep the top line before it scrolls away
+fun remember() {
+    if (hist_max == 0) { ret; }
+    val at: u64 = hist_head * cols;
+    var k: u64 = 0;
+    for (k < cols) {
+        hist_c[at + k] = cells[k];
+        hist_a[at + k] = attrs[k];
+        k = k + 1;
+    }
+    hist_head = (hist_head + 1) % hist_max;
+    if (hist_n < hist_max) { hist_n = hist_n + 1; }
+}
+
 fun scroll() {
+    remember();
     val n: u64 = (rows - 1) * cols;
     var i: u64 = 0;
     for (i < n) {
@@ -236,10 +264,52 @@ pub fun init(f: *info.Framebuffer) u8 {
         attrs[i] = DEFAULT;
         i = i + 1;
     }
+    hist_max = HIST_CELLS / cols;
     cx = 0;
     cy = 0;
     show();
     ret 1;
+}
+
+# paint the screen as seen `view` lines back
+fun repaint() {
+    var r: u64 = 0;
+    for (r < rows) {
+        var k: u64 = 0;
+        if (r < view) {
+            # history line (view - r) back from the newest
+            val line: u64 = (hist_head + hist_max - (view - r)) % hist_max;
+            for (k < cols) {
+                paint_char(r * cols + k, hist_c[line * cols + k], hist_a[line * cols + k]);
+                k = k + 1;
+            }
+        } or {
+            val src: u64 = (r - view) * cols;
+            for (k < cols) {
+                paint_char(r * cols + k, cells[src + k], attrs[src + k]);
+                k = k + 1;
+            }
+        }
+        r = r + 1;
+    }
+    show();
+}
+
+# page back through the history (shift+pgup) and forward again (shift+pgdn)
+pub fun view_up() {
+    if (base == 0 || hist_n == 0) { ret; }
+    var v: u64 = view + rows / 2;
+    if (v > hist_n) { v = hist_n; }
+    if (v == view) { ret; }
+    view = v;
+    repaint();
+}
+
+pub fun view_down() {
+    if (base == 0 || view == 0) { ret; }
+    if (view > rows / 2) { view = view - rows / 2; }
+    or                   { view = 0; }
+    repaint();
 }
 
 pub fun cols_of() u64 { ret cols; }
@@ -300,6 +370,10 @@ fun put(c: u8) {
 
 pub fun putc(c: u8) {
     if (base == 0) { ret; }
+    if (view != 0) { # output: back to the live screen
+        view = 0;
+        repaint();
+    }
     hide();
     put(c);
     show();
