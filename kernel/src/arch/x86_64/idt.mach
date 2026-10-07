@@ -318,6 +318,9 @@ pub fun set_gate(v: u64, handler: u64, ist: u8) {
 
 pub val VECTORS: u64 = 64;
 
+# load the (shared) IDT on another cpu
+pub fun load() { idt_load(?ptr); }
+
 pub fun init() {
     val base: u64 = isr_stubs::u64;
     var v: u64 = 0;

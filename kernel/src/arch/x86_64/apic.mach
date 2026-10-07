@@ -41,6 +41,20 @@ fun iow(reg: u32, v: u32) {
 pub fun eoi() { lw(EOI, 0); }
 
 var calibrated: u8 = 1;
+var per_tick: u32 = 0;
+
+# this cpu's local APIC id
+pub fun id() u32 { ret lr(ID) >> 24; }
+
+# another cpu: its local APIC on, its timer like the first cpu's
+pub fun init_ap() {
+    cpu.wrmsr(0x1B, cpu.rdmsr(0x1B) | (1 << 11));
+    lw(SVR, 0x100 | SPURIOUS_VECTOR::u32);
+    lw(0x080, 0);
+    lw(DIVIDE, 3);
+    lw(LVT_TIMER, TIMER_VECTOR::u32 | (1 << 17));
+    lw(INIT, per_tick);
+}
 
 pub fun timer_calibrated() u8 { ret calibrated; }
 
@@ -109,7 +123,7 @@ pub fun init(rsdp: u64) *u8 {
     lw(SVR, 0x100 | SPURIOUS_VECTOR::u32);
     lw(0x080, 0);                                 # accept every priority
 
-    val per_tick: u32 = calibrate() * 100 / HZ::u32;
+    per_tick = calibrate() * 100 / HZ::u32;
     lw(DIVIDE, 3);
     lw(LVT_TIMER, TIMER_VECTOR::u32 | (1 << 17)); # periodic
     lw(INIT, per_tick);

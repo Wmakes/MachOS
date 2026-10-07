@@ -6,6 +6,7 @@
 # callee-saved registers and rsp on one kernel stack and restoring them from
 # another (`switch_to`); the scheduler loop runs on the boot stack
 
+use smp:  machos.arch.x86_64.smp;
 use abi:     sdk.abi;
 use cpu:     machos.arch.x86_64.cpu;
 use gdt:     machos.arch.x86_64.gdt;
@@ -84,10 +85,27 @@ var cur: *Proc = nil;
 var last: u64 = 0;      # round robin position
 var ticks: u64 = 0;
 
-#[symbol("sched_ksp")]
-var sched_ksp: u64 = 0;
+# per cpu: its scheduler loop's saved stack and the process it runs.
+# `cur` is the running process of the cpu inside the kernel (only one is,
+# holding the big lock), set on every entry
+var sched_ksp: [16]u64;
+var running: [16]*Proc;
 
 pub fun current() *Proc { ret cur; }
+
+# a cpu just entered the kernel (and holds the lock)
+pub fun entered() { cur = running[smp.me()]; }
+
+# where a new process's first switch_to "returns": drop the lock the
+# scheduler held, then into user mode
+#[naked]
+#[symbol("first_entry")]
+fun first_entry() {
+    asm x86_64 {
+        call bkl_unlock
+        jmp isr_return
+    }
+}
 pub fun uptime_ticks() u64 { ret ticks; }
 pub fun slot(i: u64) *Proc { ret ?table[i]; }
 
@@ -191,7 +209,7 @@ pub fun start(p: *Proc, rip: u64, rsp: u64, rdi: u64, rsi: u64, rdx: u64) {
     # switch_to pops rflags, r15 r14 r13 r12 rbx rbp, then returns into
     # isr_return; rflags 0x2: interrupts off, AC clear
     sp = sp - 8;
-    @(sp::*u64) = idt.isr_return::u64;
+    @(sp::*u64) = first_entry::u64;
     sp = sp - 48;
     mem.fill(sp, 0, 48);
     sp = sp - 8;
@@ -211,7 +229,7 @@ pub fun start_copy(p: *Proc, f: *idt.Frame) {
     val cf: *idt.Frame = (sp + idt.FPU_AREA)::*idt.Frame;
     cf.rax = 0;
     sp = sp - 8;
-    @(sp::*u64) = idt.isr_return::u64;
+    @(sp::*u64) = first_entry::u64;
     sp = sp - 48;
     mem.fill(sp, 0, 48);
     sp = sp - 8;
@@ -223,7 +241,7 @@ pub fun start_copy(p: *Proc, f: *idt.Frame) {
 # give the cpu back to the scheduler loop; returns when picked again
 fun sched() {
     val p: *Proc = cur;
-    switch_to(?p.ksp, sched_ksp);
+    switch_to(?p.ksp, sched_ksp[smp.me()]);
 }
 
 pub fun yield() {
@@ -368,8 +386,9 @@ pub fun exit(code: u64) {
     sched();
 }
 
-# run processes forever; idles in cpu.wait when none can run
-pub fun scheduler() {
+# run processes forever on cpu `me` (holding the big lock); idles in
+# cpu.wait, without the lock, when none can run
+pub fun scheduler(me: u64) {
     for {
         var picked: *Proc = nil;
         var n: u64 = 0;
@@ -380,16 +399,24 @@ pub fun scheduler() {
         }
         if (picked == nil) {
             # nothing to run: a good moment to put dirty disk blocks on the disk
-            blk.sync();
+            if (me == 0) { blk.sync(); }
+            smp.unlock();
             cpu.wait();
+            smp.lock();
+            cur = nil;
             cnt;
         }
         cur = picked;
+        running[me] = picked;
         picked.state = RUNNING;
-        gdt.set_rsp0(kstack_top(picked));
-        syscall.set_kstack(kstack_top(picked));
+        gdt.set_rsp0(me, kstack_top(picked));
+        syscall.set_kstack(me, kstack_top(picked));
         cpu.set_cr3(picked.pml4);
-        switch_to(?sched_ksp, picked.ksp);
+        switch_to(?sched_ksp[me], picked.ksp);
+        # back on this cpu's loop: leave its address space, which may be
+        # freed while this cpu idles
+        cpu.set_cr3(vmm.kernel_space());
+        running[me] = nil;
         cur = nil;
         if (picked.state == ZOMBIE && picked.ppid == 0) { reap(picked); }
     }

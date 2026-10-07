@@ -95,6 +95,24 @@ var module_req: Request = Request{
     revision: 0, response: 0,
 };
 
+#[volatile]
+rec MpRequest { id: [4]u64; revision: u64; response: u64; flags: u64; }
+
+#[volatile]
+rec MpResponse { revision: u64; flags: u32; bsp_lapic_id: u32; cpu_count: u64; cpus: **MpInfo; }
+
+# one processor; writing goto_address starts it there with rdi = this
+# record (on a stack of Limine's), extra_argument is ours to use
+#[volatile]
+pub rec MpInfo { processor_id: u32; lapic_id: u32; reserved: u64; goto_address: u64; extra_argument: u64; }
+
+#[section(".limine_requests")]
+#[align(8)]
+var mp_req: MpRequest = MpRequest{
+    id: [4]u64{0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x95a67b819a1b857e, 0xa0b61b723b6a73e0},
+    revision: 0, response: 0, flags: 0,
+};
+
 fun kind_of(k: u64) u8 {
     if (k == 0) { ret info.MEM_USABLE; }
     if (k == 2) { ret info.MEM_RECLAIMABLE; } # acpi reclaimable
@@ -136,6 +154,22 @@ pub fun collect(bi: *info.BootInfo) *u8 {
     bi.kelf = kf.address;
     bi.kelf_len = kf.size;
     bi.cmdline = kf.cmdline;
+
+    bi.cpus = 1;
+    bi.bsp_lapic = 0;
+    if (mp_req.response != 0) {
+        val mp: *MpResponse = mp_req.response::*MpResponse;
+        bi.bsp_lapic = mp.bsp_lapic_id;
+        var c: u64 = mp.cpu_count;
+        if (c > 16) { c = 16; }
+        var k: u64 = 0;
+        for (k < c) {
+            bi.cpu_lapic[k] = mp.cpus[k].lapic_id;
+            bi.cpu_start[k] = mp.cpus[k]::u64;
+            k = k + 1;
+        }
+        bi.cpus = c;
+    }
 
     bi.initrd = 0;
     bi.initrd_len = 0;

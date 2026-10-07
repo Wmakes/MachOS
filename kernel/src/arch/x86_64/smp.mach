@@ -1,0 +1,63 @@
+# the cpus and the big kernel lock. every cpu runs user programs, but only
+# one at a time is inside the kernel: entering it (an interrupt, a system
+# call, the scheduler) takes the lock, returning to user mode or idling
+# drops it. the kernel itself keeps running with interrupts off, as on
+# one cpu, so nothing else in it needs locking
+
+use cpu:  machos.arch.x86_64.cpu;
+use apic: machos.arch.x86_64.apic;
+
+pub val MAX: u64 = 16;
+
+var lapic_ids: [16]u32;
+var count: u64 = 1;   # cpus known (the first is index 0)
+var ready: [16]u8;    # cpus running (each sets its own)
+
+#[symbol("bkl_word")]
+var word: u64 = 0;
+var holder: u64 = 0;  # the cpu holding the lock
+
+pub fun set_first(lapic: u32) { lapic_ids[0] = lapic; }
+
+# give the cpu with APIC id `lapic` an index; MAX when there is no room
+pub fun add(lapic: u32) u64 {
+    if (count == MAX) { ret MAX; }
+    lapic_ids[count] = lapic;
+    count = count + 1;
+    ret count - 1;
+}
+
+pub fun online() u64 {
+    var n: u64 = 1;
+    var i: u64 = 1;
+    for (i < count) {
+        if (ready[i] != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+pub fun came_up(c: u64) { ready[c] = 1; }
+
+# the index of the cpu running this
+pub fun here() u64 {
+    val id: u32 = apic.id();
+    var i: u64 = 0;
+    for (i < count) {
+        if (lapic_ids[i] == id) { ret i; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+pub fun lock() {
+    val me: u64 = here();
+    for (cpu.xchg(?word, 1) != 0) { cpu.pause(); }
+    holder = me;
+}
+
+#[symbol("bkl_unlock")]
+pub fun unlock() { cpu.xchg(?word, 0); }
+
+# the cpu inside the kernel (valid while holding the lock)
+pub fun me() u64 { ret holder; }

@@ -3,7 +3,7 @@
 #   $? (last status), $0-$9 and $# (script arguments), $$ (the shell's pid),
 #   $NAME and ${NAME} (variables), ~ (home), $(command) (its output)
 #   NAME=value  set a variable; NAME=value cmd  run cmd with it in its environment
-#   builtins: cd pwd exit jobs fg bg export unset set
+#   builtins: cd pwd exit jobs fg bg wait export unset set
 #   job control: ^Z stops the foreground job; fg / bg [N] continue it
 #   a | b | c        pipelines
 #   < f  > f  >> f   redirections, also N< f  N> f  N>> f  N>&M  N>&-  (fds 0-9)
@@ -598,6 +598,28 @@ fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
         status = 0;
         ret 1;
     }
+    if (io.streq(name, "wait\0") != 0) { # every background job (not the stopped)
+        var i: u64 = 0;
+        status = 0;
+        for (i < MAX_BG) {
+            val j: *Job = ?jobs[i];
+            if (j.used != 0 && j.stopped == 0) {
+                var k: u64 = 0;
+                for (k < j.npids) {
+                    if (j.done[k] == 0) {
+                        var st: u64 = 0;
+                        val r: u64 = sys.waitpid(j.pids[k], ?st, 0);
+                        if (r == j.pids[k]) { status = abi.wexitstatus(st); }
+                        j.done[k] = 1;
+                    }
+                    k = k + 1;
+                }
+                j.used = 0;
+            }
+            i = i + 1;
+        }
+        ret 1;
+    }
     if (io.streq(name, "jobs\0") != 0) {
         var i: u64 = 0;
         for (i < MAX_BG) {
@@ -745,7 +767,7 @@ fun wait_job(j: *Job) {
 
 fun is_builtin(name: *u8) u8 {
     if (io.streq(name, "cd\0") != 0 || io.streq(name, "pwd\0") != 0 ||
-        io.streq(name, "exit\0") != 0 || io.streq(name, "jobs\0") != 0 ||
+        io.streq(name, "exit\0") != 0 || io.streq(name, "jobs\0") != 0 || io.streq(name, "wait\0") != 0 ||
         io.streq(name, "fg\0") != 0 || io.streq(name, "bg\0") != 0 ||
         io.streq(name, "export\0") != 0 || io.streq(name, "unset\0") != 0 ||
         io.streq(name, "set\0") != 0) { ret 1; }

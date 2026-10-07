@@ -279,6 +279,25 @@ pub fun wait() {
     }
 }
 
+# atomically put `v` in *p; the value it held (a full memory barrier)
+pub fun xchg(p: *u64, v: u64) u64 {
+    var old: u64 = v;
+    asm x86_64 {
+        mov rcx, {p}
+        mov rax, {old}
+        xchg [rcx], rax
+        mov {old}, rax
+    }
+    ret old;
+}
+
+# a spin-wait hint
+pub fun pause() {
+    asm x86_64 {
+        .byte 0xf3, 0x90 :: writes()
+    }
+}
+
 # load an empty IDT and raise an exception: the cpu resets
 pub fun triple_fault() {
     var zero: [10]u8;

@@ -29,6 +29,7 @@ use version: machos.abi.version;
 use cpu:    machos.arch.x86_64.cpu;
 use fbcon:  machos.dev.fbcon;
 use mmap:   machos.kern.mmap;
+use smp:    machos.arch.x86_64.smp;
 
 val ARGS_MAX: u64 = 65536;
 val ENV_MAX: u64 = 65536;
@@ -766,7 +767,7 @@ fun sys_info(out: u64) u64 {
     i.heap_used = heap.used();
     i.uptime_ms = proc.uptime_ticks() * 1000 / apic.HZ;
     i.procs = proc.count();
-    i.cpus = 1;
+    i.cpus = smp.online();
     i.screen_w = fbcon.width_of();
     i.screen_h = fbcon.height_of();
     cpu.brand(?i.cpu_name[0]);
@@ -1217,6 +1218,13 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
 
 #[symbol("syscall_dispatch")]
 fun syscall_dispatch(f: *idt.Frame) {
+    smp.lock();
+    proc.entered();
+    syscall_body(f);
+    smp.unlock();
+}
+
+fun syscall_body(f: *idt.Frame) {
     frame = f;
     vfs.set_cred(cur().euid, cur().egid);
     # user memory is reachable (SMAP) only while the call runs; every user

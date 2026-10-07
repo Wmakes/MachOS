@@ -8,13 +8,17 @@ use gdt: machos.arch.x86_64.gdt;
 
 pub val SYSCALL_VECTOR: u64 = 0x7F;
 
-# only touched with interrupts off on the one cpu
-#[symbol("sc_kstack")]
-var sc_kstack: u64 = 0; # top of the running process's kernel stack
-#[symbol("sc_rsp")]
-var sc_rsp: u64 = 0;    # its user rsp while the frame is being built
+# each cpu's: entry finds it through the kernel GS base (swapgs), using
+# GS only for these two loads and switching straight back, so the kernel
+# itself never depends on GS
+rec PerCpu {
+    kstack:   u64; # @0: top of the running process's kernel stack
+    user_rsp: u64; # @8: its user rsp while the frame is being built
+}
 
-pub fun set_kstack(top: u64) { sc_kstack = top; }
+var percpu: [16]PerCpu;
+
+pub fun set_kstack(c: u64, top: u64) { percpu[c].kstack = top; }
 
 # frame offsets: r15 @0 ... rax @112, vector @120, error @128,
 # rip @136, cs @144, rflags @152, rsp @160, ss @168
@@ -22,8 +26,9 @@ pub fun set_kstack(top: u64) { sc_kstack = top; }
 #[symbol("syscall_entry")]
 fun syscall_entry() {
     asm x86_64 {
-        mov [sc_rsp], rsp
-        mov rsp, [sc_kstack]
+        .byte 0x0f, 0x01, 0xf8 :: writes()
+        .byte 0x65, 0x48, 0x89, 0x24, 0x25, 0x08, 0x00, 0x00, 0x00 :: writes()
+        .byte 0x65, 0x48, 0x8b, 0x24, 0x25, 0x00, 0x00, 0x00, 0x00 :: writes()
         sub rsp, 16
         push r11
         push 0x23
@@ -45,7 +50,8 @@ fun syscall_entry() {
         push r13
         push r14
         push r15
-        mov rax, [sc_rsp]
+        .byte 0x65, 0x48, 0x8b, 0x04, 0x25, 0x08, 0x00, 0x00, 0x00 :: writes()
+        .byte 0x0f, 0x01, 0xf8 :: writes()
         mov [rsp + 160], rax
         mov rax, 0x1b
         mov [rsp + 168], rax
@@ -63,7 +69,13 @@ val MSR_STAR:   u32 = 0xC0000081;
 val MSR_LSTAR:  u32 = 0xC0000082;
 val MSR_FMASK:  u32 = 0xC0000084;
 
-pub fun init() {
+pub fun init() { init_cpu(0); }
+
+# swapgs (0f 01 f8), mov gs:[8], rsp; mov rsp, gs:[0]; ...; mov rax, gs:[8]
+# are written as bytes above
+pub fun init_cpu(c: u64) {
+    cpu.wrmsr(0xC0000101, 0);                       # GS base: user's (none)
+    cpu.wrmsr(0xC0000102, (?percpu[c])::u64);       # kernel GS base
     cpu.wrmsr(cpu.MSR_EFER, cpu.rdmsr(cpu.MSR_EFER) | 1); # SCE
     # kernel cs = 0x08 (ss 0x10); sysret base 0x10 -> user ss 0x18, cs 0x20
     cpu.wrmsr(MSR_STAR, (gdt.KCODE::u64 << 32) | ((gdt.KDATA::u64 | 3) << 48));

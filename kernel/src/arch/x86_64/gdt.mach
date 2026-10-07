@@ -23,15 +23,18 @@ pub rec Tss {
     iomap: u16;
 }
 
+pub val CPUS: u64 = 16;
+
+# one GDT, TSS and double-fault stack per cpu
 #[align(16)]
-var table: [7]u64;
-var ptr: Pointer;
+var tables: [16][7]u64;
+var ptrs: [16]Pointer;
 
 #[align(16)]
-pub var tss: Tss;
+var tsses: [16]Tss;
 
 #[align(16)]
-var df_stack: [4096]u8; # double faults run on IST1, a known-good stack
+var df_stacks: [16][4096]u8; # double faults run on IST1, a known-good stack
 
 # lgdt [rdi], reload data segments, far-return into the new code segment
 #[naked]
@@ -63,10 +66,15 @@ fun tss_load() {
     }
 }
 
-# the stack the cpu switches to when an interrupt arrives from user mode
-pub fun set_rsp0(top: u64) { tss.rsp0 = top; }
+# the stack cpu `c` switches to when an interrupt arrives from user mode
+pub fun set_rsp0(c: u64, top: u64) { tsses[c].rsp0 = top; }
 
-pub fun init() {
+pub fun init() { init_cpu(0); }
+
+# load cpu `c`'s GDT and TSS on the cpu running this
+pub fun init_cpu(c: u64) {
+    val table: *u64 = ?tables[c][0];
+    val tss: *Tss = ?tsses[c];
     table[0] = 0;
     table[1] = 0x00AF9A000000FFFF; # kernel code, long mode
     table[2] = 0x00CF92000000FFFF; # kernel data
@@ -74,9 +82,9 @@ pub fun init() {
     table[4] = 0x00AFFA000000FFFF; # user code, dpl 3, long mode
 
     tss.iomap = $size_of(Tss)::u16; # no io bitmap
-    tss.ist[0] = (?df_stack[0])::u64 + 4096;
+    tss.ist[0] = (?df_stacks[c][0])::u64 + 4096;
 
-    val base: u64 = (?tss)::u64;
+    val base: u64 = tss::u64;
     val limit: u64 = $size_of(Tss)::u64 - 1;
     table[5] = (limit & 0xFFFF)
              | ((base & 0xFFFFFF) << 16)
@@ -85,8 +93,9 @@ pub fun init() {
              | (((base >> 24) & 0xFF) << 56);
     table[6] = base >> 32;
 
+    val ptr: *Pointer = ?ptrs[c];
     ptr.limit = ($size_of([7]u64) - 1)::u16;
-    ptr.base  = (?table[0])::u64;
-    gdt_load(?ptr);
+    ptr.base  = table::u64;
+    gdt_load(ptr);
     tss_load();
 }

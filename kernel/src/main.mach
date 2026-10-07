@@ -30,6 +30,7 @@ use clock:  machos.kern.clock;
 use pci:    machos.dev.pci;
 use xhci:   machos.dev.xhci;
 use dsk:    machos.dev.disk;
+use smp:    machos.arch.x86_64.smp;
 
 var boot: info.BootInfo;
 
@@ -115,6 +116,8 @@ fun kmain() {
 
     val aerr: *u8 = apic.init(boot.rsdp);
     if (aerr != nil) { kprint.panic(aerr); }
+    smp.set_first(apic.id());
+    smp.lock(); # held by this cpu until it first runs a program
     if (kbd.init() != 0) { apic.route(1, apic.IRQ_BASE + 1); }
     serial.enable_rx();
     apic.route(4, apic.IRQ_BASE + 4);
@@ -178,12 +181,80 @@ fun kmain() {
         tmp.mode = 0x3FF; # 01777: everyone may make files, only owners remove them
     }
 
+    start_cpus();
     val pid: u64 = sys.spawn_init("/bin/init\0", rescue());
     if (abi.is_err(pid) != 0) {
         kprint.puts("/bin/init: \0");
         kprint.panic(abi.err_name(pid));
     }
-    proc.scheduler();
+    proc.scheduler(0);
+}
+
+#[symbol("ap_cr3")]
+var ap_cr3: u64 = 0;
+
+# where another cpu starts: no-execute pages on (EFER.NXE) and our page
+# tables loaded before it touches its own stack (extra_argument, in the
+# kernel heap Limine's tables do not map), then into ap_main
+#[naked]
+#[symbol("ap_entry")]
+fun ap_entry() {
+    asm x86_64 {
+        mov rsi, rdi
+        mov ecx, 0xC0000080
+        rdmsr
+        or eax, 0x800
+        wrmsr
+        mov rax, [ap_cr3]
+        mov cr3, rax
+        mov rdi, rsi
+        mov rsp, [rdi + 24]
+        call ap_main
+        cli
+        hlt
+    }
+}
+
+#[symbol("ap_main")]
+fun ap_main(r: *limine.MpInfo) {
+    cpu.init();                       # no-execute pages on before our page tables
+    cpu.set_cr3(vmm.kernel_space());
+    val me: u64 = smp.here();
+    gdt.init_cpu(me);
+    idt.load();
+    syscall.init_cpu(me);
+    apic.init_ap();
+    smp.came_up(me);
+    smp.lock();
+    proc.scheduler(me);
+}
+
+# start the other processors and wait (up to ~1 s) until they run
+fun start_cpus() {
+    ap_cr3 = vmm.kernel_space();
+    var want: u64 = 1;
+    var k: u64 = 0;
+    for (k < boot.cpus) {
+        if (boot.cpu_lapic[k] != boot.bsp_lapic) {
+            val idx: u64 = smp.add(boot.cpu_lapic[k]);
+            if (idx == smp.MAX) { brk; }
+            val stack: u64 = heap.alloc(16384);
+            if (stack == 0) { brk; }
+            val r: *limine.MpInfo = boot.cpu_start[k]::*limine.MpInfo;
+            r.extra_argument = stack + 16384;
+            r.goto_address = ap_entry::u64;
+            want = want + 1;
+        }
+        k = k + 1;
+    }
+    var spins: u64 = 0;
+    for (smp.online() < want && spins < 1000000) {
+        cpu.outb(0x80, 0);
+        spins = spins + 1;
+    }
+    kprint.puts("smp: \0");
+    kprint.dec(smp.online());
+    kprint.puts(" cpu(s) running\n\0");
 }
 
 fun make_dev(dir: *vfs.Node, name: *u8, n: u64, id: u64) {

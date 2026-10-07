@@ -1,4 +1,4 @@
-# date: the current date and time (UTC)
+# date [+%s]: the current date and time (UTC); +%s: seconds since 1970
 
 use sys: sdk.sys;
 use io:  sdk.io;
@@ -19,6 +19,11 @@ fun two(v: u64) {
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     val t: u64 = sys.time();
+    if (argc > 1 && io.streq(argv[1], "+%s\0") != 0) {
+        io.dec(t);
+        io.putc(10);
+        ret 0;
+    }
     var days: u64 = t / 86400;
     val secs: u64 = t % 86400;
     var year: u64 = 1970;

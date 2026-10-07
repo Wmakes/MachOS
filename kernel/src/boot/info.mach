@@ -40,4 +40,8 @@ pub rec BootInfo {
     fb:         Framebuffer;
     mem:        [128]MemRegion;
     mem_len:    u64;
+    cpus:       u64;      # processors, this one included (1 when unknown)
+    bsp_lapic:  u32;      # this one's local APIC id
+    cpu_lapic:  [16]u32;  # each one's local APIC id
+    cpu_start:  [16]u64;  # each one's boot-protocol record (see boot/limine.mach)
 }
