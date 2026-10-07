@@ -251,7 +251,12 @@ pub rec Stat {
     uid:   u64;
     gid:   u64;
     sector: u64; # a disk's (or partition's) sector size, 0 otherwise
+    rdev:  u64; # a device's number (DEV_*), 0 otherwise
 }
+
+# device numbers (Stat.rdev)
+pub val DEV_CONSOLE: u64 = 1;  # the console: tty1
+pub val DEV_TTY:     u64 = 4;  # + 0..5: tty1..tty6
 
 pub rec Entry {
     kind:     u64;

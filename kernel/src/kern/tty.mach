@@ -1,166 +1,231 @@
-# the console terminal: keyboard and serial bytes come in here. modes are
-# POSIX's local flags (sdk abi): with ICANON, input is line edited (backspace,
-# ^D) and readers get whole lines; without it every byte is readable as it
-# arrives. ECHO shows what is typed, ISIG makes ^C kill the foreground
-# process group. in line mode escape sequences (arrow keys) are dropped
+# the console terminals tty1..tty6 (index 0..5): keyboard bytes go to the
+# one on screen, serial bytes always to tty1, which the serial port also
+# mirrors. alt+F1..F6 switch. modes are POSIX's local flags (sdk abi): with
+# ICANON, input is line edited (backspace, ^D) and readers get whole lines;
+# without it every byte is readable as it arrives. ECHO shows what is
+# typed, ISIG makes ^C kill the foreground process group. in line mode
+# escape sequences (arrow keys) are dropped
 
 use abi:    sdk.abi;
 use kprint: machos.kern.kprint;
 use proc:   machos.kern.proc;
+use fbcon:  machos.dev.fbcon;
 
+pub val COUNT: u64 = 6;
 val LINE: u64 = 1024;
 val RING: u64 = 4096;
 
-var line: [1024]u8;
-var line_len: u64 = 0;
-
-var ring: [4096]u8;
-var head: u64 = 0;  # next byte to read
-var count: u64 = 0; # bytes waiting
-var eofs: u64 = 0;  # pending ^D on an empty line, each reads as end of file
-var fg: u64 = 0;    # process group ^C is delivered to, 0 = nobody
-var lflag: u64 = 11; # ISIG | ICANON | ECHO
-var esc: u8 = 0;    # line mode, inside an escape sequence: 1 after ESC, 2 after ESC [
-
-fun push(c: u8) {
-    if (count == RING) { ret; }
-    ring[(head + count) % RING] = c;
-    count = count + 1;
+rec Term {
+    line:     [1024]u8;
+    line_len: u64;
+    ring:     [4096]u8;
+    head:     u64;  # next byte to read
+    count:    u64;  # bytes waiting
+    eofs:     u64;  # pending ^D on an empty line, each reads as end of file
+    fg:       u64;  # process group ^C is delivered to, 0 = nobody
+    lflag:    u64;
+    esc:      u8;   # line mode, inside an escape sequence: 1 after ESC, 2 after ESC [
 }
 
-fun commit() {
+var terms: [6]Term;
+var active: u64 = 0;
+var ready: u8 = 0;
+
+fun setup() {
+    if (ready != 0) { ret; }
     var i: u64 = 0;
-    for (i < line_len) {
-        push(line[i]);
+    for (i < COUNT) {
+        terms[i].lflag = 11; # ISIG | ICANON | ECHO
         i = i + 1;
     }
-    line_len = 0;
+    ready = 1;
+}
+
+fun push(t: *Term, c: u8) {
+    if (t.count == RING) { ret; }
+    t.ring[(t.head + t.count) % RING] = c;
+    t.count = t.count + 1;
+}
+
+fun commit(t: *Term) {
+    var i: u64 = 0;
+    for (i < t.line_len) {
+        push(t, t.line[i]);
+        i = i + 1;
+    }
+    t.line_len = 0;
     proc.wakeup(proc.CHAN_TTY);
 }
 
-fun echo(c: u8) {
-    if ((lflag & abi.ECHO) != 0) { kprint.putc(c); }
+# a byte to terminal `n`'s screen
+pub fun out(n: u64, c: u8) { kprint.putc_to(n, c); }
+
+fun outs(n: u64, s: *u8) {
+    var i: u64 = 0;
+    for (s[i] != 0) {
+        out(n, s[i]);
+        i = i + 1;
+    }
 }
 
-fun canonical(c: u8) {
+fun echo(n: u64, c: u8) {
+    if ((terms[n].lflag & abi.ECHO) != 0) { out(n, c); }
+}
+
+fun canonical(n: u64, c: u8) {
+    val t: *Term = ?terms[n];
     # skip ESC [ ... final, or ESC O x
-    if (esc == 1) {
-        if (c == 91 || c == 79) { esc = 2; }
-        or                      { esc = 0; }
+    if (t.esc == 1) {
+        if (c == 91 || c == 79) { t.esc = 2; }
+        or                      { t.esc = 0; }
         ret;
     }
-    if (esc == 2) {
-        if (c >= 64 && c <= 126) { esc = 0; }
+    if (t.esc == 2) {
+        if (c >= 64 && c <= 126) { t.esc = 0; }
         ret;
     }
     if (c == 27) {
-        esc = 1;
+        t.esc = 1;
         ret;
     }
     if (c == 4) {
-        if (line_len == 0) {
-            eofs = eofs + 1;
+        if (t.line_len == 0) {
+            t.eofs = t.eofs + 1;
             proc.wakeup(proc.CHAN_TTY);
         } or {
-            commit();
+            commit(t);
         }
         ret;
     }
     if (c == 8) {
-        if (line_len > 0) {
-            line_len = line_len - 1;
-            if ((lflag & abi.ECHO) != 0) { kprint.puts("\x08 \x08\0"); }
+        if (t.line_len > 0) {
+            t.line_len = t.line_len - 1;
+            if ((t.lflag & abi.ECHO) != 0) { outs(n, "\x08 \x08\0"); }
         }
         ret;
     }
     if (c == 21) { # ^U: kill the line
-        for (line_len > 0) {
-            line_len = line_len - 1;
-            if ((lflag & abi.ECHO) != 0) { kprint.puts("\x08 \x08\0"); }
+        for (t.line_len > 0) {
+            t.line_len = t.line_len - 1;
+            if ((t.lflag & abi.ECHO) != 0) { outs(n, "\x08 \x08\0"); }
         }
         ret;
     }
     if (c == 10) {
-        line[line_len] = 10;
-        line_len = line_len + 1;
-        echo(10);
-        commit();
+        t.line[t.line_len] = 10;
+        t.line_len = t.line_len + 1;
+        echo(n, 10);
+        commit(t);
         ret;
     }
     if ((c >= 32 && c < 127) || c == 9) {
-        if (line_len < LINE - 1) {
-            line[line_len] = c;
-            line_len = line_len + 1;
-            echo(c);
+        if (t.line_len < LINE - 1) {
+            t.line[t.line_len] = c;
+            t.line_len = t.line_len + 1;
+            echo(n, c);
         }
     }
 }
 
-# one input byte from a device
-pub fun input(raw: u8) {
+# one input byte for terminal `n`
+pub fun input_to(n: u64, raw: u8) {
+    setup();
+    val t: *Term = ?terms[n];
     var c: u8 = raw;
     if (c == 13) { c = 10; }
     if (c == 127) { c = 8; }
 
     # ^C, ^Z and ^\ signal the foreground group
-    if ((lflag & abi.ISIG) != 0 && (c == 3 || c == 26 || c == 28)) {
+    if ((t.lflag & abi.ISIG) != 0 && (c == 3 || c == 26 || c == 28)) {
         var sig: u64 = abi.SIGINT;
         if (c == 26) {
             sig = abi.SIGTSTP;
-            kprint.puts("^Z\n\0");
+            outs(n, "^Z\n\0");
         } or (c == 28) {
             sig = abi.SIGQUIT;
-            kprint.puts("^\\\n\0");
+            outs(n, "^\\\n\0");
         } or {
-            kprint.puts("^C\n\0");
+            outs(n, "^C\n\0");
         }
-        line_len = 0;
-        esc = 0;
-        if (fg != 0) { proc.send_group(fg, sig); }
+        t.line_len = 0;
+        t.esc = 0;
+        if (t.fg != 0) { proc.send_group(t.fg, sig); }
         ret;
     }
-    if ((lflag & abi.ICANON) != 0) {
-        canonical(c);
+    if ((t.lflag & abi.ICANON) != 0) {
+        canonical(n, c);
         ret;
     }
-    push(c);
-    echo(c);
+    push(t, c);
+    echo(n, c);
     proc.wakeup(proc.CHAN_TTY);
 }
 
+# what ctrl makes of a key: ^A..^Z for letters, and ^[ ^\ ^] ^^ ^_ for
+# the keys a terminal maps there ([ \ ] 6 and / - _)
+pub fun control(c: u8) u8 {
+    if (c >= 97 && c <= 122) { ret c - 96; }
+    if (c >= 65 && c <= 90) { ret c - 64; }
+    if (c == 91) { ret 27; }
+    if (c == 92 || c == 124) { ret 28; }
+    if (c == 93) { ret 29; }
+    if (c == 54 || c == 94) { ret 30; }
+    if (c == 47 || c == 45 || c == 95) { ret 31; }
+    ret c;
+}
+
+# a byte from the keyboard: to the terminal on screen
+pub fun input(c: u8) { input_to(active, c); }
+
+# show terminal `n` (alt+Fn)
+pub fun switch_to(n: u64) {
+    if (n >= COUNT || n == active) { ret; }
+    active = n;
+    fbcon.show_screen(n);
+}
+
+pub fun current() u64 { ret active; }
+
 # whether a read would return right away (data or end of file)
-pub fun readable() u8 {
-    if (count > 0 || eofs > 0) { ret 1; }
+pub fun readable(n: u64) u8 {
+    setup();
+    if (terms[n].count > 0 || terms[n].eofs > 0) { ret 1; }
     ret 0;
 }
 
-# take up to `n` bytes (in line mode, stopping after a newline); 0 means
+# take up to `len` bytes (in line mode, stopping after a newline); 0 means
 # end of file. call only when readable()
-pub fun read(buf: *u8, n: u64) u64 {
-    if (count == 0) {
-        if (eofs > 0) { eofs = eofs - 1; }
+pub fun read(n: u64, buf: *u8, len: u64) u64 {
+    val t: *Term = ?terms[n];
+    if (t.count == 0) {
+        if (t.eofs > 0) { t.eofs = t.eofs - 1; }
         ret 0;
     }
     var i: u64 = 0;
-    for (i < n && count > 0) {
-        val c: u8 = ring[head];
-        head = (head + 1) % RING;
-        count = count - 1;
+    for (i < len && t.count > 0) {
+        val c: u8 = t.ring[t.head];
+        t.head = (t.head + 1) % RING;
+        t.count = t.count - 1;
         buf[i] = c;
         i = i + 1;
-        if (c == 10 && (lflag & abi.ICANON) != 0) { brk; }
+        if (c == 10 && (t.lflag & abi.ICANON) != 0) { brk; }
     }
     ret i;
 }
 
-pub fun set_foreground(group: u64) { fg = group; }
-pub fun foreground() u64 { ret fg; }
+pub fun set_foreground(n: u64, group: u64) { terms[n].fg = group; }
+pub fun foreground(n: u64) u64 { ret terms[n].fg; }
 
-pub fun get_lflag() u64 { ret lflag; }
+pub fun get_lflag(n: u64) u64 {
+    setup();
+    ret terms[n].lflag;
+}
 
-pub fun set_lflag(f: u64) {
+pub fun set_lflag(n: u64, f: u64) {
+    setup();
+    val t: *Term = ?terms[n];
     # leaving line mode hands over whatever was half typed
-    if ((lflag & abi.ICANON) != 0 && (f & abi.ICANON) == 0 && line_len > 0) { commit(); }
-    lflag = f & (abi.ISIG | abi.ICANON | abi.ECHO);
-    esc = 0;
+    if ((t.lflag & abi.ICANON) != 0 && (f & abi.ICANON) == 0 && t.line_len > 0) { commit(t); }
+    t.lflag = f & (abi.ISIG | abi.ICANON | abi.ECHO);
+    t.esc = 0;
 }

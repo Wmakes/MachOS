@@ -19,6 +19,32 @@ val DEFAULT: u8 = 0x07;     # light grey on black: bg in the high nibble
 
 # the 16 colours, in ANSI order: black red green yellow blue magenta cyan
 # white, then their bright versions
+pub val SCREENS: u64 = 6;
+
+# one terminal's screen: its characters, colours, cursor, escape parser
+# and history. only the screen shown is painted
+rec Screen {
+    cells:     [32768]u8;
+    attrs:     [32768]u8;
+    hist_c:    [98304]u8;  # lines that scrolled off, a ring of hist_max lines
+    hist_a:    [98304]u8;
+    hist_head: u64;        # where the next line goes
+    hist_n:    u64;        # lines kept
+    view:      u64;        # lines scrolled back, 0 = live
+    cx:        u64;
+    cy:        u64;
+    attr:      u8;
+    bold:      u8;
+    reverse:   u8;
+    esc:       u8;         # 0 normal, 1 after ESC, 2 inside ESC[
+    params:    [8]u64;
+    nparams:   u64;
+}
+
+var screens: [6]Screen;
+var s: *Screen = nil;      # the screen being written
+var shown: u64 = 0;        # the screen on display
+
 val PAL_R: [16]u8 = [16]u8{0x00, 0xAA, 0x00, 0xAA, 0x00, 0xAA, 0x00, 0xAA, 0x55, 0xFF, 0x55, 0xFF, 0x55, 0xFF, 0x55, 0xFF};
 val PAL_G: [16]u8 = [16]u8{0x00, 0x00, 0xAA, 0x55, 0x00, 0x00, 0xAA, 0xAA, 0x55, 0x55, 0xFF, 0xFF, 0x55, 0x55, 0xFF, 0xFF};
 val PAL_B: [16]u8 = [16]u8{0x00, 0x00, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0x55, 0x55, 0x55, 0x55, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -27,26 +53,11 @@ var base: u64 = 0; # virtual address of pixel (0,0), 0 = no console
 var pitch: u64 = 0;
 var cols: u64 = 0;
 var rows: u64 = 0;
-var cx: u64 = 0;
-var cy: u64 = 0;
-var attr: u8 = 0x07;
-var bold: u8 = 0;
-var reverse: u8 = 0;
 var palette: [16]u32;
-var cells: [32768]u8;
-var attrs: [32768]u8;
 
-val HIST_CELLS: u64 = 196608;
-var hist_c: [196608]u8;  # lines that scrolled off, a ring of hist_max lines
-var hist_a: [196608]u8;
+val HIST_CELLS: u64 = 98304;
 var hist_max: u64 = 0;
-var hist_head: u64 = 0;  # where the next line goes
-var hist_n: u64 = 0;     # lines kept
-var view: u64 = 0;       # lines scrolled back, 0 = live
 
-var esc: u8 = 0;         # 0 normal, 1 after ESC, 2 inside ESC[
-var params: [8]u64;
-var nparams: u64 = 0;
 
 fun channel(v: u32, size: u8, shift: u8) u32 {
     # scale an 8-bit channel down to `size` bits, then place it
@@ -59,7 +70,7 @@ fun rgb(f: *info.Framebuffer, r: u32, g: u32, b: u32) u32 {
       | channel(b, f.b_size, f.b_shift);
 }
 
-fun paint(i: u64, a: u8) { paint_char(i, cells[i], a); }
+fun paint(i: u64, a: u8) { paint_char(i, s.cells[i], a); }
 
 fun paint_char(i: u64, ch: u8, a: u8) {
     val c: u64 = ch::u64;
@@ -80,47 +91,50 @@ fun paint_char(i: u64, ch: u8, a: u8) {
     }
 }
 
-fun draw(i: u64) { paint(i, attrs[i]); }
+fun draw(i: u64) { paint(i, s.attrs[i]); }
+
+# whether what is written now should reach the pixels
+fun visible() u8 { ret (s == ?screens[shown] && s.view == 0)::u8; }
 
 fun set(i: u64, c: u8, a: u8) {
-    if (cells[i] != c || attrs[i] != a) {
-        cells[i] = c;
-        attrs[i] = a;
-        if (view == 0) { draw(i); }
+    if (s.cells[i] != c || s.attrs[i] != a) {
+        s.cells[i] = c;
+        s.attrs[i] = a;
+        if (visible() != 0) { draw(i); }
     }
 }
 
 # the cursor is the cell under it drawn with fg and bg swapped
 fun cursor_cell() u64 {
-    var x: u64 = cx;
+    var x: u64 = s.cx;
     if (x >= cols) { x = cols - 1; }
-    ret cy * cols + x;
+    ret s.cy * cols + x;
 }
 
-fun hide() { if (view == 0) { draw(cursor_cell()); } }
+fun hide() { if (visible() != 0) { draw(cursor_cell()); } }
 
 fun show() {
-    if (view != 0) { ret; }
+    if (visible() == 0) { ret; }
     val i: u64 = cursor_cell();
-    val a: u8 = attrs[i];
+    val a: u8 = s.attrs[i];
     paint(i, (a << 4) | (a >> 4));
 }
 
 # an empty cell: the current background, a visible foreground for the cursor
-fun blank() u8 { ret (attr & 0xF0) | 0x07; }
+fun blank() u8 { ret (s.attr & 0xF0) | 0x07; }
 
 # keep the top line before it scrolls away
 fun remember() {
     if (hist_max == 0) { ret; }
-    val at: u64 = hist_head * cols;
+    val at: u64 = s.hist_head * cols;
     var k: u64 = 0;
     for (k < cols) {
-        hist_c[at + k] = cells[k];
-        hist_a[at + k] = attrs[k];
+        s.hist_c[at + k] = s.cells[k];
+        s.hist_a[at + k] = s.attrs[k];
         k = k + 1;
     }
-    hist_head = (hist_head + 1) % hist_max;
-    if (hist_n < hist_max) { hist_n = hist_n + 1; }
+    s.hist_head = (s.hist_head + 1) % hist_max;
+    if (s.hist_n < hist_max) { s.hist_n = s.hist_n + 1; }
 }
 
 fun scroll() {
@@ -128,7 +142,7 @@ fun scroll() {
     val n: u64 = (rows - 1) * cols;
     var i: u64 = 0;
     for (i < n) {
-        set(i, cells[i + cols], attrs[i + cols]);
+        set(i, s.cells[i + cols], s.attrs[i + cols]);
         i = i + 1;
     }
     for (i < rows * cols) {
@@ -138,8 +152,8 @@ fun scroll() {
 }
 
 fun newline() {
-    cx = 0;
-    if (cy + 1 < rows) { cy = cy + 1; }
+    s.cx = 0;
+    if (s.cy + 1 < rows) { s.cy = s.cy + 1; }
     or                 { scroll(); }
 }
 
@@ -153,82 +167,82 @@ fun clear_from(i: u64, end: u64) {
 
 fun sgr(p: u64) {
     if (p == 0) {
-        attr = DEFAULT;
-        bold = 0;
-        reverse = 0;
+        s.attr = DEFAULT;
+        s.bold = 0;
+        s.reverse = 0;
     } or (p == 1) {
-        bold = 1;
-        attr = attr | 0x08;
+        s.bold = 1;
+        s.attr = s.attr | 0x08;
     } or (p == 7) { # reverse video
-        if (reverse == 0) {
-            reverse = 1;
-            attr = (attr << 4) | (attr >> 4);
+        if (s.reverse == 0) {
+            s.reverse = 1;
+            s.attr = (s.attr << 4) | (s.attr >> 4);
         }
     } or (p == 27) {
-        if (reverse != 0) {
-            reverse = 0;
-            attr = (attr << 4) | (attr >> 4);
+        if (s.reverse != 0) {
+            s.reverse = 0;
+            s.attr = (s.attr << 4) | (s.attr >> 4);
         }
     } or (p == 22) {
-        bold = 0;
-        attr = attr & 0xF7;
+        s.bold = 0;
+        s.attr = s.attr & 0xF7;
     } or (p >= 30 && p <= 37) {
-        attr = (attr & 0xF0) | (p - 30)::u8;
-        if (bold != 0) { attr = attr | 0x08; }
+        s.attr = (s.attr & 0xF0) | (p - 30)::u8;
+        if (s.bold != 0) { s.attr = s.attr | 0x08; }
     } or (p == 39) {
-        attr = (attr & 0xF0) | 0x07;
-        if (bold != 0) { attr = attr | 0x08; }
+        s.attr = (s.attr & 0xF0) | 0x07;
+        if (s.bold != 0) { s.attr = s.attr | 0x08; }
     } or (p >= 40 && p <= 47) {
-        attr = (attr & 0x0F) | ((p - 40)::u8 << 4);
+        s.attr = (s.attr & 0x0F) | ((p - 40)::u8 << 4);
     } or (p == 49) {
-        attr = attr & 0x0F;
+        s.attr = s.attr & 0x0F;
     } or (p >= 90 && p <= 97) {
-        attr = (attr & 0xF0) | (p - 90)::u8 | 0x08;
+        s.attr = (s.attr & 0xF0) | (p - 90)::u8 | 0x08;
     }
 }
 
 fun csi(final: u8) {
     if (final == 109) { # m
-        if (nparams == 0) { sgr(0); }
+        if (s.nparams == 0) { sgr(0); }
         var i: u64 = 0;
-        for (i < nparams) {
-            sgr(params[i]);
+        for (i < s.nparams) {
+            sgr(s.params[i]);
             i = i + 1;
         }
     } or (final == 74) { # J: 2 = whole screen
-        if (nparams > 0 && params[0] == 2) {
+        if (s.nparams > 0 && s.params[0] == 2) {
             clear_from(0, rows * cols);
-            cx = 0;
-            cy = 0;
+            s.cx = 0;
+            s.cy = 0;
         } or {
             clear_from(cursor_cell(), rows * cols);
         }
     } or (final == 72) { # H: row;col, 1-based
         var r: u64 = 1;
         var c: u64 = 1;
-        if (nparams > 0 && params[0] > 0) { r = params[0]; }
-        if (nparams > 1 && params[1] > 0) { c = params[1]; }
+        if (s.nparams > 0 && s.params[0] > 0) { r = s.params[0]; }
+        if (s.nparams > 1 && s.params[1] > 0) { c = s.params[1]; }
         if (r > rows) { r = rows; }
         if (c > cols) { c = cols; }
-        cy = r - 1;
-        cx = c - 1;
+        s.cy = r - 1;
+        s.cx = c - 1;
     } or (final == 67 || final == 68) { # C / D: n columns right / left
         var k: u64 = 1;
-        if (nparams > 0 && params[0] > 0) { k = params[0]; }
+        if (s.nparams > 0 && s.params[0] > 0) { k = s.params[0]; }
         if (final == 67) {
-            cx = cx + k;
-            if (cx >= cols) { cx = cols - 1; }
+            s.cx = s.cx + k;
+            if (s.cx >= cols) { s.cx = cols - 1; }
         } or {
-            if (k > cx) { cx = 0; }
-            or          { cx = cx - k; }
+            if (k > s.cx) { s.cx = 0; }
+            or          { s.cx = s.cx - k; }
         }
     } or (final == 71) { # G: column n, 1-based
         var k: u64 = 1;
-        if (nparams > 0 && params[0] > 0) { k = params[0]; }
+        if (s.nparams > 0 && s.params[0] > 0) { k = s.params[0]; }
         if (k > cols) { k = cols; }
-        cx = k - 1;
+        s.cx = k - 1;
     } or (final == 75) { # K: to the end of the line
-        clear_from(cursor_cell(), (cy + 1) * cols);
+        clear_from(cursor_cell(), (s.cy + 1) * cols);
     }
 }
 
@@ -258,15 +272,20 @@ pub fun init(f: *info.Framebuffer) u8 {
         }
         y = y + 1;
     }
-    var i: u64 = 0;
-    for (i < rows * cols) {
-        cells[i] = 32;
-        attrs[i] = DEFAULT;
-        i = i + 1;
+    var n: u64 = 0;
+    for (n < SCREENS) {
+        s = ?screens[n];
+        var i: u64 = 0;
+        for (i < rows * cols) {
+            s.cells[i] = 32;
+            s.attrs[i] = DEFAULT;
+            i = i + 1;
+        }
+        s.attr = DEFAULT;
+        n = n + 1;
     }
     hist_max = HIST_CELLS / cols;
-    cx = 0;
-    cy = 0;
+    s = ?screens[0];
     show();
     ret 1;
 }
@@ -276,17 +295,17 @@ fun repaint() {
     var r: u64 = 0;
     for (r < rows) {
         var k: u64 = 0;
-        if (r < view) {
+        if (r < s.view) {
             # history line (view - r) back from the newest
-            val line: u64 = (hist_head + hist_max - (view - r)) % hist_max;
+            val line: u64 = (s.hist_head + hist_max - (s.view - r)) % hist_max;
             for (k < cols) {
-                paint_char(r * cols + k, hist_c[line * cols + k], hist_a[line * cols + k]);
+                paint_char(r * cols + k, s.hist_c[line * cols + k], s.hist_a[line * cols + k]);
                 k = k + 1;
             }
         } or {
-            val src: u64 = (r - view) * cols;
+            val src: u64 = (r - s.view) * cols;
             for (k < cols) {
-                paint_char(r * cols + k, cells[src + k], attrs[src + k]);
+                paint_char(r * cols + k, s.cells[src + k], s.attrs[src + k]);
                 k = k + 1;
             }
         }
@@ -295,20 +314,33 @@ fun repaint() {
     show();
 }
 
-# page back through the history (shift+pgup) and forward again (shift+pgdn)
+# put screen `n` on display
+pub fun show_screen(n: u64) {
+    if (base == 0 || n >= SCREENS) { ret; }
+    shown = n;
+    s = ?screens[n];
+    repaint();
+}
+
+# page back through the history of the screen on display (shift+pgup) and
+# forward again (shift+pgdn)
 pub fun view_up() {
-    if (base == 0 || hist_n == 0) { ret; }
-    var v: u64 = view + rows / 2;
-    if (v > hist_n) { v = hist_n; }
-    if (v == view) { ret; }
-    view = v;
+    if (base == 0) { ret; }
+    s = ?screens[shown];
+    if (s.hist_n == 0) { ret; }
+    var v: u64 = s.view + rows / 2;
+    if (v > s.hist_n) { v = s.hist_n; }
+    if (v == s.view) { ret; }
+    s.view = v;
     repaint();
 }
 
 pub fun view_down() {
-    if (base == 0 || view == 0) { ret; }
-    if (view > rows / 2) { view = view - rows / 2; }
-    or                   { view = 0; }
+    if (base == 0) { ret; }
+    s = ?screens[shown];
+    if (s.view == 0) { ret; }
+    if (s.view > rows / 2) { s.view = s.view - rows / 2; }
+    or                   { s.view = 0; }
     repaint();
 }
 
@@ -316,62 +348,64 @@ pub fun cols_of() u64 { ret cols; }
 pub fun rows_of() u64 { ret rows; }
 
 fun put(c: u8) {
-    if (esc == 1) {
+    if (s.esc == 1) {
         if (c == 91) { # [
-            esc = 2;
-            nparams = 0;
-            params[0] = 0;
+            s.esc = 2;
+            s.nparams = 0;
+            s.params[0] = 0;
         } or {
-            esc = 0;
+            s.esc = 0;
         }
         ret;
     }
-    if (esc == 2) {
+    if (s.esc == 2) {
         if (c >= 48 && c <= 57) {
-            if (nparams == 0) { nparams = 1; }
-            params[nparams - 1] = params[nparams - 1] * 10 + (c - 48)::u64;
+            if (s.nparams == 0) { s.nparams = 1; }
+            s.params[s.nparams - 1] = s.params[s.nparams - 1] * 10 + (c - 48)::u64;
         } or (c == 59) { # ;
-            if (nparams == 0) { nparams = 1; }
-            if (nparams < 8) {
-                params[nparams] = 0;
-                nparams = nparams + 1;
+            if (s.nparams == 0) { s.nparams = 1; }
+            if (s.nparams < 8) {
+                s.params[s.nparams] = 0;
+                s.nparams = s.nparams + 1;
             }
         } or (c >= 64 && c <= 126) {
-            esc = 0;
+            s.esc = 0;
             csi(c);
         } or (c != 63) { # tolerate '?' in private modes, give up on the rest
-            esc = 0;
+            s.esc = 0;
         }
         ret;
     }
-    if (c == 27) { esc = 1; ret; }
+    if (c == 27) { s.esc = 1; ret; }
     if (c == 10) { newline(); ret; }
-    if (c == 13) { cx = 0; ret; }
+    if (c == 13) { s.cx = 0; ret; }
     if (c == 12) { # form feed clears the screen
         clear_from(0, rows * cols);
-        cx = 0;
-        cy = 0;
+        s.cx = 0;
+        s.cy = 0;
         ret;
     }
     if (c == 8) {
-        if (cx > 0) { cx = cx - 1; }
+        if (s.cx > 0) { s.cx = s.cx - 1; }
         ret;
     }
     if (c == 9) {
         put(32);
-        for ((cx % 8) != 0 && cx < cols) { put(32); }
+        for ((s.cx % 8) != 0 && s.cx < cols) { put(32); }
         ret;
     }
     if (c < 32) { ret; }
-    if (cx >= cols) { newline(); }
-    set(cy * cols + cx, c, attr);
-    cx = cx + 1;
+    if (s.cx >= cols) { newline(); }
+    set(s.cy * cols + s.cx, c, s.attr);
+    s.cx = s.cx + 1;
 }
 
-pub fun putc(c: u8) {
-    if (base == 0) { ret; }
-    if (view != 0) { # output: back to the live screen
-        view = 0;
+# a byte for screen `n`
+pub fun putc_on(n: u64, c: u8) {
+    if (base == 0 || n >= SCREENS) { ret; }
+    s = ?screens[n];
+    if (s.view != 0 && n == shown) { # output: back to the live screen
+        s.view = 0;
         repaint();
     }
     hide();

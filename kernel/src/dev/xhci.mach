@@ -234,23 +234,45 @@ fun tilde(n: u8) {
 fun press(usage: u8, mods: u8) {
     val shift: u8 = ((mods & 0x22) != 0)::u8;
     val ctrl: u8 = ((mods & 0x11) != 0)::u8;
+    val alt: u8 = ((mods & 0x44) != 0)::u8;
+    if (alt != 0) { # alt+F1..F6 and alt+left/right switch terminals
+        if (usage >= 0x3A && usage <= 0x3F) {
+            tty.switch_to((usage - 0x3A)::u64);
+            ret;
+        }
+        if (usage == 0x50) {
+            tty.switch_to((tty.current() + tty.COUNT - 1) % tty.COUNT);
+            ret;
+        }
+        if (usage == 0x4F) {
+            tty.switch_to((tty.current() + 1) % tty.COUNT);
+            ret;
+        }
+    }
+    # keys that type a character: ctrl makes control codes of them, alt
+    # sends ESC first (as terminals do)
+    var c: u8 = 0;
     if (usage >= 0x04 && usage <= 0x1D) {
-        var c: u8 = NORMAL[(usage - 4)::u64];
+        c = NORMAL[(usage - 4)::u64];
         if ((shift ^ caps) != 0) { c = c - 32; }
-        if (ctrl != 0) { c = (c | 0x20) - 96; }
-        tty.input(c);
     } or (usage >= 0x1E && usage <= 0x27) {
-        if (shift != 0) { tty.input(SHIFT_DIGITS[(usage - 0x1E)::u64]); }
-        or              { tty.input(NORMAL[(usage - 4)::u64]); }
-    } or (usage == 0x28 || usage == 0x58) { tty.input(10); }   # enter, keypad enter
+        if (shift != 0) { c = SHIFT_DIGITS[(usage - 0x1E)::u64]; }
+        or              { c = NORMAL[(usage - 4)::u64]; }
+    } or (usage == 0x2C) { c = 32; }
+    or (usage >= 0x2D && usage <= 0x38) {
+        if (shift != 0) { c = PUNCT_SHIFT[(usage - 0x2D)::u64]; }
+        or              { c = PUNCT[(usage - 0x2D)::u64]; }
+    }
+    if (c != 0) {
+        if (ctrl != 0) { c = tty.control(c); }
+        if (alt != 0) { tty.input(27); }
+        tty.input(c);
+        ret;
+    }
+    if (usage == 0x28 || usage == 0x58) { tty.input(10); }      # enter, keypad enter
     or (usage == 0x29) { tty.input(27); }                       # escape
     or (usage == 0x2A) { tty.input(127); }                      # backspace
     or (usage == 0x2B) { tty.input(9); }
-    or (usage == 0x2C) { tty.input(32); }
-    or (usage >= 0x2D && usage <= 0x38) {
-        if (shift != 0) { tty.input(PUNCT_SHIFT[(usage - 0x2D)::u64]); }
-        or              { tty.input(PUNCT[(usage - 0x2D)::u64]); }
-    }
     or (usage == 0x39) { caps = caps ^ 1; }
     or (usage == 0x4F) { seq(67); }   # right
     or (usage == 0x50) { seq(68); }   # left
@@ -276,6 +298,7 @@ fun press(usage: u8, mods: u8) {
 
 fun repeats(usage: u8) u8 {
     if (usage == 0x39 || usage == 0 || usage == 1) { ret 0; } # caps lock, nothing, rollover
+    if (usage >= 0x3A && usage <= 0x45) { ret 0; }              # F1..F12
     ret 1;
 }
 

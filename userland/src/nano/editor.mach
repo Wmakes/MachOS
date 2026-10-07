@@ -1,0 +1,1103 @@
+# the text editor behind `nano` and `edit`, made to feel like GNU nano:
+# a title bar, the text, a status line and two lines of shortcuts.
+#   ^G help         ^X exit          ^O write out     ^S save
+#   ^W where is     ^Q where was     M-W next         ^\ M-R replace
+#   ^K cut line     ^U paste         M-6 copy line    ^R insert a file
+#   ^C location     ^_ ^T M-G go to line              M-\ M-/ first/last line
+#   M-U undo        M-E redo         ^A ^E home/end   ^Y ^V page up/down
+#   ^P ^N ^B ^F as the arrows        ^D delete        ^H backspace
+# M-x is alt+x, or escape then x. the text is one buffer of bytes; tabs
+# show as spaces to the next multiple of 8. only screen rows that changed
+# are redrawn
+
+use abi:  sdk.abi;
+use sys:  sdk.sys;
+use io:   sdk.io;
+use term: userland.ui.term;
+
+val CAP: u64 = 1048576;   # largest file: 1 MiB
+val MAXROWS: u64 = 128;
+val MAXCOLS: u64 = 512;
+val NONE: u64 = 0xFFFFFFFFFFFFFFFF;
+
+var text: [1048576]u8;
+var len: u64 = 0;
+var cur: u64 = 0;       # cursor, as a byte offset
+var want_col: u64 = 0;  # column up/down try to keep
+var top: u64 = 0;       # first line on screen
+var hoff: u64 = 0;      # columns scrolled off to the left
+var dirty: u8 = 0;
+var title: *u8 = nil;   # "nano" or "edit"
+var release: [64]u8;
+
+var name: [256]u8;      # the file's name ("" = a new buffer)
+var name_len: u64 = 0;
+
+var msg: [256]u8;
+var msg_len: u64 = 0;
+
+var cutbuf: [65536]u8;
+var cut_len: u64 = 0;
+var last_was_cut: u8 = 0;
+
+var last_find: [128]u8;
+var last_find_len: u64 = 0;
+
+var shown: [128][512]u8;  # what each screen row shows now
+var shown_len: [128]u64;
+var shown_ok: [128]u8;
+
+# --- output, gathered and written at once ----------------------------------
+
+var ob: [16384]u8;
+var obn: u64 = 0;
+
+fun flush() {
+    if (obn > 0) { io.outn(?ob[0], obn); }
+    obn = 0;
+}
+
+fun oc(c: u8) {
+    if (obn == 16384) { flush(); }
+    ob[obn] = c;
+    obn = obn + 1;
+}
+
+fun on(s: *u8, n: u64) {
+    var i: u64 = 0;
+    for (i < n) {
+        oc(s[i]);
+        i = i + 1;
+    }
+}
+
+fun o(s: *u8) { on(s, io.len(s)); }
+
+fun odec(v: u64) {
+    var b: [20]u8;
+    on(?b[0], io.fmt_dec(v, ?b[0]));
+}
+
+fun go(row: u64, col: u64) {
+    o("\x1b[\0");
+    odec(row + 1);
+    oc(59);
+    odec(col + 1);
+    oc(72);
+}
+
+fun clear_eol() { o("\x1b[K\0"); }
+fun rev(on_: u8) {
+    if (on_ != 0) { o("\x1b[7m\0"); }
+    or            { o("\x1b[0m\0"); }
+}
+
+fun say(s: *u8) {
+    msg_len = io.len(s);
+    if (msg_len > 255) { msg_len = 255; }
+    io.copy(?msg[0], s, msg_len);
+}
+
+# say "<a><number><b>"
+fun say_num(a: *u8, v: u64, b: *u8) {
+    var t: [256]u8;
+    var k: u64 = io.len(a);
+    io.copy(?t[0], a, k);
+    k = k + io.fmt_dec(v, ?t[k]);
+    val bn: u64 = io.len(b);
+    io.copy(?t[k], b, bn);
+    k = k + bn;
+    io.copy(?msg[0], ?t[0], k);
+    msg_len = k;
+}
+
+# --- lines and columns ------------------------------------------------------
+
+fun line_start(p: u64) u64 {
+    var i: u64 = p;
+    for (i > 0 && text[i - 1] != 10) { i = i - 1; }
+    ret i;
+}
+
+fun line_end(p: u64) u64 {
+    var i: u64 = p;
+    for (i < len && text[i] != 10) { i = i + 1; }
+    ret i;
+}
+
+fun line_of(p: u64) u64 {
+    var n: u64 = 0;
+    var i: u64 = 0;
+    for (i < p) {
+        if (text[i] == 10) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun lines() u64 { ret line_of(len) + 1; }
+
+# start of line `n` (or the end of the text)
+fun nth_line(n: u64) u64 {
+    var i: u64 = 0;
+    var k: u64 = 0;
+    for (k < n && i < len) {
+        if (text[i] == 10) { k = k + 1; }
+        i = i + 1;
+    }
+    ret i;
+}
+
+fun advance(col: u64, c: u8) u64 {
+    if (c == 9) { ret (col / 8 + 1) * 8; }
+    ret col + 1;
+}
+
+fun col_of(p: u64) u64 {
+    var col: u64 = 0;
+    var i: u64 = line_start(p);
+    for (i < p) {
+        col = advance(col, text[i]);
+        i = i + 1;
+    }
+    ret col;
+}
+
+# the offset on the line starting at `s` closest to column `col`
+fun at_col(s: u64, col: u64) u64 {
+    var c: u64 = 0;
+    var i: u64 = s;
+    for (i < len && text[i] != 10) {
+        val n: u64 = advance(c, text[i]);
+        if (n > col) { brk; }
+        c = n;
+        i = i + 1;
+    }
+    ret i;
+}
+
+# --- editing, with undo -----------------------------------------------------
+
+val MAX_OPS: u64 = 4096;
+val ARENA: u64 = 262144;
+val OP_INS: u8 = 1;
+val OP_DEL: u8 = 2;
+
+rec Op {
+    kind: u8;
+    pos:  u64;
+    at:   u64;  # its bytes, in the arena
+    n:    u64;
+}
+
+var ops: [4096]Op;
+var nops: u64 = 0;     # ops kept
+var applied: u64 = 0;  # ops[0..applied) are done; the rest can be redone
+var arena: [262144]u8;
+var arena_used: u64 = 0;
+var typing: u8 = 0;    # the last edit was typing: more typing joins it
+
+fun record(kind: u8, pos: u64, src: *u8, n: u64) {
+    # anything undone can no longer be redone
+    nops = applied;
+    arena_used = 0;
+    if (applied > 0) { arena_used = ops[applied - 1].at + ops[applied - 1].n; }
+    if (n > ARENA) { # too big to remember: start over
+        nops = 0;
+        applied = 0;
+        arena_used = 0;
+        ret;
+    }
+    if (kind == OP_INS && typing != 0 && applied > 0) {
+        val last: *Op = ?ops[applied - 1];
+        if (last.kind == OP_INS && last.pos + last.n == pos && arena_used + n <= ARENA) {
+            io.copy(?arena[arena_used], src, n);
+            last.n = last.n + n;
+            ret;
+        }
+    }
+    if (nops == MAX_OPS || arena_used + n > ARENA) {
+        nops = 0;
+        applied = 0;
+        arena_used = 0;
+    }
+    val op: *Op = ?ops[nops];
+    op.kind = kind;
+    op.pos = pos;
+    op.at = arena_used;
+    op.n = n;
+    io.copy(?arena[arena_used], src, n);
+    nops = nops + 1;
+    applied = nops;
+}
+
+# put n bytes at pos; 0 if they do not fit
+fun ins(pos: u64, src: *u8, n: u64, rec_: u8) u8 {
+    if (len + n > CAP) {
+        say("the file is full (1 MiB)\0");
+        ret 0;
+    }
+    if (rec_ != 0) { record(OP_INS, pos, src, n); }
+    var i: u64 = len;
+    for (i > pos) {
+        text[i + n - 1] = text[i - 1];
+        i = i - 1;
+    }
+    io.copy(?text[pos], src, n);
+    len = len + n;
+    dirty = 1;
+    ret 1;
+}
+
+fun del(pos: u64, n: u64, rec_: u8) {
+    if (n == 0) { ret; }
+    if (rec_ != 0) { record(OP_DEL, pos, ?text[pos], n); }
+    var i: u64 = pos;
+    for (i + n < len) {
+        text[i] = text[i + n];
+        i = i + 1;
+    }
+    len = len - n;
+    dirty = 1;
+}
+
+fun type_char(c: u8) {
+    var b: [1]u8;
+    b[0] = c;
+    if (ins(cur, ?b[0], 1, 1) != 0) { cur = cur + 1; }
+}
+
+fun undo() {
+    if (applied == 0) {
+        say("Nothing to undo\0");
+        ret;
+    }
+    val op: *Op = ?ops[applied - 1];
+    if (op.kind == OP_INS) { del(op.pos, op.n, 0); cur = op.pos; }
+    or {
+        ins(op.pos, ?arena[op.at], op.n, 0);
+        cur = op.pos + op.n;
+    }
+    applied = applied - 1;
+    say("Undid an edit\0");
+}
+
+fun redo() {
+    if (applied == nops) {
+        say("Nothing to redo\0");
+        ret;
+    }
+    val op: *Op = ?ops[applied];
+    if (op.kind == OP_INS) {
+        ins(op.pos, ?arena[op.at], op.n, 0);
+        cur = op.pos + op.n;
+    } or {
+        del(op.pos, op.n, 0);
+        cur = op.pos;
+    }
+    applied = applied + 1;
+    say("Redid an edit\0");
+}
+
+# --- files ------------------------------------------------------------------
+
+# read the file `p` in at `at` (recorded as edits when rec_); bytes read,
+# or NONE when it cannot be opened
+fun read_in(p: *u8, pn: u64, at: u64, rec_: u8) u64 {
+    val h: u64 = sys.open(p, pn, abi.O_READ);
+    if (abi.is_err(h) != 0) {
+        say(abi.err_name(h));
+        ret NONE;
+    }
+    var chunk: [8192]u8;
+    var got: u64 = 0;
+    for {
+        val r: u64 = sys.read(h, ?chunk[0], 8192);
+        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        if (ins(at + got, ?chunk[0], r, rec_) == 0) { brk; }
+        got = got + r;
+    }
+    sys.close(h);
+    ret got;
+}
+
+# write the text to `p`; whether it worked
+fun write_out(p: *u8, pn: u64) u8 {
+    val h: u64 = sys.open(p, pn, abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC);
+    if (abi.is_err(h) != 0) {
+        say(abi.err_name(h));
+        ret 0;
+    }
+    val ok: u8 = io.write_all(h, ?text[0], len);
+    sys.close(h);
+    if (ok == 0) {
+        say("Error writing the file\0");
+        ret 0;
+    }
+    dirty = 0;
+    var nl: u64 = line_of(len);
+    if (len > 0 && text[len - 1] != 10) { nl = nl + 1; }
+    say_num("Wrote \0", nl, " lines\0");
+    ret 1;
+}
+
+# --- drawing ----------------------------------------------------------------
+
+var row_buf: [512]u8;
+
+fun height() u64 {
+    var h: u64 = term.height();
+    if (h > MAXROWS) { h = MAXROWS; }
+    if (h < 6) { h = 6; }
+    ret h;
+}
+
+fun width() u64 {
+    var w: u64 = term.width();
+    if (w > MAXCOLS) { w = MAXCOLS; }
+    if (w < 20) { w = 20; }
+    ret w;
+}
+
+fun body() u64 { ret height() - 4; }
+
+# put row `r` on the screen if it changed
+fun put_row(r: u64, n: u64) {
+    if (shown_ok[r] != 0 && shown_len[r] == n && io.eq(?shown[r][0], n, ?row_buf[0], n) != 0) { ret; }
+    go(r, 0);
+    on(?row_buf[0], n);
+    clear_eol();
+    io.copy(?shown[r][0], ?row_buf[0], n);
+    shown_len[r] = n;
+    shown_ok[r] = 1;
+}
+
+fun render_line(s: u64, w: u64) u64 {
+    var n: u64 = 0;
+    var col: u64 = 0;
+    var i: u64 = s;
+    for (i < len && text[i] != 10 && n < w) {
+        val next: u64 = advance(col, text[i]);
+        for (col < next) {
+            if (col >= hoff && n < w) {
+                if (text[i] == 9 || text[i] < 32 || text[i] >= 127) { row_buf[n] = 32; }
+                or                                                  { row_buf[n] = text[i]; }
+                n = n + 1;
+            }
+            col = col + 1;
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun forget_rows() {
+    var r: u64 = 0;
+    for (r < MAXROWS) {
+        shown_ok[r] = 0;
+        r = r + 1;
+    }
+}
+
+# pad with spaces from column `used` to `to`
+fun pad(used: u64, to: u64) {
+    var u: u64 = used;
+    for (u < to) {
+        oc(32);
+        u = u + 1;
+    }
+}
+
+fun title_bar(w: u64) {
+    go(0, 0);
+    rev(1);
+    var left: [96]u8;
+    var ln: u64 = 2;
+    left[0] = 32;
+    left[1] = 32;
+    val tn: u64 = io.len(title);
+    io.copy(?left[ln], title, tn);
+    ln = ln + tn;
+    left[ln] = 32;
+    ln = ln + 1;
+    var rn: u64 = io.len(?release[0]);
+    if (rn > 40) { rn = 40; }
+    io.copy(?left[ln], ?release[0], rn);
+    ln = ln + rn;
+    on(?left[0], ln);
+    var used: u64 = ln;
+
+    var mid: [300]u8;
+    var mn: u64 = 0;
+    if (name_len == 0) {
+        io.copy(?mid[0], "New Buffer\0", 10);
+        mn = 10;
+    } or {
+        io.copy(?mid[0], "File: \0", 6);
+        mn = 6;
+        var k: u64 = name_len;
+        if (k > w / 2) { k = w / 2; }
+        io.copy(?mid[mn], ?name[name_len - k], k);
+        mn = mn + k;
+    }
+    var at: u64 = 0;
+    if (w > mn) { at = (w - mn) / 2; }
+    if (at < used + 1) { at = used + 1; }
+    pad(used, at);
+    on(?mid[0], mn);
+    used = at + mn;
+    if (dirty != 0 && used + 10 < w) {
+        pad(used, w - 10);
+        o("Modified\0");
+        used = w - 2;
+    }
+    pad(used, w);
+    rev(0);
+    shown_ok[0] = 0;
+}
+
+# the status line: a message in [ brackets ], centred and highlighted
+fun status_line(h: u64, w: u64) {
+    go(h - 3, 0);
+    if (msg_len > 0) {
+        var n: u64 = msg_len;
+        if (n + 4 > w) { n = w - 4; }
+        pad(0, (w - n - 4) / 2);
+        rev(1);
+        o("[ \0");
+        on(?msg[0], n);
+        o(" ]\0");
+        rev(0);
+    }
+    clear_eol();
+}
+
+# two lines of "^K Label" pairs, in columns
+fun shortcuts(h: u64, w: u64, keys: **u8, labels: **u8, count: u64) {
+    val per: u64 = (count + 1) / 2;
+    var colw: u64 = w / per;
+    if (colw < 6) { colw = 6; }
+    var row: u64 = 0;
+    for (row < 2) {
+        go(h - 2 + row, 0);
+        var c: u64 = 0;
+        var used: u64 = 0;
+        for (c < per) {
+            val i: u64 = row * per + c;
+            if (i < count && used + colw <= w) {
+                rev(1);
+                o(keys[i]);
+                rev(0);
+                oc(32);
+                var t: u64 = io.len(keys[i]) + 1;
+                var ll: u64 = io.len(labels[i]);
+                if (t + ll > colw - 1) { ll = colw - 1 - t; }
+                on(labels[i], ll);
+                t = t + ll;
+                pad(t, colw);
+                used = used + colw;
+            }
+            c = c + 1;
+        }
+        clear_eol();
+        row = row + 1;
+    }
+}
+
+var main_keys: [14]*u8;
+var main_labels: [14]*u8;
+var ask_keys: [2]*u8;
+var ask_labels: [2]*u8;
+var yn_keys: [4]*u8;
+var yn_labels: [4]*u8;
+
+fun setup_labels() {
+    main_keys[0] = "^G\0";  main_labels[0] = "Help\0";
+    main_keys[1] = "^O\0";  main_labels[1] = "Write Out\0";
+    main_keys[2] = "^W\0";  main_labels[2] = "Where Is\0";
+    main_keys[3] = "^K\0";  main_labels[3] = "Cut\0";
+    main_keys[4] = "^R\0";  main_labels[4] = "Read File\0";
+    main_keys[5] = "^C\0";  main_labels[5] = "Location\0";
+    main_keys[6] = "M-U\0"; main_labels[6] = "Undo\0";
+    main_keys[7] = "^X\0";  main_labels[7] = "Exit\0";
+    main_keys[8] = "^S\0";  main_labels[8] = "Save\0";
+    main_keys[9] = "^\\\0"; main_labels[9] = "Replace\0";
+    main_keys[10] = "^U\0"; main_labels[10] = "Paste\0";
+    main_keys[11] = "M-6\0"; main_labels[11] = "Copy\0";
+    main_keys[12] = "^_\0"; main_labels[12] = "Go To Line\0";
+    main_keys[13] = "M-E\0"; main_labels[13] = "Redo\0";
+    ask_keys[0] = "^C\0";   ask_labels[0] = "Cancel\0";
+    ask_keys[1] = "Enter\0"; ask_labels[1] = "Accept\0";
+    yn_keys[0] = " Y\0";    yn_labels[0] = "Yes\0";
+    yn_keys[1] = " A\0";    yn_labels[1] = "All\0";
+    yn_keys[2] = " N\0";    yn_labels[2] = "No\0";
+    yn_keys[3] = "^C\0";    yn_labels[3] = "Cancel\0";
+}
+
+fun draw() {
+    val h: u64 = height();
+    val w: u64 = width();
+    val rows: u64 = body();
+    val cl: u64 = line_of(cur);
+    val cc: u64 = col_of(cur);
+    if (cl < top) { top = cl; }
+    if (cl >= top + rows) { top = cl - rows + 1; }
+    if (cc < hoff) { hoff = cc; }
+    if (cc >= hoff + w) { hoff = cc - w + 1; }
+
+    title_bar(w);
+    var s: u64 = nth_line(top);
+    var r: u64 = 0;
+    val total: u64 = lines();
+    for (r < rows) {
+        var n: u64 = 0;
+        if (top + r < total) {
+            n = render_line(s, w);
+            s = line_end(s);
+            if (s < len) { s = s + 1; }
+        }
+        put_row(r + 1, n);
+        r = r + 1;
+    }
+    status_line(h, w);
+    shortcuts(h, w, ?main_keys[0], ?main_labels[0], 14);
+    go(1 + cl - top, cc - hoff);
+    flush();
+}
+
+# --- prompts ----------------------------------------------------------------
+
+# ask for a line of text on the status row, starting from out[0..n);
+# its length, or NONE if cancelled
+fun ask(q: *u8, out: *u8, start: u64, cap: u64) u64 {
+    var n: u64 = start;
+    val h: u64 = height();
+    val w: u64 = width();
+    shortcuts(h, w, ?ask_keys[0], ?ask_labels[0], 2);
+    for {
+        go(h - 3, 0);
+        rev(1);
+        o(q);
+        var shown_n: u64 = n;
+        var from: u64 = 0;
+        val ql: u64 = io.len(q);
+        if (ql + n + 1 > w) {
+            from = ql + n + 1 - w;
+            shown_n = n - from;
+        }
+        on(?out[from], shown_n);
+        pad(ql + shown_n, w);
+        rev(0);
+        go(h - 3, ql + shown_n);
+        flush();
+        val k: u64 = term.key();
+        if (k == 10) { ret n; }
+        if (k == 3 || k == 7 || k == 27 || k == term.KEY_EOF) {
+            say("Cancelled\0");
+            ret NONE;
+        }
+        if ((k == 127 || k == 8) && n > 0) { n = n - 1; }
+        if (k == 21) { n = 0; } # ^U: clear
+        if (((k >= 32 && k < 127) || k == 9) && n < cap) {
+            out[n] = k::u8;
+            n = n + 1;
+        }
+    }
+    ret NONE;
+}
+
+# a one-key question: 'y', 'n', 'a' (when all_ok), or 0 for cancel
+fun ask_choice(q: *u8, all_ok: u8) u8 {
+    val h: u64 = height();
+    val w: u64 = width();
+    if (all_ok != 0) { shortcuts(h, w, ?yn_keys[0], ?yn_labels[0], 4); }
+    or {
+        var k2: [3]*u8;
+        var l2: [3]*u8;
+        k2[0] = yn_keys[0]; l2[0] = yn_labels[0];
+        k2[1] = yn_keys[2]; l2[1] = yn_labels[2];
+        k2[2] = yn_keys[3]; l2[2] = yn_labels[3];
+        shortcuts(h, w, ?k2[0], ?l2[0], 3);
+    }
+    for {
+        go(h - 3, 0);
+        rev(1);
+        o(q);
+        pad(io.len(q), w);
+        rev(0);
+        go(h - 3, io.len(q));
+        flush();
+        val k: u64 = term.key();
+        if (k == 121 || k == 89) { ret 121; }
+        if (k == 110 || k == 78) { ret 110; }
+        if (all_ok != 0 && (k == 97 || k == 65)) { ret 97; }
+        if (k == 3 || k == 27 || k == term.KEY_EOF) {
+            say("Cancelled\0");
+            ret 0;
+        }
+    }
+    ret 0;
+}
+
+# --- commands ---------------------------------------------------------------
+
+fun lower(c: u8) u8 {
+    if (c >= 65 && c <= 90) { ret c + 32; }
+    ret c;
+}
+
+# does the text at `at` match q (ignoring case, like nano)?
+fun match_at(at: u64, q: *u8, n: u64) u8 {
+    if (at + n > len) { ret 0; }
+    var i: u64 = 0;
+    for (i < n) {
+        if (lower(text[at + i]) != lower(q[i])) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# the next match after `from` (forward) or before it (back), wrapping round
+fun search(from: u64, q: *u8, n: u64, back: u8) u64 {
+    if (n == 0 || n > len) { ret NONE; }
+    var k: u64 = 1;
+    for (k <= len) {
+        var at: u64 = 0;
+        if (back == 0) { at = (from + k) % (len + 1); }
+        or             { at = (from + (len + 1) * 2 - k) % (len + 1); }
+        if (match_at(at, q, n) != 0) {
+            if ((back == 0 && at <= from) || (back != 0 && at >= from)) { say("Search Wrapped\0"); }
+            ret at;
+        }
+        k = k + 1;
+    }
+    ret NONE;
+}
+
+# the search text: asked for, or the last one when Enter alone is pressed
+fun ask_find(q: *u8) u64 {
+    var prompt: [180]u8;
+    var pl: u64 = io.len(q);
+    io.copy(?prompt[0], q, pl);
+    if (last_find_len > 0) {
+        var ln: u64 = last_find_len;
+        if (ln > 60) { ln = 60; }
+        io.copy(?prompt[pl], " [\0", 2);
+        pl = pl + 2;
+        io.copy(?prompt[pl], ?last_find[0], ln);
+        pl = pl + ln;
+        prompt[pl] = 93;
+        pl = pl + 1;
+    }
+    io.copy(?prompt[pl], ": \0", 3); # with its NUL
+    var buf: [128]u8;
+    val n: u64 = ask(?prompt[0], ?buf[0], 0, 127);
+    if (n == NONE) { ret NONE; }
+    if (n > 0) {
+        io.copy(?last_find[0], ?buf[0], n);
+        last_find_len = n;
+    }
+    if (last_find_len == 0) {
+        say("Cancelled\0");
+        ret NONE;
+    }
+    ret last_find_len;
+}
+
+fun find(back: u8, ask_first: u8) {
+    if (ask_first != 0 || last_find_len == 0) {
+        var q: *u8 = "Search\0";
+        if (back != 0) { q = "Search Backwards\0"; }
+        if (ask_find(q) == NONE) { ret; }
+    }
+    val at: u64 = search(cur, ?last_find[0], last_find_len, back);
+    if (at == NONE) {
+        msg_len = 0;
+        io.copy(?msg[0], ?last_find[0], last_find_len);
+        msg_len = last_find_len;
+        io.copy(?msg[msg_len], " not found\0", 10);
+        msg_len = msg_len + 10;
+        ret;
+    }
+    cur = at;
+    want_col = col_of(cur);
+}
+
+fun replace() {
+    if (ask_find("Search (to replace)\0") == NONE) { ret; }
+    var rep: [128]u8;
+    val rn: u64 = ask("Replace with: \0", ?rep[0], 0, 127);
+    if (rn == NONE) { ret; }
+    val qn: u64 = last_find_len;
+    var count: u64 = 0;
+    var all: u8 = 0;
+    # look from the cursor to the end, then from the start back to it
+    var limit: u64 = cur;
+    var at: u64 = cur;
+    var wrapped: u8 = 0;
+    for {
+        if (wrapped == 0 && at + qn > len) {
+            wrapped = 1;
+            at = 0;
+        }
+        if (wrapped != 0 && at + qn > limit) { brk; }
+        if (match_at(at, ?last_find[0], qn) == 0) {
+            at = at + 1;
+            cnt;
+        }
+        var yes: u8 = 1;
+        if (all == 0) {
+            cur = at;
+            msg_len = 0;
+            draw();
+            val ans: u8 = ask_choice("Replace this instance?\0", 1);
+            if (ans == 0) { brk; }
+            if (ans == 110) { yes = 0; }
+            if (ans == 97) { all = 1; }
+        }
+        if (yes == 0) {
+            at = at + 1;
+            cnt;
+        }
+        typing = 0;
+        del(at, qn, 1);
+        ins(at, ?rep[0], rn, 1);
+        count = count + 1;
+        if (wrapped != 0 || at < limit) { limit = limit + rn - qn; }
+        at = at + rn;
+        if (rn == 0 && qn == 0) { brk; }
+    }
+    cur = at;
+    if (cur > len) { cur = len; }
+    want_col = col_of(cur);
+    if (count == 1) { say("Replaced 1 occurrence\0"); }
+    or { say_num("Replaced \0", count, " occurrences\0"); }
+}
+
+fun go_to_line() {
+    var q: [32]u8;
+    val n: u64 = ask("Enter line number, column number: \0", ?q[0], 0, 31);
+    if (n == NONE || n == 0) { ret; }
+    var comma: u64 = 0;
+    for (comma < n && q[comma] != 44) { comma = comma + 1; }
+    var okk: u8 = 0;
+    val ln: u64 = io.parse_dec(?q[0], comma, ?okk);
+    if (okk == 0 || ln == 0) {
+        say("Invalid line or column number\0");
+        ret;
+    }
+    var col: u64 = 1;
+    if (comma + 1 < n) {
+        var okc: u8 = 0;
+        col = io.parse_dec(?q[comma + 1], n - comma - 1, ?okc);
+        if (okc == 0 || col == 0) { col = 1; }
+    }
+    cur = at_col(nth_line(ln - 1), col - 1);
+    want_col = col_of(cur);
+}
+
+fun percent(a: u64, b: u64) u64 {
+    if (b == 0) { ret 100; }
+    ret a * 100 / b;
+}
+
+fun location() {
+    val cl: u64 = line_of(cur) + 1;
+    val total: u64 = lines();
+    val col: u64 = col_of(cur) + 1;
+    val wide: u64 = col_of(line_end(cur)) + 1;
+    var t: [200]u8;
+    var k: u64 = 0;
+    io.copy(?t[k], "line \0", 5); k = k + 5;
+    k = k + io.fmt_dec(cl, ?t[k]); t[k] = 47; k = k + 1;
+    k = k + io.fmt_dec(total, ?t[k]);
+    io.copy(?t[k], " (\0", 2); k = k + 2;
+    k = k + io.fmt_dec(percent(cl, total), ?t[k]);
+    io.copy(?t[k], "%), col \0", 8); k = k + 8;
+    k = k + io.fmt_dec(col, ?t[k]); t[k] = 47; k = k + 1;
+    k = k + io.fmt_dec(wide, ?t[k]);
+    io.copy(?t[k], " (\0", 2); k = k + 2;
+    k = k + io.fmt_dec(percent(col, wide), ?t[k]);
+    io.copy(?t[k], "%), char \0", 9); k = k + 9;
+    k = k + io.fmt_dec(cur + 1, ?t[k]); t[k] = 47; k = k + 1;
+    k = k + io.fmt_dec(len + 1, ?t[k]);
+    io.copy(?t[k], " (\0", 2); k = k + 2;
+    k = k + io.fmt_dec(percent(cur + 1, len + 1), ?t[k]);
+    io.copy(?t[k], "%)\0", 2); k = k + 2;
+    io.copy(?msg[0], ?t[0], k);
+    msg_len = k;
+}
+
+fun cut_line(copy_only: u8) {
+    val s: u64 = line_start(cur);
+    var e: u64 = line_end(cur);
+    if (e < len) { e = e + 1; } # with its newline
+    if (last_was_cut == 0) { cut_len = 0; }
+    if (cut_len + (e - s) <= 65536) {
+        io.copy(?cutbuf[cut_len], ?text[s], e - s);
+        cut_len = cut_len + (e - s);
+    }
+    if (copy_only != 0) {
+        cur = e;
+        say("Copied a line\0");
+    } or {
+        del(s, e - s, 1);
+        cur = s;
+    }
+}
+
+fun paste() {
+    if (cut_len == 0) {
+        say("The cutbuffer is empty\0");
+        ret;
+    }
+    if (ins(cur, ?cutbuf[0], cut_len, 1) != 0) { cur = cur + cut_len; }
+}
+
+fun read_file() {
+    var p: [256]u8;
+    val n: u64 = ask("File to insert: \0", ?p[0], 0, 255);
+    if (n == NONE || n == 0) { ret; }
+    p[n] = 0;
+    val got: u64 = read_in(?p[0], n, cur, 1);
+    if (got == NONE) { ret; }
+    var nl: u64 = 0;
+    var i: u64 = cur;
+    for (i < cur + got) {
+        if (text[i] == 10) { nl = nl + 1; }
+        i = i + 1;
+    }
+    say_num("Read \0", nl, " lines\0");
+}
+
+# ask for a name and write the file there; whether it was written
+fun write_as() u8 {
+    var p: [256]u8;
+    io.copy(?p[0], ?name[0], name_len);
+    val n: u64 = ask("File Name to Write: \0", ?p[0], name_len, 255);
+    if (n == NONE || n == 0) { ret 0; }
+    p[n] = 0;
+    if (write_out(?p[0], n) == 0) { ret 0; }
+    io.copy(?name[0], ?p[0], n + 1);
+    name_len = n;
+    ret 1;
+}
+
+fun save() u8 {
+    if (name_len == 0) { ret write_as(); }
+    ret write_out(?name[0], name_len);
+}
+
+var help_lines: [40]*u8;
+
+fun help() {
+    var i: u64 = 0;
+    help_lines[i] = "Main nano help text\0"; i = i + 1;
+    help_lines[i] = "\0"; i = i + 1;
+    help_lines[i] = " Type to insert text. Shortcuts: ^ is Ctrl, M- is Alt (or Esc, then the key).\0"; i = i + 1;
+    help_lines[i] = "\0"; i = i + 1;
+    help_lines[i] = " ^G         this help text            ^X         exit (asks to save changes)\0"; i = i + 1;
+    help_lines[i] = " ^O         write the file out        ^S         save without asking\0"; i = i + 1;
+    help_lines[i] = " ^R         insert another file       ^C         show the cursor position\0"; i = i + 1;
+    help_lines[i] = " ^W         search forward            ^Q         search backward\0"; i = i + 1;
+    help_lines[i] = " M-W        repeat the last search    ^\\ or M-R  search and replace\0"; i = i + 1;
+    help_lines[i] = " ^K         cut the line (repeat: more lines)     M-6   copy the line\0"; i = i + 1;
+    help_lines[i] = " ^U         paste what was cut        ^_ ^T M-G  go to a line (and column)\0"; i = i + 1;
+    help_lines[i] = " M-U        undo                      M-E        redo\0"; i = i + 1;
+    help_lines[i] = " ^A Home    start of the line         ^E End     end of the line\0"; i = i + 1;
+    help_lines[i] = " ^Y PgUp    a page up                 ^V PgDn    a page down\0"; i = i + 1;
+    help_lines[i] = " ^P ^N      line up / down            ^B ^F      character left / right\0"; i = i + 1;
+    help_lines[i] = " M-\\        first line                M-/        last line\0"; i = i + 1;
+    help_lines[i] = " ^D Del     delete under the cursor   ^H Bksp    delete before the cursor\0"; i = i + 1;
+    help_lines[i] = " ^L         redraw the screen\0"; i = i + 1;
+    help_lines[i] = "\0"; i = i + 1;
+    help_lines[i] = " In prompts: Enter accepts, ^C cancels, ^U clears.\0"; i = i + 1;
+    val count: u64 = i;
+    val h: u64 = height();
+    val w: u64 = width();
+    o("\x1b[2J\0");
+    go(0, 0);
+    rev(1);
+    o("  Help\0");
+    pad(6, w);
+    rev(0);
+    var r: u64 = 0;
+    for (r < count && r + 2 < h - 3) {
+        go(r + 2, 0);
+        var n: u64 = io.len(help_lines[r]);
+        if (n > w) { n = w; }
+        on(help_lines[r], n);
+        r = r + 1;
+    }
+    var k1: [1]*u8;
+    var l1: [1]*u8;
+    k1[0] = "^X\0";
+    l1[0] = "Close\0";
+    shortcuts(h, w, ?k1[0], ?l1[0], 1);
+    go(h - 3, 0);
+    flush();
+    term.key();
+    o("\x1b[2J\0");
+    forget_rows();
+}
+
+# --- the loop ---------------------------------------------------------------
+
+fun move_lines(k: u64, up: u8) {
+    var steps: u64 = k;
+    var s: u64 = line_start(cur);
+    if (up != 0) {
+        for (steps > 0 && s > 0) {
+            s = line_start(s - 1);
+            steps = steps - 1;
+        }
+    } or {
+        for (steps > 0) {
+            val e: u64 = line_end(s);
+            if (e >= len) { brk; }
+            s = e + 1;
+            steps = steps - 1;
+        }
+    }
+    cur = at_col(s, want_col);
+}
+
+pub fun run(argc: u64, argv: **u8, prog: *u8) u64 {
+    title = prog;
+    if (argc > 2) {
+        io.err("usage: \0");
+        io.err(prog);
+        io.err(" [FILE]\n\0");
+        ret 2;
+    }
+    var un: abi.Uname;
+    sys.uname(?un);
+    io.copy(?release[0], ?un.release[0], io.len(?un.release[0]) + 1);
+    setup_labels();
+    if (argc == 2) {
+        name_len = io.len(argv[1]);
+        if (name_len > 254) { name_len = 254; }
+        io.copy(?name[0], argv[1], name_len);
+        name[name_len] = 0;
+        var st: abi.Stat;
+        if (abi.is_err(sys.stat(?name[0], name_len, ?st)) == 0 && st.kind != abi.KIND_FILE) {
+            io.err(prog);
+            io.err(": not a regular file\n\0");
+            ret 1;
+        }
+        val got: u64 = read_in(?name[0], name_len, 0, 0);
+        if (got == NONE) {
+            msg_len = 0;
+            say("New File\0");
+        } or {
+            if (len == CAP) { say("The file was cut at 1 MiB\0"); }
+            or {
+                var nl: u64 = line_of(len);
+                if (len > 0 && text[len - 1] != 10) { nl = nl + 1; }
+                say_num("Read \0", nl, " lines\0");
+            }
+        }
+        dirty = 0;
+    }
+    if (term.start(abi.STDIN) == 0) {
+        io.err(prog);
+        io.err(": stdin is not a terminal\n\0");
+        ret 1;
+    }
+    for {
+        draw();
+        val k: u64 = term.key();
+        msg_len = 0;
+        val was_cut: u8 = last_was_cut;
+        last_was_cut = 0;
+        val was_typing: u8 = typing;
+        typing = 0;
+        if (k == term.KEY_EOF) { brk; }
+        if (k == 24) { # ^X
+            if (dirty == 0) { brk; }
+            val ans: u8 = ask_choice("Save modified buffer?  \0", 0);
+            if (ans == 110) { brk; }
+            if (ans == 121 && save() != 0) { brk; }
+            cnt;
+        }
+        if (k == 7) { help(); cnt; }
+        if (k == 15) { write_as(); cnt; }
+        if (k == 19) { save(); cnt; }
+        if (k == 23) { find(0, 1); cnt; }
+        if (k == 17) { find(1, 1); cnt; }
+        if (k == term.KEY_ALT + 119 || k == term.KEY_ALT + 87) { find(0, 0); cnt; }
+        if (k == 28 || k == term.KEY_ALT + 114 || k == term.KEY_ALT + 82) { replace(); cnt; }
+        if (k == 31 || k == 20 || k == term.KEY_ALT + 103 || k == term.KEY_ALT + 71) { go_to_line(); cnt; }
+        if (k == 3) { location(); cnt; }
+        if (k == 18) { read_file(); cnt; }
+        if (k == 12) {
+            o("\x1b[2J\0");
+            forget_rows();
+            cnt;
+        }
+        if (k == 11) {
+            last_was_cut = was_cut;
+            cut_line(0);
+            last_was_cut = 1;
+            cnt;
+        }
+        if (k == term.KEY_ALT + 54) {
+            last_was_cut = was_cut;
+            cut_line(1);
+            last_was_cut = 1;
+            cnt;
+        }
+        if (k == 21) { paste(); cnt; }
+        if (k == term.KEY_ALT + 117 || k == term.KEY_ALT + 85) { undo(); want_col = col_of(cur); cnt; }
+        if (k == term.KEY_ALT + 101 || k == term.KEY_ALT + 69) { redo(); want_col = col_of(cur); cnt; }
+        if (k == term.KEY_ALT + 92) { cur = 0; want_col = 0; cnt; }
+        if (k == term.KEY_ALT + 47) { cur = nth_line(lines() - 1); want_col = 0; cnt; }
+        if (k == term.KEY_LEFT || k == 2) {
+            if (cur > 0) { cur = cur - 1; }
+            want_col = col_of(cur);
+            cnt;
+        }
+        if (k == term.KEY_RIGHT || k == 6) {
+            if (cur < len) { cur = cur + 1; }
+            want_col = col_of(cur);
+            cnt;
+        }
+        if (k == term.KEY_UP || k == 16) { move_lines(1, 1); cnt; }
+        if (k == term.KEY_DOWN || k == 14) { move_lines(1, 0); cnt; }
+        if (k == term.KEY_PGUP || k == 25) { move_lines(body() - 1, 1); cnt; }
+        if (k == term.KEY_PGDN || k == 22) { move_lines(body() - 1, 0); cnt; }
+        if (k == term.KEY_HOME || k == 1) {
+            cur = line_start(cur);
+            want_col = 0;
+            cnt;
+        }
+        if (k == term.KEY_END || k == 5) {
+            cur = line_end(cur);
+            want_col = col_of(cur);
+            cnt;
+        }
+        if (k == 127 || k == 8) {
+            if (cur > 0) {
+                cur = cur - 1;
+                del(cur, 1, 1);
+            }
+            want_col = col_of(cur);
+            cnt;
+        }
+        if (k == term.KEY_DEL || k == 4) {
+            if (cur < len) { del(cur, 1, 1); }
+            cnt;
+        }
+        if (k == 10 || k == 9 || (k >= 32 && k < 127)) {
+            typing = was_typing;
+            type_char(k::u8);
+            typing = 1;
+            if (k == 10) { typing = 0; } # a new line starts a new undo step
+            want_col = col_of(cur);
+        }
+    }
+    o("\x1b[0m\0");
+    flush();
+    term.stop();
+    ret 0;
+}

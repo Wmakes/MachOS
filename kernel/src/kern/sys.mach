@@ -559,7 +559,9 @@ fun sys_stat(pva: u64, plen: u64, out: u64) u64 {
 
 fun fill_stat(nd: *vfs.Node, st: *abi.Stat) {
     st.sector = 0;
+    st.rdev = 0;
     if (nd.kind == abi.KIND_DEV) {
+        st.rdev = nd.dev;
         val bd: *parts.Bdev = parts.get(nd.dev);
         if (bd != nil) { st.sector = dsk.disk(bd.disk).native; }
     }
@@ -969,12 +971,12 @@ fun sys_uname(out: u64) u64 {
     ret 0;
 }
 
-# the terminal behind handle `h`, or an error (E_NOTTY)
+# the terminal behind handle `h` (0 = tty1), or an error (E_NOTTY)
 fun tty_handle(h: u64) u64 {
     val f: *file.Handle = handle(h);
     if (f == nil) { ret e(abi.E_BADF); }
-    if (f.kind != file.NODE || f.node.kind != abi.KIND_DEV || f.node.dev != vfs.DEV_CONSOLE) { ret e(abi.E_NOTTY); }
-    ret 0;
+    if (f.kind != file.NODE || f.node.kind != abi.KIND_DEV || vfs.tty_of(f.node.dev) == 0xFF) { ret e(abi.E_NOTTY); }
+    ret vfs.tty_of(f.node.dev);
 }
 
 fun sys_tcgetattr(h: u64, out: u64) u64 {
@@ -982,7 +984,7 @@ fun sys_tcgetattr(h: u64, out: u64) u64 {
     if (abi.is_err(r) != 0) { ret r; }
     if (ok(out, $size_of(abi.Termios)::u64, 1) == 0) { ret e(abi.E_FAULT); }
     val t: *abi.Termios = out::*abi.Termios;
-    t.lflag = tty.get_lflag();
+    t.lflag = tty.get_lflag(r);
     t.rows = fbcon.rows_of();
     t.cols = fbcon.cols_of();
     if (t.rows == 0 || t.cols == 0) { # serial only: assume the classic size
@@ -996,7 +998,7 @@ fun sys_tcsetattr(h: u64, in: u64) u64 {
     val r: u64 = tty_handle(h);
     if (abi.is_err(r) != 0) { ret r; }
     if (ok(in, $size_of(abi.Termios)::u64, 0) == 0) { ret e(abi.E_FAULT); }
-    tty.set_lflag((@(in::*abi.Termios)).lflag);
+    tty.set_lflag(r, (@(in::*abi.Termios)).lflag);
     ret 0;
 }
 
@@ -1054,21 +1056,13 @@ fun sys_fstat(h: u64, out: u64) u64 {
     if (ok(out, $size_of(abi.Stat)::u64, 1) == 0) { ret e(abi.E_FAULT); }
     val st: *abi.Stat = out::*abi.Stat;
     if (f.kind == file.NODE) {
-        st.kind = f.node.kind;
-        st.size = f.node.size;
-        st.mtime = vfs.mtime_of(f.node);
-        st.mode = f.node.mode;
-        st.uid = f.node.uid;
-        st.gid = f.node.gid;
-        st.sector = 0;
-        if (f.node.kind == abi.KIND_DEV) {
-            val bd: *parts.Bdev = parts.get(f.node.dev);
-            if (bd != nil) { st.sector = dsk.disk(bd.disk).native; }
-        }
+        fill_stat(f.node, st);
     } or {
         st.kind = abi.KIND_PIPE;
         st.size = 0;
         st.mtime = 0;
+        st.sector = 0;
+        st.rdev = 0;
     }
     ret 0;
 }
@@ -1155,17 +1149,17 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.TCSETPGRP) {
         val r: u64 = tty_handle(a);
         if (abi.is_err(r) != 0) { ret r; }
-        tty.set_foreground(b);
+        tty.set_foreground(r, b);
         ret 0;
     }
     if (n == abi.TCGETPGRP) {
         val r: u64 = tty_handle(a);
         if (abi.is_err(r) != 0) { ret r; }
-        ret tty.foreground();
+        ret tty.foreground(r);
     }
     if (n == abi.SBRK)    { ret sys_sbrk(a); }
     if (n == abi.SETFG) {
-        tty.set_foreground(a);
+        tty.set_foreground(0, a);
         ret 0;
     }
     if (n == abi.RENAME)  { ret sys_rename(a, b, c, d); }

@@ -122,6 +122,22 @@ TESTS = [
      USB_HUB + ["wait:" + P, "keys:echo Behind_hubs<ret>", "wait:" + P],
      ["usb: 1 xhci controller(s), 1 keyboard(s)", "Behind_hubs"]),
 
+    # nano: type, undo, cut and paste, replace all, save on exit
+    ("nano", False, False,
+     ["wait:" + P, "send:nano /tmp/t.txt\\n", "sleep:1", "send:hello world\\nsecond line\\nthird\\n", "sleep:0.5",
+      "send:\\x1bu", "sleep:0.3", "send:\\x1b[A\\x1b[A\\x0b\\x1b[B\\x15", "sleep:0.3",
+      "send:\\x1cline\\r", "sleep:0.5", "send:LINE\\r", "sleep:0.5", "send:a", "sleep:0.5",
+      "send:\\x18", "sleep:0.5", "send:y", "sleep:0.5", "send:\\r", "sleep:0.8",
+      "send:cat /tmp/t.txt; tty\\n", "wait:" + P],
+     ["Replaced 1 occurrence", "second LINE\nhello world", "/dev/tty1"]),
+
+    # six terminals: log in on tty2 with the keyboard, then back to tty1
+    ("terminals", False, False,
+     ["wait:" + P, "keys:<alt-f2>", "sleep:0.5", "keys:root<ret>", "sleep:1.5",
+      "keys:tty > /tmp/which<ret>", "sleep:0.5", "keys:<alt-f1>", "sleep:0.3",
+      "send:cat /tmp/which; ps | grep -c login\\n", "wait:" + P],
+     ["/dev/tty2", "\n4"]),
+
     ("tools", False, False,
      ["wait:" + P,
       "send:printf 'pear\\\\napple\\\\nfig\\\\napple\\\\n' > /tmp/f; sort -u /tmp/f | tr a-z A-Z; seq 1 20 | sort -n -r | head -2\\n",

@@ -161,6 +161,14 @@ fun kmain() {
     val dev: *vfs.Node = vfs.create_ram(vfs.get_root(), "dev\0", 3, abi.KIND_DIR);
     if (dev == nil) { kprint.panic("vfs: out of memory\0"); }
     make_dev(dev, "console\0", 7, vfs.DEV_CONSOLE);
+    var tn: [5]u8;
+    tn[0] = 116; tn[1] = 116; tn[2] = 121; tn[4] = 0; # "ttyN"
+    var ti: u64 = 0;
+    for (ti < 6) {
+        tn[3] = 49 + ti::u8;
+        make_dev(dev, ?tn[0], 4, vfs.DEV_TTY + ti);
+        ti = ti + 1;
+    }
     make_dev(dev, "null\0", 4, vfs.DEV_NULL);
     make_dev(dev, "zero\0", 4, vfs.DEV_ZERO);
     parts.publish(dev);

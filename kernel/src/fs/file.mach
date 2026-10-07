@@ -131,12 +131,12 @@ fun disk_io(h: *Handle, buf: u64, n: u64, write: u8) u64 {
     ret done;
 }
 
-fun console_read(buf: u64, n: u64) u64 {
-    for (tty.readable() == 0) {
+fun console_read(t: u64, buf: u64, n: u64) u64 {
+    for (tty.readable(t) == 0) {
         if (proc.interrupted(proc.current()) != 0) { ret abi.err(abi.E_INTR); }
         proc.sleep_on(proc.CHAN_TTY);
     }
-    ret tty.read(buf::*u8, n);
+    ret tty.read(t, buf::*u8, n);
 }
 
 # `buf` must already be checked to be writable user memory
@@ -147,7 +147,7 @@ pub fun read(h: *Handle, buf: u64, n: u64) u64 {
     val nd: *vfs.Node = h.node;
     if (nd.kind == abi.KIND_DIR) { ret abi.err(abi.E_ISDIR); }
     if (nd.kind == abi.KIND_DEV) {
-        if (nd.dev == vfs.DEV_CONSOLE) { ret console_read(buf, n); }
+        if (vfs.tty_of(nd.dev) != 0xFF) { ret console_read(vfs.tty_of(nd.dev), buf, n); }
         if (nd.dev >= vfs.DEV_DISK) { ret disk_io(h, buf, n, 0); }
         if (nd.dev == vfs.DEV_ZERO) {
             mem.fill(buf, 0, n);
@@ -168,11 +168,12 @@ pub fun write(h: *Handle, buf: u64, n: u64) u64 {
     if (nd.kind == abi.KIND_DIR) { ret abi.err(abi.E_ISDIR); }
     if (nd.kind == abi.KIND_DEV) {
         if (nd.dev >= vfs.DEV_DISK) { ret disk_io(h, buf, n, 1); }
-        if (nd.dev == vfs.DEV_CONSOLE) {
+        if (vfs.tty_of(nd.dev) != 0xFF) {
+            val t: u64 = vfs.tty_of(nd.dev);
             val b: *u8 = buf::*u8;
             var i: u64 = 0;
             for (i < n) {
-                kprint.putc(b[i]);
+                kprint.putc_to(t, b[i]);
                 i = i + 1;
             }
         }

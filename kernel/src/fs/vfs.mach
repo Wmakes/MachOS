@@ -16,8 +16,16 @@ pub val FS_RAM:  u64 = 0;
 pub val FS_EXT2: u64 = 1;
 
 pub val DEV_CONSOLE: u64 = 1;
+
+# which terminal a device is (0 = tty1), or 0xFF when it is not one
+pub fun tty_of(dev: u64) u64 {
+    if (dev == DEV_CONSOLE) { ret 0; }
+    if (dev >= DEV_TTY && dev < DEV_TTY + 6) { ret dev - DEV_TTY; }
+    ret 0xFF;
+}
 pub val DEV_NULL:    u64 = 2;
 pub val DEV_ZERO:    u64 = 3;
+pub val DEV_TTY:     u64 = 4;  # + 0..5: tty1..tty6 (the console is tty1)
 pub val DEV_DISK:    u64 = 16; # + the AHCI disk index
 
 pub rec Node {

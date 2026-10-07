@@ -323,6 +323,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.nano]
+kind = "bin"
+entry = "bin/nano.mach"
+out = "bin/nano"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.partname]
 kind = "bin"
 entry = "bin/partname.mach"
@@ -495,6 +503,14 @@ need = []
 kind = "bin"
 entry = "bin/true.mach"
 out = "bin/true"
+targets = ["machos"]
+link = []
+need = []
+
+[artifact.tty]
+kind = "bin"
+entry = "bin/tty.mach"
+out = "bin/tty"
 targets = ["machos"]
 link = []
 need = []

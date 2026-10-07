@@ -5,10 +5,16 @@ use cpu:    machos.arch.x86_64.cpu;
 use serial: machos.dev.serial;
 use fbcon:  machos.dev.fbcon;
 
-pub fun putc(c: u8) {
-    if (c == 10) { serial.putc(13); }
-    serial.putc(c);
-    fbcon.putc(c);
+# kernel messages: tty1 (and the serial port)
+pub fun putc(c: u8) { putc_to(0, c); }
+
+# a byte for terminal `n`'s screen; tty1 is mirrored on the serial port
+pub fun putc_to(n: u64, c: u8) {
+    if (n == 0) {
+        if (c == 10) { serial.putc(13); }
+        serial.putc(c);
+    }
+    fbcon.putc_on(n, c);
 }
 
 pub fun puts(s: *u8) {
@@ -47,6 +53,7 @@ pub fun dec(v: u64) {
 }
 
 pub fun panic(msg: *u8) {
+    fbcon.show_screen(0);
     puts("\npanic: \0");
     puts(msg);
     putc(10);

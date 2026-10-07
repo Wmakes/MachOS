@@ -1,0 +1,7 @@
+# nano [FILE]: a nano-like text editor (userland/src/nano/editor.mach)
+
+use rt:     sdk.rt;
+use editor: userland.nano.editor;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 { ret editor.run(argc, argv, "nano\0"); }

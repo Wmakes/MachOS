@@ -124,7 +124,7 @@ fun ask() {
         term.clear_eol();
         val k: u64 = term.key();
         if (k == 10) { brk; }
-        if (k == 27 || k == 3 || k == term.KEY_EOF) {
+        if (k == 27 || k == 3 || k == term.KEY_EOF || k >= term.KEY_ALT) {
             plen = 0;
             ret;
         }

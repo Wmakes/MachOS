@@ -15,6 +15,7 @@ pub val KEY_DEL:   u64 = 0x107;
 pub val KEY_PGUP:  u64 = 0x108;
 pub val KEY_PGDN:  u64 = 0x109;
 pub val KEY_EOF:   u64 = 0xFFFFFFFFFFFFFFFF;
+pub val KEY_ALT:   u64 = 0x1000; # + the key: alt+key, or escape then key ("M-x")
 
 var tty: u64 = 0;     # where keys come from (a terminal handle)
 var rows: u64 = 24;
@@ -73,7 +74,8 @@ pub fun key() u64 {
         ret c;
     }
     val c2: u64 = byte();
-    if (c2 != 91 && c2 != 79) { ret 27; }
+    if (c2 == 27 || c2 == KEY_EOF) { ret 27; }
+    if (c2 != 91 && c2 != 79) { ret KEY_ALT + c2; }
     var num: u64 = 0;
     var f: u64 = byte();
     for (f >= 48 && f <= 57) {
