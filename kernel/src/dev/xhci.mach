@@ -1,9 +1,10 @@
-# xHCI (USB 3) host controllers and the USB keyboards on their root ports.
+# xHCI (USB 3) host controllers, USB hubs and the keyboards on them.
 # polled: the command ring is waited on synchronously while setting up, and
 # the timer interrupt calls poll() to collect keyboard reports from the
-# event ring. a keyboard is driven in the HID boot protocol (8-byte
-# reports), so no report descriptor needs parsing. hubs are not supported
-# yet: a keyboard must sit on a root port
+# event ring and to notice devices being plugged in and out (root ports
+# post port events, hubs report on their status-change endpoint). a
+# keyboard is driven in the HID boot protocol (8-byte reports), so no
+# report descriptor needs parsing
 
 use pci:  machos.dev.pci;
 use vmm:  machos.mm.vmm;
@@ -26,9 +27,11 @@ val T_LINK: u32 = 6;
 val T_ENABLE_SLOT: u32 = 9;
 val T_ADDRESS: u32 = 11;
 val T_CONFIGURE: u32 = 12;
+val T_DISABLE_SLOT: u32 = 10;
 val T_EVALUATE: u32 = 13;
 val T_TRANSFER_EV: u32 = 32;
 val T_COMMAND_EV: u32 = 33;
+val T_PORT_EV: u32 = 34;
 
 #[volatile]
 rec Reg { v: u32; }
@@ -52,6 +55,7 @@ rec Ctrl {
     ev:     u64;  # event ring segment, physical
     ev_idx: u64;
     ev_cycle: u32;
+    pend:   [256]u8; # root ports that reported a change
 }
 
 rec Kbd {
@@ -66,6 +70,49 @@ rec Kbd {
     next_rep: u64;  # tick of the next repeat
 }
 
+# where a device sits: the root port its path starts at, the route string
+# (one hub port number per nibble), how many hubs deep, and for a low/full
+# speed device behind a high speed hub, that hub's slot and port (its
+# transaction translator)
+rec Place {
+    root:    u64;
+    route:   u32;
+    depth:   u64;
+    tt_slot: u64;
+    tt_port: u64;
+}
+
+val MAX_DEV: u64 = 32;
+val D_OTHER: u8 = 1;
+val D_HUB: u8 = 2;
+val D_KBD: u8 = 3;
+
+# every device set up: where it is, its control pipe and pages; for hubs
+# the status-change endpoint that says when a port changed
+rec Dev {
+    used:     u8;
+    kind:     u8;
+    ctrl:     *Ctrl;
+    slot:     u64;
+    root:     u64;
+    route:    u32;
+    depth:    u64;
+    speed:    u32;
+    tt_slot:  u64;
+    tt_port:  u64;
+    ep0:      Ring;
+    out:      u64;  # pages: output and input contexts, a transfer buffer
+    input:    u64;
+    buf:      u64;
+    nports:   u64;
+    int_dci:  u64;
+    int_ring: Ring;
+    int_buf:  u64;
+    int_len:  u64;
+    pending:  u8;   # the hub said a port changed
+}
+
+var devs: [32]Dev;
 var ctrls: [4]Ctrl;
 var nctrl: u64 = 0;
 var kbds: [4]Kbd;
@@ -344,24 +391,43 @@ fun arm(k: *Kbd) {
     doorbell(k.ctrl, k.slot, k.dci::u32);
 }
 
-# an event that was not waited for: keyboard reports
+fun arm_hub(d: *Dev) {
+    enqueue(?d.int_ring, d.int_buf, d.int_len::u32, (T_NORMAL << 10) | (1 << 5) | (1 << 2));
+    doorbell(d.ctrl, d.slot, d.int_dci::u32);
+}
+
+# an event that was not waited for: keyboard reports, hubs and root ports
+# saying something was plugged in or out (those are handled in poll)
 fun handle(c: *Ctrl, e: *u32) {
     val t: u32 = (e[3] >> 10) & 0x3F;
+    if (t == T_PORT_EV) {
+        val port: u64 = (e[0] >> 24)::u64;
+        if (port >= 1 && port <= c.ports) { c.pend[port] = 1; }
+        ret;
+    }
     if (t != T_TRANSFER_EV) { ret; }
     val slot: u64 = (e[3] >> 24)::u64;
     val ep: u64 = ((e[3] >> 16) & 0x1F)::u64;
+    val good: u8 = ok(e[2] >> 24);
     var i: u64 = 0;
     for (i < nkbd) {
         val k: *Kbd = ?kbds[i];
-        if (k.ctrl == c && k.slot == slot && k.dci == ep) {
-            if (ok(e[2] >> 24) != 0) { report(k); }
+        if (k.ctrl == c && k.slot == slot && k.dci == ep && good != 0) { # a failed transfer: unplugged
+            report(k);
             arm(k);
         }
         i = i + 1;
     }
+    i = 0;
+    for (i < MAX_DEV) {
+        val d: *Dev = ?devs[i];
+        if (d.used != 0 && d.kind == D_HUB && d.ctrl == c && d.slot == slot && d.int_dci == ep && good != 0) { d.pending = 1; }
+        i = i + 1;
+    }
 }
 
-# the timer calls this every tick: read reports, repeat held keys
+# the timer calls this every tick: read reports, repeat held keys, and set
+# up or forget what was plugged in or pulled out
 pub fun poll(tick: u64) {
     now = tick;
     var ev: [4]u32;
@@ -369,6 +435,28 @@ pub fun poll(tick: u64) {
     for (i < nctrl) {
         val c: *Ctrl = ?ctrls[i];
         for (next_event(c, ?ev[0]) != 0) { handle(c, ?ev[0]); }
+        var p: u64 = 1;
+        for (p <= c.ports) {
+            if (c.pend[p] != 0) {
+                c.pend[p] = 0;
+                root_port(c, p, 1);
+            }
+            p = p + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < MAX_DEV) {
+        val d: *Dev = ?devs[i];
+        if (d.used != 0 && d.kind == D_HUB && d.pending != 0) {
+            d.pending = 0;
+            var p: u64 = 1;
+            for (p <= d.nports) {
+                hub_port(d, p, 1);
+                p = p + 1;
+            }
+            if (d.used != 0) { arm_hub(d); }
+        }
         i = i + 1;
     }
     i = 0;
@@ -399,30 +487,117 @@ fun interval(speed: u32, b: u8) u32 {
     ret n;
 }
 
-# where a device sits: the root port its path starts at, the route string
-# (one hub port number per nibble), how many hubs deep, and for a low/full
-# speed device behind a high speed hub, that hub's slot and port (its
-# transaction translator)
-rec Place {
-    root:    u64;
-    route:   u32;
-    depth:   u64;
-    tt_slot: u64;
-    tt_port: u64;
+fun free_page(pa: u64) {
+    if (pa != 0) { pmm.free(pa); }
+}
+
+# forget device `d`: its keyboard, its slot, its memory
+fun drop(d: *Dev) {
+    val c: *Ctrl = d.ctrl;
+    var i: u64 = 0;
+    for (i < nkbd) {
+        val k: *Kbd = ?kbds[i];
+        if (k.ctrl == c && k.slot == d.slot && d.slot != 0) {
+            free_page(k.report);
+            free_page(k.ring.phys);
+            var j: u64 = i;
+            for (j + 1 < nkbd) {
+                kbds[j] = kbds[j + 1];
+                j = j + 1;
+            }
+            nkbd = nkbd - 1;
+            cnt;
+        }
+        i = i + 1;
+    }
+    if (d.slot != 0) {
+        var ev: [4]u32;
+        command(c, 0, (T_DISABLE_SLOT << 10) | (d.slot::u32 << 24), ?ev[0]);
+        @((vmm.phys_to_virt(c.dcbaa) + d.slot * 8)::*u64) = 0;
+    }
+    free_page(d.out);
+    free_page(d.input);
+    free_page(d.buf);
+    free_page(d.ep0.phys);
+    free_page(d.int_ring.phys);
+    free_page(d.int_buf);
+    mem.fill(d::u64, 0, $size_of(Dev)::u64);
+}
+
+# forget everything below a port: devices on root port `root` whose route
+# starts with `prefix` (its first `depth` hops)
+fun drop_below(c: *Ctrl, root: u64, depth: u64, prefix: u32) {
+    var mask: u32 = 0;
+    if (depth > 0) { mask = ((1::u64 << (depth * 4)) - 1)::u32; }
+    var i: u64 = 0;
+    for (i < MAX_DEV) {
+        val d: *Dev = ?devs[i];
+        if (d.used != 0 && d.ctrl == c && d.root == root && d.depth >= depth && (d.route & mask) == prefix) { drop(d); }
+        i = i + 1;
+    }
+}
+
+# is there a device at exactly this place?
+fun known(c: *Ctrl, root: u64, depth: u64, route: u32) u8 {
+    var i: u64 = 0;
+    for (i < MAX_DEV) {
+        val d: *Dev = ?devs[i];
+        if (d.used != 0 && d.ctrl == c && d.root == root && d.depth == depth && d.route == route) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun new_dev() *Dev {
+    var i: u64 = 0;
+    for (i < MAX_DEV) {
+        if (devs[i].used == 0) {
+            val d: *Dev = ?devs[i];
+            mem.fill(d::u64, 0, $size_of(Dev)::u64);
+            d.used = 1;
+            ret d;
+        }
+        i = i + 1;
+    }
+    ret nil;
 }
 
 # set up the device at `at`, running at `speed` (1 full, 2 low, 3 high, 4 super)
 fun device(c: *Ctrl, at: *Place, speed: u32) {
+    val d: *Dev = new_dev();
+    if (d == nil) { ret; }
+    d.ctrl = c;
+    d.kind = D_OTHER;
+    d.root = at.root;
+    d.route = at.route;
+    d.depth = at.depth;
+    d.speed = speed;
+    d.tt_slot = at.tt_slot;
+    d.tt_port = at.tt_port;
     var ev: [4]u32;
-    if (command(c, 0, T_ENABLE_SLOT << 10, ?ev[0]) != 1) { ret; }
+    if (command(c, 0, T_ENABLE_SLOT << 10, ?ev[0]) != 1) {
+        drop(d);
+        ret;
+    }
     val slot: u64 = (ev[3] >> 24)::u64;
-    if (slot == 0 || slot > c.slots) { ret; }
+    if (slot == 0 || slot > c.slots) {
+        drop(d);
+        ret;
+    }
+    d.slot = slot;
 
-    val out: u64 = pmm.alloc();
-    val input: u64 = pmm.alloc();
-    val buf: u64 = pmm.alloc();
-    var ep0: Ring;
-    if (out == 0 || input == 0 || buf == 0 || ring_new(?ep0) == 0) { ret; }
+    d.out = pmm.alloc();
+    d.input = pmm.alloc();
+    d.buf = pmm.alloc();
+    if (d.out == 0 || d.input == 0 || d.buf == 0 || ring_new(?d.ep0) == 0) {
+        drop(d);
+        ret;
+    }
+    val out: u64 = d.out;
+    val input: u64 = d.input;
+    val buf: u64 = d.buf;
+    mem.fill(vmm.phys_to_virt(out), 0, 4096);
+    mem.fill(vmm.phys_to_virt(input), 0, 4096);
     @((vmm.phys_to_virt(c.dcbaa) + slot * 8)::*u64) = out;
 
     var mps: u32 = 8;
@@ -436,14 +611,20 @@ fun device(c: *Ctrl, at: *Place, speed: u32) {
     sc[2] = at.tt_slot::u32 | (at.tt_port::u32 << 8);
     val e0: *u32 = ctx(input, c, 2);
     e0[1] = (3 << 1) | (4 << 3) | (mps << 16); # CErr 3, control
-    e0[2] = ((ep0.phys & 0xFFFFFFFF) | 1)::u32;
-    e0[3] = (ep0.phys >> 32)::u32;
+    e0[2] = ((d.ep0.phys & 0xFFFFFFFF) | 1)::u32;
+    e0[3] = (d.ep0.phys >> 32)::u32;
     e0[4] = 8;
-    if (command(c, input, (T_ADDRESS << 10) | (slot::u32 << 24), ?ev[0]) != 1) { ret; }
+    if (command(c, input, (T_ADDRESS << 10) | (slot::u32 << 24), ?ev[0]) != 1) {
+        drop(d);
+        ret;
+    }
     sleep_ms(2);
 
     # the device descriptor's first 8 bytes tell EP0's real packet size
-    if (ok(control(c, slot, ?ep0, 0x80, 6, 0x0100, 0, 8, buf)) == 0) { ret; }
+    if (ok(control(c, slot, ?d.ep0, 0x80, 6, 0x0100, 0, 8, buf)) == 0) {
+        drop(d);
+        ret;
+    }
     val real: u32 = (@((vmm.phys_to_virt(buf) + 7)::*u8))::u32;
     val class: u8 = @((vmm.phys_to_virt(buf) + 4)::*u8);
     if (speed < 4 && real != 0 && real != mps) {
@@ -453,51 +634,75 @@ fun device(c: *Ctrl, at: *Place, speed: u32) {
         command(c, input, (T_EVALUATE << 10) | (slot::u32 << 24), ?ev[0]);
     }
 
-    # the configuration: find a boot keyboard interface and its IN endpoint
-    if (ok(control(c, slot, ?ep0, 0x80, 6, 0x0200, 0, 9, buf)) == 0) { ret; }
+    # the configuration: a boot keyboard interface and its IN endpoint, and
+    # the first interrupt IN endpoint of any interface (a hub's)
+    if (ok(control(c, slot, ?d.ep0, 0x80, 6, 0x0200, 0, 9, buf)) == 0) {
+        drop(d);
+        ret;
+    }
     var total: u16 = @((vmm.phys_to_virt(buf) + 2)::*u16);
     if (total > 1024) { total = 1024; }
-    if (ok(control(c, slot, ?ep0, 0x80, 6, 0x0200, 0, total, buf)) == 0) { ret; }
-    val d: *u8 = vmm.phys_to_virt(buf)::*u8;
-    val config: u8 = d[5];
+    if (ok(control(c, slot, ?d.ep0, 0x80, 6, 0x0200, 0, total, buf)) == 0) {
+        drop(d);
+        ret;
+    }
+    val dd: *u8 = vmm.phys_to_virt(buf)::*u8;
+    val config: u8 = dd[5];
     var iface: u8 = 0xFF;
     var ep_addr: u8 = 0;
     var ep_mps: u16 = 0;
     var ep_int: u8 = 0;
+    var any_addr: u8 = 0;
+    var any_mps: u16 = 0;
+    var any_int: u8 = 0;
     var in_kbd: u8 = 0;
     var pos: u64 = 0;
     for (pos + 2 <= total::u64) {
-        val len: u64 = d[pos]::u64;
+        val len: u64 = dd[pos]::u64;
         if (len < 2) { brk; }
-        val dt: u8 = d[pos + 1];
+        val dt: u8 = dd[pos + 1];
         if (dt == 4) { # interface: class 3 (HID), subclass 1 (boot), protocol 1 (keyboard)
-            in_kbd = (d[pos + 5] == 3 && d[pos + 6] == 1 && d[pos + 7] == 1)::u8;
-            if (in_kbd != 0 && iface == 0xFF) { iface = d[pos + 2]; }
-        } or (dt == 5 && in_kbd != 0 && ep_addr == 0 && (d[pos + 2] & 0x80) != 0 && (d[pos + 3] & 3) == 3) {
-            ep_addr = d[pos + 2];
-            ep_mps = (d[pos + 4]::u16 | (d[pos + 5]::u16 << 8)) & 0x7FF;
-            ep_int = d[pos + 6];
+            in_kbd = (dd[pos + 5] == 3 && dd[pos + 6] == 1 && dd[pos + 7] == 1)::u8;
+            if (in_kbd != 0 && iface == 0xFF) { iface = dd[pos + 2]; }
+        } or (dt == 5 && (dd[pos + 2] & 0x80) != 0 && (dd[pos + 3] & 3) == 3) {
+            val a: u8 = dd[pos + 2];
+            val m: u16 = (dd[pos + 4]::u16 | (dd[pos + 5]::u16 << 8)) & 0x7FF;
+            if (any_addr == 0) {
+                any_addr = a;
+                any_mps = m;
+                any_int = dd[pos + 6];
+            }
+            if (in_kbd != 0 && ep_addr == 0) {
+                ep_addr = a;
+                ep_mps = m;
+                ep_int = dd[pos + 6];
+            }
         }
         pos = pos + len;
     }
     if (class == 9) {
-        if (ok(control(c, slot, ?ep0, 0x00, 9, config::u16, 0, 0, 0)) != 0) {
-            hub(c, at, speed, slot, ?ep0, input, out, buf);
+        if (ok(control(c, slot, ?d.ep0, 0x00, 9, config::u16, 0, 0, 0)) != 0) {
+            d.kind = D_HUB;
+            hub(d, any_addr, any_mps, any_int);
         }
         ret;
     }
-    if (iface == 0xFF || ep_addr == 0 || nkbd == MAX_KBD) { ret; } # not a keyboard
+    if (iface == 0xFF || ep_addr == 0 || nkbd == MAX_KBD) { ret; } # not a keyboard: kept, unused
 
-    if (ok(control(c, slot, ?ep0, 0x00, 9, config::u16, 0, 0, 0)) == 0) { ret; }      # SET_CONFIGURATION
-    control(c, slot, ?ep0, 0x21, 0x0B, 0, iface::u16, 0, 0);                             # SET_PROTOCOL boot
-    control(c, slot, ?ep0, 0x21, 0x0A, 0, iface::u16, 0, 0);                             # SET_IDLE: only changes
+    if (ok(control(c, slot, ?d.ep0, 0x00, 9, config::u16, 0, 0, 0)) == 0) { ret; }   # SET_CONFIGURATION
+    control(c, slot, ?d.ep0, 0x21, 0x0B, 0, iface::u16, 0, 0);                          # SET_PROTOCOL boot
+    control(c, slot, ?d.ep0, 0x21, 0x0A, 0, iface::u16, 0, 0);                          # SET_IDLE: only changes
 
     val k: *Kbd = ?kbds[nkbd];
+    mem.fill(k::u64, 0, $size_of(Kbd)::u64);
     k.ctrl = c;
     k.slot = slot;
     k.dci = ((ep_addr & 0xF)::u64) * 2 + 1;
     k.report = pmm.alloc();
-    if (k.report == 0 || ring_new(?k.ring) == 0) { ret; }
+    if (k.report == 0 || ring_new(?k.ring) == 0) {
+        free_page(k.report);
+        ret;
+    }
     mem.fill(vmm.phys_to_virt(input), 0, 4096);
     icc[1] = 1 | (1::u32 << k.dci::u32);
     # the slot context as it stands, with enough context entries
@@ -509,82 +714,165 @@ fun device(c: *Ctrl, at: *Place, speed: u32) {
     ec[2] = ((k.ring.phys & 0xFFFFFFFF) | 1)::u32;
     ec[3] = (k.ring.phys >> 32)::u32;
     ec[4] = ep_mps::u32 | (ep_mps::u32 << 16);
-    if (command(c, input, (T_CONFIGURE << 10) | (slot::u32 << 24), ?ev[0]) != 1) { ret; }
+    if (command(c, input, (T_CONFIGURE << 10) | (slot::u32 << 24), ?ev[0]) != 1) {
+        free_page(k.report);
+        free_page(k.ring.phys);
+        ret;
+    }
+    d.kind = D_KBD;
     nkbd = nkbd + 1;
     arm(k);
 }
 
 # a hub's port status (low word) and what changed (high word)
-fun port_status(c: *Ctrl, slot: u64, ep0: *Ring, port: u64, buf: u64) u32 {
-    @(vmm.phys_to_virt(buf)::*u32) = 0;
-    if (ok(control(c, slot, ep0, 0xA3, 0, 0, port::u16, 4, buf)) == 0) { ret 0; }
-    ret @(vmm.phys_to_virt(buf)::*u32);
+fun port_status(d: *Dev, port: u64) u32 {
+    @(vmm.phys_to_virt(d.buf)::*u32) = 0;
+    if (ok(control(d.ctrl, d.slot, ?d.ep0, 0xA3, 0, 0, port::u16, 4, d.buf)) == 0) { ret 0; }
+    ret @(vmm.phys_to_virt(d.buf)::*u32);
 }
 
-# the hub in `slot` (configured already): tell the controller it is a hub,
-# power its ports and set up what is plugged into them. USB 3 hubs are
-# left alone: a USB 2 keyboard plugged into one shows up on the USB 2 hub
-# that every USB 3 hub also contains
-fun hub(c: *Ctrl, at: *Place, speed: u32, slot: u64, ep0: *Ring, input: u64, out: u64, buf: u64) {
-    if (speed >= 4 || at.depth >= 5) { ret; }
-    if (ok(control(c, slot, ep0, 0xA0, 6, 0x2900, 0, 8, buf)) == 0) { ret; }
-    val hd: *u8 = vmm.phys_to_virt(buf)::*u8;
+fun hub_feature(d: *Dev, req: u8, feature: u16, port: u64) {
+    control(d.ctrl, d.slot, ?d.ep0, 0x23, req, feature, port::u16, 0, 0);
+}
+
+# port `p` of hub `d`: set up what was plugged in, forget what was pulled out
+fun hub_port(d: *Dev, p: u64, hotplug: u8) {
+    val c: *Ctrl = d.ctrl;
+    var st: u32 = port_status(d, p);
+    val changed: u8 = ((st & (1 << 16)) != 0)::u8;
+    if ((st & (1 << 16)) != 0) { hub_feature(d, 1, 16, p); } # clear C_PORT_CONNECTION
+    if ((st & (1 << 17)) != 0) { hub_feature(d, 1, 17, p); } # C_PORT_ENABLE
+    if ((st & (1 << 20)) != 0) { hub_feature(d, 1, 20, p); } # C_PORT_RESET
+    val route: u32 = d.route | ((p::u32) << (d.depth::u32 * 4));
+    val there: u8 = known(c, d.root, d.depth + 1, route);
+    if ((st & 1) == 0) {
+        if (there != 0) { drop_below(c, d.root, d.depth + 1, route); }
+        ret;
+    }
+    if (there != 0) {
+        if (changed == 0) { ret; }
+        drop_below(c, d.root, d.depth + 1, route); # unplugged and plugged again
+    }
+    if (hotplug != 0) { sleep_ms(100); } # let the plug settle
+    hub_feature(d, 3, 4, p); # SET_FEATURE PORT_RESET
+    var tries: u64 = 0;
+    for (tries < 50) {
+        sleep_ms(10);
+        st = port_status(d, p);
+        if ((st & (1 << 20)) != 0 || (st & (1 << 4)) == 0) { brk; }
+        tries = tries + 1;
+    }
+    hub_feature(d, 1, 20, p);
+    hub_feature(d, 1, 16, p);
+    sleep_ms(20);
+    st = port_status(d, p);
+    if ((st & 3) != 3) { ret; }
+    var child_speed: u32 = 1;
+    if ((st & (1 << 9)) != 0) { child_speed = 2; }
+    if ((st & (1 << 10)) != 0) { child_speed = 3; }
+    var child: Place;
+    child.root = d.root;
+    child.route = route;
+    child.depth = d.depth + 1;
+    child.tt_slot = d.tt_slot;
+    child.tt_port = d.tt_port;
+    if (d.speed == 3 && child_speed < 3) {
+        child.tt_slot = d.slot;
+        child.tt_port = p;
+    }
+    device(c, ?child, child_speed);
+}
+
+# the hub `d` (configured already): tell the controller it is a hub and
+# about its status-change endpoint, power its ports and set up what is
+# plugged into them. USB 3 hubs are left alone: a USB 2 keyboard plugged
+# into one shows up on the USB 2 hub that every USB 3 hub also contains
+fun hub(d: *Dev, ep_addr: u8, ep_mps: u16, ep_int: u8) {
+    val c: *Ctrl = d.ctrl;
+    if (d.speed >= 4 || d.depth >= 5) { ret; }
+    if (ok(control(c, d.slot, ?d.ep0, 0xA0, 6, 0x2900, 0, 8, d.buf)) == 0) { ret; }
+    val hd: *u8 = vmm.phys_to_virt(d.buf)::*u8;
     var nports: u64 = hd[2]::u64;
     if (nports > 15) { nports = 15; }
     val settle: u64 = hd[5]::u64 * 2;
+    d.nports = nports;
 
     var ev: [4]u32;
+    val input: u64 = d.input;
     mem.fill(vmm.phys_to_virt(input), 0, 4096);
     val icc: *u32 = ctx(input, c, 0);
-    icc[1] = 1; # the slot context only
+    icc[1] = 1; # the slot context
     val sc: *u32 = ctx(input, c, 1);
-    mem.copy(sc::u64, vmm.phys_to_virt(out), c.csz);
+    mem.copy(sc::u64, vmm.phys_to_virt(d.out), c.csz);
     sc[0] = sc[0] | (1 << 26);
     sc[1] = (sc[1] & 0x00FFFFFF) | ((nports::u32) << 24);
-    command(c, input, (T_CONFIGURE << 10) | (slot::u32 << 24), ?ev[0]);
+    var watch: u8 = 0;
+    if (ep_addr != 0 && ep_mps > 0 && ring_new(?d.int_ring) != 0) {
+        d.int_buf = pmm.alloc();
+        if (d.int_buf != 0) {
+            d.int_dci = ((ep_addr & 0xF)::u64) * 2 + 1;
+            d.int_len = ep_mps::u64;
+            icc[1] = 1 | (1::u32 << d.int_dci::u32);
+            sc[0] = (sc[0] & 0x07FFFFFF) | ((d.int_dci::u32) << 27);
+            val ec: *u32 = ctx(input, c, 1 + d.int_dci);
+            ec[0] = interval(d.speed, ep_int) << 16;
+            ec[1] = (3 << 1) | (7 << 3) | (ep_mps::u32 << 16);
+            ec[2] = ((d.int_ring.phys & 0xFFFFFFFF) | 1)::u32;
+            ec[3] = (d.int_ring.phys >> 32)::u32;
+            ec[4] = ep_mps::u32 | (ep_mps::u32 << 16);
+            watch = 1;
+        }
+    }
+    if (command(c, input, (T_CONFIGURE << 10) | (d.slot::u32 << 24), ?ev[0]) != 1) { watch = 0; }
 
     var p: u64 = 1;
     for (p <= nports) {
-        control(c, slot, ep0, 0x23, 3, 8, p::u16, 0, 0); # SET_FEATURE PORT_POWER
+        hub_feature(d, 3, 8, p); # SET_FEATURE PORT_POWER
         p = p + 1;
     }
     sleep_ms(settle + 100);
-
     p = 1;
     for (p <= nports) {
-        if ((port_status(c, slot, ep0, p, buf) & 1) != 0) {
-            control(c, slot, ep0, 0x23, 3, 4, p::u16, 0, 0); # SET_FEATURE PORT_RESET
-            var tries: u64 = 0;
-            var st: u32 = 0;
-            for (tries < 50) {
-                sleep_ms(10);
-                st = port_status(c, slot, ep0, p, buf);
-                if ((st & (1 << 20)) != 0 || (st & (1 << 4)) == 0) { brk; }
-                tries = tries + 1;
-            }
-            control(c, slot, ep0, 0x23, 1, 20, p::u16, 0, 0); # clear C_PORT_RESET
-            control(c, slot, ep0, 0x23, 1, 16, p::u16, 0, 0); # clear C_PORT_CONNECTION
-            sleep_ms(20);
-            st = port_status(c, slot, ep0, p, buf);
-            if ((st & 3) == 3) {
-                var child_speed: u32 = 1;
-                if ((st & (1 << 9)) != 0) { child_speed = 2; }
-                if ((st & (1 << 10)) != 0) { child_speed = 3; }
-                var child: Place;
-                child.root = at.root;
-                child.route = at.route | ((p::u32) << (at.depth::u32 * 4));
-                child.depth = at.depth + 1;
-                child.tt_slot = at.tt_slot;
-                child.tt_port = at.tt_port;
-                if (speed == 3 && child_speed < 3) {
-                    child.tt_slot = slot;
-                    child.tt_port = p;
-                }
-                device(c, ?child, child_speed);
-            }
-        }
+        hub_port(d, p, 0);
         p = p + 1;
     }
+    if (watch != 0) { arm_hub(d); }
+    or { d.int_dci = 0; }
+}
+
+# root port `p`: set up what was plugged in, forget what was pulled out
+fun root_port(c: *Ctrl, p: u64, hotplug: u8) {
+    val ps: u64 = c.op + 0x400 + (p - 1) * 0x10;
+    var v: u32 = rd(ps);
+    val changed: u8 = ((v & (1 << 17)) != 0)::u8;
+    wr(ps, (1 << 9) | (v & 0x00FE0000)); # clear the change bits (never write 1 to enabled)
+    val there: u8 = known(c, p, 0, 0);
+    if ((v & 1) == 0) {
+        if (there != 0) { drop_below(c, p, 0, 0); }
+        ret;
+    }
+    if (there != 0) {
+        if (changed == 0) { ret; }
+        drop_below(c, p, 0, 0);
+    }
+    if (hotplug != 0) { sleep_ms(100); }
+    v = rd(ps);
+    if ((v & 1) == 0) { ret; }
+    if ((v & 2) == 0) { # USB 2: reset to enable it (USB 3 ports enable themselves)
+        wr(ps, (1 << 9) | (1 << 4));
+        spin_until(ps, 1 << 21, 1 << 21);
+        sleep_ms(20);
+        wr(ps, (1 << 9) | (rd(ps) & 0x00FE0000));
+        v = rd(ps);
+    }
+    if ((v & 2) == 0) { ret; }
+    var at: Place;
+    at.root = p;
+    at.route = 0;
+    at.depth = 0;
+    at.tt_slot = 0;
+    at.tt_port = 0;
+    device(c, ?at, (v >> 10) & 0xF);
 }
 
 # take the controller from the firmware (the USB legacy support capability)
@@ -672,29 +960,10 @@ fun setup(c: *Ctrl, dev: *pci.Device) u8 {
     }
     sleep_ms(200);
 
-    # every connected root port: reset (USB 2) or already enabled (USB 3)
+    # every connected root port (later plugging is handled by poll)
     p = 1;
     for (p <= c.ports) {
-        val ps: u64 = c.op + 0x400 + (p - 1) * 0x10;
-        var v: u32 = rd(ps);
-        if ((v & 1) != 0) {
-            if ((v & 2) == 0) {
-                wr(ps, (1 << 9) | (1 << 4));        # power + reset
-                spin_until(ps, 1 << 21, 1 << 21);   # reset changed
-                sleep_ms(20);
-            }
-            wr(ps, (1 << 9) | 0x00FE0000);          # clear the change bits
-            v = rd(ps);
-            if ((v & 2) != 0) {
-                var at: Place;
-                at.root = p;
-                at.route = 0;
-                at.depth = 0;
-                at.tt_slot = 0;
-                at.tt_port = 0;
-                device(c, ?at, (v >> 10) & 0xF);
-            }
-        }
+        root_port(c, p, 0);
         p = p + 1;
     }
     ret 1;

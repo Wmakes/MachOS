@@ -15,6 +15,7 @@ steps run in order:
   keys:TEXT      type TEXT on the PS/2 keyboard (via the QEMU monitor);
                  <up>, <left>, <tab>, ... press named keys,
                  <x 900> holds x down for 900 ms
+  mon:COMMAND    a QEMU monitor command (device_add, device_del, ...)
   sleep:SECONDS  pause
   shot:PATH      save a PNG screenshot of the framebuffer
 
@@ -184,6 +185,8 @@ def main():
                             time.sleep(int(tok[1:-1].split()[1]) / 1000 + 0.1)
                     else:
                         monitor("sendkey " + keyname(tok))
+            elif kind == "mon":
+                monitor(arg)
             elif kind == "sleep":
                 time.sleep(float(arg))
             elif kind == "shot":

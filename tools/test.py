@@ -70,6 +70,8 @@ def broken_clean_on_host():
 USB = ["--qemu=-machine", "--qemu=i8042=off", "--qemu=-device", "--qemu=qemu-xhci,id=xhci",
        "--qemu=-device", "--qemu=usb-kbd,bus=xhci.0"]
 
+USB_BARE = ["--qemu=-machine", "--qemu=i8042=off", "--qemu=-device", "--qemu=qemu-xhci,id=xhci"]
+
 USB_HUB = ["--qemu=-machine", "--qemu=i8042=off", "--qemu=-device", "--qemu=qemu-xhci,id=xhci",
            "--qemu=-device", "--qemu=usb-hub,bus=xhci.0,port=2",
            "--qemu=-device", "--qemu=usb-hub,bus=xhci.0,port=2.1",
@@ -137,6 +139,17 @@ TESTS = [
       "keys:tty > /tmp/which<ret>", "sleep:0.5", "keys:<alt-f1>", "sleep:0.3",
       "send:cat /tmp/which; ps | grep -c login\\n", "wait:" + P],
      ["/dev/tty2", "\n4"]),
+
+    # plugging in while running: a keyboard, then a hub and a keyboard on
+    # it, unplugged and plugged into another of its ports
+    ("usb-hotplug", False, False,
+     USB_BARE + ["wait:" + P,
+      "mon:device_add usb-kbd,bus=xhci.0,port=1,id=k1", "sleep:1.5", "keys:echo plugged_in<ret>", "wait:" + P,
+      "mon:device_del k1", "sleep:1", "mon:device_add usb-hub,bus=xhci.0,port=2,id=h1", "sleep:1.5",
+      "mon:device_add usb-kbd,bus=xhci.0,port=2.3,id=k2", "sleep:1.5", "keys:echo via_hub<ret>", "wait:" + P,
+      "mon:device_del k2", "sleep:1", "mon:device_add usb-kbd,bus=xhci.0,port=2.1,id=k3", "sleep:1.5",
+      "keys:echo again<ret>", "wait:" + P],
+     ["usb: 1 xhci controller(s), 0 keyboard(s)", "plugged_in\nroot", "via_hub\nroot", "again\nroot"]),
 
     ("tools", False, False,
      ["wait:" + P,
