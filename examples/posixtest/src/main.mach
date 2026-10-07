@@ -347,6 +347,89 @@ fun big_files() {
     sys.close(h);
 }
 
+var kids: [300]u64;
+
+fun limits() {
+    var inf: abi.Info;
+    sys.info(?inf);
+    val free_before: u64 = inf.mem_free;
+
+    # fork until the process table is full: an error, not a crash
+    var n: u64 = 0;
+    var last: u64 = 0;
+    for (n < 300) {
+        val pid: u64 = sys.fork();
+        if (pid == 0) {
+            for { sys.sleep(1000); }
+        }
+        if (abi.is_err(pid) != 0) {
+            last = pid;
+            brk;
+        }
+        kids[n] = pid;
+        n = n + 1;
+    }
+    check("fork stops with an error when full\0", (abi.is_err(last) != 0 && n > 100)::u8);
+    var k: u64 = 0;
+    for (k < n) {
+        sys.kill(kids[k], abi.SIGKILL);
+        k = k + 1;
+    }
+    var st: u64 = 0;
+    k = 0;
+    for (k < n) {
+        sys.waitpid(kids[k], ?st, 0);
+        k = k + 1;
+    }
+    val again: u64 = sys.fork();
+    if (again == 0) { sys.exit(0); }
+    check("fork works again afterwards\0", (abi.is_err(again) == 0 && sys.waitpid(again, ?st, 0) == again)::u8);
+
+    # open until the handle table is full
+    var opened: u64 = 0;
+    var err: u64 = 0;
+    var hs: [70]u64;
+    for (opened < 70) {
+        val h: u64 = sys.open("/etc/motd\0", 9, abi.O_READ);
+        if (abi.is_err(h) != 0) {
+            err = h;
+            brk;
+        }
+        hs[opened] = h;
+        opened = opened + 1;
+    }
+    check("open stops with E_MFILE\0", (abi.err_code(err) == abi.E_MFILE && opened > 50)::u8);
+    k = 0;
+    for (k < opened) {
+        sys.close(hs[k]);
+        k = k + 1;
+    }
+
+    # a child that eats all memory is stopped; the memory comes back
+    val hog: u64 = sys.fork();
+    if (hog == 0) {
+        val size: u64 = 64 * 1024 * 1024 * 1024;
+        val a: u64 = sys.mmap(0, size, abi.PROT_READ | abi.PROT_WRITE, abi.MAP_PRIVATE | abi.MAP_ANONYMOUS, 0, 0);
+        if (abi.is_err(a) != 0) { sys.exit(9); }
+        var off: u64 = 0;
+        for (off < size) {
+            @((a + off)::*u64) = off;
+            off = off + 4096;
+        }
+        sys.exit(8);
+    }
+    sys.waitpid(hog, ?st, 0);
+    check("a memory hog is killed\0", (abi.wifsignaled(st) != 0)::u8);
+    sys.info(?inf);
+    check("its memory comes back\0", (inf.mem_free + 4 * 1024 * 1024 > free_before)::u8);
+    val after: u64 = sys.fork();
+    if (after == 0) { sys.exit(0); }
+    check("the system still works\0", (abi.is_err(after) == 0 && sys.waitpid(after, ?st, 0) == after)::u8);
+
+    # sbrk past everything fails
+    check("a huge sbrk fails\0", abi.is_err(sys.sbrk(0x7FFF00000000)));
+}
+
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     fds();
@@ -356,6 +439,7 @@ fun main(argc: u64, argv: **u8) u64 {
     permissions();
     mappings();
     big_files();
+    limits();
     io.out("posixtest: \0");
     io.dec(failures);
     io.out(" failures\n\0");

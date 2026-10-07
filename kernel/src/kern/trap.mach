@@ -14,6 +14,7 @@ use vmm:    machos.mm.vmm;
 use abi:    sdk.abi;
 use signal: machos.kern.signal;
 use mmap:   machos.kern.mmap;
+use pmm:    machos.mm.pmm;
 
 fun name_of(v: u64) *u8 {
     if (v == 0)  { ret "divide error\0"; }
@@ -66,6 +67,20 @@ fun dump(f: *idt.Frame) {
 # a user program faulted: say so on the console and end it
 fun user_fault(f: *idt.Frame) {
     val p: *proc.Proc = proc.current();
+    # a page it needed could not be had: memory ran out
+    if (f.vector == 14 && pmm.free_pages() < 16) {
+        kprint.puts("out of memory: killed \0");
+        kprint.dec(p.pid);
+        kprint.putc(32);
+        var j: u64 = 0;
+        for (j < p.name_len) {
+            kprint.putc(p.name[j]);
+            j = j + 1;
+        }
+        kprint.putc(10);
+        signal.fault(abi.SIGKILL);
+        ret;
+    }
     kprint.puts("\0");
     kprint.dec(p.pid);
     kprint.putc(32);
