@@ -62,7 +62,23 @@ pub val GETGID:  u64 = 55;
 pub val GETEGID: u64 = 56;
 pub val UMASK:   u64 = 57; # (mask)                                -> the old one
 pub val ACCESS:  u64 = 58; # (path, path_len, R_OK|W_OK|X_OK)      with the real uid
-pub val COUNT:   u64 = 59;
+pub val MMAP:    u64 = 59; # (addr, len, prot | flags << 8, handle, offset) -> the address
+pub val MUNMAP:  u64 = 60; # (addr, len)
+pub val MPROTECT: u64 = 61; # (addr, len, prot)
+pub val COUNT:   u64 = 62;
+
+# mmap: what the pages allow, and what kind of mapping. anonymous pages
+# start zeroed and only take memory once touched; a file mapping is a
+# private copy (MAP_SHARED is accepted read-only)
+pub val PROT_NONE:  u64 = 0;
+pub val PROT_READ:  u64 = 1;
+pub val PROT_WRITE: u64 = 2;
+pub val PROT_EXEC:  u64 = 4;
+pub val MAP_SHARED:    u64 = 1;
+pub val MAP_PRIVATE:   u64 = 2;
+pub val MAP_FIXED:     u64 = 0x10;
+pub val MAP_ANONYMOUS: u64 = 0x20;
+pub val MAP_FAILED: u64 = 0xFFFFFFFFFFFFFFFF;
 
 pub val NO_ID: u64 = 0xFFFFFFFFFFFFFFFF;
 pub val R_OK: u64 = 4;
@@ -167,6 +183,7 @@ pub val E_NOTTY:    u64 = 22; # not a terminal
 pub val E_INTR:     u64 = 23; # interrupted by a signal
 pub val E_PERM:     u64 = 24; # not allowed
 pub val E_ACCES:    u64 = 25; # permission denied
+pub val E_NOTSUP:   u64 = 26; # not supported
 
 pub val ERR_MIN: u64 = 0xFFFFFFFFFFFFF000;
 
@@ -206,6 +223,7 @@ pub fun err_name(v: u64) *u8 {
     if (e == E_INTR)     { ret "interrupted\0"; }
     if (e == E_PERM)     { ret "operation not permitted\0"; }
     if (e == E_ACCES)    { ret "permission denied\0"; }
+    if (e == E_NOTSUP)   { ret "not supported\0"; }
     ret "unknown error\0";
 }
 

@@ -216,6 +216,8 @@ fun load_image(p: *proc.Proc, img: u64, len: u64, args: u64, args_len: u64,
     if (entry < LOAD_MIN || entry >= top) { ret abi.err(abi.E_NOEXEC); }
     p.brk_base = (top + PAGE - 1) & ~(PAGE - 1);
     p.brk = p.brk_base;
+    p.nmaps = 0;
+    p.mmap_next = STACK_TOP - STACK_PAGES * PAGE - 0x1000000; # 16 MiB below the stack
 
     var va: u64 = STACK_TOP - STACK_PAGES * PAGE;
     for (va < STACK_TOP) {

@@ -60,6 +60,9 @@ pub rec Proc {
     wake_at:   u64;  # tick a CHAN_TIMER sleeper wakes at
     brk:       u64;  # end of the user heap
     brk_base:  u64;
+    maps:      [64]Region; # mmap's regions (kern/mmap.mach)
+    nmaps:     u64;
+    mmap_next: u64;  # the next mapping goes below this
     pages:     u64;  # user pages mapped
     handles:   [32]u64;
     fdflags:   [32]u8; # FD_CLOEXEC per fd
@@ -67,6 +70,12 @@ pub rec Proc {
     cwd_len:   u64;
     name:      [32]u8;
     name_len:  u64;
+}
+
+pub rec Region {
+    start: u64;
+    end:   u64;
+    prot:  u64;  # abi.PROT_*
 }
 
 var table: [64]Proc;

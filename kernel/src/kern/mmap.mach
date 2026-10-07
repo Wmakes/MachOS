@@ -1,0 +1,258 @@
+# memory mappings: mmap, munmap, mprotect. a process keeps a list of
+# regions it reserved; their pages are only given memory when first
+# touched (a zeroed page, on the page fault), so reserving a lot is cheap.
+# a file mapping is a private copy of the file read in at once. new
+# mappings go downward from below the stack; sbrk's heap grows up to them
+
+use abi:  sdk.abi;
+use proc: machos.kern.proc;
+use vmm:  machos.mm.vmm;
+use pmm:  machos.mm.pmm;
+use mem:  machos.kern.mem;
+use vfs:  machos.fs.vfs;
+use file: machos.fs.file;
+
+val PAGE: u64 = 4096;
+pub val MAX: u64 = 64;              # regions per process
+pub val GAP: u64 = 0x1000000;       # 16 MiB kept free above the heap and below the stack
+
+fun page_flags(prot: u64) u64 {
+    var f: u64 = vmm.U;
+    if ((prot & abi.PROT_WRITE) != 0) { f = f | vmm.W; }
+    if ((prot & abi.PROT_EXEC) == 0) { f = f | vmm.NX; }
+    ret f;
+}
+
+# the region holding `va`, or MAX
+fun find(p: *proc.Proc, va: u64) u64 {
+    var i: u64 = 0;
+    for (i < p.nmaps) {
+        if (va >= p.maps[i].start && va < p.maps[i].end) { ret i; }
+        i = i + 1;
+    }
+    ret MAX;
+}
+
+fun add(p: *proc.Proc, start: u64, end: u64, prot: u64) u8 {
+    if (p.nmaps == MAX) { ret 0; }
+    p.maps[p.nmaps].start = start;
+    p.maps[p.nmaps].end = end;
+    p.maps[p.nmaps].prot = prot;
+    p.nmaps = p.nmaps + 1;
+    ret 1;
+}
+
+fun remove_at(p: *proc.Proc, i: u64) {
+    var k: u64 = i;
+    for (k + 1 < p.nmaps) {
+        p.maps[k] = p.maps[k + 1];
+        k = k + 1;
+    }
+    p.nmaps = p.nmaps - 1;
+}
+
+# take [a, b) out of every region; the parts that were inside a region go
+# to `covered` (start, end, prot triples) when it is not nil. 0 when the
+# region list would overflow
+fun cut(p: *proc.Proc, a: u64, b: u64, covered: *u64, ncov: *u64) u8 {
+    var i: u64 = 0;
+    for (i < p.nmaps) {
+        val s: u64 = p.maps[i].start;
+        val t: u64 = p.maps[i].end;
+        val pr: u64 = p.maps[i].prot;
+        if (t <= a || s >= b) {
+            i = i + 1;
+            cnt;
+        }
+        if (covered != nil && @ncov < MAX) {
+            var cs: u64 = s;
+            var ce: u64 = t;
+            if (cs < a) { cs = a; }
+            if (ce > b) { ce = b; }
+            covered[@ncov * 3] = cs;
+            covered[@ncov * 3 + 1] = ce;
+            covered[@ncov * 3 + 2] = pr;
+            @ncov = @ncov + 1;
+        }
+        if (s < a && t > b) { # split in two
+            if (p.nmaps == MAX) { ret 0; }
+            p.maps[i].end = a;
+            add(p, b, t, pr);
+            i = i + 1;
+            cnt;
+        }
+        if (s < a) {
+            p.maps[i].end = a;
+            i = i + 1;
+            cnt;
+        }
+        if (t > b) {
+            p.maps[i].start = b;
+            i = i + 1;
+            cnt;
+        }
+        remove_at(p, i); # wholly inside
+    }
+    ret 1;
+}
+
+# give the untouched page at `va` its memory; 0 if `va` is not in a region
+# that allows the access
+fun fill(p: *proc.Proc, va: u64, write: u8) u8 {
+    val i: u64 = find(p, va);
+    if (i == MAX) { ret 0; }
+    val prot: u64 = p.maps[i].prot;
+    if ((prot & (abi.PROT_READ | abi.PROT_WRITE | abi.PROT_EXEC)) == 0) { ret 0; }
+    if (write != 0 && (prot & abi.PROT_WRITE) == 0) { ret 0; }
+    val pg: u64 = va & ~(PAGE - 1);
+    if ((vmm.lookup(p.pml4, pg) & vmm.P) != 0) { ret 1; } # already there
+    val pa: u64 = pmm.alloc();
+    if (pa == 0) { ret 0; }
+    if (vmm.map(p.pml4, pg, pa, page_flags(prot)) == 0) {
+        pmm.free(pa);
+        ret 0;
+    }
+    p.pages = p.pages + 1;
+    ret 1;
+}
+
+# a page fault in user mode at `va` (error code `err`): handled here if it
+# touched a reserved page for the first time
+pub fun fault(p: *proc.Proc, va: u64, err: u64) u8 {
+    if ((err & 1) != 0) { ret 0; } # the page is there: a protection fault
+    ret fill(p, va, ((err & 2) != 0)::u8);
+}
+
+# whether part of [va, va+n) is in a region that may not be written (so a
+# copy-on-write page there must not be given a writable copy)
+pub fun denies_write(p: *proc.Proc, va: u64, n: u64) u8 {
+    var i: u64 = 0;
+    for (i < p.nmaps) {
+        if (va < p.maps[i].end && va + n > p.maps[i].start && (p.maps[i].prot & abi.PROT_WRITE) == 0) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# make sure [va, va+n) has its pages before the kernel reads or writes it
+pub fun touch(p: *proc.Proc, va: u64, n: u64, write: u8) {
+    if (n == 0 || p.nmaps == 0 || va >= vmm.USER_END || n > vmm.USER_END - va) { ret; }
+    var pg: u64 = va & ~(PAGE - 1);
+    for (pg < va + n) {
+        if ((vmm.lookup(p.pml4, pg) & vmm.P) == 0) { fill(p, pg, write); }
+        pg = pg + PAGE;
+    }
+}
+
+# drop the pages in [a, b)
+fun unmap_pages(p: *proc.Proc, a: u64, b: u64) {
+    var va: u64 = a;
+    for (va < b) {
+        val pa: u64 = vmm.unmap(p.pml4, va);
+        if (pa != 0) {
+            pmm.release(pa);
+            if (p.pages > 0) { p.pages = p.pages - 1; }
+        }
+        va = va + PAGE;
+    }
+}
+
+# the lowest address mappings may use: above the heap and its gap
+fun floor(p: *proc.Proc) u64 { ret ((p.brk + PAGE - 1) & ~(PAGE - 1)) + GAP; }
+
+# the start of mappings, for sbrk's limit
+pub fun lowest(p: *proc.Proc) u64 { ret p.mmap_next; }
+
+pub fun munmap(p: *proc.Proc, addr: u64, len: u64) u64 {
+    if ((addr & (PAGE - 1)) != 0 || len == 0) { ret abi.err(abi.E_INVAL); }
+    val end: u64 = (addr + len + PAGE - 1) & ~(PAGE - 1);
+    if (end > vmm.USER_END || end < addr) { ret abi.err(abi.E_INVAL); }
+    if (cut(p, addr, end, nil, nil) == 0) { ret abi.err(abi.E_NOMEM); }
+    unmap_pages(p, addr, end);
+    ret 0;
+}
+
+pub fun mprotect(p: *proc.Proc, addr: u64, len: u64, prot: u64) u64 {
+    if ((addr & (PAGE - 1)) != 0) { ret abi.err(abi.E_INVAL); }
+    val end: u64 = (addr + len + PAGE - 1) & ~(PAGE - 1);
+    if (end > vmm.USER_END || end < addr) { ret abi.err(abi.E_INVAL); }
+    var cov: [192]u64;
+    var n: u64 = 0;
+    if (cut(p, addr, end, ?cov[0], ?n) == 0) { ret abi.err(abi.E_NOMEM); }
+    var i: u64 = 0;
+    for (i < n) {
+        if (add(p, cov[i * 3], cov[i * 3 + 1], prot) == 0) { ret abi.err(abi.E_NOMEM); }
+        i = i + 1;
+    }
+    # pages already there change now (a copy-on-write page stays read-only:
+    # the write fault gives it its copy)
+    var va: u64 = addr;
+    for (va < end) {
+        val e: u64 = vmm.lookup(p.pml4, va);
+        if ((e & vmm.P) != 0 && find(p, va) != MAX) {
+            var f: u64 = page_flags(prot);
+            # no access: the page stays, but only the kernel may touch it
+            if ((prot & (abi.PROT_READ | abi.PROT_WRITE | abi.PROT_EXEC)) == 0) { f = f & ~vmm.U; }
+            if ((e & vmm.COW) != 0) { f = (f & ~vmm.W) | vmm.COW; }
+            vmm.map(p.pml4, va, e & 0x000FFFFFFFFFF000, f);
+        }
+        va = va + PAGE;
+    }
+    ret 0;
+}
+
+# read `n` bytes of `nd` at `off` into fresh pages at [va, va + n)
+fun load_file(p: *proc.Proc, nd: *vfs.Node, off: u64, va: u64, len: u64, prot: u64) u8 {
+    var at: u64 = 0;
+    for (at < len) {
+        val pa: u64 = pmm.alloc();
+        if (pa == 0) { ret 0; }
+        if (off + at < nd.size) {
+            var want: u64 = nd.size - (off + at);
+            if (want > PAGE) { want = PAGE; }
+            vfs.read(nd, off + at, vmm.phys_to_virt(pa), want);
+        }
+        if (vmm.map(p.pml4, va + at, pa, page_flags(prot)) == 0) {
+            pmm.free(pa);
+            ret 0;
+        }
+        p.pages = p.pages + 1;
+        at = at + PAGE;
+    }
+    ret 1;
+}
+
+pub fun mmap(p: *proc.Proc, addr: u64, len: u64, prot: u64, flags: u64, h: *file.Handle, off: u64) u64 {
+    if (len == 0 || len > vmm.USER_END) { ret abi.err(abi.E_INVAL); }
+    val size: u64 = (len + PAGE - 1) & ~(PAGE - 1);
+    val anon: u8 = ((flags & abi.MAP_ANONYMOUS) != 0)::u8;
+    if ((flags & (abi.MAP_PRIVATE | abi.MAP_SHARED)) == 0) { ret abi.err(abi.E_INVAL); }
+    var nd: *vfs.Node = nil;
+    if (anon == 0) {
+        if (h == nil || h.kind != file.NODE) { ret abi.err(abi.E_BADF); }
+        nd = h.node;
+        if (nd.kind != abi.KIND_FILE) { ret abi.err(abi.E_ACCES); }
+        if ((h.flags & abi.O_READ) == 0) { ret abi.err(abi.E_ACCES); }
+        if ((off & (PAGE - 1)) != 0) { ret abi.err(abi.E_INVAL); }
+        # writes to a shared mapping would have to reach the file: not yet
+        if ((flags & abi.MAP_SHARED) != 0 && (prot & abi.PROT_WRITE) != 0) { ret abi.err(abi.E_NOTSUP); }
+    }
+    var at: u64 = 0;
+    if ((flags & abi.MAP_FIXED) != 0) {
+        if ((addr & (PAGE - 1)) != 0 || addr == 0 || addr + size > vmm.USER_END || addr + size < addr) { ret abi.err(abi.E_INVAL); }
+        at = addr;
+        if (cut(p, at, at + size, nil, nil) == 0) { ret abi.err(abi.E_NOMEM); }
+        unmap_pages(p, at, at + size);
+    } or {
+        if (p.mmap_next < size || p.mmap_next - size < floor(p)) { ret abi.err(abi.E_NOMEM); }
+        at = p.mmap_next - size;
+        p.mmap_next = at;
+    }
+    if (add(p, at, at + size, prot) == 0) { ret abi.err(abi.E_NOMEM); }
+    if (anon == 0 && load_file(p, nd, off, at, size, prot) == 0) {
+        cut(p, at, at + size, nil, nil);
+        unmap_pages(p, at, at + size);
+        ret abi.err(abi.E_NOMEM);
+    }
+    ret at;
+}

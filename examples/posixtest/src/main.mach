@@ -262,6 +262,73 @@ fun permissions() {
     sys.remove("/tmp/pt_root\0", 12);
 }
 
+fun mappings() {
+    # a big anonymous mapping: reserved, zeroed, memory only where touched
+    var inf: abi.Info;
+    sys.info(?inf);
+    val before: u64 = inf.mem_free;
+    val big: u64 = 1024 * 1024 * 1024; # 1 GiB
+    val a: u64 = sys.mmap(0, big, abi.PROT_READ | abi.PROT_WRITE, abi.MAP_PRIVATE | abi.MAP_ANONYMOUS, 0, 0);
+    check("mmap 1 GiB\0", (abi.is_err(a) == 0 && (a & 4095) == 0)::u8);
+    val first: *u64 = a::*u64;
+    val last: *u64 = (a + big - 8)::*u64;
+    check("mapped memory starts zeroed\0", (@first == 0 && @last == 0)::u8);
+    @first = 11;
+    @last = 22;
+    check("mapped memory keeps writes\0", (@first == 11 && @last == 22)::u8);
+    sys.info(?inf);
+    check("only touched pages use memory\0", (before - inf.mem_free < 1024 * 1024)::u8);
+
+    # the kernel can read and write mapped pages it was handed
+    val hp: u64 = sys.open("/tmp/mapped\0", 11, abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC);
+    val mid: *u8 = (a + 512 * 1024 * 1024)::*u8;
+    io.copy(mid, "mapped file text\0", 16);
+    check("write() from mapped memory\0", (sys.write(hp, mid, 16) == 16)::u8);
+    sys.close(hp);
+    val buf: *u8 = (a + 700 * 1024 * 1024)::*u8;
+    val hr: u64 = sys.open("/tmp/mapped\0", 11, abi.O_READ);
+    check("read() into untouched mapped memory\0", (sys.read(hr, buf, 16) == 16 && io.eq(buf, 16, "mapped file text\0", 16) != 0)::u8);
+
+    # a file mapping is a copy of the file
+    val fm: u64 = sys.mmap(0, 16, abi.PROT_READ, abi.MAP_PRIVATE, hr, 0);
+    check("mmap a file\0", (abi.is_err(fm) == 0 && io.eq(fm::*u8, 16, "mapped file text\0", 16) != 0)::u8);
+    sys.close(hr);
+
+    # fork copies mappings
+    val pid: u64 = sys.fork();
+    if (pid == 0) {
+        if (@first != 11 || @last != 22) { sys.exit(1); }
+        @first = 99;
+        sys.exit(0);
+    }
+    var st: u64 = 0;
+    sys.waitpid(pid, ?st, 0);
+    check("a child sees the parent's mappings\0", (abi.wexitstatus(st) == 0 && @first == 11)::u8);
+
+    # mprotect read-only, then writing faults
+    check("mprotect\0", (sys.mprotect(a, 4096, abi.PROT_READ) == 0)::u8);
+    val w: u64 = sys.fork();
+    if (w == 0) {
+        @first = 5;
+        sys.exit(0);
+    }
+    sys.waitpid(w, ?st, 0);
+    check("writing read-only memory is SIGSEGV\0", (abi.wifsignaled(st) != 0 && abi.wtermsig(st) == abi.SIGSEGV)::u8);
+    check("read-only memory still reads\0", (@first == 11)::u8);
+
+    # munmap: gone, and touching it faults
+    check("munmap\0", (sys.munmap(a, big) == 0)::u8);
+    val g: u64 = sys.fork();
+    if (g == 0) {
+        val x: u64 = @last;
+        sys.exit(x);
+    }
+    sys.waitpid(g, ?st, 0);
+    check("unmapped memory is SIGSEGV\0", (abi.wifsignaled(st) != 0 && abi.wtermsig(st) == abi.SIGSEGV)::u8);
+    check("munmap of nothing mapped is fine\0", (sys.munmap(a, 4096) == 0)::u8);
+    check("mmap of 0 bytes fails\0", abi.is_err(sys.mmap(0, 0, abi.PROT_READ, abi.MAP_PRIVATE | abi.MAP_ANONYMOUS, 0, 0)));
+}
+
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     fds();
@@ -269,6 +336,7 @@ fun main(argc: u64, argv: **u8) u64 {
     processes();
     signals();
     permissions();
+    mappings();
     io.out("posixtest: \0");
     io.dec(failures);
     io.out(" failures\n\0");

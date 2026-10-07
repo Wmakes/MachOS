@@ -13,6 +13,7 @@ use sys:    machos.kern.sys;
 use vmm:    machos.mm.vmm;
 use abi:    sdk.abi;
 use signal: machos.kern.signal;
+use mmap:   machos.kern.mmap;
 
 fun name_of(v: u64) *u8 {
     if (v == 0)  { ret "divide error\0"; }
@@ -97,9 +98,11 @@ fun isr_dispatch(f: *idt.Frame) {
     val from_user: u8 = ((f.cs & 3) == 3)::u8;
     if (f.vector < 32) {
         # a write to a copy-on-write page (present + write + user): copy it
-        if (f.vector == 14 && from_user != 0 && (f.error & 7) == 7) {
+        if (f.vector == 14 && from_user != 0 && (f.error & 7) == 7 && mmap.denies_write(proc.current(), cpu.cr2(), 1) == 0) {
             if (vmm.cow_break(proc.current().pml4, cpu.cr2()) != 0) { ret; }
         }
+        # the first touch of a page mmap reserved
+        if (f.vector == 14 && from_user != 0 && mmap.fault(proc.current(), cpu.cr2(), f.error) != 0) { ret; }
         if (from_user != 0) {
             user_fault(f);
             signal.deliver(f);

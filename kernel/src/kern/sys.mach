@@ -28,6 +28,7 @@ use signal: machos.kern.signal;
 use version: machos.abi.version;
 use cpu:    machos.arch.x86_64.cpu;
 use fbcon:  machos.dev.fbcon;
+use mmap:   machos.kern.mmap;
 
 val ARGS_MAX: u64 = 65536;
 val ENV_MAX: u64 = 65536;
@@ -38,6 +39,8 @@ var last_sync: u64 = 0; # tick of the last periodic sync
 fun cur() *proc.Proc { ret proc.current(); }
 
 fun ok(va: u64, n: u64, write: u8) u8 {
+    if (write != 0 && mmap.denies_write(cur(), va, n) != 0) { ret 0; }
+    mmap.touch(cur(), va, n, write); # reserved pages not touched yet get theirs
     ret vmm.user_ok(cur().pml4, va, n, write);
 }
 
@@ -341,6 +344,13 @@ fun sys_fork() u64 {
     }
     c.brk = p.brk;
     c.brk_base = p.brk_base;
+    c.nmaps = p.nmaps;
+    c.mmap_next = p.mmap_next;
+    var mi: u64 = 0;
+    for (mi < p.nmaps) {
+        c.maps[mi] = p.maps[mi];
+        mi = mi + 1;
+    }
     c.pages = p.pages;
     mem.copy((?c.cwd[0])::u64, (?p.cwd[0])::u64, p.cwd_len);
     c.cwd_len = p.cwd_len;
@@ -894,7 +904,7 @@ fun sys_sbrk(n: u64) u64 {
     val p: *proc.Proc = cur();
     val old: u64 = p.brk;
     if (n == 0) { ret old; }
-    val limit: u64 = exec.STACK_TOP - exec.STACK_PAGES * 4096 - 0x100000;
+    val limit: u64 = mmap.lowest(p) - mmap.GAP; # below the mappings
     if (n > limit || old + n > limit) { ret e(abi.E_NOMEM); }
     var va: u64 = (old + 4095) & ~4095::u64;
     val end: u64 = old + n;
@@ -1162,6 +1172,13 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
         ret tty.foreground(r);
     }
     if (n == abi.SBRK)    { ret sys_sbrk(a); }
+    if (n == abi.MMAP) {
+        var fh: *file.Handle = nil;
+        if (((c >> 8) & abi.MAP_ANONYMOUS) == 0) { fh = handle(d); }
+        ret mmap.mmap(cur(), a, b, c & 0xFF, c >> 8, fh, f5);
+    }
+    if (n == abi.MUNMAP)  { ret mmap.munmap(cur(), a, b); }
+    if (n == abi.MPROTECT) { ret mmap.mprotect(cur(), a, b, c); }
     if (n == abi.SETFG) {
         tty.set_foreground(0, a);
         ret 0;
