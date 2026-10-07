@@ -7,17 +7,12 @@ use rt:  sdk.rt;
 
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
-    var st: abi.Stat;
-    if (abi.is_err(sys.fstat(abi.STDIN, ?st)) == 0 && st.kind == abi.KIND_DEV) {
-        var n: u64 = 0;
-        if (st.rdev == abi.DEV_CONSOLE) { n = 1; }
-        if (st.rdev >= abi.DEV_TTY && st.rdev < abi.DEV_TTY + 6) { n = st.rdev - abi.DEV_TTY + 1; }
-        if (n != 0) {
-            io.out("/dev/tty\0");
-            io.dec(n);
-            io.putc(10);
-            ret 0;
-        }
+    val n: u64 = sys.tty_number(abi.STDIN);
+    if (n != 0) {
+        io.out("/dev/tty\0");
+        io.dec(n);
+        io.putc(10);
+        ret 0;
     }
     io.out("not a tty\n\0");
     ret 1;

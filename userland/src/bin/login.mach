@@ -21,7 +21,14 @@ fun main(argc: u64, argv: **u8) u64 {
         logo.show(2);
         io.out("\n  \x1b[1mMachOS \0");
         io.out(?un.release[0]);
-        io.out("\x1b[0m  (alt+F1..F6: more terminals)\n\nmachos login: \0");
+        io.out("\x1b[0m\0");
+        val t: u64 = sys.tty_number(abi.STDIN);
+        if (t != 0) {
+            io.out(" (tty\0");
+            io.dec(t);
+            io.out(")\0");
+        }
+        io.out("   alt+F1..F6 switch terminals\n\nmachos login: \0");
         var name: [32]u8;
         val n: u64 = users.read_line(?name[0], 31);
         if (n == abi.NO_ID) { ret 1; }

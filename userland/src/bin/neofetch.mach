@@ -165,17 +165,12 @@ fun main(argc: u64, argv: **u8) u64 {
         end_line();
     }
 
-    var st: abi.Stat;
-    if (abi.is_err(sys.fstat(abi.STDIN, ?st)) == 0 && st.kind == abi.KIND_DEV) {
-        var n: u64 = 0;
-        if (st.rdev == abi.DEV_CONSOLE) { n = 1; }
-        if (st.rdev >= abi.DEV_TTY && st.rdev < abi.DEV_TTY + 6) { n = st.rdev - abi.DEV_TTY + 1; }
-        if (n != 0) {
-            title("Terminal\0");
-            add("tty\0");
-            add_dec(n);
-            end_line();
-        }
+    val tn: u64 = sys.tty_number(abi.STDIN);
+    if (tn != 0) {
+        title("Terminal\0");
+        add("tty\0");
+        add_dec(tn);
+        end_line();
     }
 
     title("CPU\0");
