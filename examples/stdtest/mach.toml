@@ -43,5 +43,5 @@ need = []
 
 # std with its MachOS layer, until mach-std has a way to add one from outside
 [dep.std]
-git = "https://github.com/Wmakes/machos-std"
+git = "git@github.com:Wmakes/machos-std.git"
 ref = "branch/machos"
