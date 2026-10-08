@@ -1,11 +1,13 @@
 # partname DISK N: the device of partition N of DISK, the Linux way:
 # /dev/sda 2 -> /dev/sda2, /dev/nvme0n1 2 -> /dev/nvme0n1p2
 
-use io: sdk.io;
-use rt: sdk.rt;
+use io:  userland.lib.cli;
+use std.runtime;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     if (argc != 3) {
         io.err("usage: partname DISK N\n\0");
         ret 2;

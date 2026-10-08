@@ -1,0 +1,306 @@
+# what most programs in /bin need, on mach's std: writing to the standard
+# streams, decimal numbers, "prog: what: reason" messages and opening files.
+# handles and codes are std.system.os's: a negative i64 is a native code
+
+use std.system.os;
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+pub fun len(s: *u8) u64 { ret str_len(s::str)::u64; }
+
+# 1 when the two are the same bytes
+pub fun eq(a: *u8, an: u64, b: *u8, bn: u64) u8 {
+    if (an != bn) { ret 0; }
+    var i: u64 = 0;
+    for (i < an) {
+        if (a[i] != b[i]) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+pub fun streq(a: *u8, b: *u8) u8 { ret eq(a, len(a), b, len(b)); }
+
+pub fun copy(dst: *u8, src: *u8, n: u64) {
+    var i: u64 = 0;
+    for (i < n) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+# write everything, retrying short writes; 1 when it all went
+pub fun write_all(h: i64, buf: *u8, n: u64) u8 {
+    var done: u64 = 0;
+    for (done < n) {
+        val r: i64 = os.write(h::usize, ?buf[done], (n - done)::usize);
+        if (r <= 0) { ret 0; }
+        done = done + r::u64;
+    }
+    ret 1;
+}
+
+pub fun out(s: *u8) { write_all(1, s, len(s)); }
+pub fun outn(s: *u8, n: u64) { write_all(1, s, n); }
+pub fun err(s: *u8) { write_all(2, s, len(s)); }
+pub fun errn(s: *u8, n: u64) { write_all(2, s, n); }
+
+pub fun putc(c: u8) {
+    var b: u8 = c;
+    write_all(1, ?b, 1);
+}
+
+# decimal digits of v into buf (20 bytes); the count
+pub fun fmt_dec(v: u64, buf: *u8) u64 {
+    var tmp: [20]u8;
+    var n: u64 = 0;
+    var x: u64 = v;
+    for {
+        tmp[n] = 48 + (x % 10)::u8;
+        n = n + 1;
+        x = x / 10;
+        if (x == 0) { brk; }
+    }
+    var i: u64 = 0;
+    for (i < n) {
+        buf[i] = tmp[n - 1 - i];
+        i = i + 1;
+    }
+    ret n;
+}
+
+pub fun dec(v: u64) {
+    var buf: [20]u8;
+    outn(?buf[0], fmt_dec(v, ?buf[0]));
+}
+
+# right-aligned in `width` columns
+pub fun dec_pad(v: u64, width: u64) {
+    var buf: [20]u8;
+    val n: u64 = fmt_dec(v, ?buf[0]);
+    var i: u64 = n;
+    for (i < width) {
+        putc(32);
+        i = i + 1;
+    }
+    outn(?buf[0], n);
+}
+
+# a decimal number; `ok` is set to 0 if `s` is not one
+pub fun parse_dec(s: *u8, n: u64, ok: *u8) u64 {
+    @ok = 0;
+    if (n == 0) { ret 0; }
+    var v: u64 = 0;
+    var i: u64 = 0;
+    for (i < n) {
+        if (s[i] < 48 || s[i] > 57) { ret 0; }
+        v = v * 10 + (s[i] - 48)::u64;
+        i = i + 1;
+    }
+    @ok = 1;
+    ret v;
+}
+
+# the text for a native code
+pub fun reason(code: i64) *u8 { ret os.error_message(code)::*u8; }
+
+# "prog: what: reason\n" on stderr (no "what: " when it is nil)
+pub fun fail(prog: *u8, what: *u8, code: i64) {
+    err(prog);
+    err(": ");
+    if (what != nil) {
+        err(what);
+        err(": ");
+    }
+    err(reason(code));
+    err("\n");
+}
+
+# open `path` relative to the working directory; the handle, or a negative
+# native code
+pub fun open(path: *u8, flags: i32, mode: i32) i64 {
+    var h: usize = 0;
+    val r: i64 = os.open(os.working_dir(), path, flags, mode, ?h);
+    if (r < 0) { ret r; }
+    ret h::i64;
+}
+
+pub fun open_read(path: *u8) i64 { ret open(path, os.O_RDONLY, 0); }
+
+pub fun close(h: i64) { os.close(h::usize); }
+
+pub fun read(h: i64, buf: *u8, n: u64) i64 { ret os.read(h::usize, buf, n::usize); }
+
+pub fun write(h: i64, buf: *u8, n: u64) i64 { ret os.write(h::usize, buf, n::usize); }
+
+# stat a path (or with h, an open handle)
+pub fun stat(path: *u8, st: *os.stat_t) i64 { ret os.stat_path(os.working_dir(), path, st, 0); }
+pub fun fstat(h: i64, st: *os.stat_t) i64 { ret os.stat(h::usize, st); }
+
+pub fun is_dir(st: *os.stat_t) bool { ret (st.st_mode & os.S_IFMT) == os.S_IFDIR; }
+pub fun is_file(st: *os.stat_t) bool { ret (st.st_mode & os.S_IFMT) == os.S_IFREG; }
+
+# the permission bits (07777)
+pub fun perms(st: *os.stat_t) u64 { ret (st.st_mode & 0o7777)::u64; }
+
+pub fun exists(path: *u8) bool {
+    var st: os.stat_t;
+    ret stat(path, ?st) >= 0;
+}
+
+# the standard streams
+pub val STDIN:  i64 = 0;
+pub val STDOUT: i64 = 1;
+pub val STDERR: i64 = 2;
+
+# open with the mode a new file gets (less the umask)
+pub fun open_mode(path: *u8, flags: i32, mode: u64) i64 { ret open(path, flags, mode::i32); }
+
+pub fun seek(h: i64, offset: i64, whence: i32) i64 { ret os.seek(h::usize, offset, whence); }
+
+# a terminal is a character device
+pub fun isatty(h: i64) u8 {
+    var st: os.stat_t;
+    if (fstat(h, ?st) < 0) { ret 0; }
+    ret ((st.st_mode & os.S_IFMT) == 0o020000)::u8;
+}
+
+pub fun mkdir(path: *u8, mode: u64) i64 { ret os.make_dir(os.working_dir(), path, mode::i32); }
+
+pub fun chmod(path: *u8, mode: u64) i64 { ret os.set_mode_at(os.working_dir(), path, mode::i32); }
+
+pub fun rename(from: *u8, to: *u8) i64 { ret os.rename(os.working_dir(), from, os.working_dir(), to); }
+
+# a file, or an empty directory
+pub fun remove(path: *u8) i64 {
+    var st: os.stat_t;
+    val r: i64 = stat(path, ?st);
+    if (r < 0) { ret r; }
+    var flags: i32 = 0;
+    if (is_dir(?st)) { flags = os.AT_REMOVEDIR; }
+    ret os.unlink(os.working_dir(), path, flags);
+}
+
+# the working directory into buf; its length, or a negative native code
+pub fun getcwd(buf: *u8, cap: u64) i64 { ret os.getcwd(buf, cap::usize); }
+
+# seconds since 1970-01-01 UTC
+pub fun time() u64 {
+    var ts: os.Timespec;
+    os.realtime(?ts);
+    ret ts.sec::u64;
+}
+
+# milliseconds on the monotonic clock
+pub fun now_ms() u64 {
+    var ts: os.Timespec;
+    os.monotonic(?ts);
+    ret ts.sec::u64 * 1000 + ts.nsec::u64 / 1000000;
+}
+
+pub fun sleep_ms(ms: u64) { os.sleep((ms * 1000000)::i64); }
+
+# a directory being read: Dir.name is the current entry's name (NUL
+# terminated), valid until the next call
+pub rec Dir {
+    handle: i64;
+    cursor: os.DirectoryCursor;
+    entry:  os.DirectoryEntry;
+    name:   *u8;
+    len:    u64;
+}
+
+# start reading directory `path`; 0, or a negative native code
+pub fun dir_open(d: *Dir, path: *u8) i64 {
+    val h: i64 = open(path, os.O_RDONLY | os.O_DIRECTORY, 0);
+    if (h < 0) { ret h; }
+    ret dir_from(d, h);
+}
+
+# start reading the open directory handle h (dir_close closes it)
+pub fun dir_from(d: *Dir, h: i64) i64 {
+    d.handle = h;
+    d.cursor = os.DirectoryCursor{};
+    val r: os.DirectoryInitResult = os.directory_init(?d.cursor, h::usize);
+    if (r.code < 0) {
+        close(h);
+        ret r.code;
+    }
+    ret 0;
+}
+
+# the next entry, skipping "." and ".."; 1, 0 at the end, or a negative code
+pub fun dir_next(d: *Dir) i64 {
+    for {
+        val r: i64 = os.directory_next(?d.cursor, ?d.entry);
+        if (r <= 0) { ret r; }
+        d.name = d.entry.name::*u8;
+        d.len = d.entry.length::u64;
+        if (d.name[0] == 46 && (d.len == 1 || (d.len == 2 && d.name[1] == 46))) { cnt; }
+        ret 1;
+    }
+    ret 0;
+}
+
+pub fun dir_close(d: *Dir) {
+    os.directory_close(?d.cursor);
+    close(d.handle);
+}
+
+# what kind of file a stat describes, as MachOS numbers them
+pub val KIND_FILE: u64 = 1;
+pub val KIND_DIR:  u64 = 2;
+pub val KIND_DEV:  u64 = 3;
+pub val KIND_PIPE: u64 = 4;
+
+pub fun kind_of(mode: u32) u64 {
+    val t: u32 = mode & os.S_IFMT;
+    if (t == os.S_IFDIR) { ret KIND_DIR; }
+    if (t == 0o020000) { ret KIND_DEV; }
+    if (t == 0o010000) { ret KIND_PIPE; }
+    ret KIND_FILE;
+}
+
+# run program `path` with argv (nil-ended) and envp (nil: this program's)
+# and wait for it: its exit code, 128 + the signal that ended it, or a
+# negative native code when it could not start
+pub fun run_program(path: *u8, argv: **u8, envp: **u8) i64 {
+    var e: **u8 = envp;
+    if (e == nil) { e = os.environ(); }
+    val pid: i64 = os.spawn(path, argv, e);
+    if (pid < 0) { ret pid; }
+    var st: os.ProcessStatus;
+    val w: os.WaitResult = os.wait_pid(pid, ?st, 0);
+    if (w.pid <= 0) { ret w.error.code; }
+    if (st.kind == os.PROCESS_EXITED) { ret st.code::i64; }
+    ret 128 + st.signal::i64;
+}
+
+# NUL-separated strings (n bytes) as a nil-ended array of at most max - 1
+# pointers into them; the count
+pub fun unpack(buf: *u8, n: u64, out: **u8, max: u64) u64 {
+    var count: u64 = 0;
+    var s: u64 = 0;
+    var i: u64 = 0;
+    for (i < n && count + 1 < max) {
+        if (buf[i] == 0) {
+            out[count] = ?buf[s];
+            count = count + 1;
+            s = i + 1;
+        }
+        i = i + 1;
+    }
+    out[count] = nil;
+    ret count;
+}
+
+# the kind of the entry dir_next found (io.KIND_*)
+pub fun dir_kind(d: *Dir) u64 {
+    val t: u8 = d.entry.type_hint;
+    if (t == 4) { ret KIND_DIR; }
+    if (t == 2 || t == 6) { ret KIND_DEV; }
+    if (t == 1) { ret KIND_PIPE; }
+    ret KIND_FILE;
+}

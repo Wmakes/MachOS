@@ -1,53 +1,52 @@
 # cp [-r] SRC... DEST: copy files. with several sources, or when DEST is a
 # directory, the copies go inside it. -r copies directories recursively
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 
 var recursive: u8 = 0;
 var buf: [8192]u8;
 
 fun is_dir(p: *u8, n: u64) u8 {
-    var st: abi.Stat;
-    if (abi.is_err(sys.stat(p, n, ?st)) != 0) { ret 0; }
-    if (st.kind == abi.KIND_DIR) { ret 1; }
+    var st: os.stat_t;
+    if (io.stat(p, ?st) < 0) { ret 0; }
+    if (io.kind_of(st.st_mode) == io.KIND_DIR) { ret 1; }
     ret 0;
 }
 
-fun complain(p: *u8, n: u64, e: u64) {
+fun complain(p: *u8, n: u64, e: i64) {
     io.err("cp: \0");
     io.errn(p, n);
     io.err(": \0");
-    io.err(abi.err_name(e));
+    io.err(io.reason(e));
     io.err("\n\0");
 }
 
 fun copy_file(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
-    val from: u64 = sys.open(src, sn, abi.O_READ);
-    if (abi.is_err(from) != 0) {
+    val from: i64 = io.open_read(src);
+    if (from < 0) {
         complain(src, sn, from);
         ret 0;
     }
-    var st: abi.Stat;
-    sys.fstat(from, ?st);
-    val to: u64 = sys.open_mode(dst, dn, abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC, st.mode & 0x1FF);
-    if (abi.is_err(to) != 0) {
-        sys.close(from);
+    var st: os.stat_t;
+    io.fstat(from, ?st);
+    val to: i64 = io.open_mode(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, io.perms(?st) & 0x1FF);
+    if (to < 0) {
+        io.close(from);
         complain(dst, dn, to);
         ret 0;
     }
     var ok: u8 = 1;
     for {
-        val r: u64 = sys.read(from, ?buf[0], 8192);
-        if (abi.is_err(r) != 0) {
+        val r: i64 = io.read(from, ?buf[0], 8192);
+        if (r < 0) {
             complain(src, sn, r);
             ok = 0;
             brk;
         }
         if (r == 0) { brk; }
-        if (io.write_all(to, ?buf[0], r) == 0) {
+        if (io.write_all(to, ?buf[0], r::u64) == 0) {
             io.err("cp: write failed: \0");
             io.errn(dst, dn);
             io.err("\n\0");
@@ -55,12 +54,11 @@ fun copy_file(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
             brk;
         }
     }
-    sys.close(from);
-    sys.close(to);
-    # the copy gets the original's mode (set-id bits only when root copies)
-    var mode: u64 = st.mode & 0x1FF;
-    if (sys.geteuid() == 0) { mode = st.mode & 0xFFF; }
-    sys.chmod(dst, dn, mode);
+    io.close(from);
+    io.close(to);
+    # the copy gets the original's mode, set-id bits too: it belongs to
+    # whoever made it (as cp -p does it)
+    io.chmod(dst, io.perms(?st));
     ret ok;
 }
 
@@ -73,47 +71,51 @@ fun copy(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
         ret 0;
     }
     if (is_dir(dst, dn) == 0) {
-        var sst: abi.Stat;
-        sys.stat(src, sn, ?sst);
-        val m: u64 = sys.mkdir_mode(dst, dn, sst.mode & 0xFFF);
-        if (abi.is_err(m) != 0) {
+        var sst: os.stat_t;
+        io.stat(src, ?sst);
+        val m: i64 = io.mkdir(dst, io.perms(?sst));
+        if (m < 0) {
             complain(dst, dn, m);
             ret 0;
         }
     }
-    val h: u64 = sys.open(src, sn, abi.O_READ);
-    if (abi.is_err(h) != 0) {
+    val h: i64 = io.open_read(src);
+    if (h < 0) {
         complain(src, sn, h);
         ret 0;
     }
     var ok: u8 = 1;
-    var i: u64 = 0;
-    for {
-        var e: abi.Entry;
-        val got: u64 = sys.readdir(h, i, ?e);
-        if (abi.is_err(got) != 0 || got == 0) { brk; }
-        i = i + 1;
+    var dir: io.Dir;
+    if (io.dir_from(?dir, h) < 0) {
+        complain(src, sn, -1);
+        ret 0;
+    }
+    for (io.dir_next(?dir) > 0) {
         var s: [256]u8;
         var d: [256]u8;
-        if (sn + 1 + e.name_len >= 256 || dn + 1 + e.name_len >= 256) {
+        if (sn + 1 + dir.len >= 256 || dn + 1 + dir.len >= 256) {
             io.err("cp: path too long\n\0");
             ok = 0;
             cnt;
         }
         io.copy(?s[0], src, sn);
         s[sn] = 47;
-        io.copy(?s[sn + 1], ?e.name[0], e.name_len);
+        io.copy(?s[sn + 1], dir.name, dir.len);
+        s[sn + 1 + dir.len] = 0;
         io.copy(?d[0], dst, dn);
         d[dn] = 47;
-        io.copy(?d[dn + 1], ?e.name[0], e.name_len);
-        if (copy(?s[0], sn + 1 + e.name_len, ?d[0], dn + 1 + e.name_len) == 0) { ok = 0; }
+        io.copy(?d[dn + 1], dir.name, dir.len);
+        d[dn + 1 + dir.len] = 0;
+        if (copy(?s[0], sn + 1 + dir.len, ?d[0], dn + 1 + dir.len) == 0) { ok = 0; }
     }
-    sys.close(h);
+    io.dir_close(?dir);
     ret ok;
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     var i: u64 = 1;
     if (argc > 1 && io.streq(argv[1], "-r\0") != 0) {
         recursive = 1;
@@ -152,6 +154,7 @@ fun main(argc: u64, argv: **u8) u64 {
                 io.copy(?d[0], dest, dl);
                 d[dl] = 47;
                 io.copy(?d[dl + 1], ?src[s], b - s);
+                d[dl + 1 + (b - s)] = 0;
                 if (copy(src, sl, ?d[0], dl + 1 + (b - s)) == 0) { status = 1; }
             }
         }

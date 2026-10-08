@@ -3,10 +3,9 @@
 #   + - * / % **   & | ^ ~ << >>   ( )   123  0x7f  0b101
 # prints the result in decimal, and in hex too when it is not small
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 
 var src: [1024]u8;
 var len: u64 = 0;
@@ -219,8 +218,10 @@ fun eval() u8 {
     ret 1;
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     if (argc > 1) {
         len = 0;
         var i: u64 = 1;
@@ -238,12 +239,12 @@ fun main(argc: u64, argv: **u8) u64 {
     }
     # one expression per line
     for {
-        if (sys.isatty(abi.STDIN) != 0) { io.out("> \0"); }
+        if (io.isatty(io.STDIN) != 0) { io.out("> \0"); }
         len = 0;
         for (len < 1023) {
             var c: u8 = 0;
-            val r: u64 = sys.read(abi.STDIN, ?c, 1);
-            if (abi.is_err(r) != 0 || r == 0) { brk; }
+            val r: i64 = io.read(io.STDIN, ?c, 1);
+            if (r <= 0) { brk; }
             if (c == 10) { brk; }
             src[len] = c;
             len = len + 1;

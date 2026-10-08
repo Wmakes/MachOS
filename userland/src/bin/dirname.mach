@@ -1,10 +1,12 @@
 # dirname PATH: PATH without its last part
 
-use io: sdk.io;
-use rt: sdk.rt;
+use io:  userland.lib.cli;
+use std.runtime;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     if (argc != 2) {
         io.err("usage: dirname PATH\n\0");
         ret 2;

@@ -1,16 +1,18 @@
 # tail [-N] [FILE]: the last N (default 10) lines
 
-use abi:  sdk.abi;
-use io:   sdk.io;
-use rt:   sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 use text: userland.lib.text;
 
 var buf: [4194304]u8;
 var starts: [262144]u64;
 var lens: [262144]u64;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     var want: u64 = 10;
     var i: u64 = 1;
     if (i < argc && argv[i][0] == 45 && argv[i][1] != 0) {
@@ -24,8 +26,8 @@ fun main(argc: u64, argv: **u8) u64 {
     }
     var path: *u8 = nil;
     if (i < argc) { path = argv[i]; }
-    val h: u64 = text.open_in("tail\0", path);
-    if (abi.is_err(h) != 0) { ret 1; }
+    val h: i64 = text.open_in("tail\0", path);
+    if (h < 0) { ret 1; }
     val n: u64 = text.read_all(h, ?buf[0], 4194304);
     val count: u64 = text.split_lines(?buf[0], n, ?starts[0], ?lens[0], 262144);
     var k: u64 = 0;

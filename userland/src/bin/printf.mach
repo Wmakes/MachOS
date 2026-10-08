@@ -1,11 +1,13 @@
 # printf FORMAT [ARG...]: print FORMAT with \n \t \\ escapes and %s %d %c %%
 # filled from the ARGs in turn (the format repeats while ARGs are left)
 
-use io: sdk.io;
-use rt: sdk.rt;
+use io:  userland.lib.cli;
+use std.runtime;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     if (argc < 2) {
         io.err("usage: printf FORMAT [ARG...]\n\0");
         ret 2;

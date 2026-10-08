@@ -2,9 +2,9 @@
 # run under an @@ header with its line numbers. files up to 1000 lines.
 # exit 0 when they are the same, 1 when they differ
 
-use abi:  sdk.abi;
-use io:   sdk.io;
-use rt:   sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 use text: userland.lib.text;
 
 val MAXL: u64 = 1000;
@@ -18,16 +18,18 @@ var lcs: [1002001]u16; # (MAXL + 1)^2: the LCS of every pair of suffixes
 
 fun same(i: u64, j: u64) u8 { ret io.eq(?abuf[as[i]], al[i], ?bbuf[bs[j]], bl[j]); }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     if (argc != 3) {
         io.err("usage: diff A B\n\0");
         ret 2;
     }
-    val ha: u64 = text.open_in("diff\0", argv[1]);
-    if (abi.is_err(ha) != 0) { ret 2; }
-    val hb: u64 = text.open_in("diff\0", argv[2]);
-    if (abi.is_err(hb) != 0) { ret 2; }
+    val ha: i64 = text.open_in("diff\0", argv[1]);
+    if (ha < 0) { ret 2; }
+    val hb: i64 = text.open_in("diff\0", argv[2]);
+    if (hb < 0) { ret 2; }
     val na: u64 = text.read_all(ha, ?abuf[0], 1048576);
     val nb: u64 = text.read_all(hb, ?bbuf[0], 1048576);
     val n: u64 = text.split_lines(?abuf[0], na, ?as[0], ?al[0], MAXL);

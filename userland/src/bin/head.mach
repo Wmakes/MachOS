@@ -1,14 +1,15 @@
 # head [-N] [FILE]: the first N (default 10) lines
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 
 var buf: [4096]u8;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     var want: u64 = 10;
     var i: u64 = 1;
     if (i < argc && argv[i][0] == 45) {
@@ -20,20 +21,20 @@ fun main(argc: u64, argv: **u8) u64 {
         }
         i = i + 1;
     }
-    var h: u64 = abi.STDIN;
+    var h: i64 = io.STDIN;
     if (i < argc) {
-        h = sys.open(argv[i], io.len(argv[i]), abi.O_READ);
-        if (abi.is_err(h) != 0) {
+        h = io.open_mode(argv[i], os.O_RDONLY, 0o666);
+        if (h < 0) {
             io.fail("head\0", argv[i], h);
             ret 1;
         }
     }
     var seen: u64 = 0;
     for (seen < want) {
-        val r: u64 = sys.read(h, ?buf[0], 4096);
-        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        val r: i64 = io.read(h, ?buf[0], 4096);
+        if (r <= 0) { brk; }
         var k: u64 = 0;
-        for (k < r && seen < want) {
+        for (k < r::u64 && seen < want) {
             if (buf[k] == 10) { seen = seen + 1; }
             k = k + 1;
         }

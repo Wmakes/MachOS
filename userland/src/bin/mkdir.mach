@@ -1,12 +1,13 @@
 # mkdir DIR...: make directories
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     if (argc < 2) {
         io.err("usage: mkdir DIR...\n\0");
         ret 2;
@@ -14,8 +15,8 @@ fun main(argc: u64, argv: **u8) u64 {
     var status: u64 = 0;
     var i: u64 = 1;
     for (i < argc) {
-        val r: u64 = sys.mkdir(argv[i], io.len(argv[i]));
-        if (abi.is_err(r) != 0) {
+        val r: i64 = io.mkdir(argv[i], 0o777);
+        if (r < 0) {
             io.fail("mkdir\0", argv[i], r);
             status = 1;
         }

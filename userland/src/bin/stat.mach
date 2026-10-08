@@ -1,33 +1,34 @@
 # stat PATH...: kind, size and last change of each
 
-use abi:  sdk.abi;
-use sys:  sdk.sys;
-use io:   sdk.io;
-use rt:   sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 use text: userland.lib.text;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     var status: u64 = 0;
     var i: u64 = 1;
     for (i < argc) {
-        var st: abi.Stat;
-        val r: u64 = sys.stat(argv[i], io.len(argv[i]), ?st);
-        if (abi.is_err(r) != 0) {
+        var st: os.stat_t;
+        val r: i64 = io.stat(argv[i], ?st);
+        if (r < 0) {
             io.fail("stat\0", argv[i], r);
             status = 1;
         } or {
             io.out("  File: \0");
             io.out(argv[i]);
             io.out("\n  Type: \0");
-            if (st.kind == abi.KIND_DIR) { io.out("directory\0"); }
-            or (st.kind == abi.KIND_DEV) { io.out("device\0"); }
+            if (io.kind_of(st.st_mode) == io.KIND_DIR) { io.out("directory\0"); }
+            or (io.kind_of(st.st_mode) == io.KIND_DEV) { io.out("device\0"); }
             or                           { io.out("regular file\0"); }
             io.out("\n  Size: \0");
-            io.dec(st.size);
+            io.dec(st.st_size::u64);
             io.out("\nChange: \0");
             var t: [16]u8;
-            io.outn(?t[0], text.fmt_time(st.mtime, ?t[0]));
+            io.outn(?t[0], text.fmt_time(st.st_mtime::u64, ?t[0]));
             io.out(" UTC\n\0");
         }
         i = i + 1;

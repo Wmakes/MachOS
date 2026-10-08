@@ -1,0 +1,156 @@
+# looking up accounts: /etc/passwd (name:x:uid:gid:full name:home:shell)
+# and /etc/group (name:x:gid:members). changing them, and passwords, is the
+# SDK's (sdk.users), for the programs that log people in
+
+use io: userland.lib.cli;
+
+pub rec User {
+    name:      [32]u8;
+    name_len:  u64;
+    uid:       u64;
+    gid:       u64;
+    home:      [128]u8;
+    home_len:  u64;
+    shell:     [64]u8;
+    shell_len: u64;
+}
+
+val CAP: u64 = 16384;
+var file: [16384]u8;
+var flen: u64 = 0;
+
+fun load(p: *u8) u8 {
+    flen = 0;
+    val h: i64 = io.open_read(p);
+    if (h < 0) { ret 0; }
+    for (flen < CAP) {
+        val r: i64 = io.read(h, ?file[flen], CAP - flen);
+        if (r <= 0) { brk; }
+        flen = flen + r::u64;
+    }
+    io.close(h);
+    ret 1;
+}
+
+# field `k` (0-based, ':'-separated) of the line at file[s..e]
+fun field(s: u64, e: u64, k: u64, fs: *u64, fl: *u64) u8 {
+    var i: u64 = s;
+    var n: u64 = 0;
+    var start: u64 = s;
+    for (i <= e) {
+        if (i == e || file[i] == 58) {
+            if (n == k) {
+                @fs = start;
+                @fl = i - start;
+                ret 1;
+            }
+            n = n + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun num(s: u64, n: u64) u64 {
+    var okk: u8 = 0;
+    ret io.parse_dec(?file[s], n, ?okk);
+}
+
+# find the line whose field `k` is `want`; its bounds
+fun find_line(k: u64, want: *u8, wn: u64, ls: *u64, le: *u64) u8 {
+    var s: u64 = 0;
+    for (s < flen) {
+        var e: u64 = s;
+        for (e < flen && file[e] != 10) { e = e + 1; }
+        var fs: u64 = 0;
+        var fl: u64 = 0;
+        if (field(s, e, k, ?fs, ?fl) != 0 && io.eq(?file[fs], fl, want, wn) != 0) {
+            @ls = s;
+            @le = e;
+            ret 1;
+        }
+        s = e + 1;
+    }
+    ret 0;
+}
+
+fun fill(u: *User, s: u64, e: u64) {
+    var fs: u64 = 0;
+    var fl: u64 = 0;
+    field(s, e, 0, ?fs, ?fl);
+    if (fl > 31) { fl = 31; }
+    io.copy(?u.name[0], ?file[fs], fl);
+    u.name[fl] = 0;
+    u.name_len = fl;
+    field(s, e, 2, ?fs, ?fl);
+    u.uid = num(fs, fl);
+    field(s, e, 3, ?fs, ?fl);
+    u.gid = num(fs, fl);
+    u.home_len = 0;
+    if (field(s, e, 5, ?fs, ?fl) != 0 && fl < 127) {
+        io.copy(?u.home[0], ?file[fs], fl);
+        u.home_len = fl;
+    }
+    u.home[u.home_len] = 0;
+    u.shell_len = 0;
+    if (field(s, e, 6, ?fs, ?fl) != 0 && fl < 63) {
+        io.copy(?u.shell[0], ?file[fs], fl);
+        u.shell_len = fl;
+    }
+    u.shell[u.shell_len] = 0;
+}
+
+pub fun by_name(name: *u8, n: u64, out: *User) u8 {
+    if (load("/etc/passwd\0") == 0) { ret 0; }
+    var s: u64 = 0;
+    var e: u64 = 0;
+    if (find_line(0, name, n, ?s, ?e) == 0) { ret 0; }
+    fill(out, s, e);
+    ret 1;
+}
+
+pub fun by_uid(uid: u64, out: *User) u8 {
+    var d: [20]u8;
+    val dn: u64 = io.fmt_dec(uid, ?d[0]);
+    if (load("/etc/passwd\0") == 0) { ret 0; }
+    var s: u64 = 0;
+    var e: u64 = 0;
+    if (find_line(2, ?d[0], dn, ?s, ?e) == 0) { ret 0; }
+    fill(out, s, e);
+    ret 1;
+}
+
+# the name of user `uid` (or the number) into out (32 bytes); its length
+pub fun user_name(uid: u64, out: *u8) u64 {
+    var u: User;
+    if (by_uid(uid, ?u) != 0) {
+        io.copy(out, ?u.name[0], u.name_len + 1);
+        ret u.name_len;
+    }
+    val n: u64 = io.fmt_dec(uid, out);
+    out[n] = 0;
+    ret n;
+}
+
+# the name of group `gid` (or the number) into out (32 bytes); its length
+pub fun group_name(gid: u64, out: *u8) u64 {
+    var d: [20]u8;
+    val dn: u64 = io.fmt_dec(gid, ?d[0]);
+    if (load("/etc/group\0") != 0) {
+        var s: u64 = 0;
+        var e: u64 = 0;
+        if (find_line(2, ?d[0], dn, ?s, ?e) != 0) {
+            var fs: u64 = 0;
+            var fl: u64 = 0;
+            field(s, e, 0, ?fs, ?fl);
+            if (fl > 31) { fl = 31; }
+            io.copy(out, ?file[fs], fl);
+            out[fl] = 0;
+            ret fl;
+        }
+    }
+    io.copy(out, ?d[0], dn);
+    out[dn] = 0;
+    ret dn;
+}

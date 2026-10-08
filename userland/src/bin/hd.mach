@@ -1,10 +1,9 @@
 # hd [-n BYTES] [FILE]: hex dump, 16 bytes a row with their characters
 # (handy on disks: hd -n 512 /dev/sda)
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 
 val HEX: *u8 = "0123456789abcdef\0";
 
@@ -16,8 +15,10 @@ fun hex(v: u64, digits: u64) {
     }
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     var limit: u64 = 0xFFFFFFFFFFFFFFFF;
     var i: u64 = 1;
     if (i + 1 < argc && io.streq(argv[i], "-n\0") != 0) {
@@ -29,10 +30,10 @@ fun main(argc: u64, argv: **u8) u64 {
         }
         i = i + 2;
     }
-    var h: u64 = abi.STDIN;
+    var h: i64 = io.STDIN;
     if (i < argc) {
-        h = sys.open(argv[i], io.len(argv[i]), abi.O_READ);
-        if (abi.is_err(h) != 0) {
+        h = io.open_mode(argv[i], os.O_RDONLY, 0o666);
+        if (h < 0) {
             io.fail("hd\0", argv[i], h);
             ret 1;
         }
@@ -44,16 +45,16 @@ fun main(argc: u64, argv: **u8) u64 {
         if (limit - off < 16) { want = limit - off; }
         var got: u64 = 0;
         for (got < want) {
-            val r: u64 = sys.read(h, ?row[got], want - got);
-            if (abi.is_err(r) != 0 || r == 0) { brk; }
-            got = got + r;
+            val r: i64 = io.read(h, ?row[got], want - got);
+            if (r <= 0) { brk; }
+            got = got + r::u64;
         }
         if (got == 0) { brk; }
         hex(off, 8);
         io.out("  \0");
         var k: u64 = 0;
         for (k < 16) {
-            if (k < got) {
+            if (k < got::u64) {
                 hex(row[k]::u64, 2);
                 io.putc(32);
             } or {
@@ -64,13 +65,13 @@ fun main(argc: u64, argv: **u8) u64 {
         }
         io.out(" |\0");
         k = 0;
-        for (k < got) {
+        for (k < got::u64) {
             if (row[k] >= 32 && row[k] < 127) { io.putc(row[k]); }
             or                               { io.putc(46); }
             k = k + 1;
         }
         io.out("|\n\0");
-        off = off + got;
+        off = off + got::u64;
         if (got < want) { brk; }
     }
     ret 0;

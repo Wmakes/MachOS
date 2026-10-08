@@ -1,10 +1,9 @@
 # wc [-l] [-w] [-c] [FILE...]: count lines, words and bytes (all three
 # unless some are asked for)
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 
 var buf: [4096]u8;
 var tl: u64 = 0;
@@ -25,20 +24,20 @@ fun report(lines: u64, words: u64, bytes: u64, name: *u8) {
     io.putc(10);
 }
 
-fun count(h: u64, name: *u8) u8 {
+fun count(h: i64, name: *u8) u8 {
     var lines: u64 = 0;
     var words: u64 = 0;
     var bytes: u64 = 0;
     var inword: u8 = 0;
     for {
-        val r: u64 = sys.read(h, ?buf[0], 4096);
-        if (abi.is_err(r) != 0) {
+        val r: i64 = io.read(h, ?buf[0], 4096);
+        if (r < 0) {
             io.fail("wc\0", name, r);
             ret 0;
         }
         if (r == 0) { brk; }
         var i: u64 = 0;
-        for (i < r) {
+        for (i < r::u64) {
             val c: u8 = buf[i];
             if (c == 10) { lines = lines + 1; }
             if (c == 32 || c == 10 || c == 9 || c == 13) {
@@ -49,7 +48,7 @@ fun count(h: u64, name: *u8) u8 {
             }
             i = i + 1;
         }
-        bytes = bytes + r;
+        bytes = bytes + r::u64;
     }
     report(lines, words, bytes, name);
     tl = tl + lines;
@@ -58,8 +57,10 @@ fun count(h: u64, name: *u8) u8 {
     ret 1;
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     var first: u64 = 1;
     var picked: u8 = 0;
     for (first < argc && argv[first][0] == 45 && argv[first][1] != 0) {
@@ -83,19 +84,19 @@ fun main(argc: u64, argv: **u8) u64 {
         first = first + 1;
     }
     if (argc - first == 0) {
-        if (count(abi.STDIN, nil) == 0) { ret 1; }
+        if (count(io.STDIN, nil) == 0) { ret 1; }
         ret 0;
     }
     var status: u64 = 0;
     var i: u64 = first;
     for (i < argc) {
-        val h: u64 = sys.open(argv[i], io.len(argv[i]), abi.O_READ);
-        if (abi.is_err(h) != 0) {
+        val h: i64 = io.open_mode(argv[i], os.O_RDONLY, 0o666);
+        if (h < 0) {
             io.fail("wc\0", argv[i], h);
             status = 1;
         } or {
             if (count(h, argv[i]) == 0) { status = 1; }
-            sys.close(h);
+            io.close(h);
         }
         i = i + 1;
     }

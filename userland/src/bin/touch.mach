@@ -1,21 +1,22 @@
 # touch FILE...: create empty files that do not exist yet
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     var status: u64 = 0;
     var i: u64 = 1;
     for (i < argc) {
-        val h: u64 = sys.open(argv[i], io.len(argv[i]), abi.O_WRITE | abi.O_CREATE);
-        if (abi.is_err(h) != 0) {
+        val h: i64 = io.open_mode(argv[i], os.O_WRONLY | os.O_CREAT, 0o666);
+        if (h < 0) {
             io.fail("touch\0", argv[i], h);
             status = 1;
         } or {
-            sys.close(h);
+            io.close(h);
         }
         i = i + 1;
     }

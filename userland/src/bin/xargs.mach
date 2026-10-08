@@ -1,17 +1,18 @@
 # xargs COMMAND [ARGS...]: run COMMAND with ARGS and the words read from stdin
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
-use path: sdk.path;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
+use path: userland.lib.path;
 
 val CAP: u64 = 65536;
 var args: [65536]u8;
 var input: [65536]u8;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     if (argc < 2) {
         io.err("usage: xargs COMMAND [ARGS...]\n\0");
         ret 2;
@@ -35,12 +36,12 @@ fun main(argc: u64, argv: **u8) u64 {
     }
     var got: u64 = 0;
     for (got < CAP) {
-        val r: u64 = sys.read(abi.STDIN, ?input[got], CAP - got);
-        if (abi.is_err(r) != 0 || r == 0) { brk; }
-        got = got + r;
+        val r: i64 = io.read(io.STDIN, ?input[got], CAP - got);
+        if (r <= 0) { brk; }
+        got = got + r::u64;
     }
     i = 0;
-    for (i < got) {
+    for (i < got::u64) {
         for (i < got && (input[i] == 32 || input[i] == 10 || input[i] == 9)) { i = i + 1; }
         val s: u64 = i;
         for (i < got && input[i] != 32 && input[i] != 10 && input[i] != 9) { i = i + 1; }
@@ -55,12 +56,12 @@ fun main(argc: u64, argv: **u8) u64 {
             n = n + 1;
         }
     }
-    val pid: u64 = sys.spawn(?full[0], pn, ?args[0], n, nil);
-    if (abi.is_err(pid) != 0) {
-        io.fail("xargs\0", argv[1], pid);
+    var list: [4096]*u8;
+    io.unpack(?args[0], n, ?list[0], 4096);
+    val st: i64 = io.run_program(?full[0], ?list[0], nil);
+    if (st < 0) {
+        io.fail("xargs\0", argv[1], st);
         ret 127;
     }
-    val st: u64 = sys.wait(pid);
-    if (abi.is_err(st) != 0) { ret 1; }
-    ret st;
+    ret st::u64;
 }

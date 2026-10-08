@@ -1,24 +1,22 @@
 # sha256sum [FILE...]: SHA-256 of each file (or stdin)
 
-use abi:    sdk.abi;
-use sys:    sdk.sys;
-use io:     sdk.io;
-use sha256: sdk.sha256;
-use rt:     sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use sha256: std.crypto.hash.sha256;
+use std.runtime;
 
 var buf: [8192]u8;
 val HEX: *u8 = "0123456789abcdef\0";
 
-fun sum(h: u64, name: *u8) {
-    var c: sha256.Ctx;
-    sha256.init(?c);
+fun sum(h: i64, name: *u8) {
+    var c: sha256.State = sha256.init();
     for {
-        val r: u64 = sys.read(h, ?buf[0], 8192);
-        if (abi.is_err(r) != 0 || r == 0) { brk; }
-        sha256.update(?c, ?buf[0], r);
+        val r: i64 = io.read(h, ?buf[0], 8192);
+        if (r <= 0) { brk; }
+        sha256.update(?c, ?buf[0], r::u64);
     }
     var d: [32]u8;
-    sha256.finish(?c, ?d[0]);
+    sha256.final(?c, ?d[0]);
     var k: u64 = 0;
     for (k < 32) {
         io.putc(HEX[d[k] >> 4]);
@@ -30,22 +28,24 @@ fun sum(h: u64, name: *u8) {
     io.putc(10);
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     if (argc < 2) {
-        sum(abi.STDIN, "-\0");
+        sum(io.STDIN, "-\0");
         ret 0;
     }
     var status: u64 = 0;
     var i: u64 = 1;
     for (i < argc) {
-        val h: u64 = sys.open(argv[i], io.len(argv[i]), abi.O_READ);
-        if (abi.is_err(h) != 0) {
+        val h: i64 = io.open_mode(argv[i], os.O_RDONLY, 0o666);
+        if (h < 0) {
             io.fail("sha256sum\0", argv[i], h);
             status = 1;
         } or {
             sum(h, argv[i]);
-            sys.close(h);
+            io.close(h);
         }
         i = i + 1;
     }

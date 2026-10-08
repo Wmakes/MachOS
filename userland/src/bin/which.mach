@@ -1,11 +1,13 @@
 # which NAME...: where each command would be found (through $PATH)
 
-use io:   sdk.io;
-use path: sdk.path;
-use rt:   sdk.rt;
+use io:  userland.lib.cli;
+use path: userland.lib.path;
+use std.runtime;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     var status: u64 = 0;
     var i: u64 = 1;
     for (i < argc) {

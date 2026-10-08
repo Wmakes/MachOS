@@ -1,24 +1,19 @@
 # sleep SECONDS: wait that long, even when stopped and continued on the way
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 
-fun now_ms() u64 {
-    var i: abi.Info;
-    sys.info(?i);
-    ret i.uptime_ms;
-}
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+fun run(argc: u64, argv: **u8) u64 {
     var ok: u8 = 0;
     if (argc == 2) {
         val s: u64 = io.parse_dec(argv[1], io.len(argv[1]), ?ok);
         if (ok != 0) {
-            val until: u64 = now_ms() + s * 1000;
-            for (now_ms() < until) { sys.sleep(until - now_ms()); }
+            val until: u64 = io.now_ms() + s * 1000;
+            for (io.now_ms() < until) { io.sleep_ms(until - io.now_ms()); }
             ret 0;
         }
     }

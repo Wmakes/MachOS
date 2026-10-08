@@ -4,9 +4,9 @@
 # whole inputs and outputs live in big mmap'ed regions: only what is used
 # takes memory
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.types.size.usize;
 
 pub val NONE: u64 = 0xFFFFFFFFFFFFFFFF;
 
@@ -26,29 +26,29 @@ pub rec Buf {
 }
 
 pub fun buf_new(b: *Buf, cap: u64) u8 {
-    val a: u64 = sys.mmap(0, cap, abi.PROT_READ | abi.PROT_WRITE, abi.MAP_PRIVATE | abi.MAP_ANONYMOUS, 0, 0);
-    if (abi.is_err(a) != 0) { ret 0; }
-    b.base = a;
+    val a: ptr = os.allocate(cap::usize);
+    if (a == nil) { ret 0; }
+    b.base = a::u64;
     b.len = 0;
     b.cap = cap;
     ret 1;
 }
 
 pub fun buf_free(b: *Buf) {
-    if (b.base != 0) { sys.munmap(b.base, b.cap); }
+    if (b.base != 0) { os.deallocate(b.base::ptr, b.cap::usize); }
     b.base = 0;
 }
 
 # all of handle h into b; 0 when it does not fit or reading failed
-pub fun read_all(h: u64, b: *Buf) u8 {
+pub fun read_all(h: i64, b: *Buf) u8 {
     for {
         if (b.len == b.cap) { ret 0; }
         var want: u64 = b.cap - b.len;
         if (want > 1048576) { want = 1048576; }
-        val r: u64 = sys.read(h, (b.base + b.len)::*u8, want);
-        if (abi.is_err(r) != 0) { ret 0; }
+        val r: i64 = io.read(h, (b.base + b.len)::*u8, want);
+        if (r < 0) { ret 0; }
         if (r == 0) { ret 1; }
-        b.len = b.len + r;
+        b.len = b.len + r::u64;
     }
     ret 1;
 }

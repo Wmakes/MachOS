@@ -1,26 +1,27 @@
 # tee [-a] FILE...: copy stdin to stdout and to every FILE (-a appends)
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 
 var buf: [8192]u8;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
-    var flags: u64 = abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC;
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
+    var flags: i32 = os.O_WRONLY | os.O_CREAT | os.O_TRUNC;
     var i: u64 = 1;
     if (i < argc && io.streq(argv[i], "-a\0") != 0) {
-        flags = abi.O_WRITE | abi.O_CREATE | abi.O_APPEND;
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND;
         i = i + 1;
     }
-    var outs: [14]u64;
+    var outs: [14]i64;
     var nout: u64 = 0;
     var status: u64 = 0;
     for (i < argc && nout < 14) {
-        val h: u64 = sys.open(argv[i], io.len(argv[i]), flags);
-        if (abi.is_err(h) != 0) {
+        val h: i64 = io.open_mode(argv[i], flags, 0o666);
+        if (h < 0) {
             io.fail("tee\0", argv[i], h);
             status = 1;
         } or {
@@ -30,12 +31,12 @@ fun main(argc: u64, argv: **u8) u64 {
         i = i + 1;
     }
     for {
-        val r: u64 = sys.read(abi.STDIN, ?buf[0], 8192);
-        if (abi.is_err(r) != 0 || r == 0) { brk; }
-        io.write_all(abi.STDOUT, ?buf[0], r);
+        val r: i64 = io.read(io.STDIN, ?buf[0], 8192);
+        if (r <= 0) { brk; }
+        io.write_all(io.STDOUT, ?buf[0], r::u64);
         var k: u64 = 0;
         for (k < nout) {
-            io.write_all(outs[k], ?buf[0], r);
+            io.write_all(outs[k], ?buf[0], r::u64);
             k = k + 1;
         }
     }

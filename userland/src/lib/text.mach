@@ -1,25 +1,24 @@
 # helpers the text tools share: whole inputs, lines, dates, wildcards
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
+use os:  std.system.os;
+use io:  userland.lib.cli;
 
 # all of `h` into buf (at most cap bytes); the length
-pub fun read_all(h: u64, buf: *u8, cap: u64) u64 {
+pub fun read_all(h: i64, buf: *u8, cap: u64) u64 {
     var n: u64 = 0;
     for (n < cap) {
-        val r: u64 = sys.read(h, ?buf[n], cap - n);
-        if (abi.is_err(r) != 0 || r == 0) { brk; }
-        n = n + r;
+        val r: i64 = io.read(h, ?buf[n], cap - n);
+        if (r <= 0) { brk; }
+        n = n + r::u64;
     }
     ret n;
 }
 
 # FILE opened for reading, or stdin for nil / "-"; an error is reported
-pub fun open_in(prog: *u8, path: *u8) u64 {
-    if (path == nil || io.streq(path, "-\0") != 0) { ret abi.STDIN; }
-    val h: u64 = sys.open(path, io.len(path), abi.O_READ);
-    if (abi.is_err(h) != 0) { io.fail(prog, path, h); }
+pub fun open_in(prog: *u8, path: *u8) i64 {
+    if (path == nil || io.streq(path, "-\0") != 0) { ret io.STDIN; }
+    val h: i64 = io.open_mode(path, os.O_RDONLY, 0o666);
+    if (h < 0) { io.fail(prog, path, h); }
     ret h;
 }
 

@@ -1,49 +1,55 @@
 # rm [-r] PATH...: remove files and empty directories (-r: and everything in them)
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
 
 var recursive: u8 = 0;
 
 fun remove(p: *u8, n: u64) u8 {
     if (recursive != 0) {
-        var st: abi.Stat;
-        val s: u64 = sys.stat(p, n, ?st);
-        if (abi.is_err(s) == 0 && st.kind == abi.KIND_DIR) {
-            val h: u64 = sys.open(p, n, abi.O_READ);
-            if (abi.is_err(h) == 0) {
-                # always take entry 0: removing it shifts the rest down
-                for {
-                    var e: abi.Entry;
-                    val got: u64 = sys.readdir(h, 0, ?e);
-                    if (abi.is_err(got) != 0 || got == 0) { brk; }
+        var st: os.stat_t;
+        if (io.stat(p, ?st) >= 0 && io.is_dir(?st)) {
+            # read it afresh after each removal: the entries move up
+            var more: bool = true;
+            for (more) {
+                more = false;
+                var d: io.Dir;
+                if (io.dir_open(?d, p) < 0) { brk; }
+                if (io.dir_next(?d) > 0 && n + 1 + d.len < 256) {
                     var child: [256]u8;
-                    if (n + 1 + e.name_len >= 256) { brk; }
                     io.copy(?child[0], p, n);
                     child[n] = 47;
-                    io.copy(?child[n + 1], ?e.name[0], e.name_len);
-                    if (remove(?child[0], n + 1 + e.name_len) == 0) { brk; }
+                    io.copy(?child[n + 1], d.name, d.len);
+                    child[n + 1 + d.len] = 0;
+                    io.dir_close(?d);
+                    if (remove(?child[0], n + 1 + d.len) == 0) { brk; }
+                    more = true;
+                } or {
+                    io.dir_close(?d);
                 }
-                sys.close(h);
             }
         }
     }
-    val r: u64 = sys.remove(p, n);
-    if (abi.is_err(r) != 0) {
+    val r: i64 = io.remove(p);
+    if (r < 0) {
         io.err("rm: \0");
         io.errn(p, n);
         io.err(": \0");
-        io.err(abi.err_name(r));
+        io.err(io.reason(r));
         io.err("\n\0");
         ret 0;
     }
     ret 1;
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     var i: u64 = 1;
     if (argc > 1 && io.streq(argv[1], "-r\0") != 0) {
         recursive = 1;

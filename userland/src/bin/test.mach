@@ -3,15 +3,14 @@
 #   -b PATH  is a disk/device -n STR  not empty      -z STR   empty
 #   STR = STR, STR != STR, and a single STR (not empty)
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 
 fun kind(p: *u8) u64 {
-    var st: abi.Stat;
-    if (abi.is_err(sys.stat(p, io.len(p), ?st)) != 0) { ret 0; }
-    ret st.kind;
+    var st: os.stat_t;
+    if (io.stat(p, ?st) < 0) { ret 0; }
+    ret io.kind_of(st.st_mode);
 }
 
 fun yes(c: u8) u64 {
@@ -19,8 +18,10 @@ fun yes(c: u8) u64 {
     ret 1;
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     if (argc == 1) { ret 1; }
     if (argc == 2) { ret yes((io.len(argv[1]) > 0)::u8); }
     if (argc == 3) {
@@ -29,9 +30,9 @@ fun main(argc: u64, argv: **u8) u64 {
         if (io.streq(op, "-n\0") != 0) { ret yes((io.len(a) > 0)::u8); }
         if (io.streq(op, "-z\0") != 0) { ret yes((io.len(a) == 0)::u8); }
         if (io.streq(op, "-e\0") != 0) { ret yes((kind(a) != 0)::u8); }
-        if (io.streq(op, "-f\0") != 0) { ret yes((kind(a) == abi.KIND_FILE)::u8); }
-        if (io.streq(op, "-d\0") != 0) { ret yes((kind(a) == abi.KIND_DIR)::u8); }
-        if (io.streq(op, "-b\0") != 0) { ret yes((kind(a) == abi.KIND_DEV)::u8); }
+        if (io.streq(op, "-f\0") != 0) { ret yes((kind(a) == io.KIND_FILE)::u8); }
+        if (io.streq(op, "-d\0") != 0) { ret yes((kind(a) == io.KIND_DIR)::u8); }
+        if (io.streq(op, "-b\0") != 0) { ret yes((kind(a) == io.KIND_DEV)::u8); }
     }
     if (argc == 4) {
         if (io.streq(argv[2], "=\0") != 0) { ret yes(io.streq(argv[1], argv[3])); }

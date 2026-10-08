@@ -1,12 +1,13 @@
 # mv FROM TO: rename or move a file or directory
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     if (argc != 3) {
         io.err("usage: mv FROM TO\n\0");
         ret 2;
@@ -16,8 +17,8 @@ fun main(argc: u64, argv: **u8) u64 {
     var tn: u64 = io.len(argv[2]);
     if (tn >= 256) { tn = 255; }
     io.copy(?to[0], argv[2], tn);
-    var st: abi.Stat;
-    if (abi.is_err(sys.stat(argv[2], io.len(argv[2]), ?st)) == 0 && st.kind == abi.KIND_DIR) {
+    var st: os.stat_t;
+    if (io.stat(argv[2], ?st) >= 0 && io.kind_of(st.st_mode) == io.KIND_DIR) {
         val from: *u8 = argv[1];
         val fl: u64 = io.len(from);
         var b: u64 = fl;
@@ -28,8 +29,9 @@ fun main(argc: u64, argv: **u8) u64 {
             tn = tn + 1 + fl - b;
         }
     }
-    val r: u64 = sys.rename(argv[1], io.len(argv[1]), ?to[0], tn);
-    if (abi.is_err(r) != 0) {
+    to[tn] = 0;
+    val r: i64 = io.rename(argv[1], ?to[0]);
+    if (r < 0) {
         io.fail("mv\0", argv[1], r);
         ret 1;
     }

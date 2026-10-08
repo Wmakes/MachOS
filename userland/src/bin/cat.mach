@@ -1,41 +1,62 @@
 # cat [FILE...]: copy files (or stdin) to stdout
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use std.runtime;
+use std.print;
+use std.filesystem;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.system.os;
+use io_error: std.io.error;
 
 var buf: [4096]u8;
 
-fun pump(h: u64, name: *u8) u8 {
-    for {
-        val r: u64 = sys.read(h, ?buf[0], 4096);
-        if (abi.is_err(r) != 0) {
-            io.fail("cat\0", name, r);
-            ret 0;
-        }
-        if (r == 0) { ret 1; }
-        if (io.write_all(abi.STDOUT, ?buf[0], r) == 0) { ret 0; }
-    }
-    ret 1;
+fun complain(name: str, e: io_error.Error) {
+    print.eprintlnf("cat: {}: {}", name, os.message(e));
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+# copy everything f has to stdout; whether it all went
+fun pump(f: filesystem.File, name: str) bool {
+    for {
+        val r: res[usize, io_error.Error] = filesystem.read(f, ?buf[0], 4096);
+        if (sel r.err) {
+            complain(name, r.err);
+            ret false;
+        }
+        val n: usize = r.ok;
+        if (n == 0) { ret true; }
+        var at: usize = 0;
+        for (at < n) {
+            val w: res[usize, io_error.Error] = filesystem.write(filesystem.STDOUT, ?buf[at], n - at);
+            if (sel w.err) { ret false; }
+            at = at + w.ok;
+        }
+    }
+    ret true;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
     if (argc < 2) {
-        if (pump(abi.STDIN, "stdin\0") == 0) { ret 1; }
+        if (!pump(filesystem.STDIN, "stdin")) { ret 1; }
         ret 0;
     }
-    var status: u64 = 0;
-    var i: u64 = 1;
+    var status: i64 = 0;
+    var i: i64 = 1;
     for (i < argc) {
-        val h: u64 = sys.open(argv[i], io.len(argv[i]), abi.O_READ);
-        if (abi.is_err(h) != 0) {
-            io.fail("cat\0", argv[i], h);
+        val name: str = argv[i]::str;
+        val opened: res[filesystem.File, io_error.Error] = filesystem.open(name);
+        if (sel opened.ok) {
+            var f: filesystem.File = opened.ok;
+            if (!pump(f, name)) { status = 1; }
+            filesystem.close(?f);
+        }
+        if (sel opened.err) {
+            complain(name, opened.err);
             status = 1;
-        } or {
-            if (pump(h, argv[i]) == 0) { status = 1; }
-            sys.close(h);
         }
         i = i + 1;
     }

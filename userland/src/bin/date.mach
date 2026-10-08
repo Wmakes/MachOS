@@ -1,8 +1,7 @@
 # date [+%s]: the current date and time (UTC); +%s: seconds since 1970
 
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use io:  userland.lib.cli;
+use std.runtime;
 
 val MONTH_DAYS: [12]u64 = [12]u64{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
@@ -16,9 +15,11 @@ fun two(v: u64) {
     io.dec(v);
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
-    val t: u64 = sys.time();
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
+    val t: u64 = io.time();
     if (argc > 1 && io.streq(argv[1], "+%s\0") != 0) {
         io.dec(t);
         io.putc(10);

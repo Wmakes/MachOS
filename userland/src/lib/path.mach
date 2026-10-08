@@ -1,0 +1,65 @@
+# finding commands the way a shell does: a name with a slash is used as it
+# is, anything else is looked for in each directory of $PATH (/bin when
+# PATH is unset; an empty entry means the current directory)
+
+use os: std.system.os;
+use io: userland.lib.cli;
+
+fun put(out: *u8, at: u64, s: *u8, n: u64) {
+    var i: u64 = 0;
+    for (i < n) {
+        out[at + i] = s[i];
+        i = i + 1;
+    }
+}
+
+fun is_file(p: *u8) u8 {
+    var st: os.stat_t;
+    if (io.stat(p, ?st) < 0) { ret 0; }
+    ret io.is_file(?st)::u8;
+}
+
+var path_buf: [1024]u8;
+
+# the path `name` runs from into out (256 bytes, NUL-terminated); its
+# length, or 0 when there is no such command
+pub fun lookup(name: *u8, out: *u8) u64 {
+    val n: u64 = io.len(name);
+    if (n == 0 || n >= 255) { ret 0; }
+    var i: u64 = 0;
+    for (i < n) {
+        if (name[i] == 47) {
+            put(out, 0, name, n);
+            out[n] = 0;
+            if (is_file(out) == 0) { ret 0; }
+            ret n;
+        }
+        i = i + 1;
+    }
+    var p: *u8 = "/bin";
+    val got: i64 = os.getenv("PATH", ?path_buf[0], 1024);
+    if (got >= 0 && got < 1024) { p = ?path_buf[0]; }
+    val pn: u64 = io.len(p);
+    var s: u64 = 0;
+    i = 0;
+    for (i <= pn) {
+        if (i == pn || p[i] == 58) {
+            var len: u64 = i - s;
+            if (len == 0) {
+                out[0] = 46;
+                len = 1;
+            } or {
+                put(out, 0, ?p[s], len);
+            }
+            if (len + 1 + n < 256) {
+                out[len] = 47;
+                put(out, len + 1, name, n);
+                out[len + 1 + n] = 0;
+                if (is_file(out) != 0) { ret len + 1 + n; }
+            }
+            s = i + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
