@@ -2,7 +2,7 @@
 # FAT32 and copy each file SRC into it as DEST (/boot/kernel.elf:boot/kernel.elf).
 # directories along DEST are made as needed. ?SRC:DEST copies SRC only if
 # it exists. names that are not plain 8.3
-# get long-name entries, so `limine.conf` stays `limine.conf`.
+# get long-name entries, so `machboot.conf` stays `machboot.conf`.
 #
 # one sector per cluster; every directory is one cluster (16 entries), which
 # is plenty for a boot partition

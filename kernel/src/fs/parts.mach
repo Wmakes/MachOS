@@ -21,6 +21,7 @@ pub rec Bdev {
     start: u64; # first sector
     count: u64; # sectors
     kind:  [16]u8; # partition type GUID
+    unique: [16]u8; # its own GUID (zeros for whole disks)
     node:  *vfs.Node;
 }
 
@@ -48,7 +49,7 @@ fun make_node(i: u64) {
     b.node = nd;
 }
 
-fun add(disk: u64, part: u64, start: u64, count: u64, kind: *u8) *Bdev {
+fun add(disk: u64, part: u64, start: u64, count: u64, kind: *u8, unique: *u8) *Bdev {
     var i: u64 = 0;
     for (i < MAX) {
         val b: *Bdev = ?devs[i];
@@ -60,6 +61,8 @@ fun add(disk: u64, part: u64, start: u64, count: u64, kind: *u8) *Bdev {
             b.count = count;
             if (kind != nil) { mem.copy((?b.kind[0])::u64, kind::u64, 16); }
             or               { mem.fill((?b.kind[0])::u64, 0, 16); }
+            if (unique != nil) { mem.copy((?b.unique[0])::u64, unique::u64, 16); }
+            or                 { mem.fill((?b.unique[0])::u64, 0, 16); }
             b.node = nil;
             if (devdir != nil) { make_node(i); }
             ret b;
@@ -96,7 +99,7 @@ fun add_partitions(disk: u64) {
     var i: u64 = 0;
     for (i < n && i < 99) {
         val e: *gpt.Entry = ?entries[i];
-        add(disk, e.index, e.first, e.count, ?e.kind[0]);
+        add(disk, e.index, e.first, e.count, ?e.kind[0], ?e.unique[0]);
         var pn: [24]u8;
         val l: u64 = dsk.part_name(d, e.index, ?pn[0]);
         kprint.info("gpt\0");
@@ -121,7 +124,7 @@ fun add_partitions(disk: u64) {
 pub fun probe() {
     var d: u64 = 0;
     for (d < dsk.disk_count()) {
-        add(d, 0, 0, dsk.disk(d).sectors, nil);
+        add(d, 0, 0, dsk.disk(d).sectors, nil, nil);
         add_partitions(d);
         d = d + 1;
     }
@@ -156,7 +159,25 @@ pub fun rescan(disk: u64) {
 }
 
 # the first partition with the MachOS root type, in disk order, or nil
-pub fun find_root() *Bdev {
+# the MachOS root: the partition whose GUID is `want` (the one the boot
+# loader read the kernel from) when it is one, else the first with the
+# MachOS root type, in disk order
+pub fun find_root(want: *u8) *Bdev {
+    var zero: u8 = 1;
+    var k: u64 = 0;
+    for (k < 16) {
+        if (want[k] != 0) { zero = 0; }
+        k = k + 1;
+    }
+    if (zero == 0) {
+        var j: u64 = 0;
+        for (j < MAX) {
+            val b: *Bdev = ?devs[j];
+            if (b.used != 0 && b.part != 0 && mem.equal(?b.unique[0], want, 16) != 0 &&
+                mem.equal(?b.kind[0], ?gpt.ROOT_TYPE[0], 16) != 0) { ret b; }
+            j = j + 1;
+        }
+    }
     var d: u64 = 0;
     for (d < dsk.disk_count()) {
         var i: u64 = 0;

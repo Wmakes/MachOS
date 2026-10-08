@@ -1,0 +1,42 @@
+# machboot: the MachOS boot loader, a UEFI application. mach builds it for a
+# win64 target (the UEFI calling convention); tools/machboot.sh links the
+# object with lld-link as an EFI application (subsystem 10, relocatable)
+[project]
+id = "machboot"
+version = "0.8.0"
+mach = "^6.10"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[target.uefi]
+isa  = "x86_64"
+os   = "windows"
+abi  = "win64"
+of   = "coff"
+base = 0x100000
+
+[artifact.machboot]
+kind = "bin"
+entry = "main.mach"
+out = "machboot.exe"
+targets = ["uefi"]
+link = []
+need = []
+
+[dep.sdk]
+path = "../sdk"

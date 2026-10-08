@@ -1,0 +1,66 @@
+# the machboot protocol (sdk/src/handoff.mach): the Handoff machboot passes
+# in rdi becomes the kernel's BootInfo
+
+use info: machos.boot.info;
+use ho:   sdk.handoff;
+
+# fill `bi` from the Handoff at physical address `h_pa` (still reachable
+# one-to-one on machboot's page tables); an error message, or nil
+pub fun collect(h_pa: u64, bi: *info.BootInfo) *u8 {
+    if (h_pa == 0) { ret "boot: no handoff from the boot loader (machboot needed)\0"; }
+    val h: *ho.Handoff = (h_pa + ho.HHDM)::*ho.Handoff;
+    if (h.magic != ho.MAGIC) { ret "boot: not started by machboot\0"; }
+    if (h.version != ho.VERSION) { ret "boot: machboot speaks another protocol version\0"; }
+    val hh: u64 = h.hhdm;
+    bi.hhdm = hh;
+    bi.rsdp = h.rsdp;
+    bi.kphys = h.kphys;
+    bi.kvirt = h.kvirt;
+    bi.kelf = hh + h.kfile;
+    bi.kelf_len = h.kfile_len;
+    bi.cmdline = (hh + h.cmdline)::*u8;
+    bi.initrd = 0;
+    bi.initrd_len = 0;
+    if (h.initrd != 0) {
+        bi.initrd = hh + h.initrd;
+        bi.initrd_len = h.initrd_len;
+    }
+    bi.fb.addr = 0;
+    if (h.fb_addr != 0) {
+        bi.fb.addr = hh + h.fb_addr;
+        bi.fb.width = h.fb_width;
+        bi.fb.height = h.fb_height;
+        bi.fb.pitch = h.fb_pitch;
+        bi.fb.bpp = h.fb_bpp::u16;
+        bi.fb.r_size = 8;
+        bi.fb.g_size = 8;
+        bi.fb.b_size = 8;
+        bi.fb.r_shift = h.fb_r_shift::u8;
+        bi.fb.g_shift = h.fb_g_shift::u8;
+        bi.fb.b_shift = h.fb_b_shift::u8;
+    }
+    var n: u64 = h.nregions;
+    if (n > info.MEM_MAX) { n = info.MEM_MAX; }
+    val r: *ho.Region = (hh + h.regions)::*ho.Region;
+    var i: u64 = 0;
+    for (i < n) {
+        bi.mem[i].base = r[i].base;
+        bi.mem[i].len = r[i].len;
+        bi.mem[i].kind = r[i].kind::u8;
+        i = i + 1;
+    }
+    bi.mem_len = n;
+    bi.trampoline = h.trampoline;
+    i = 0;
+    for (i < 16) {
+        bi.root_guid[i] = h.root_guid[i];
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 32) {
+        bi.loader[i] = h.loader[i];
+        i = i + 1;
+    }
+    bi.loader[31] = 0;
+    ret nil;
+}

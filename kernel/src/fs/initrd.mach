@@ -1,4 +1,4 @@
-# unpack a USTAR archive (the Limine module) into an in-memory root
+# unpack a USTAR archive (the initrd machboot loads) into an in-memory root
 
 use abi:   sdk.abi;
 use vfs:   machos.fs.vfs;

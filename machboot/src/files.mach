@@ -1,0 +1,131 @@
+# where machboot reads its files: the MachOS root partition (ext2), found
+# on the disk machboot came from first, then on any disk; failing that the
+# EFI partition it was loaded from (FAT, through the firmware), as on the
+# live ISO
+
+use efi:  machboot.efi;
+use disk: machboot.disk;
+use ext2: machboot.ext2;
+
+# A9056588-C0B9-470F-AC01-A8528DCA9461 as stored on disk
+val ROOT_TYPE: [16]u8 = [16]u8{0x88, 0x65, 0x05, 0xa9, 0xb9, 0xc0, 0x0f, 0x47,
+                               0xac, 0x01, 0xa8, 0x52, 0x8d, 0xca, 0x94, 0x61};
+
+var fs: ext2.Fs;
+pub var on_root: u8 = 0;         # files come from an ext2 root
+pub var root: *disk.Part = nil;
+var esp_root: u64 = 0;           # the EFI volume's root directory (efi.File)
+
+# a root partition that has `/boot/machboot.conf`
+fun usable(p: *disk.Part) u8 {
+    if (disk.same(?p.kind[0], ?ROOT_TYPE[0], 16) == 0) { ret 0; }
+    if (ext2.open(?fs, p) == 0) { ret 0; }
+    var i: ext2.Inode;
+    ret ext2.lookup(?fs, "/boot/machboot.conf\0", ?i);
+}
+
+# pick where files come from. the description of it for the menu into
+# `where` (a short string)
+pub fun init() {
+    disk.scan();
+    val boot: *disk.Part = disk.boot_partition();
+    var i: u64 = 0;
+    # the root next to the EFI partition we came from
+    if (boot != nil) {
+        for (i < disk.nparts) {
+            val p: *disk.Part = ?disk.parts[i];
+            if (p.disk == boot.disk && usable(p) != 0) {
+                root = p;
+                on_root = 1;
+                ret;
+            }
+            i = i + 1;
+        }
+    }
+    # no root next to us (the live ISO, a USB stick): the boot volume's own
+    # files come first, so it does not boot an installed system instead
+    if (esp() != 0) {
+        var t: u64 = 0;
+        var l: u64 = 0;
+        on_root = 0;
+        if (load("/boot/machboot.conf\0", ?t, ?l, 0) != 0) { ret; }
+    }
+    # any root
+    i = 0;
+    for (i < disk.nparts) {
+        val p: *disk.Part = ?disk.parts[i];
+        if (usable(p) != 0) {
+            root = p;
+            on_root = 1;
+            ret;
+        }
+        i = i + 1;
+    }
+    on_root = 0;
+}
+
+# open the EFI volume machboot was loaded from
+fun esp() u8 {
+    if (esp_root != 0) { ret 1; }
+    var lg: efi.Guid;
+    efi.loaded_image_guid(?lg);
+    var li: u64 = 0;
+    if (efi.failed(efi.bs.handle_protocol(efi.image, ?lg, ?li)) != 0) { ret 0; }
+    val img: *efi.LoadedImage = li::*efi.LoadedImage;
+    var fg: efi.Guid;
+    efi.simple_fs_guid(?fg);
+    var sfs: u64 = 0;
+    if (efi.failed(efi.bs.handle_protocol(img.device, ?fg, ?sfs)) != 0) { ret 0; }
+    val s: *efi.SimpleFs = sfs::*efi.SimpleFs;
+    if (efi.failed(s.open_volume(s, ?esp_root)) != 0) {
+        esp_root = 0;
+        ret 0;
+    }
+    ret 1;
+}
+
+# a whole file into fresh pages; 0 if it cannot be read. `extra` more bytes
+# (zeroed) follow it, for a NUL at the end of text
+pub fun load(path: *u8, addr: *u64, len: *u64, extra: u64) u8 {
+    if (on_root != 0) {
+        var ino: ext2.Inode;
+        if (ext2.lookup(?fs, path, ?ino) == 0) { ret 0; }
+        if ((ino.mode & 0xF000) != 0x8000) { ret 0; }
+        val a: u64 = efi.alloc_pages((ino.size + extra + 4095) / 4096 + 1, 0);
+        if (a == 0) { ret 0; }
+        if (ext2.read_file(?fs, ?ino, 0, ino.size, a) == 0) { ret 0; }
+        @addr = a;
+        @len = ino.size;
+        ret 1;
+    }
+    if (esp() == 0) { ret 0; }
+    # the firmware wants \\boot\\kernel.elf in UTF-16
+    var name: [256]u16;
+    var i: u64 = 0;
+    for (path[i] != 0 && i < 255) {
+        if (path[i] == 47) { name[i] = 92; } or { name[i] = path[i]::u16; }
+        i = i + 1;
+    }
+    name[i] = 0;
+    val r: *efi.File = esp_root::*efi.File;
+    var fh: u64 = 0;
+    if (efi.failed(r.open(r, ?fh, ?name[0], 1, 0)) != 0) { ret 0; }
+    val f: *efi.File = fh::*efi.File;
+    # the size: seek to the end and ask where we are
+    var size: u64 = 0;
+    f.set_pos(f, 0xFFFFFFFFFFFFFFFF);
+    f.get_pos(f, ?size);
+    f.set_pos(f, 0);
+    val a: u64 = efi.alloc_pages((size + extra + 4095) / 4096 + 1, 0);
+    if (a == 0) {
+        f.close(f);
+        ret 0;
+    }
+    var got: u64 = size;
+    val st: u64 = f.read(f, ?got, a);
+    f.close(f);
+    if (efi.failed(st) != 0 || got != size) { ret 0; }
+    @addr = a;
+    @len = size;
+    ret 1;
+}

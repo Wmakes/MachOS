@@ -2,8 +2,9 @@
 # install DISK: erase DISK and install MachOS on it, e.g. `install /dev/sdb`
 # or `install /dev/nvme0n1`
 #   1. gpt     a new partition table: EFI system + MachOS root
-#   2. mkfat   the EFI partition, with Limine, its config, the kernel and (if
-#              there is one) the initrd the rescue entry boots
+#   2. mkfat   the EFI partition, with machboot (the boot loader) and copies
+#              of its config, the kernel and the initrd (machboot reads the
+#              real ones from the root partition's /boot)
 #   3. mkext2  the root partition, an empty filesystem
 #   4. mount it and copy /bin, /etc and /boot over
 test -n "$1" || echo "usage: install DISK (see ls -l /dev)"
@@ -15,7 +16,7 @@ confirm "Type yes to continue: " || exit 1
 ESP=$(partname $1 1)
 ROOT=$(partname $1 2)
 gpt $1 || exit 1
-mkfat $ESP /boot/BOOTX64.EFI:EFI/BOOT/BOOTX64.EFI /boot/limine.conf:boot/limine/limine.conf /boot/kernel.elf:boot/kernel.elf ?/boot/initrd.tar:boot/initrd.tar || exit 1
+mkfat $ESP /boot/BOOTX64.EFI:EFI/BOOT/BOOTX64.EFI /boot/machboot.conf:boot/machboot.conf /boot/kernel.elf:boot/kernel.elf ?/boot/initrd.tar:boot/initrd.tar || exit 1
 mkext2 $ROOT || exit 1
 test -d /mnt || mkdir /mnt
 mount $ROOT /mnt || exit 1

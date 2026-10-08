@@ -1,0 +1,57 @@
+# the machboot protocol: what the bootloader hands the kernel. machboot
+# jumps to the kernel's ELF entry point with rdi = the physical address of
+# a Handoff, interrupts off, in long mode, on page tables that map
+#   - all memory one-to-one (identity) and again at `hhdm` + physical,
+#   - the kernel's segments at the addresses it was linked for.
+# every address in here is physical. the kernel must stop relying on the
+# identity mapping (and on the bootloader's page tables) once it has its
+# own; KIND_KERNEL memory holds the kernel, this record, the initrd, the
+# boot page tables and the low SMP trampoline pages, and must be kept
+
+pub val MAGIC: u64 = 0x544F4F4248434D;   # "MCHBOOT" little endian
+pub val VERSION: u64 = 1;
+pub val HHDM: u64 = 0xFFFF800000000000;  # where machboot puts the direct map
+
+# memory kinds (the kernel's boot/info.mach uses the same numbers)
+pub val KIND_USABLE: u64 = 0;
+pub val KIND_RESERVED: u64 = 1;
+pub val KIND_RECLAIMABLE: u64 = 2;   # firmware/boot loader leftovers: free once booted
+pub val KIND_ACPI: u64 = 3;          # ACPI tables (reclaimable after parsing)
+pub val KIND_KERNEL: u64 = 4;        # see above: never hand out
+pub val KIND_FRAMEBUFFER: u64 = 5;
+
+pub val MAX_REGIONS: u64 = 256;
+
+pub rec Region {
+    base: u64;
+    len:  u64;
+    kind: u64;
+}
+
+pub rec Handoff {
+    magic:      u64;
+    version:    u64;
+    hhdm:       u64;
+    regions:    u64;       # [Region], sorted by address, adjacent equal kinds merged
+    nregions:   u64;
+    fb_addr:    u64;       # 0: no framebuffer
+    fb_width:   u64;
+    fb_height:  u64;
+    fb_pitch:   u64;       # bytes per row
+    fb_bpp:     u64;
+    fb_r_shift: u64;       # channel positions within a 32-bit pixel (8 bits each)
+    fb_g_shift: u64;
+    fb_b_shift: u64;
+    rsdp:       u64;       # 0: no ACPI
+    kphys:      u64;       # where the kernel's lowest segment was loaded
+    kvirt:      u64;       # and the address it is linked for
+    kfile:      u64;       # the kernel's ELF file, as read from the disk
+    kfile_len:  u64;
+    cmdline:    u64;       # NUL-terminated
+    initrd:     u64;       # 0: none
+    initrd_len: u64;
+    trampoline: u64;       # 4 pages below 1 MiB for starting the other cpus, 0: none
+    root_guid:  [16]u8;    # unique GUID of the GPT partition the kernel came from (zeros: the EFI partition)
+    loader:     [32]u8;    # "machboot 0.8.0", NUL-terminated
+    boot_us:    u64;       # microseconds machboot spent (from its start to the jump), 0 if unknown
+}

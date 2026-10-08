@@ -19,6 +19,8 @@ pub rec Madt {
     ioapic_gsi: u32; # first gsi it handles
     overrides:  [16]Override;
     n_override: u64;
+    cpu_ids:    [16]u32; # local APIC ids of the enabled processors
+    n_cpu:      u64;
 }
 
 fun rd8(a: u64) u8 { ret @(a::*u8); }
@@ -171,6 +173,7 @@ pub fun madt(rsdp_pa: u64, m: *Madt) *u8 {
     m.lapic = rd32(t + 36)::u64;
     m.ioapic = 0;
     m.n_override = 0;
+    m.n_cpu = 0;
     val end: u64 = t + rd32(t + 4)::u64;
     var e: u64 = t + 44;
     for (e + 2 <= end) {
@@ -188,6 +191,12 @@ pub fun madt(rsdp_pa: u64, m: *Madt) *u8 {
             m.n_override = m.n_override + 1;
         } or (kind == 5) {
             m.lapic = rd64(e + 4); # 64-bit local APIC address override
+        } or (kind == 0 && (rd32(e + 4) & 1) != 0 && m.n_cpu < 16) {
+            m.cpu_ids[m.n_cpu] = rd8(e + 3)::u32;   # processor local APIC, enabled
+            m.n_cpu = m.n_cpu + 1;
+        } or (kind == 9 && (rd32(e + 8) & 1) != 0 && m.n_cpu < 16) {
+            m.cpu_ids[m.n_cpu] = rd32(e + 4);       # processor local x2APIC, enabled
+            m.n_cpu = m.n_cpu + 1;
         }
         e = e + len::u64;
     }

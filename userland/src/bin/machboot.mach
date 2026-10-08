@@ -1,0 +1,325 @@
+# machboot: the boot loader's settings, in /boot/machboot.conf
+#   machboot                          the menu: timeout, default, entries
+#   machboot default N                boot entry N unless another is picked
+#   machboot timeout SECONDS          how long the menu waits (0: no menu)
+#   machboot cmdline N [TEXT...]      entry N's kernel command line
+#   machboot add NAME [KERNEL [INITRD [CMDLINE...]]]   a new entry
+#   machboot remove N                 drop entry N
+#   machboot edit                     open the file in nano
+#   machboot install PARTITION        write machboot (and copies of the
+#                                     config, kernel and initrd) to an EFI
+#                                     system partition: it is reformatted
+# entries count from 1. changing anything needs root
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+val PATH: *u8 = "/boot/machboot.conf\0";
+val MAX: u64 = 16;
+
+rec Entry {
+    name:    [64]u8;
+    nlen:    u64;
+    kernel:  [128]u8;
+    klen:    u64;
+    initrd:  [128]u8;
+    ilen:    u64;
+    cmdline: [256]u8;
+    clen:    u64;
+}
+
+var entries: [16]Entry;
+var count: u64 = 0;
+var timeout: u64 = 3;
+var default: u64 = 1;
+var text: [16384]u8;
+
+fun fail(why: *u8) u64 {
+    io.err("machboot: \0");
+    io.err(why);
+    io.err("\n\0");
+    ret 1;
+}
+
+fun space(c: u8) u8 { ret (c == 32 || c == 9)::u8; }
+
+fun is(p: *u8, n: u64, w: *u8) u8 { ret io.eq(p, n, w, io.len(w)); }
+
+fun num(p: *u8, n: u64, ok: *u8) u64 { ret io.parse_dec(p, n, ok); }
+
+fun set(dst: *u8, cap: u64, src: *u8, n: u64) u64 {
+    var k: u64 = n;
+    if (k > cap - 1) { k = cap - 1; }
+    io.copy(dst, src, k);
+    dst[k] = 0;
+    ret k;
+}
+
+fun load() u8 {
+    val h: u64 = sys.open(PATH, io.len(PATH), abi.O_READ);
+    if (abi.is_err(h) != 0) { ret 0; }
+    var n: u64 = 0;
+    for (n < 16384) {
+        val r: u64 = sys.read(h, ?text[n], 16384 - n);
+        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        n = n + r;
+    }
+    sys.close(h);
+    var i: u64 = 0;
+    for (i < n) {
+        var e: u64 = i;
+        for (e < n && text[e] != 10) { e = e + 1; }
+        var s: u64 = i;
+        for (s < e && space(text[s]) != 0) { s = s + 1; }
+        var end: u64 = e;
+        for (end > s && space(text[end - 1]) != 0) { end = end - 1; }
+        if (s < end && text[s] != 35) {
+            var k: u64 = s;
+            for (k < end && space(text[k]) == 0) { k = k + 1; }
+            val key: *u8 = ?text[s];
+            val kn: u64 = k - s;
+            for (k < end && space(text[k]) != 0) { k = k + 1; }
+            val v: *u8 = ?text[k];
+            val vn: u64 = end - k;
+            var okk: u8 = 0;
+            if (is(key, kn, "timeout\0") != 0) { timeout = num(v, vn, ?okk); }
+            or (is(key, kn, "default\0") != 0) { default = num(v, vn, ?okk); }
+            or (is(key, kn, "entry\0") != 0) {
+                if (count < MAX) {
+                    val en: *Entry = ?entries[count];
+                    en.nlen = set(?en.name[0], 64, v, vn);
+                    en.klen = 0;
+                    en.ilen = 0;
+                    en.clen = 0;
+                    count = count + 1;
+                }
+            } or (count > 0) {
+                val en: *Entry = ?entries[count - 1];
+                if (is(key, kn, "kernel\0") != 0) { en.klen = set(?en.kernel[0], 128, v, vn); }
+                or (is(key, kn, "initrd\0") != 0) { en.ilen = set(?en.initrd[0], 128, v, vn); }
+                or (is(key, kn, "cmdline\0") != 0) { en.clen = set(?en.cmdline[0], 256, v, vn); }
+            }
+        }
+        i = e + 1;
+    }
+    ret 1;
+}
+
+fun put(h: u64, s: *u8) { io.write_all(h, s, io.len(s)); }
+fun putn(h: u64, s: *u8, n: u64) { io.write_all(h, s, n); }
+
+fun put_num(h: u64, v: u64) {
+    var b: [20]u8;
+    io.write_all(h, ?b[0], io.fmt_dec(v, ?b[0]));
+}
+
+fun save() u64 {
+    val h: u64 = sys.open(PATH, io.len(PATH), abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC);
+    if (abi.is_err(h) != 0) {
+        if (abi.err_code(h) == abi.E_ACCES) { ret fail("only root may change the boot settings\0"); }
+        ret fail(abi.err_name(h));
+    }
+    put(h, "# machboot, the MachOS boot loader. `machboot` changes this file (or edit\n\0");
+    put(h, "# it with nano). entries are numbered from 1 in the order written here\n\0");
+    put(h, "timeout \0");
+    put_num(h, timeout);
+    put(h, "\ndefault \0");
+    put_num(h, default);
+    put(h, "\n\0");
+    var i: u64 = 0;
+    for (i < count) {
+        val e: *Entry = ?entries[i];
+        put(h, "\nentry \0");
+        putn(h, ?e.name[0], e.nlen);
+        put(h, "\n    kernel  \0");
+        putn(h, ?e.kernel[0], e.klen);
+        if (e.ilen > 0) {
+            put(h, "\n    initrd  \0");
+            putn(h, ?e.initrd[0], e.ilen);
+        }
+        put(h, "\n    cmdline \0");
+        putn(h, ?e.cmdline[0], e.clen);
+        put(h, "\n\0");
+        i = i + 1;
+    }
+    sys.close(h);
+    sys.sync();
+    ret 0;
+}
+
+fun list() u64 {
+    io.out("\x1b[95mmachboot\x1b[0m  \0");
+    io.out(PATH);
+    io.out("\n  menu waits \0");
+    io.dec(timeout);
+    io.out(" s, boots entry \0");
+    io.dec(default);
+    io.out(" unless another is picked\n\n\0");
+    var i: u64 = 0;
+    for (i < count) {
+        val e: *Entry = ?entries[i];
+        if (i + 1 == default) { io.out("  * \0"); } or { io.out("    \0"); }
+        io.dec(i + 1);
+        io.out("  \x1b[1m\0");
+        io.outn(?e.name[0], e.nlen);
+        io.out("\x1b[0m\n        kernel \0");
+        io.outn(?e.kernel[0], e.klen);
+        if (e.ilen > 0) {
+            io.out(", initrd \0");
+            io.outn(?e.initrd[0], e.ilen);
+        }
+        io.out(", command line \0");
+        if (e.clen > 0) {
+            io.putc(39);
+            io.outn(?e.cmdline[0], e.clen);
+            io.putc(39);
+        } or { io.out("(none)\0"); }
+        io.putc(10);
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# argument `i` as an entry number (1..count); 0 if it is not one
+fun entry_arg(s: *u8) u64 {
+    var okk: u8 = 0;
+    val n: u64 = io.parse_dec(s, io.len(s), ?okk);
+    if (okk == 0 || n == 0 || n > count) { ret 0; }
+    ret n;
+}
+
+# the rest of the arguments, joined with spaces
+fun join(argc: u64, argv: **u8, from: u64, out: *u8, cap: u64) u64 {
+    var n: u64 = 0;
+    var i: u64 = from;
+    for (i < argc) {
+        val l: u64 = io.len(argv[i]);
+        if (n + l + 1 >= cap) { brk; }
+        if (n > 0) {
+            out[n] = 32;
+            n = n + 1;
+        }
+        io.copy(?out[n], argv[i], l);
+        n = n + l;
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun run(prog: *u8, args: *u8, alen: u64) u64 {
+    val pid: u64 = sys.spawn(prog, io.len(prog), args, alen, nil);
+    if (abi.is_err(pid) != 0) { ret 127; }
+    ret sys.wait(pid);
+}
+
+# put machboot on EFI system partition `part` (reformatting it)
+fun install(part: *u8) u64 {
+    var st: abi.Stat;
+    if (abi.is_err(sys.stat(part, io.len(part), ?st)) != 0 || st.kind != abi.KIND_DEV) {
+        ret fail("give the EFI system partition, e.g. /dev/sda1\0");
+    }
+    io.out("This reformats \0");
+    io.out(part);
+    io.out(" (everything on it is lost) and puts machboot there.\n\0");
+    var cargs: [64]u8;
+    var cl: u64 = 0;
+    io.copy(?cargs[0], "confirm\0", 8);
+    cl = 8;
+    io.copy(?cargs[cl], "Type yes to continue: \0", 23);
+    cl = cl + 23;
+    if (run("/bin/confirm\0", ?cargs[0], cl) != 0) { ret 1; }
+    # mkfat PART  machboot and copies of what it boots
+    var a: [512]u8;
+    var n: u64 = 0;
+    io.copy(?a[n], "mkfat\0", 6);
+    n = n + 6;
+    val pl: u64 = io.len(part);
+    io.copy(?a[n], part, pl + 1);
+    n = n + pl + 1;
+    val f1: *u8 = "/boot/BOOTX64.EFI:EFI/BOOT/BOOTX64.EFI\0";
+    io.copy(?a[n], f1, io.len(f1) + 1);
+    n = n + io.len(f1) + 1;
+    val f2: *u8 = "/boot/machboot.conf:boot/machboot.conf\0";
+    io.copy(?a[n], f2, io.len(f2) + 1);
+    n = n + io.len(f2) + 1;
+    val f3: *u8 = "/boot/kernel.elf:boot/kernel.elf\0";
+    io.copy(?a[n], f3, io.len(f3) + 1);
+    n = n + io.len(f3) + 1;
+    val f4: *u8 = "?/boot/initrd.tar:boot/initrd.tar\0";
+    io.copy(?a[n], f4, io.len(f4) + 1);
+    n = n + io.len(f4) + 1;
+    if (run("/bin/mkfat\0", ?a[0], n) != 0) { ret fail("writing the EFI partition failed\0"); }
+    io.out("machboot is installed on \0");
+    io.out(part);
+    io.putc(10);
+    ret 0;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (load() == 0 && (argc < 2 || io.streq(argv[1], "install\0") == 0)) {
+        ret fail("cannot read /boot/machboot.conf\0");
+    }
+    if (argc == 1 || (argc == 2 && io.streq(argv[1], "list\0") != 0)) { ret list(); }
+    val cmd: *u8 = argv[1];
+    if (io.streq(cmd, "default\0") != 0 && argc == 3) {
+        val n: u64 = entry_arg(argv[2]);
+        if (n == 0) { ret fail("no such entry\0"); }
+        default = n;
+        ret save();
+    }
+    if (io.streq(cmd, "timeout\0") != 0 && argc == 3) {
+        var okk: u8 = 0;
+        val t: u64 = io.parse_dec(argv[2], io.len(argv[2]), ?okk);
+        if (okk == 0 || t > 600) { ret fail("give seconds, 0 to 600\0"); }
+        timeout = t;
+        ret save();
+    }
+    if (io.streq(cmd, "cmdline\0") != 0 && argc >= 3) {
+        val n: u64 = entry_arg(argv[2]);
+        if (n == 0) { ret fail("no such entry\0"); }
+        val e: *Entry = ?entries[n - 1];
+        e.clen = join(argc, argv, 3, ?e.cmdline[0], 256);
+        ret save();
+    }
+    if (io.streq(cmd, "add\0") != 0 && argc >= 3) {
+        if (count == MAX) { ret fail("no room for more entries\0"); }
+        val e: *Entry = ?entries[count];
+        e.nlen = set(?e.name[0], 64, argv[2], io.len(argv[2]));
+        var k: *u8 = "/boot/kernel.elf\0";
+        if (argc >= 4) { k = argv[3]; }
+        e.klen = set(?e.kernel[0], 128, k, io.len(k));
+        e.ilen = 0;
+        if (argc >= 5 && io.streq(argv[4], "-\0") == 0) { e.ilen = set(?e.initrd[0], 128, argv[4], io.len(argv[4])); }
+        e.clen = join(argc, argv, 5, ?e.cmdline[0], 256);
+        count = count + 1;
+        ret save();
+    }
+    if (io.streq(cmd, "remove\0") != 0 && argc == 3) {
+        val n: u64 = entry_arg(argv[2]);
+        if (n == 0) { ret fail("no such entry\0"); }
+        if (count == 1) { ret fail("that is the only entry\0"); }
+        var i: u64 = n - 1;
+        for (i + 1 < count) {
+            entries[i] = entries[i + 1];
+            i = i + 1;
+        }
+        count = count - 1;
+        if (default > count) { default = 1; }
+        or (default > n) { default = default - 1; }
+        ret save();
+    }
+    if (io.streq(cmd, "edit\0") != 0) {
+        var a: [64]u8;
+        io.copy(?a[0], "nano\0", 5);
+        io.copy(?a[5], PATH, io.len(PATH) + 1);
+        ret run("/bin/nano\0", ?a[0], 5 + io.len(PATH) + 1);
+    }
+    if (io.streq(cmd, "install\0") != 0 && argc == 3) { ret install(argv[2]); }
+    io.err("usage: machboot [list | default N | timeout SECONDS | cmdline N [TEXT...] |\n\0");
+    io.err("                add NAME [KERNEL [INITRD|- [CMDLINE...]]] | remove N | edit |\n\0");
+    io.err("                install PARTITION]\n\0");
+    ret 2;
+}

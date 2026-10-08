@@ -1,0 +1,185 @@
+# machboot: the MachOS boot loader (UEFI). it reads /boot/machboot.conf
+# from the MachOS root partition (or, on the live ISO, from the EFI
+# partition), shows a menu, and boots the chosen entry
+#   up/down choose   enter boot   e edit the command line
+#   r restart        p power off  (any key stops the countdown)
+
+use efi:   machboot.efi;
+use files: machboot.files;
+use conf:  machboot.conf;
+use boot:  machboot.boot;
+
+val LOGO_LINES: u64 = 5;
+
+fun logo(i: u64) *u8 {
+    if (i == 0) { ret " __  __            _      ___  ____\0"; }
+    if (i == 1) { ret "|  \\/  | __ _  ___| |__  / _ \\/ ___|\0"; }
+    if (i == 2) { ret "| |\\/| |/ _` |/ __| '_ \\| | | \\___ \\\0"; }
+    if (i == 3) { ret "| |  | | (_| | (__| | | | |_| |___) |\0"; }
+    ret "|_|  |_|\\__,_|\\___|_| |_|\\___/|____/\0";
+}
+
+var cols: u64 = 80;
+var rows: u64 = 25;
+var chosen: u64 = 0;
+var msg: *u8 = nil;
+
+fun pad_line(used: u64) {
+    var u: u64 = used;
+    for (u + 1 < cols) {
+        efi.putc(32);
+        u = u + 1;
+    }
+}
+
+fun draw(left: u64) {
+    efi.color(efi.LIGHTGRAY, efi.BLACK);
+    efi.clear();
+    efi.color(efi.LIGHTMAGENTA, efi.BLACK);
+    var i: u64 = 0;
+    for (i < LOGO_LINES) {
+        efi.at(2, 1 + i);
+        efi.puts(logo(i));
+        i = i + 1;
+    }
+    efi.color(efi.WHITE, efi.BLACK);
+    efi.at(2, 7);
+    efi.puts("machboot 0.8.0\0");
+    efi.color(efi.DARKGRAY, efi.BLACK);
+    if (files.on_root != 0) { efi.puts("   files from the MachOS root partition\0"); }
+    or { efi.puts("   files from the EFI partition\0"); }
+    i = 0;
+    for (i < conf.count) {
+        val e: *conf.Entry = ?conf.entries[i];
+        efi.at(2, 9 + i);
+        if (i == chosen) { efi.color(efi.WHITE, 5); } # white on magenta
+        or { efi.color(efi.LIGHTGRAY, efi.BLACK); }
+        efi.puts("  \0");
+        efi.putn(?e.name[0], e.name_len);
+        var used: u64 = 2 + e.name_len;
+        if (e.cmdline_len > 0) {
+            efi.puts("  (\0");
+            efi.putn(?e.cmdline[0], e.cmdline_len);
+            efi.puts(")\0");
+            used = used + 4 + e.cmdline_len;
+        }
+        for (used < 50) {
+            efi.putc(32);
+            used = used + 1;
+        }
+        i = i + 1;
+    }
+    efi.color(efi.DARKGRAY, efi.BLACK);
+    efi.at(2, 10 + conf.count);
+    efi.puts("up/down choose   enter boot   e edit command line   r restart   p power off\0");
+    if (msg != nil) {
+        efi.color(efi.LIGHTRED, efi.BLACK);
+        efi.at(2, 12 + conf.count);
+        efi.puts(msg);
+    }
+    efi.color(efi.LIGHTGRAY, efi.BLACK);
+    efi.at(2, 14 + conf.count);
+    if (left != 0xFFFFFFFFFFFFFFFF) {
+        efi.puts("booting in \0");
+        efi.dec(left);
+        efi.puts(" s \0");
+    }
+}
+
+# edit the chosen entry's command line on the bottom line
+fun edit() {
+    val e: *conf.Entry = ?conf.entries[chosen];
+    for {
+        efi.color(efi.WHITE, efi.BLACK);
+        efi.at(2, 14 + conf.count);
+        efi.puts("command line: \0");
+        efi.putn(?e.cmdline[0], e.cmdline_len);
+        pad_line(16 + e.cmdline_len);
+        efi.at(16 + e.cmdline_len, 14 + conf.count);
+        efi.cursor(1);
+        var k: efi.Key;
+        efi.wait_key(?k);
+        efi.cursor(0);
+        if (k.ch == 13 || k.ch == 10) { ret; }
+        if (k.scan == efi.SCAN_ESC) { ret; }
+        if (k.ch == 8 && e.cmdline_len > 0) { e.cmdline_len = e.cmdline_len - 1; }
+        if (k.ch >= 32 && k.ch < 127 && e.cmdline_len < 250) {
+            e.cmdline[e.cmdline_len] = k.ch::u8;
+            e.cmdline_len = e.cmdline_len + 1;
+        }
+        e.cmdline[e.cmdline_len] = 0;
+    }
+}
+
+fun run(e: *conf.Entry) {
+    efi.color(efi.LIGHTGRAY, efi.BLACK);
+    efi.clear();
+    efi.puts("machboot: booting \0");
+    efi.putn(?e.name[0], e.name_len);
+    efi.puts("\n\0");
+    boot.boot(e);
+    msg = boot.error(); # only back here if it failed
+}
+
+# the menu; never returns (it boots, restarts or powers off)
+fun menu() {
+    var left: u64 = conf.timeout;
+    var counting: u8 = 1;
+    var ticks: u64 = 0;
+    draw(left);
+    for {
+        var k: efi.Key;
+        if (efi.poll_key(?k) != 0) {
+            if (counting != 0) {
+                counting = 0;
+                left = 0xFFFFFFFFFFFFFFFF;
+            }
+            if (k.scan == efi.SCAN_UP && chosen > 0) { chosen = chosen - 1; }
+            or (k.scan == efi.SCAN_DOWN && chosen + 1 < conf.count) { chosen = chosen + 1; }
+            or (k.ch == 13 || k.ch == 10) { run(?conf.entries[chosen]); }
+            or (k.ch == 101) { edit(); }
+            or (k.ch == 114) { efi.st.runtime.reset_system(0, 0, 0, 0); }   # cold reset
+            or (k.ch == 112) { efi.st.runtime.reset_system(2, 0, 0, 0); }   # shutdown
+            draw(left);
+            cnt;
+        }
+        efi.stall(10000);
+        if (counting != 0) {
+            ticks = ticks + 1;
+            if (ticks == 100) {
+                ticks = 0;
+                if (left <= 1) {
+                    run(?conf.entries[chosen]);
+                    counting = 0;
+                    left = 0xFFFFFFFFFFFFFFFF;
+                } or {
+                    left = left - 1;
+                }
+                draw(left);
+            }
+        }
+    }
+}
+
+#[symbol("mainCRTStartup")]
+fun efi_main(image: u64, table: *efi.SystemTable) u64 {
+    efi.init(image, table);
+    efi.screen(?cols, ?rows);
+    efi.cursor(0);
+    files.init();
+    var text: u64 = 0;
+    var len: u64 = 0;
+    if (files.load("/boot/machboot.conf\0", ?text, ?len, 1) != 0) { conf.parse(text::*u8, len); }
+    or {
+        conf.fallback();
+        msg = "no /boot/machboot.conf: using the built-in entry\0";
+    }
+    chosen = conf.default;
+    if (conf.timeout == 0) {
+        # straight away, unless that fails
+        var k: efi.Key;
+        if (efi.poll_key(?k) == 0) { run(?conf.entries[chosen]); }
+    }
+    menu();
+    ret 0;
+}

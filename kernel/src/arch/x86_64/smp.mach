@@ -61,6 +61,7 @@ pub fun online() u64 {
 }
 
 pub fun came_up(c: u64) { ready[c] = 1; }
+pub fun is_up(c: u64) u8 { ret ready[c]; }
 
 # the index of the cpu running this
 pub fun here() u64 {

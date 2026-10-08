@@ -8,7 +8,7 @@ pub val MEM_ACPI:        u8 = 3;
 pub val MEM_KERNEL:      u8 = 4;
 pub val MEM_FRAMEBUFFER: u8 = 5;
 
-pub val MEM_MAX: u64 = 128;
+pub val MEM_MAX: u64 = 256;
 
 pub rec MemRegion {
     base: u64;
@@ -38,10 +38,9 @@ pub rec BootInfo {
     initrd:     u64; # virtual address of the initrd tar, 0 when absent
     initrd_len: u64;
     fb:         Framebuffer;
-    mem:        [128]MemRegion;
+    mem:        [256]MemRegion;
     mem_len:    u64;
-    cpus:       u64;      # processors, this one included (1 when unknown)
-    bsp_lapic:  u32;      # this one's local APIC id
-    cpu_lapic:  [16]u32;  # each one's local APIC id
-    cpu_start:  [16]u64;  # each one's boot-protocol record (see boot/limine.mach)
+    trampoline: u64;      # 4 pages below 1 MiB for starting cpus (physical), 0: none
+    root_guid:  [16]u8;   # the GPT partition the kernel was loaded from (zeros: unknown)
+    loader:     [32]u8;   # the boot loader's name and version
 }

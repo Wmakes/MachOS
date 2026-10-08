@@ -1,0 +1,367 @@
+# UEFI, as much as machboot uses: the system table, boot services, and the
+# protocols for text, keys, graphics, disks and files. every function
+# pointer here uses the Microsoft x64 convention, which is what this whole
+# program is compiled for. layouts follow the UEFI 2.x specification
+
+pub rec Guid { a: u32; b: u16; c: u16; d: [8]u8; }
+
+pub rec TextMode { max_mode: i32; mode: i32; attr: i32; col: i32; row: i32; visible: u8; }
+
+pub rec TextOut {
+    reset:         fun(*TextOut, u8) u64;
+    output:        fun(*TextOut, *u16) u64;
+    test:          u64;
+    query_mode:    fun(*TextOut, u64, *u64, *u64) u64;
+    set_mode:      fun(*TextOut, u64) u64;
+    set_attr:      fun(*TextOut, u64) u64;
+    clear:         fun(*TextOut) u64;
+    set_cursor:    fun(*TextOut, u64, u64) u64;
+    enable_cursor: fun(*TextOut, u8) u64;
+    mode:          *TextMode;
+}
+
+pub rec Key { scan: u16; ch: u16; }
+
+pub rec TextIn {
+    reset:    fun(*TextIn, u8) u64;
+    read_key: fun(*TextIn, *Key) u64;
+    wait_key: u64;
+}
+
+pub rec ConfigTable { guid: Guid; table: u64; }
+
+pub rec Runtime {
+    hdr: [3]u64;
+    get_time: u64;
+    set_time: u64;
+    get_wakeup: u64;
+    set_wakeup: u64;
+    set_virtual_map: u64;
+    convert_pointer: u64;
+    get_variable: u64;
+    get_next_variable: u64;
+    set_variable: u64;
+    next_high_mono: u64;
+    reset_system: fun(u64, u64, u64, u64) u64;
+}
+
+pub rec BootServices {
+    hdr:                  [3]u64;
+    raise_tpl:            u64;
+    restore_tpl:          u64;
+    allocate_pages:       fun(u64, u64, u64, *u64) u64;
+    free_pages:           fun(u64, u64) u64;
+    get_memory_map:       fun(*u64, u64, *u64, *u64, *u32) u64;
+    allocate_pool:        fun(u64, u64, *u64) u64;
+    free_pool:            fun(u64) u64;
+    create_event:         u64;
+    set_timer:            u64;
+    wait_for_event:       u64;
+    signal_event:         u64;
+    close_event:          u64;
+    check_event:          u64;
+    install_pi:           u64;
+    reinstall_pi:         u64;
+    uninstall_pi:         u64;
+    handle_protocol:      fun(u64, *Guid, *u64) u64;
+    reserved:             u64;
+    register_notify:      u64;
+    locate_handle:        u64;
+    locate_device_path:   u64;
+    install_config:       u64;
+    load_image:           u64;
+    start_image:          u64;
+    exit:                 u64;
+    unload_image:         u64;
+    exit_boot_services:   fun(u64, u64) u64;
+    next_mono:            u64;
+    stall:                fun(u64) u64;
+    set_watchdog:         fun(u64, u64, u64, u64) u64;
+    connect:              u64;
+    disconnect:           u64;
+    open_protocol:        u64;
+    close_protocol:       u64;
+    open_info:            u64;
+    protocols_per_handle: u64;
+    locate_handle_buffer: fun(u64, *Guid, u64, *u64, *u64) u64;
+    locate_protocol:      fun(*Guid, u64, *u64) u64;
+}
+
+pub rec SystemTable {
+    hdr:            [3]u64;
+    vendor:         *u16;
+    revision:       u64;
+    con_in_handle:  u64;
+    con_in:         *TextIn;
+    con_out_handle: u64;
+    con_out:        *TextOut;
+    err_handle:     u64;
+    std_err:        *TextOut;
+    runtime:        *Runtime;
+    boot:           *BootServices;
+    n_tables:       u64;
+    tables:         *ConfigTable;
+}
+
+pub rec Media {
+    media_id:      u32;
+    removable:     u8;
+    present:       u8;
+    logical:       u8;   # a partition rather than a whole disk
+    read_only:     u8;
+    write_caching: u8;
+    block_size:    u32;
+    io_align:      u32;
+    last_block:    u64;
+}
+
+pub rec BlockIo {
+    revision: u64;
+    media:    *Media;
+    reset:    u64;
+    read:     fun(*BlockIo, u32, u64, u64, u64) u64;
+    write:    u64;
+    flush:    u64;
+}
+
+pub rec GopInfo {
+    version: u32;
+    width:   u32;
+    height:  u32;
+    format:  u32;      # 0 RGBX, 1 BGRX, 2 bit masks, 3 no framebuffer
+    masks:   [4]u32;   # red, green, blue, reserved (format 2)
+    stride:  u32;      # pixels per row
+}
+
+pub rec GopMode {
+    max_mode:  u32;
+    mode:      u32;
+    info:      *GopInfo;
+    info_size: u64;
+    fb_base:   u64;
+    fb_size:   u64;
+}
+
+pub rec Gop {
+    query_mode: fun(*Gop, u32, *u64, *u64) u64;
+    set_mode:   fun(*Gop, u32) u64;
+    blt:        u64;
+    mode:       *GopMode;
+}
+
+pub rec LoadedImage {
+    revision:     u32;
+    parent:       u64;
+    system:       u64;
+    device:       u64;   # the handle of the volume (partition) machboot came from
+    file_path:    u64;
+    reserved:     u64;
+    options_size: u32;
+    options:      u64;
+    image_base:   u64;
+    image_size:   u64;
+}
+
+pub rec SimpleFs {
+    revision:    u64;
+    open_volume: fun(*SimpleFs, *u64) u64;
+}
+
+pub rec File {
+    revision: u64;
+    open:     fun(*File, *u64, *u16, u64, u64) u64;
+    close:    fun(*File) u64;
+    delete:   u64;
+    read:     fun(*File, *u64, u64) u64;
+    write:    u64;
+    get_pos:  fun(*File, *u64) u64;
+    set_pos:  fun(*File, u64) u64;
+}
+
+# status codes (the high bit marks an error)
+pub val SUCCESS: u64 = 0;
+pub val ERR: u64 = 0x8000000000000000;
+pub val NOT_READY: u64 = 0x8000000000000006;
+pub val BUFFER_TOO_SMALL: u64 = 0x8000000000000005;
+pub val INVALID_PARAMETER: u64 = 0x8000000000000002;
+
+pub fun failed(s: u64) u8 { ret ((s & ERR) != 0)::u8; }
+
+# memory types for allocations and in the memory map
+pub val LOADER_CODE: u64 = 1;
+pub val LOADER_DATA: u64 = 2;
+pub val ALLOC_ANY: u64 = 0;
+pub val ALLOC_MAX: u64 = 1;
+
+# key scan codes
+pub val SCAN_UP: u16 = 1;
+pub val SCAN_DOWN: u16 = 2;
+pub val SCAN_RIGHT: u16 = 3;
+pub val SCAN_LEFT: u16 = 4;
+pub val SCAN_HOME: u16 = 5;
+pub val SCAN_END: u16 = 6;
+pub val SCAN_DELETE: u16 = 8;
+pub val SCAN_ESC: u16 = 0x17;
+
+# text colours (foreground | background << 4)
+pub val BLACK: u64 = 0;
+pub val LIGHTGRAY: u64 = 7;
+pub val DARKGRAY: u64 = 8;
+pub val LIGHTMAGENTA: u64 = 13;
+pub val YELLOW: u64 = 14;
+pub val WHITE: u64 = 15;
+pub val LIGHTRED: u64 = 12;
+
+# --- the program's view of the firmware -------------------------------------
+
+pub var st: *SystemTable = nil;
+pub var bs: *BootServices = nil;
+pub var image: u64 = 0;
+
+pub fun init(img: u64, table: *SystemTable) {
+    image = img;
+    st = table;
+    bs = table.boot;
+    bs.set_watchdog(0, 0, 0, 0); # no reboot after 5 minutes in the menu
+}
+
+pub fun guid(g: *Guid, a: u32, b: u16, c: u16, d0: u8, d1: u8, d2: u8, d3: u8, d4: u8, d5: u8, d6: u8, d7: u8) {
+    g.a = a;
+    g.b = b;
+    g.c = c;
+    g.d[0] = d0; g.d[1] = d1; g.d[2] = d2; g.d[3] = d3;
+    g.d[4] = d4; g.d[5] = d5; g.d[6] = d6; g.d[7] = d7;
+}
+
+pub fun same_guid(x: *Guid, y: *Guid) u8 {
+    if (x.a != y.a || x.b != y.b || x.c != y.c) { ret 0; }
+    var i: u64 = 0;
+    for (i < 8) {
+        if (x.d[i] != y.d[i]) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+pub fun gop_guid(g: *Guid) { guid(g, 0x9042a9de, 0x23dc, 0x4a38, 0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a); }
+pub fun block_io_guid(g: *Guid) { guid(g, 0x964e5b21, 0x6459, 0x11d2, 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b); }
+pub fun loaded_image_guid(g: *Guid) { guid(g, 0x5b1b31a1, 0x9562, 0x11d2, 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b); }
+pub fun simple_fs_guid(g: *Guid) { guid(g, 0x964e5b22, 0x6459, 0x11d2, 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b); }
+pub fun device_path_guid(g: *Guid) { guid(g, 0x09576e91, 0x6d3f, 0x11d2, 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b); }
+pub fun acpi2_guid(g: *Guid) { guid(g, 0x8868e871, 0xe4f1, 0x11d3, 0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81); }
+pub fun acpi1_guid(g: *Guid) { guid(g, 0xeb9d2d30, 0x2d88, 0x11d3, 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d); }
+
+# `pages` pages of loader memory anywhere (`below` = 0) or below `below`;
+# their address, or 0
+pub fun alloc_pages(pages: u64, below: u64) u64 {
+    var at: u64 = below;
+    var how: u64 = ALLOC_ANY;
+    if (below != 0) { how = ALLOC_MAX; }
+    if (failed(bs.allocate_pages(how, LOADER_DATA, pages, ?at)) != 0) { ret 0; }
+    # zeroed, so tables and buffers start clean
+    var i: u64 = 0;
+    for (i < pages * 512) {
+        @((at + i * 8)::*u64) = 0;
+        i = i + 1;
+    }
+    ret at;
+}
+
+pub fun stall(us: u64) { bs.stall(us); }
+
+# --- text ---------------------------------------------------------------------
+
+var wbuf: [256]u16;
+
+pub fun puts(s: *u8) {
+    var i: u64 = 0;
+    var n: u64 = 0;
+    for (s[i] != 0) {
+        if (s[i] == 10) {
+            wbuf[n] = 13;
+            n = n + 1;
+        }
+        wbuf[n] = s[i]::u16;
+        n = n + 1;
+        i = i + 1;
+        if (n >= 250) {
+            wbuf[n] = 0;
+            st.con_out.output(st.con_out, ?wbuf[0]);
+            n = 0;
+        }
+    }
+    wbuf[n] = 0;
+    st.con_out.output(st.con_out, ?wbuf[0]);
+}
+
+pub fun putn(s: *u8, len: u64) {
+    var i: u64 = 0;
+    for (i < len) {
+        var one: [2]u8;
+        one[0] = s[i];
+        one[1] = 0;
+        puts(?one[0]);
+        i = i + 1;
+    }
+}
+
+pub fun putc(c: u8) {
+    var one: [2]u8;
+    one[0] = c;
+    one[1] = 0;
+    puts(?one[0]);
+}
+
+pub fun dec(v: u64) {
+    var b: [21]u8;
+    var n: u64 = 20;
+    b[20] = 0;
+    var x: u64 = v;
+    for {
+        n = n - 1;
+        b[n] = 48 + (x % 10)::u8;
+        x = x / 10;
+        if (x == 0) { brk; }
+    }
+    puts(?b[n]);
+}
+
+pub fun hex(v: u64) {
+    var b: [19]u8;
+    b[0] = 48;
+    b[1] = 120;
+    var i: u64 = 0;
+    for (i < 16) {
+        val d: u8 = ((v >> ((15 - i) * 4)) & 15)::u8;
+        if (d < 10) { b[2 + i] = 48 + d; }
+        or          { b[2 + i] = 87 + d; }
+        i = i + 1;
+    }
+    b[18] = 0;
+    puts(?b[0]);
+}
+
+pub fun color(fg: u64, bg: u64) { st.con_out.set_attr(st.con_out, fg | (bg << 4)); }
+pub fun clear() { st.con_out.clear(st.con_out); }
+pub fun at(col: u64, row: u64) { st.con_out.set_cursor(st.con_out, col, row); }
+pub fun cursor(on: u8) { st.con_out.enable_cursor(st.con_out, on); }
+
+# the text screen's size
+pub fun screen(cols: *u64, rows: *u64) {
+    @cols = 80;
+    @rows = 25;
+    val m: *TextMode = st.con_out.mode;
+    if (m != nil) { st.con_out.query_mode(st.con_out, m.mode::u64, cols, rows); }
+}
+
+# a key if one was pressed (scan code or character), else 0 in both
+pub fun poll_key(k: *Key) u8 {
+    k.scan = 0;
+    k.ch = 0;
+    if (failed(st.con_in.read_key(st.con_in, k)) != 0) { ret 0; }
+    ret 1;
+}
+
+pub fun wait_key(k: *Key) {
+    for (poll_key(k) == 0) { stall(10000); }
+}

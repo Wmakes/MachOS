@@ -1,6 +1,6 @@
 #!/bin/sh
 # build MachOS, update the dev disk out/<profile>/disk.img, boot it under OVMF
-# Arch: sudo pacman -S limine qemu-system-x86 edk2-ovmf mtools gptfdisk e2fsprogs
+# Arch: sudo pacman -S lld qemu-system-x86 edk2-ovmf mtools gptfdisk e2fsprogs
 # usage: tools/run.sh [release] [--fresh] [--disk FILE]... [extra qemu args...]
 #   --fresh      start from a new, empty dev disk
 #   --disk FILE  attach FILE as one more disk (/dev/sdb, ...), making a blank

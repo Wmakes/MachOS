@@ -162,6 +162,20 @@ TESTS = [
       "send:dmesg | grep smp; top -n 1 | grep cpu3; time true; history | grep -c calc\\n", "wait:" + P],
      ["14", "366503875925", "1\n", "e.tar.gz", "tmp/e/motd", "same", "binsame", "smp: 4 cpu(s)", "cpu3", "real", "\n2\n"]),
 
+    # machboot's settings, changed inside MachOS, take effect on the next boot
+    ("machboot-config", False, True,
+     ["wait:" + P, "send:machboot cmdline 1 loglevel=4 hello; machboot timeout 1; machboot\\n", "wait:" + P],
+     ["menu waits 1 s", "loglevel=4 hello"]),
+    ("machboot-config-boots", True, True,
+     ["wait:" + P, "send:dmesg | grep 'command line'; dmesg | grep 'loaded by'\\n", "wait:" + P],
+     ["command line: 'loglevel=4 hello'", "loaded by machboot"]),
+
+    # the live ISO, as a USB stick would boot it: runs from memory
+    ("live-iso", False, False,
+     ["--prep", lambda: sh("tools/iso.sh out/headless/live.iso"), "--boot", os.path.join(ROOT, "out/headless/live.iso"),
+      "wait:" + P, "send:dmesg | grep -E 'live system|loaded by'; ls /bin | wc -l\\n", "wait:" + P],
+     ["loaded by machboot", "live system: running from memory"]),
+
     ("tools", False, False,
      ["wait:" + P,
       "send:printf 'pear\\\\napple\\\\nfig\\\\napple\\\\n' > /tmp/f; sort -u /tmp/f | tr a-z A-Z; seq 1 20 | sort -n -r | head -2\\n",
@@ -170,7 +184,7 @@ TESTS = [
       "wait:diff=", "wait:" + P,
       "send:find / -name '*.conf'; ls /etc | xargs echo got; seq 1 50 | tail -2 | tee /tmp/t | wc -l; basename /a/b.txt .txt; df\\n",
       "wait:" + P],
-     ["APPLE", "FIG", "PEAR", "20", "19", "-3", "+X", "diff=1", "/boot/limine.conf", "got group motd passwd shadow",
+     ["APPLE", "FIG", "PEAR", "20", "19", "-3", "+X", "diff=1", "/boot/machboot.conf", "got group motd passwd shadow",
       "      2", "b", "/dev/sda2", "%"]),
 
     ("jobs-and-ctrl-c", False, False,

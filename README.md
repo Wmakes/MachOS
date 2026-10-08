@@ -4,7 +4,7 @@ A small Unix-like operating system for x86_64, written in [mach](https://github.
 
 ## Build and run
 
-You need mach 6.10, QEMU, OVMF, Limine, mtools, gptfdisk and e2fsprogs.
+You need mach 6.10, lld, QEMU, OVMF, mtools, gptfdisk and e2fsprogs.
 
 ```
 tools/run.sh        # build a disk image and boot it in QEMU

@@ -315,6 +315,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.machboot]
+kind = "bin"
+entry = "bin/machboot.mach"
+out = "bin/machboot"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.mkdir]
 kind = "bin"
 entry = "bin/mkdir.mach"

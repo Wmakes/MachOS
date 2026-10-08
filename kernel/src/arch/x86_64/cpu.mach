@@ -317,6 +317,21 @@ pub fun us_since_boot(t: u64) u64 {
     ret (d / tsc_rate) * 1000000 + (d % tsc_rate) * 1000000 / tsc_rate;
 }
 
+# wait about `us` microseconds (on the time-stamp counter; a rough spin
+# before it is measured)
+pub fun delay_us(us: u64) {
+    if (tsc_rate == 0) {
+        var i: u64 = 0;
+        for (i < us * 1000) {
+            pause();
+            i = i + 1;
+        }
+        ret;
+    }
+    val end: u64 = rdtsc() + us * (tsc_rate / 1000000);
+    for (rdtsc() < end) { pause(); }
+}
+
 # what cpuid says the time-stamp counter runs at (leaf 0x16, MHz), or 0
 pub fun tsc_hz_from_cpuid() u64 {
     var r: [4]u32;

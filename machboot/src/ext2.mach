@@ -1,0 +1,159 @@
+# reading files from an ext2 filesystem (the MachOS root): superblock,
+# group descriptors, inodes with direct and single/double/triple indirect
+# blocks, and linear directories. read-only
+
+use efi:  machboot.efi;
+use disk: machboot.disk;
+
+pub rec Fs {
+    part:      *disk.Part;
+    bsize:     u64;
+    ipg:       u64;
+    isize:     u64;
+    first:     u64;   # s_first_data_block
+    groups:    u64;
+    blocks:    u64;
+}
+
+pub rec Inode {
+    mode:  u16;
+    size:  u64;
+    block: [15]u32;
+}
+
+var blockbuf: u64 = 0;   # one block (up to 64 KiB) for indirect lookups
+
+fun read(fs: *Fs, off: u64, n: u64, dst: u64) u8 {
+    ret disk.read(fs.part.disk, fs.part.first * fs.part.disk.bsize + off, n, dst);
+}
+
+# an ext2 filesystem on partition p; 0 if it is not one
+pub fun open(fs: *Fs, p: *disk.Part) u8 {
+    fs.part = p;
+    var sb: [1024]u8;
+    if (disk.read(p.disk, p.first * p.disk.bsize + 1024, 1024, (?sb[0])::u64) == 0) { ret 0; }
+    if ((@((?sb[56])::*u16)) != 0xEF53) { ret 0; }
+    fs.bsize = 1024::u64 << (@((?sb[24])::*u32))::u64;
+    if (fs.bsize > 65536) { ret 0; }
+    fs.blocks = (@((?sb[4])::*u32))::u64;
+    fs.first = (@((?sb[20])::*u32))::u64;
+    val bpg: u64 = (@((?sb[32])::*u32))::u64;
+    fs.ipg = (@((?sb[40])::*u32))::u64;
+    fs.isize = 128;
+    if ((@((?sb[76])::*u32)) >= 1) { fs.isize = (@((?sb[88])::*u16))::u64; }
+    if (bpg == 0 || fs.ipg == 0) { ret 0; }
+    fs.groups = (fs.blocks - fs.first + bpg - 1) / bpg;
+    if (blockbuf == 0) {
+        blockbuf = efi.alloc_pages(16, 0);
+        if (blockbuf == 0) { ret 0; }
+    }
+    ret 1;
+}
+
+pub fun inode(fs: *Fs, ino: u64, out: *Inode) u8 {
+    if (ino == 0) { ret 0; }
+    val g: u64 = (ino - 1) / fs.ipg;
+    if (g >= fs.groups) { ret 0; }
+    var gd: [32]u8;
+    if (read(fs, (fs.first + 1) * fs.bsize + g * 32, 32, (?gd[0])::u64) == 0) { ret 0; }
+    val table: u64 = (@((?gd[8])::*u32))::u64;
+    var raw: [128]u8;
+    if (read(fs, table * fs.bsize + ((ino - 1) % fs.ipg) * fs.isize, 128, (?raw[0])::u64) == 0) { ret 0; }
+    out.mode = @((?raw[0])::*u16);
+    out.size = (@((?raw[4])::*u32))::u64;
+    if ((out.mode & 0xF000) == 0x8000) { out.size = out.size | ((@((?raw[108])::*u32))::u64 << 32); }
+    var i: u64 = 0;
+    for (i < 15) {
+        out.block[i] = @((?raw[40 + i * 4])::*u32);
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# entry `idx` of indirect block `b`
+fun slot(fs: *Fs, b: u64, idx: u64) u64 {
+    if (b == 0) { ret 0; }
+    var v: u32 = 0;
+    if (read(fs, b * fs.bsize + idx * 4, 4, (?v)::u64) == 0) { ret 0; }
+    ret v::u64;
+}
+
+# the disk block holding file block `n` (0: a hole)
+pub fun bmap(fs: *Fs, i: *Inode, n: u64) u64 {
+    val per: u64 = fs.bsize / 4;
+    if (n < 12) { ret i.block[n]::u64; }
+    var k: u64 = n - 12;
+    if (k < per) { ret slot(fs, i.block[12]::u64, k); }
+    k = k - per;
+    if (k < per * per) { ret slot(fs, slot(fs, i.block[13]::u64, k / per), k % per); }
+    k = k - per * per;
+    ret slot(fs, slot(fs, slot(fs, i.block[14]::u64, k / (per * per)), (k / per) % per), k % per);
+}
+
+# n bytes of the file at `off` into dst
+pub fun read_file(fs: *Fs, i: *Inode, off: u64, n: u64, dst: u64) u8 {
+    var done: u64 = 0;
+    for (done < n) {
+        val at: u64 = off + done;
+        val b: u64 = bmap(fs, i, at / fs.bsize);
+        var k: u64 = fs.bsize - at % fs.bsize;
+        if (k > n - done) { k = n - done; }
+        if (b == 0) { # a hole reads as zeros
+            var z: u64 = 0;
+            for (z < k) {
+                @((dst + done + z)::*u8) = 0;
+                z = z + 1;
+            }
+        } or {
+            # whole runs of consecutive blocks in one read
+            var run: u64 = k;
+            if (at % fs.bsize == 0) {
+                var next: u64 = 1;
+                for (run + fs.bsize <= n - done && run < 1048576 && bmap(fs, i, at / fs.bsize + next) == b + next) {
+                    run = run + fs.bsize;
+                    next = next + 1;
+                }
+            }
+            if (read(fs, b * fs.bsize + at % fs.bsize, run, dst + done) == 0) { ret 0; }
+            k = run;
+        }
+        done = done + k;
+    }
+    ret 1;
+}
+
+# the inode number of `name` (n bytes) in directory `dir`, or 0
+fun find(fs: *Fs, dir: *Inode, name: *u8, n: u64) u64 {
+    var off: u64 = 0;
+    for (off < dir.size) {
+        if (read_file(fs, dir, off, fs.bsize, blockbuf) == 0) { ret 0; }
+        var at: u64 = 0;
+        for (at + 8 <= fs.bsize) {
+            val ino: u64 = (@((blockbuf + at)::*u32))::u64;
+            val rec: u64 = (@((blockbuf + at + 4)::*u16))::u64;
+            val len: u64 = (@((blockbuf + at + 6)::*u8))::u64;
+            if (rec < 8) { brk; }
+            if (ino != 0 && len == n && disk.same((blockbuf + at + 8)::*u8, name, n) != 0) { ret ino; }
+            at = at + rec;
+        }
+        off = off + fs.bsize;
+    }
+    ret 0;
+}
+
+# the inode of an absolute path ("/boot/kernel.elf"), into out
+pub fun lookup(fs: *Fs, path: *u8, out: *Inode) u8 {
+    if (inode(fs, 2, out) == 0) { ret 0; }
+    var i: u64 = 0;
+    for (path[i] != 0) {
+        for (path[i] == 47) { i = i + 1; }
+        if (path[i] == 0) { brk; }
+        var e: u64 = i;
+        for (path[e] != 0 && path[e] != 47) { e = e + 1; }
+        if ((out.mode & 0xF000) != 0x4000) { ret 0; }
+        val ino: u64 = find(fs, out, ?path[i], e - i);
+        if (ino == 0 || inode(fs, ino, out) == 0) { ret 0; }
+        i = e;
+    }
+    ret 1;
+}

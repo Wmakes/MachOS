@@ -45,6 +45,31 @@ pub fun eoi() { lw(EOI, 0); }
 var calibrated: u8 = 1;
 var per_tick: u32 = 0;
 
+fun icr_wait() {
+    var spins: u64 = 0;
+    for ((lr(0x300) & (1 << 12)) != 0 && spins < 1000000) { spins = spins + 1; }
+}
+
+# INIT, then (after the caller waits) startup at page `page` (physical
+# address page * 4096): how a cpu that firmware left halted is started
+pub fun send_init(id: u32) {
+    icr_wait();
+    lw(0x310, id << 24);
+    lw(0x300, 0x4500); # INIT, assert
+    icr_wait();
+}
+
+pub fun send_sipi(id: u32, page: u64) {
+    icr_wait();
+    lw(0x310, id << 24);
+    lw(0x300, 0x4600 | (page & 0xFF)::u32); # startup
+    icr_wait();
+}
+
+# the processors the MADT lists
+pub fun cpu_count() u64 { ret madt.n_cpu; }
+pub fun cpu_id(i: u64) u32 { ret madt.cpu_ids[i]; }
+
 # send a fixed interrupt `vector` to the cpu with APIC id `id`
 pub fun send_ipi(id: u32, vector: u64) {
     var spins: u64 = 0;

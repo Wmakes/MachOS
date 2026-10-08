@@ -1,0 +1,341 @@
+# boot an entry: load the kernel's ELF segments, the initrd and the command
+# line, describe the machine in a Handoff (sdk/src/handoff.mach), build
+# page tables, leave the firmware's boot services and jump to the kernel
+
+use efi:   machboot.efi;
+use files: machboot.files;
+use conf:  machboot.conf;
+use ho:    sdk.handoff;
+
+val P: u64 = 1;
+val W: u64 = 2;
+val PS: u64 = 0x80;
+
+var pml4: u64 = 0;
+var why: *u8 = nil;   # what went wrong
+
+pub fun error() *u8 { ret why; }
+
+fun fail(w: *u8) u8 {
+    why = w;
+    ret 0;
+}
+
+# --- page tables ------------------------------------------------------------
+
+fun table(e: *u64) u64 {
+    if ((@e & P) == 0) {
+        val t: u64 = efi.alloc_pages(1, 0);
+        if (t == 0) { ret 0; }
+        @e = t | P | W;
+    }
+    ret @e & 0x000FFFFFFFFFF000;
+}
+
+fun entry(t: u64, i: u64) *u64 { ret (t + i * 8)::*u64; }
+
+# map the 2 MiB page at `va` to `pa`
+fun map_big(va: u64, pa: u64) u8 {
+    val pdpt: u64 = table(entry(pml4, (va >> 39) & 511));
+    if (pdpt == 0) { ret 0; }
+    val pd: u64 = table(entry(pdpt, (va >> 30) & 511));
+    if (pd == 0) { ret 0; }
+    @entry(pd, (va >> 21) & 511) = pa | P | W | PS;
+    ret 1;
+}
+
+fun map_page(va: u64, pa: u64) u8 {
+    val pdpt: u64 = table(entry(pml4, (va >> 39) & 511));
+    if (pdpt == 0) { ret 0; }
+    val pd: u64 = table(entry(pdpt, (va >> 30) & 511));
+    if (pd == 0) { ret 0; }
+    val pt: u64 = table(entry(pd, (va >> 21) & 511));
+    if (pt == 0) { ret 0; }
+    @entry(pt, (va >> 12) & 511) = pa | P | W;
+    ret 1;
+}
+
+# [0, top) one-to-one and at the direct map, in 2 MiB pages
+fun map_memory(top: u64) u8 {
+    var pa: u64 = 0;
+    for (pa < top) {
+        if (map_big(pa, pa) == 0 || map_big(ho.HHDM + pa, pa) == 0) { ret 0; }
+        pa = pa + 0x200000;
+    }
+    ret 1;
+}
+
+# --- the kernel -------------------------------------------------------------
+
+var kentry: u64 = 0;
+
+# load the ELF file at `f` (len bytes): every PT_LOAD into one run of pages,
+# mapped at its link address
+fun load_kernel(f: u64, len: u64, h: *ho.Handoff) u8 {
+    if (len < 64 || @(f::*u32) != 0x464C457F) { ret fail("the kernel is not an ELF file\0"); }
+    if (@((f + 4)::*u8) != 2 || @((f + 18)::*u16) != 0x3E) { ret fail("the kernel is not a 64-bit x86 ELF file\0"); }
+    kentry = @((f + 24)::*u64);
+    val phoff: u64 = @((f + 32)::*u64);
+    val phsize: u64 = (@((f + 54)::*u16))::u64;
+    val phnum: u64 = (@((f + 56)::*u16))::u64;
+    var lo: u64 = 0xFFFFFFFFFFFFFFFF;
+    var hi: u64 = 0;
+    var i: u64 = 0;
+    for (i < phnum) {
+        val ph: u64 = f + phoff + i * phsize;
+        if (@(ph::*u32) == 1) { # PT_LOAD
+            val va: u64 = @((ph + 16)::*u64);
+            val msz: u64 = @((ph + 40)::*u64);
+            if (va < lo) { lo = va; }
+            if (va + msz > hi) { hi = va + msz; }
+        }
+        i = i + 1;
+    }
+    if (hi <= lo) { ret fail("the kernel has nothing to load\0"); }
+    lo = lo & ~0xFFF::u64;
+    hi = (hi + 0xFFF) & ~0xFFF::u64;
+    val pages: u64 = (hi - lo) / 4096;
+    val base: u64 = efi.alloc_pages(pages, 0);
+    if (base == 0) { ret fail("no memory for the kernel\0"); }
+    i = 0;
+    for (i < phnum) {
+        val ph: u64 = f + phoff + i * phsize;
+        if (@(ph::*u32) == 1) {
+            val off: u64 = @((ph + 8)::*u64);
+            val va: u64 = @((ph + 16)::*u64);
+            val fsz: u64 = @((ph + 32)::*u64);
+            if (off + fsz > len) { ret fail("the kernel file is cut short\0"); }
+            var k: u64 = 0;
+            for (k < fsz) {
+                @((base + va - lo + k)::*u8) = @((f + off + k)::*u8);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    var p: u64 = 0;
+    for (p < pages) {
+        if (map_page(lo + p * 4096, base + p * 4096) == 0) { ret fail("no memory for page tables\0"); }
+        p = p + 1;
+    }
+    h.kphys = base;
+    h.kvirt = lo;
+    h.kfile = f;
+    h.kfile_len = len;
+    ret 1;
+}
+
+# --- the machine ------------------------------------------------------------
+
+fun shift_of(mask: u32) u64 {
+    var s: u64 = 0;
+    for (s < 32 && ((mask >> s::u32) & 1) == 0) { s = s + 1; }
+    ret s;
+}
+
+fun framebuffer(h: *ho.Handoff) {
+    var g: efi.Guid;
+    efi.gop_guid(?g);
+    var gp: u64 = 0;
+    if (efi.failed(efi.bs.locate_protocol(?g, 0, ?gp)) != 0 || gp == 0) { ret; }
+    val gop: *efi.Gop = gp::*efi.Gop;
+    val m: *efi.GopMode = gop.mode;
+    val info: *efi.GopInfo = m.info;
+    if (info.format > 2 || m.fb_base == 0) { ret; }
+    h.fb_addr = m.fb_base;
+    h.fb_width = info.width::u64;
+    h.fb_height = info.height::u64;
+    h.fb_pitch = info.stride::u64 * 4;
+    h.fb_bpp = 32;
+    if (info.format == 0) { h.fb_r_shift = 0; h.fb_g_shift = 8; h.fb_b_shift = 16; }
+    or (info.format == 1) { h.fb_r_shift = 16; h.fb_g_shift = 8; h.fb_b_shift = 0; }
+    or {
+        h.fb_r_shift = shift_of(info.masks[0]);
+        h.fb_g_shift = shift_of(info.masks[1]);
+        h.fb_b_shift = shift_of(info.masks[2]);
+    }
+}
+
+fun acpi(h: *ho.Handoff) {
+    var g2: efi.Guid;
+    var g1: efi.Guid;
+    efi.acpi2_guid(?g2);
+    efi.acpi1_guid(?g1);
+    var i: u64 = 0;
+    for (i < efi.st.n_tables) {
+        val t: *efi.ConfigTable = ?efi.st.tables[i];
+        if (efi.same_guid(?t.guid, ?g2) != 0) {
+            h.rsdp = t.table;
+            ret;
+        }
+        if (efi.same_guid(?t.guid, ?g1) != 0) { h.rsdp = t.table; }
+        i = i + 1;
+    }
+}
+
+# --- the memory map ---------------------------------------------------------
+
+var map: u64 = 0;
+var map_cap: u64 = 0;
+var map_size: u64 = 0;
+var map_key: u64 = 0;
+var desc_size: u64 = 0;
+
+fun get_map() u8 {
+    map_size = map_cap;
+    var ver: u32 = 0;
+    ret (efi.failed(efi.bs.get_memory_map(?map_size, map, ?map_key, ?desc_size, ?ver)) == 0)::u8;
+}
+
+fun kind_of(t: u32) u64 {
+    if (t == 7 || t == 3 || t == 4) { ret ho.KIND_USABLE; }
+    if (t == 1) { ret ho.KIND_RECLAIMABLE; }
+    if (t == 2) { ret ho.KIND_KERNEL; }
+    if (t == 9) { ret ho.KIND_ACPI; }
+    ret ho.KIND_RESERVED;
+}
+
+# the highest address of memory (and the framebuffer)
+fun top(h: *ho.Handoff) u64 {
+    var hi: u64 = 0x100000000; # always at least the first 4 GiB
+    var off: u64 = 0;
+    for (off + desc_size <= map_size) {
+        val d: u64 = map + off;
+        val end: u64 = @((d + 8)::*u64) + @((d + 24)::*u64) * 4096;
+        if (end > hi) { hi = end; }
+        off = off + desc_size;
+    }
+    if (h.fb_addr + h.fb_pitch * h.fb_height > hi) { hi = h.fb_addr + h.fb_pitch * h.fb_height; }
+    ret (hi + 0x3FFFFFFF) & ~0x3FFFFFFF::u64;
+}
+
+# the firmware's map into the Handoff's regions: sorted, merged, the
+# framebuffer added. allocates nothing (it runs between the last map and
+# ExitBootServices)
+fun convert(h: *ho.Handoff) {
+    val r: *ho.Region = h.regions::*ho.Region;
+    var n: u64 = 0;
+    var off: u64 = 0;
+    for (off + desc_size <= map_size && n < ho.MAX_REGIONS - 1) {
+        val d: u64 = map + off;
+        r[n].base = @((d + 8)::*u64);
+        r[n].len = @((d + 24)::*u64) * 4096;
+        r[n].kind = kind_of(@(d::*u32));
+        n = n + 1;
+        off = off + desc_size;
+    }
+    if (h.fb_addr != 0) {
+        r[n].base = h.fb_addr;
+        r[n].len = h.fb_pitch * h.fb_height;
+        r[n].kind = ho.KIND_FRAMEBUFFER;
+        n = n + 1;
+    }
+    # by address (insertion sort: the firmware's map is nearly sorted)
+    var i: u64 = 1;
+    for (i < n) {
+        var j: u64 = i;
+        for (j > 0 && r[j].base < r[j - 1].base) {
+            val t: ho.Region = r[j];
+            r[j] = r[j - 1];
+            r[j - 1] = t;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    # neighbours of the same kind become one
+    var m: u64 = 0;
+    i = 0;
+    for (i < n) {
+        if (m > 0 && r[m - 1].kind == r[i].kind && r[m - 1].base + r[m - 1].len == r[i].base) {
+            r[m - 1].len = r[m - 1].len + r[i].len;
+        } or {
+            r[m] = r[i];
+            m = m + 1;
+        }
+        i = i + 1;
+    }
+    h.nregions = m;
+}
+
+# --- booting ----------------------------------------------------------------
+
+fun copy_str(dst: u64, s: *u8, n: u64) {
+    var i: u64 = 0;
+    for (i < n) {
+        @((dst + i)::*u8) = s[i];
+        i = i + 1;
+    }
+    @((dst + n)::*u8) = 0;
+}
+
+# boot entry `e`; returns only if that failed (then error() says why)
+pub fun boot(e: *conf.Entry) u8 {
+    why = nil;
+    val hp: u64 = efi.alloc_pages(1, 0);
+    pml4 = efi.alloc_pages(1, 0);
+    if (hp == 0 || pml4 == 0) { ret fail("out of memory\0"); }
+    val h: *ho.Handoff = hp::*ho.Handoff;
+    h.magic = ho.MAGIC;
+    h.version = ho.VERSION;
+    h.hhdm = ho.HHDM;
+    copy_str((?h.loader[0])::u64, "machboot 0.8.0\0", 14);
+
+    var kf: u64 = 0;
+    var kl: u64 = 0;
+    if (files.load(?e.kernel[0], ?kf, ?kl, 0) == 0) { ret fail("cannot read the kernel\0"); }
+    if (load_kernel(kf, kl, h) == 0) { ret 0; }
+    if (e.initrd[0] != 0) {
+        var ia: u64 = 0;
+        var il: u64 = 0;
+        if (files.load(?e.initrd[0], ?ia, ?il, 0) != 0) {
+            h.initrd = ia;
+            h.initrd_len = il;
+        }
+    }
+    val cl: u64 = efi.alloc_pages(1, 0);
+    if (cl == 0) { ret fail("out of memory\0"); }
+    copy_str(cl, ?e.cmdline[0], e.cmdline_len);
+    h.cmdline = cl;
+    if (files.on_root != 0) {
+        var k: u64 = 0;
+        for (k < 16) {
+            h.root_guid[k] = files.root.unique[k];
+            k = k + 1;
+        }
+    }
+    framebuffer(h);
+    acpi(h);
+    h.trampoline = efi.alloc_pages(4, 0x9F000); # below 640 KiB, for starting cpus
+    h.regions = efi.alloc_pages((ho.MAX_REGIONS * 24 + 4095) / 4096, 0);
+    if (h.regions == 0) { ret fail("out of memory\0"); }
+
+    # the memory map, once to size the page tables, then for real
+    map_cap = 64 * 4096;
+    map = efi.alloc_pages(64, 0);
+    if (map == 0 || get_map() == 0) { ret fail("cannot read the memory map\0"); }
+    if (map_memory(top(h)) == 0) { ret fail("no memory for page tables\0"); }
+
+    # from here on nothing may allocate: the map must stay as read
+    var tries: u64 = 0;
+    for (tries < 8) {
+        if (get_map() == 0) { ret fail("cannot read the memory map\0"); }
+        convert(h);
+        if (efi.failed(efi.bs.exit_boot_services(efi.image, map_key)) == 0) { brk; }
+        tries = tries + 1;
+    }
+    if (tries == 8) { ret fail("the firmware would not let go\0"); }
+    jump(pml4, hp, kentry);
+    ret 0;
+}
+
+# into the kernel: interrupts off, our page tables, rdi = the Handoff
+fun jump(tables: u64, handoff: u64, entry_va: u64) {
+    asm x86_64 {
+        cli
+        mov rax, {tables}
+        mov cr3, rax
+        mov rdi, {handoff}
+        mov rax, {entry_va}
+        jmp rax
+    }
+}

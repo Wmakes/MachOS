@@ -1,5 +1,5 @@
 # gpt DISK: replace DISK's partition table (e.g. /dev/sdb) with the MachOS layout
-#   1  EFI system partition, 64 MiB (FAT32, for the firmware and Limine)
+#   1  EFI system partition, 64 MiB (FAT32, for the firmware and machboot)
 #   2  MachOS root, the rest of the disk up to 32 GiB (ext2)
 # writes a protective MBR, the primary GPT, and the backup GPT at the end
 

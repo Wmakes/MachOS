@@ -1,0 +1,123 @@
+# /boot/machboot.conf:
+#
+#   # comments start with #
+#   timeout 3            seconds the menu waits (0: boot at once)
+#   default 1            the entry it boots (1 is the first)
+#
+#   entry MachOS
+#       kernel  /boot/kernel.elf
+#       initrd  /boot/initrd.tar
+#       cmdline quiet
+#
+# MachOS's `machboot` command edits this file
+
+pub val MAX: u64 = 16;
+
+pub rec Entry {
+    name:        [64]u8;
+    name_len:    u64;
+    kernel:      [128]u8;  # NUL-terminated
+    initrd:      [128]u8;  # "" for none
+    cmdline:     [256]u8;
+    cmdline_len: u64;
+}
+
+pub var entries: [16]Entry;
+pub var count: u64 = 0;
+pub var timeout: u64 = 3;
+pub var default: u64 = 0;   # 0-based
+
+fun space(c: u8) u8 { ret (c == 32 || c == 9)::u8; }
+
+fun word_is(p: *u8, n: u64, w: *u8) u8 {
+    var i: u64 = 0;
+    for (w[i] != 0) {
+        if (i >= n || p[i] != w[i]) { ret 0; }
+        i = i + 1;
+    }
+    ret (i == n)::u8;
+}
+
+fun number(p: *u8, n: u64) u64 {
+    var v: u64 = 0;
+    var i: u64 = 0;
+    for (i < n && p[i] >= 48 && p[i] <= 57) {
+        v = v * 10 + (p[i] - 48)::u64;
+        i = i + 1;
+    }
+    ret v;
+}
+
+fun copy(dst: *u8, cap: u64, src: *u8, n: u64) u64 {
+    var k: u64 = n;
+    if (k > cap - 1) { k = cap - 1; }
+    var i: u64 = 0;
+    for (i < k) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    dst[k] = 0;
+    ret k;
+}
+
+# the built-in entry when there is no config file: MachOS from /boot
+pub fun fallback() {
+    count = 1;
+    val e: *Entry = ?entries[0];
+    e.name_len = copy(?e.name[0], 64, "MachOS\0", 6);
+    copy(?e.kernel[0], 128, "/boot/kernel.elf\0", 16);
+    copy(?e.initrd[0], 128, "/boot/initrd.tar\0", 16);
+    e.cmdline_len = 0;
+    e.cmdline[0] = 0;
+}
+
+pub fun parse(text: *u8, n: u64) {
+    count = 0;
+    var i: u64 = 0;
+    for (i < n) {
+        var e: u64 = i;
+        for (e < n && text[e] != 10) { e = e + 1; }
+        var s: u64 = i;
+        for (s < e && space(text[s]) != 0) { s = s + 1; }
+        var end: u64 = e;
+        for (end > s && (space(text[end - 1]) != 0 || text[end - 1] == 13)) { end = end - 1; }
+        if (s < end && text[s] != 35) {
+            var k: u64 = s;
+            for (k < end && space(text[k]) == 0) { k = k + 1; }
+            val key: *u8 = ?text[s];
+            val kn: u64 = k - s;
+            for (k < end && space(text[k]) != 0) { k = k + 1; }
+            val val_p: *u8 = ?text[k];
+            val vn: u64 = end - k;
+            if (word_is(key, kn, "timeout\0") != 0) { timeout = number(val_p, vn); }
+            or (word_is(key, kn, "default\0") != 0) {
+                val d: u64 = number(val_p, vn);
+                if (d > 0) { default = d - 1; }
+            } or (word_is(key, kn, "entry\0") != 0) {
+                if (count < MAX) {
+                    val en: *Entry = ?entries[count];
+                    en.name_len = copy(?en.name[0], 64, val_p, vn);
+                    en.kernel[0] = 0;
+                    en.initrd[0] = 0;
+                    en.cmdline[0] = 0;
+                    en.cmdline_len = 0;
+                    count = count + 1;
+                }
+            } or (count > 0) {
+                val en: *Entry = ?entries[count - 1];
+                if (word_is(key, kn, "kernel\0") != 0) { copy(?en.kernel[0], 128, val_p, vn); }
+                or (word_is(key, kn, "initrd\0") != 0) { copy(?en.initrd[0], 128, val_p, vn); }
+                or (word_is(key, kn, "cmdline\0") != 0) { en.cmdline_len = copy(?en.cmdline[0], 256, val_p, vn); }
+            }
+        }
+        i = e + 1;
+    }
+    # an entry without a kernel boots the usual one
+    var j: u64 = 0;
+    for (j < count) {
+        if (entries[j].kernel[0] == 0) { copy(?entries[j].kernel[0], 128, "/boot/kernel.elf\0", 16); }
+        j = j + 1;
+    }
+    if (count == 0) { fallback(); }
+    if (default >= count) { default = 0; }
+}

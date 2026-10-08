@@ -9,6 +9,7 @@ pub val MAX: u64 = 32;
 pub rec Entry {
     index: u64; # 1-based position in the table: sdX<index>
     kind:  [16]u8;
+    unique: [16]u8; # the partition's own GUID
     first: u64;
     count: u64;
 }
@@ -49,6 +50,7 @@ pub fun scan(d: *dsk.Disk, out: *Entry) u64 {
                     val o: *Entry = ?out[n];
                     o.index = i + 1;
                     mem.copy((?o.kind[0])::u64, e, 16);
+                    mem.copy((?o.unique[0])::u64, e + 16, 16);
                     o.first = first;
                     o.count = last - first + 1;
                     n = n + 1;
