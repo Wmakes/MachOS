@@ -65,7 +65,8 @@ pub val ACCESS:  u64 = 58; # (path, path_len, R_OK|W_OK|X_OK)      with the real
 pub val MMAP:    u64 = 59; # (addr, len, prot | flags << 8, handle, offset) -> the address
 pub val MUNMAP:  u64 = 60; # (addr, len)
 pub val MPROTECT: u64 = 61; # (addr, len, prot)
-pub val KLOG:    u64 = 62; # (buf, len)                           -> bytes: the kernel's messages
+pub val KLOG:    u64 = 62; # (buf, len, since, flags)             -> bytes: the kernel's log from line
+                           # `since` on, one line each: "<level>seq,microseconds;text\n" (flags 1: clear it, root)
 pub val COUNT:   u64 = 63;
 
 # mmap: what the pages allow, and what kind of mapping. anonymous pages

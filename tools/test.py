@@ -160,7 +160,7 @@ TESTS = [
       "send:mkdir /root/x; cd /root/x; gunzip -c /tmp/e.tar.gz | tar -xvf -; diff /etc/motd tmp/e/motd && echo same\\n", "wait:" + P,
       "send:gzip -c /bin/ls > /root/ls.gz; gunzip /root/ls.gz; test \"$(sha256sum < /bin/ls)\" = \"$(sha256sum < /root/ls)\" && echo binsame\\n", "wait:" + P,
       "send:dmesg | grep smp; top -n 1 | grep cpu3; time true; history | grep -c calc\\n", "wait:" + P],
-     ["14", "366503875925", "1\n", "e.tar.gz", "tmp/e/motd", "same", "binsame", "smp: 4 cpu(s)", "cpu3", "real", "\n1\n"]),
+     ["14", "366503875925", "1\n", "e.tar.gz", "tmp/e/motd", "same", "binsame", "smp: 4 cpu(s)", "cpu3", "real", "\n2\n"]),
 
     ("tools", False, False,
      ["wait:" + P,

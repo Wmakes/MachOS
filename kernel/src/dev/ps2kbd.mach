@@ -15,6 +15,8 @@ var extended: u8 = 0;
 
 var present: u8 = 0;
 
+pub fun present_now() u8 { ret present; }
+
 # a byte waiting? never true without a controller (its status reads 0xFF)
 fun waiting() u8 {
     val st: u8 = cpu.inb(0x64);

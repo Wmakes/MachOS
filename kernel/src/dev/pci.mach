@@ -1,6 +1,7 @@
 # PCI: find devices through the legacy configuration ports 0xCF8/0xCFC
 
 use cpu: machos.arch.x86_64.cpu;
+use kprint: machos.kern.kprint;
 
 pub val MAX: u64 = 64;
 
@@ -79,6 +80,112 @@ pub fun scan() u64 {
         bus = bus + 1;
     }
     ret count;
+}
+
+# what a class/subclass/prog-if is, in words
+pub fun class_name(c: u8, sc: u8, pi: u8) *u8 {
+    if (c == 0x01) {
+        if (sc == 0x06 && pi == 0x01) { ret "SATA controller (AHCI)\0"; }
+        if (sc == 0x06) { ret "SATA controller\0"; }
+        if (sc == 0x08 && pi == 0x02) { ret "NVMe controller\0"; }
+        if (sc == 0x01) { ret "IDE controller\0"; }
+        if (sc == 0x00) { ret "SCSI controller\0"; }
+        ret "storage controller\0";
+    }
+    if (c == 0x02) {
+        if (sc == 0x00) { ret "Ethernet controller\0"; }
+        if (sc == 0x80) { ret "network controller (wireless?)\0"; }
+        ret "network controller\0";
+    }
+    if (c == 0x03) {
+        if (sc == 0x00) { ret "VGA compatible display\0"; }
+        ret "display controller\0";
+    }
+    if (c == 0x04) {
+        if (sc == 0x03) { ret "audio device (HD Audio)\0"; }
+        ret "multimedia device\0";
+    }
+    if (c == 0x06) {
+        if (sc == 0x00) { ret "host bridge\0"; }
+        if (sc == 0x01) { ret "ISA bridge\0"; }
+        if (sc == 0x04) { ret "PCI bridge\0"; }
+        ret "bridge\0";
+    }
+    if (c == 0x0C) {
+        if (sc == 0x03 && pi == 0x30) { ret "USB controller (xHCI)\0"; }
+        if (sc == 0x03 && pi == 0x20) { ret "USB controller (EHCI)\0"; }
+        if (sc == 0x03 && pi == 0x10) { ret "USB controller (OHCI)\0"; }
+        if (sc == 0x03 && pi == 0x00) { ret "USB controller (UHCI)\0"; }
+        if (sc == 0x05) { ret "SMBus controller\0"; }
+        ret "serial bus controller\0";
+    }
+    if (c == 0x08) { ret "system peripheral\0"; }
+    if (c == 0x07) { ret "communication controller\0"; }
+    if (c == 0x05) { ret "memory controller\0"; }
+    if (c == 0x0D) { ret "wireless controller\0"; }
+    ret "device\0";
+}
+
+fun vendor_name(v: u16) *u8 {
+    if (v == 0x8086) { ret "Intel\0"; }
+    if (v == 0x1022) { ret "AMD\0"; }
+    if (v == 0x10DE) { ret "NVIDIA\0"; }
+    if (v == 0x1B36) { ret "Red Hat (QEMU)\0"; }
+    if (v == 0x1234) { ret "QEMU\0"; }
+    if (v == 0x1AF4) { ret "Red Hat (virtio)\0"; }
+    if (v == 0x144D) { ret "Samsung\0"; }
+    if (v == 0x10EC) { ret "Realtek\0"; }
+    if (v == 0x14E4) { ret "Broadcom\0"; }
+    if (v == 0x1B21) { ret "ASMedia\0"; }
+    if (v == 0x1912) { ret "Renesas\0"; }
+    if (v == 0x15B7) { ret "SanDisk/WD\0"; }
+    if (v == 0x1C5C) { ret "SK hynix\0"; }
+    if (v == 0x126F) { ret "Silicon Motion\0"; }
+    if (v == 0x8087) { ret "Intel\0"; }
+    ret nil;
+}
+
+fun hex2(v: u64) {
+    val d: *u8 = "0123456789abcdef\0";
+    kprint.putc(d[(v >> 4) & 15]);
+    kprint.putc(d[v & 15]);
+}
+
+fun hex4(v: u64) {
+    hex2(v >> 8);
+    hex2(v & 0xFF);
+}
+
+# one line per function: bus:slot.func, vendor:device, what it is
+pub fun report() {
+    var i: u64 = 0;
+    for (i < count) {
+        val d: *Device = ?devices[i];
+        kprint.level(kprint.INFO);
+        kprint.puts("pci \0");
+        hex2(d.bus::u64);
+        kprint.putc(58);
+        hex2(d.slot::u64);
+        kprint.putc(46);
+        kprint.putc(48 + d.func);
+        kprint.puts(": [\0");
+        hex4(d.vendor::u64);
+        kprint.putc(58);
+        hex4(d.device::u64);
+        kprint.puts("] \0");
+        val vn: *u8 = vendor_name(d.vendor);
+        if (vn != nil) {
+            kprint.puts(vn);
+            kprint.putc(32);
+        }
+        kprint.puts(class_name(d.class, d.subclass, d.progif));
+        kprint.puts(" (class \0");
+        hex2(d.class::u64);
+        hex2(d.subclass::u64);
+        hex2(d.progif::u64);
+        kprint.puts(")\n\0");
+        i = i + 1;
+    }
 }
 
 pub fun device_count() u64 { ret count; }

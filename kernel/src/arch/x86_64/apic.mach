@@ -3,6 +3,7 @@
 use acpi: machos.acpi.acpi;
 use cpu:  machos.arch.x86_64.cpu;
 use vmm:  machos.mm.vmm;
+use kprint: machos.kern.kprint;
 
 pub val TIMER_VECTOR:    u64 = 48;
 pub val IRQ_BASE:        u64 = 32; # legacy irq n arrives on vector 32 + n
@@ -52,6 +53,57 @@ pub fun send_ipi(id: u32, vector: u64) {
     lw(0x300, vector::u32 | (1 << 14)); # fixed, assert
 }
 
+# what was found and set up, for the boot log
+pub fun report() {
+    kprint.info("apic\0");
+    kprint.puts("local APIC at \0");
+    kprint.hex(madt.lapic);
+    kprint.puts(" (id \0");
+    kprint.dec(id()::u64);
+    kprint.puts("), I/O APIC at \0");
+    kprint.hex(madt.ioapic);
+    kprint.puts(" with \0");
+    kprint.dec((((ior(1) >> 16) & 0xFF) + 1)::u64);
+    kprint.puts(" inputs from GSI \0");
+    kprint.dec(ioapic_gsi::u64);
+    kprint.putc(10);
+    var i: u64 = 0;
+    for (i < madt.n_override) {
+        kprint.debug("apic\0");
+        kprint.puts("irq \0");
+        kprint.dec(madt.overrides[i].irq::u64);
+        kprint.puts(" -> gsi \0");
+        kprint.dec(madt.overrides[i].gsi::u64);
+        kprint.puts(", flags \0");
+        kprint.hex(madt.overrides[i].flags::u64);
+        kprint.putc(10);
+        i = i + 1;
+    }
+    if (calibrated == 0) {
+        kprint.warn("apic\0");
+        kprint.puts("no PIT to calibrate against, timer speed is a guess\n\0");
+    }
+    kprint.info("apic\0");
+    kprint.puts("timer at \0");
+    kprint.dec(HZ);
+    kprint.puts(" Hz (\0");
+    kprint.dec(per_tick::u64);
+    kprint.puts(" counts per tick, bus ~\0");
+    kprint.dec(per_tick::u64 * HZ * 16 / 1000000);
+    kprint.puts(" MHz)\n\0");
+    kprint.info("tsc\0");
+    val hz: u64 = cpu.tsc_hz();
+    kprint.dec(hz / 1000000);
+    kprint.putc(46);
+    val khz: u64 = (hz / 1000) % 1000;
+    if (khz < 100) { kprint.putc(48); }
+    if (khz < 10) { kprint.putc(48); }
+    kprint.dec(khz);
+    kprint.puts(" MHz\0");
+    if (calibrated != 0) { kprint.puts(" (measured against the PIT)\0"); }
+    kprint.putc(10);
+}
+
 # this cpu's local APIC id
 pub fun id() u32 { ret lr(ID) >> 24; }
 
@@ -81,14 +133,21 @@ fun calibrate() u32 {
     cpu.outb(0x61, g | 1);
     lw(DIVIDE, 3);
     lw(INIT, 0xFFFFFFFF);
+    val t0: u64 = cpu.rdtsc();
     var spins: u64 = 0;
     for ((cpu.inb(0x61) & 0x20) == 0 && spins < 5000000) { spins = spins + 1; }
     val left: u32 = lr(CURRENT);
+    val t1: u64 = cpu.rdtsc();
     lw(INIT, 0);
     if (spins == 5000000) {
         calibrated = 0;
+        # the time-stamp counter's rate from cpuid, or a typical one
+        var hz: u64 = cpu.tsc_hz_from_cpuid();
+        if (hz == 0) { hz = 2000000000; }
+        cpu.set_tsc_hz(hz);
         ret 62500; # 100 MHz bus / 16, per 10 ms
     }
+    cpu.set_tsc_hz((t1 - t0) * 100); # counts in the same 10 ms
     ret 0xFFFFFFFF - left;
 }
 

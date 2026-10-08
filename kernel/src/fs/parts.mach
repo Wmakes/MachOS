@@ -10,6 +10,7 @@ use dsk:  machos.dev.disk;
 use mem:  machos.kern.mem;
 use gpt:  machos.fs.gpt;
 use vfs:  machos.fs.vfs;
+use kprint: machos.kern.kprint;
 
 pub val MAX: u64 = 64;
 
@@ -68,13 +69,50 @@ fun add(disk: u64, part: u64, start: u64, count: u64, kind: *u8) *Bdev {
     ret nil;
 }
 
+val ESP_TYPE: [16]u8 = [16]u8{0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11,
+                              0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b};
+val LINUX_TYPE: [16]u8 = [16]u8{0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47,
+                                0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4};
+
+fun type_name(k: *u8) *u8 {
+    if (mem.equal(k, ?gpt.ROOT_TYPE[0], 16) != 0) { ret "MachOS root\0"; }
+    if (mem.equal(k, ?ESP_TYPE[0], 16) != 0) { ret "EFI system\0"; }
+    if (mem.equal(k, ?LINUX_TYPE[0], 16) != 0) { ret "Linux filesystem\0"; }
+    ret "other\0";
+}
+
 fun add_partitions(disk: u64) {
     var entries: [32]gpt.Entry;
-    val n: u64 = gpt.scan(dsk.disk(disk), ?entries[0]);
+    val d: *dsk.Disk = dsk.disk(disk);
+    val n: u64 = gpt.scan(d, ?entries[0]);
+    kprint.info("gpt\0");
+    kprint.puts(?d.name[0]);
+    if (n == 0) { kprint.puts(": no GPT partition table\n\0"); }
+    or {
+        kprint.puts(": \0");
+        kprint.dec(n);
+        kprint.puts(" partition(s)\n\0");
+    }
     var i: u64 = 0;
     for (i < n && i < 99) {
         val e: *gpt.Entry = ?entries[i];
         add(disk, e.index, e.first, e.count, ?e.kind[0]);
+        var pn: [24]u8;
+        val l: u64 = dsk.part_name(d, e.index, ?pn[0]);
+        kprint.info("gpt\0");
+        kprint.puts("  \0");
+        var k: u64 = 0;
+        for (k < l) {
+            kprint.putc(pn[k]);
+            k = k + 1;
+        }
+        kprint.puts(": \0");
+        kprint.puts(type_name(?e.kind[0]));
+        kprint.puts(", \0");
+        kprint.dec(e.count / 2048);
+        kprint.puts(" MiB from sector \0");
+        kprint.dec(e.first);
+        kprint.putc(10);
         i = i + 1;
     }
 }

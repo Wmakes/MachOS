@@ -42,54 +42,81 @@ var boot_stack: [65536]u8;
 
 #[symbol("kmain")]
 fun kmain() {
+    cpu.tsc_begin();
     serial.init();
     cpu.pic_disable();
     cpu.init();
     val err: *u8 = limine.collect(?boot);
     if (err != nil) { kprint.panic(err); }
     val have_fb: u8 = fbcon.init(?boot.fb);
+    console_level_from_cmdline();
 
+    kprint.level(kprint.NOTICE);
     kprint.puts("MachOS \0");
     kprint.puts(version.VERSION);
-    kprint.putc(10);
+    kprint.puts(" (x86_64), kernel written in mach\n\0");
+    kprint.info("boot\0");
+    kprint.puts("command line: '\0");
+    if (boot.cmdline != nil) { kprint.puts(boot.cmdline); }
+    kprint.puts("'\n\0");
+    kprint.info("boot\0");
+    kprint.puts("kernel at \0");
+    kprint.hex(boot.kphys);
+    kprint.puts(" (virtual \0");
+    kprint.hex(boot.kvirt);
+    kprint.puts("), image \0");
+    kprint.dec(boot.kelf_len / 1024);
+    kprint.puts(" KiB, initrd \0");
+    kprint.dec(boot.initrd_len / 1024);
+    kprint.puts(" KiB\n\0");
     if (have_fb != 0) {
-        kprint.puts("fb: \0");
+        kprint.info("fb\0");
         kprint.dec(boot.fb.width);
         kprint.putc(120);
         kprint.dec(boot.fb.height);
+        kprint.puts(" at \0");
+        kprint.dec(boot.fb.bpp::u64);
+        kprint.puts(" bpp, pitch \0");
+        kprint.dec(boot.fb.pitch);
         kprint.puts(", \0");
         kprint.dec(fbcon.cols_of());
         kprint.putc(120);
         kprint.dec(fbcon.rows_of());
-        kprint.puts(" text\n\0");
+        kprint.puts(" text, 6 terminals\n\0");
     } or {
-        kprint.puts("fb: none, serial only\n\0");
+        kprint.warn("fb\0");
+        kprint.puts("none, serial only\n\0");
     }
-    kprint.puts("boot: \0");
-    kprint.dec(boot.mem_len);
-    kprint.puts(" memory regions, hhdm \0");
-    kprint.hex(boot.hhdm);
-    kprint.puts("  rsdp \0");
-    kprint.hex(boot.rsdp);
-    kprint.putc(10);
+    memory_map();
+    cpu_report();
 
     gdt.init();
     idt.init();
-    kprint.puts("gdt, tss, idt loaded\n\0");
+    kprint.info("cpu\0");
+    kprint.puts("GDT, TSS and IDT loaded (double faults on their own stack)\n\0");
 
     pmm.init(?boot);
     val verr: *u8 = vmm.init(?boot);
     if (verr != nil) { kprint.panic(verr); }
-    kprint.puts("vmm: own page tables live\n\0");
-    kprint.puts("cpu: \0");
+    kprint.info("vmm\0");
+    kprint.puts("own page tables live, hhdm at \0");
+    kprint.hex(boot.hhdm);
+    kprint.putc(10);
+    kprint.info("cpu\0");
+    kprint.puts("protection: \0");
     if (cpu.has_smep() != 0) { kprint.puts("smep \0"); }
     if (cpu.has_smap() != 0) { kprint.puts("smap \0"); }
     if (cpu.has_umip() != 0) { kprint.puts("umip \0"); }
-    if (cpu.has_smep() == 0 && cpu.has_smap() == 0) { kprint.puts("no smep/smap on this cpu\0"); }
-    kprint.putc(10);
-    kprint.puts("pmm: \0");
+    kprint.puts("nx wp\n\0");
+    if (cpu.has_smep() == 0 && cpu.has_smap() == 0) {
+        kprint.warn("cpu\0");
+        kprint.puts("no SMEP/SMAP on this cpu: the kernel is less protected from user memory\n\0");
+    }
+    kprint.info("pmm\0");
     kprint.dec(pmm.free_pages() * pmm.PAGE / 1024 / 1024);
-    kprint.puts(" MiB free\n\0");
+    kprint.puts(" MiB free of \0");
+    kprint.dec(pmm.total_pages() * pmm.PAGE / 1024 / 1024);
+    kprint.puts(" MiB usable\n\0");
 
     val a: u64 = pmm.alloc();
     val b: u64 = pmm.alloc();
@@ -110,10 +137,12 @@ fun kmain() {
     heap.free(h4);
     heap.free(h3);
     if (heap.used() != 0) { kprint.panic("heap leaked\0"); }
-    kprint.puts("heap: ok, \0");
+    kprint.info("heap\0");
+    kprint.puts("self-test passed, \0");
     kprint.dec(heap.mapped() / 1024);
     kprint.puts(" KiB mapped\n\0");
 
+    acpi.report(boot.rsdp);
     val aerr: *u8 = apic.init(boot.rsdp);
     if (aerr != nil) { kprint.panic(aerr); }
     smp.set_first(apic.id());
@@ -121,18 +150,21 @@ fun kmain() {
     if (kbd.init() != 0) { apic.route(1, apic.IRQ_BASE + 1); }
     serial.enable_rx();
     apic.route(4, apic.IRQ_BASE + 4);
-    kprint.puts("apic: timer at \0");
-    kprint.dec(apic.HZ);
-    kprint.puts(" Hz, keyboard and serial input routed\n\0");
-    if (apic.timer_calibrated() == 0) { kprint.puts("apic: no PIT to calibrate against, timer speed is a guess\n\0"); }
+    apic.report();
+    kprint.info("input\0");
+    if (kbd.present_now() != 0) { kprint.puts("PS/2 keyboard controller found, irq 1 routed\n\0"); }
+    or { kprint.puts("no PS/2 controller (USB keyboards only)\n\0"); }
+    kprint.info("serial\0");
+    kprint.puts("COM1 at 115200 baud, irq 4 routed (mirrors tty1)\n\0");
 
     syscall.init();
     clock.init();
     acpi.init_power(boot.rsdp);
 
-    kprint.puts("pci: \0");
+    kprint.info("pci\0");
     kprint.dec(pci.scan());
-    kprint.puts(" functions\n\0");
+    kprint.puts(" functions found\n\0");
+    pci.report();
     val nkbd: u64 = xhci.init();
     if (xhci.controllers() > 0) {
         kprint.puts("usb: \0");
@@ -182,6 +214,13 @@ fun kmain() {
     }
 
     start_cpus();
+    kprint.info("boot\0");
+    kprint.puts("kernel ready after \0");
+    val us: u64 = cpu.us_since_boot(cpu.rdtsc());
+    kprint.dec(us / 1000);
+    kprint.puts(" ms, starting /bin/init\0");
+    if (rescue() != 0) { kprint.puts(" (rescue mode)\0"); }
+    kprint.putc(10);
     val pid: u64 = sys.spawn_init("/bin/init\0", rescue());
     if (abi.is_err(pid) != 0) {
         kprint.puts("/bin/init: \0");
@@ -226,6 +265,12 @@ fun ap_main(r: *limine.MpInfo) {
     apic.init_ap();
     smp.came_up(me);
     smp.lock();
+    kprint.info("smp\0");
+    kprint.puts("cpu\0");
+    kprint.dec(me);
+    kprint.puts(" up (APIC id \0");
+    kprint.dec(apic.id()::u64);
+    kprint.puts(")\n\0");
     proc.scheduler(me);
 }
 
@@ -252,9 +297,15 @@ fun start_cpus() {
         cpu.outb(0x80, 0);
         spins = spins + 1;
     }
-    kprint.puts("smp: \0");
+    kprint.info("smp\0");
     kprint.dec(smp.online());
-    kprint.puts(" cpu(s) running\n\0");
+    kprint.puts(" cpu(s) running\0");
+    if (smp.online() < want) {
+        kprint.puts(", \0");
+        kprint.dec(want - smp.online());
+        kprint.puts(" did not start\0");
+    }
+    kprint.putc(10);
 }
 
 fun make_dev(dir: *vfs.Node, name: *u8, n: u64, id: u64) {
@@ -266,6 +317,109 @@ fun make_dev(dir: *vfs.Node, name: *u8, n: u64, id: u64) {
 
 # the root filesystem: ext2 on the first MachOS root partition found,
 # otherwise the initrd unpacked into memory
+# a word of the boot command line, or nil
+fun cmdline_has(w: *u8, n: u64) *u8 {
+    val c: *u8 = boot.cmdline;
+    if (c == nil) { ret nil; }
+    var i: u64 = 0;
+    for (c[i] != 0) {
+        if ((i == 0 || c[i - 1] == 32) && mem.equal(?c[i], w, n) != 0) { ret ?c[i + n]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# quiet: only warnings and worse on the console; debug: everything;
+# loglevel=N: up to level N (everything is always in the log, see dmesg)
+fun console_level_from_cmdline() {
+    if (cmdline_has("quiet\0", 5) != nil) { kprint.set_console_level(kprint.WARN); }
+    if (cmdline_has("debug\0", 5) != nil) { kprint.set_console_level(kprint.DEBUG); }
+    val l: *u8 = cmdline_has("loglevel=\0", 9);
+    if (l != nil && l[0] >= 48 && l[0] <= 55) { kprint.set_console_level((l[0] - 48)::u64); }
+}
+
+fun kind_name(k: u8) *u8 {
+    if (k == info.MEM_USABLE) { ret "usable\0"; }
+    if (k == info.MEM_RECLAIMABLE) { ret "reclaimable\0"; }
+    if (k == info.MEM_ACPI) { ret "ACPI\0"; }
+    if (k == info.MEM_KERNEL) { ret "kernel and modules\0"; }
+    if (k == info.MEM_FRAMEBUFFER) { ret "framebuffer\0"; }
+    ret "reserved\0";
+}
+
+# every region of the memory map (debug), then the totals by kind
+fun memory_map() {
+    var totals: [6]u64;
+    var k: u64 = 0;
+    for (k < 6) {
+        totals[k] = 0;
+        k = k + 1;
+    }
+    var i: u64 = 0;
+    for (i < boot.mem_len) {
+        val r: *info.MemRegion = ?boot.mem[i];
+        kprint.debug("mem\0");
+        kprint.hex(r.base);
+        kprint.putc(45);
+        kprint.hex(r.base + r.len - 1);
+        kprint.putc(32);
+        kprint.puts(kind_name(r.kind));
+        kprint.putc(10);
+        if (r.kind::u64 < 6) { totals[r.kind::u64] = totals[r.kind::u64] + r.len; }
+        i = i + 1;
+    }
+    kprint.info("mem\0");
+    kprint.dec(boot.mem_len);
+    kprint.puts(" regions: \0");
+    kprint.dec(totals[info.MEM_USABLE::u64] / 1048576);
+    kprint.puts(" MiB usable, \0");
+    kprint.dec(totals[info.MEM_RECLAIMABLE::u64] / 1048576);
+    kprint.puts(" MiB reclaimable, \0");
+    kprint.dec(totals[info.MEM_KERNEL::u64] / 1024);
+    kprint.puts(" KiB kernel and modules, \0");
+    kprint.dec(totals[info.MEM_ACPI::u64] / 1024);
+    kprint.puts(" KiB ACPI\n\0");
+}
+
+# the processor: who made it, its name, what it can do
+fun cpu_report() {
+    var v: [13]u8;
+    cpu.vendor(?v[0]);
+    v[12] = 0;
+    var name: [49]u8;
+    cpu.brand(?name[0]);
+    name[48] = 0;
+    var s: u64 = 0;
+    for (s < 48 && name[s] == 32) { s = s + 1; }
+    kprint.info("cpu\0");
+    kprint.puts(?v[0]);
+    kprint.puts(", \0");
+    kprint.puts(?name[s]);
+    kprint.puts(", \0");
+    kprint.dec(boot.cpus);
+    kprint.puts(" processor(s)\n\0");
+    var f: [3]u32;
+    cpu.features(?f[0]);
+    kprint.info("cpu\0");
+    kprint.puts("features:\0");
+    if ((f[1] & (1 << 25)) != 0) { kprint.puts(" sse\0"); }
+    if ((f[1] & (1 << 26)) != 0) { kprint.puts(" sse2\0"); }
+    if ((f[0] & 1) != 0) { kprint.puts(" sse3\0"); }
+    if ((f[0] & (1 << 9)) != 0) { kprint.puts(" ssse3\0"); }
+    if ((f[0] & (1 << 19)) != 0) { kprint.puts(" sse4.1\0"); }
+    if ((f[0] & (1 << 20)) != 0) { kprint.puts(" sse4.2\0"); }
+    if ((f[0] & (1 << 23)) != 0) { kprint.puts(" popcnt\0"); }
+    if ((f[0] & (1 << 25)) != 0) { kprint.puts(" aes\0"); }
+    if ((f[0] & (1 << 28)) != 0) { kprint.puts(" avx\0"); }
+    if ((f[2] & (1 << 5)) != 0) { kprint.puts(" avx2\0"); }
+    if ((f[2] & (1 << 16)) != 0) { kprint.puts(" avx512f\0"); }
+    if ((f[0] & (1 << 30)) != 0) { kprint.puts(" rdrand\0"); }
+    if ((f[0] & (1 << 21)) != 0) { kprint.puts(" x2apic\0"); }
+    if ((f[1] & (1 << 4)) != 0) { kprint.puts(" tsc\0"); }
+    if ((f[0] & (1 << 31)) != 0) { kprint.puts(" hypervisor\0"); }
+    kprint.putc(10);
+}
+
 fun rescue() u8 {
     val c: *u8 = boot.cmdline;
     if (c == nil) { ret 0; }

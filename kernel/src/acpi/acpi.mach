@@ -3,6 +3,7 @@
 
 use vmm: machos.mm.vmm;
 use mem: machos.kern.mem;
+use kprint: machos.kern.kprint;
 
 pub val MAX_OVERRIDES: u64 = 16;
 
@@ -67,6 +68,99 @@ fun find(rsdp_pa: u64, sig: *u8) u64 {
         i = i + 1;
     }
     ret 0;
+}
+
+fun chars(a: u64, n: u64) {
+    var i: u64 = 0;
+    for (i < n) {
+        var c: u8 = rd8(a + i);
+        if (c < 32 || c > 126) { c = 32; }
+        kprint.putc(c);
+        i = i + 1;
+    }
+}
+
+# one line per ACPI table, as Linux prints them: signature, address,
+# length, revision, OEM and table ids. the MADT's processors at the end
+pub fun report(rsdp_pa: u64) {
+    if (rsdp_pa == 0) {
+        kprint.warn("acpi\0");
+        kprint.puts("no RSDP: no ACPI tables\n\0");
+        ret;
+    }
+    val rsdp: u64 = vmm.map_phys(rsdp_pa, 36, 0);
+    if (mem.equal(rsdp::*u8, "RSD PTR \0", 8) == 0) { ret; }
+    kprint.info("acpi\0");
+    kprint.puts("RSDP \0");
+    kprint.hex(rsdp_pa);
+    kprint.puts(" (v\0");
+    kprint.dec(rd8(rsdp + 15)::u64);
+    kprint.putc(32);
+    chars(rsdp + 9, 6);
+    kprint.puts(")\n\0");
+    var root_pa: u64 = rd32(rsdp + 16)::u64;
+    var entry: u64 = 4;
+    if (rd8(rsdp + 15) >= 2 && rd64(rsdp + 24) != 0) {
+        root_pa = rd64(rsdp + 24);
+        entry = 8;
+    }
+    val root: u64 = table(root_pa);
+    if (root == 0) {
+        kprint.warn("acpi\0");
+        kprint.puts("the root table's checksum is wrong\n\0");
+        ret;
+    }
+    val n: u64 = (rd32(root + 4)::u64 - 36) / entry;
+    var i: u64 = 0;
+    for (i < n) {
+        var pa: u64 = 0;
+        if (entry == 8) { pa = rd64(root + 36 + i * 8); }
+        or              { pa = rd32(root + 36 + i * 4)::u64; }
+        val hdr: u64 = vmm.map_phys(pa, 36, 0);
+        kprint.info("acpi\0");
+        chars(hdr, 4);
+        kprint.putc(32);
+        kprint.hex(pa);
+        kprint.puts(" len \0");
+        kprint.dec(rd32(hdr + 4)::u64);
+        kprint.puts(" (v\0");
+        kprint.dec(rd8(hdr + 8)::u64);
+        kprint.putc(32);
+        chars(hdr + 10, 6);
+        kprint.putc(32);
+        chars(hdr + 16, 8);
+        kprint.putc(41);
+        if (table(pa) == 0) { kprint.puts(" bad checksum\0"); }
+        kprint.putc(10);
+        i = i + 1;
+    }
+    # processors in the MADT (type 0 entries with the enabled bit)
+    val madt_t: u64 = find(rsdp_pa, "APIC\0");
+    if (madt_t != 0) {
+        val len: u64 = rd32(madt_t + 4)::u64;
+        var at: u64 = 44;
+        var cpus: u64 = 0;
+        var ioapics: u64 = 0;
+        var overrides: u64 = 0;
+        for (at + 2 <= len) {
+            val t: u8 = rd8(madt_t + at);
+            val l: u64 = rd8(madt_t + at + 1)::u64;
+            if (l < 2) { brk; }
+            if (t == 0 && (rd32(madt_t + at + 4) & 1) != 0) { cpus = cpus + 1; }
+            if (t == 9 && (rd32(madt_t + at + 8) & 1) != 0) { cpus = cpus + 1; } # x2apic
+            if (t == 1) { ioapics = ioapics + 1; }
+            if (t == 2) { overrides = overrides + 1; }
+            at = at + l;
+        }
+        kprint.info("acpi\0");
+        kprint.puts("MADT: \0");
+        kprint.dec(cpus);
+        kprint.puts(" processor(s), \0");
+        kprint.dec(ioapics);
+        kprint.puts(" I/O APIC(s), \0");
+        kprint.dec(overrides);
+        kprint.puts(" interrupt override(s)\n\0");
+    }
 }
 
 # fill `m` from the MADT; returns an error message or nil

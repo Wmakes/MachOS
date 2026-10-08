@@ -70,6 +70,7 @@ fun user_fault(f: *idt.Frame) {
     val p: *proc.Proc = proc.current();
     # a page it needed could not be had: memory ran out
     if (f.vector == 14 && pmm.free_pages() < 16) {
+        kprint.level(kprint.ERR);
         kprint.puts("out of memory: killed \0");
         kprint.dec(p.pid);
         kprint.putc(32);
@@ -82,7 +83,7 @@ fun user_fault(f: *idt.Frame) {
         signal.fault(abi.SIGKILL);
         ret;
     }
-    kprint.puts("\0");
+    kprint.level(kprint.WARN);
     kprint.dec(p.pid);
     kprint.putc(32);
     var i: u64 = 0;

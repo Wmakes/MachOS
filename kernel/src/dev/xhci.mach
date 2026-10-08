@@ -6,6 +6,7 @@
 # keyboard is driven in the HID boot protocol (8-byte reports), so no
 # report descriptor needs parsing
 
+use kprint: machos.kern.kprint;
 use pci:  machos.dev.pci;
 use vmm:  machos.mm.vmm;
 use pmm:  machos.mm.pmm;
@@ -110,6 +111,9 @@ rec Dev {
     int_buf:  u64;
     int_len:  u64;
     pending:  u8;   # the hub said a port changed
+    vid:      u16;
+    pid:      u16;
+    announced: u8;  # its arrival was logged (so its leaving is too)
 }
 
 var devs: [32]Dev;
@@ -492,8 +496,64 @@ fun free_page(pa: u64) {
 }
 
 # forget device `d`: its keyboard, its slot, its memory
+# "usb 1-2.3" for the device: controller, root port, hub ports
+fun name(d: *Dev) {
+    var ci: u64 = 0;
+    for (ci < nctrl && ?ctrls[ci] != d.ctrl) { ci = ci + 1; }
+    kprint.puts("usb \0");
+    kprint.dec(ci + 1);
+    kprint.putc(45);
+    kprint.dec(d.root);
+    var k: u64 = 0;
+    for (k < d.depth) {
+        kprint.putc(46);
+        kprint.dec(((d.route >> (k * 4)::u32) & 0xF)::u64);
+        k = k + 1;
+    }
+}
+
+fun speed_name(s: u32) *u8 {
+    if (s == 1) { ret "full-speed (12 Mbps)\0"; }
+    if (s == 2) { ret "low-speed (1.5 Mbps)\0"; }
+    if (s == 3) { ret "high-speed (480 Mbps)\0"; }
+    if (s == 4) { ret "SuperSpeed (5 Gbps)\0"; }
+    if (s == 5) { ret "SuperSpeed+ (10 Gbps)\0"; }
+    ret "unknown-speed\0";
+}
+
+fun hex4(v: u64) {
+    val digits: *u8 = "0123456789abcdef\0";
+    var sh: u64 = 16;
+    for (sh > 0) {
+        sh = sh - 4;
+        kprint.putc(digits[(v >> sh) & 15]);
+    }
+}
+
+fun announce(d: *Dev, class: u8, what: *u8) {
+    kprint.level(kprint.INFO);
+    name(d);
+    kprint.puts(": \0");
+    kprint.puts(speed_name(d.speed));
+    kprint.puts(" device [\0");
+    hex4(d.vid::u64);
+    kprint.putc(58);
+    hex4(d.pid::u64);
+    kprint.puts("] class \0");
+    kprint.dec(class::u64);
+    kprint.puts(", \0");
+    kprint.puts(what);
+    kprint.putc(10);
+    d.announced = 1;
+}
+
 fun drop(d: *Dev) {
     val c: *Ctrl = d.ctrl;
+    if (d.announced != 0) {
+        kprint.level(kprint.INFO);
+        name(d);
+        kprint.puts(": disconnected\n\0");
+    }
     var i: u64 = 0;
     for (i < nkbd) {
         val k: *Kbd = ?kbds[i];
@@ -633,6 +693,11 @@ fun device(c: *Ctrl, at: *Place, speed: u32) {
         e0[1] = (3 << 1) | (4 << 3) | (real << 16);
         command(c, input, (T_EVALUATE << 10) | (slot::u32 << 24), ?ev[0]);
     }
+    # the whole device descriptor: who made it
+    if (ok(control(c, slot, ?d.ep0, 0x80, 6, 0x0100, 0, 18, buf)) != 0) {
+        d.vid = @((vmm.phys_to_virt(buf) + 8)::*u16);
+        d.pid = @((vmm.phys_to_virt(buf) + 10)::*u16);
+    }
 
     # the configuration: a boot keyboard interface and its IN endpoint, and
     # the first interrupt IN endpoint of any interface (a hub's)
@@ -683,11 +748,15 @@ fun device(c: *Ctrl, at: *Place, speed: u32) {
     if (class == 9) {
         if (ok(control(c, slot, ?d.ep0, 0x00, 9, config::u16, 0, 0, 0)) != 0) {
             d.kind = D_HUB;
+            announce(d, class, "hub\0");
             hub(d, any_addr, any_mps, any_int);
         }
         ret;
     }
-    if (iface == 0xFF || ep_addr == 0 || nkbd == MAX_KBD) { ret; } # not a keyboard: kept, unused
+    if (iface == 0xFF || ep_addr == 0 || nkbd == MAX_KBD) { # not a keyboard: kept, unused
+        announce(d, class, "no driver for it\0");
+        ret;
+    }
 
     if (ok(control(c, slot, ?d.ep0, 0x00, 9, config::u16, 0, 0, 0)) == 0) { ret; }   # SET_CONFIGURATION
     control(c, slot, ?d.ep0, 0x21, 0x0B, 0, iface::u16, 0, 0);                          # SET_PROTOCOL boot
@@ -720,6 +789,7 @@ fun device(c: *Ctrl, at: *Place, speed: u32) {
         ret;
     }
     d.kind = D_KBD;
+    announce(d, class, "boot-protocol keyboard\0");
     nkbd = nkbd + 1;
     arm(k);
 }
@@ -909,6 +979,20 @@ fun setup(c: *Ctrl, dev: *pci.Device) u8 {
     c.csz = 32;
     if ((rd(c.cap + 0x10) & 4) != 0) { c.csz = 64; }
     handoff(c);
+    kprint.info("xhci\0");
+    kprint.puts("xHCI \0");
+    val ver: u32 = rd(c.cap) >> 16;
+    kprint.dec((ver >> 8)::u64);
+    kprint.putc(46);
+    kprint.dec(((ver >> 4) & 0xF)::u64);
+    kprint.dec((ver & 0xF)::u64);
+    kprint.puts(", \0");
+    kprint.dec(c.ports);
+    kprint.puts(" ports, \0");
+    kprint.dec(c.slots);
+    kprint.puts(" device slots, \0");
+    kprint.dec(c.csz);
+    kprint.puts("-byte contexts\n\0");
 
     # stop, reset, wait until it is ready
     wr(c.op, rd(c.op) & ~1::u32);

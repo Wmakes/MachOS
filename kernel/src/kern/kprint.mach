@@ -5,28 +5,230 @@ use cpu:    machos.arch.x86_64.cpu;
 use serial: machos.dev.serial;
 use fbcon:  machos.dev.fbcon;
 
-val LOG: u64 = 65536;
-var log: [65536]u8;  # the last LOG bytes of kernel messages, for dmesg
-var logged: u64 = 0; # bytes ever logged
+# levels, as syslog and Linux have them
+pub val EMERG:  u64 = 0;
+pub val ALERT:  u64 = 1;
+pub val CRIT:   u64 = 2;
+pub val ERR:    u64 = 3;
+pub val WARN:   u64 = 4;
+pub val NOTICE: u64 = 5;
+pub val INFO:   u64 = 6;
+pub val DEBUG:  u64 = 7;
 
-# kernel messages: tty1 (and the serial port), and the log
-pub fun putc(c: u8) {
-    log[logged % LOG] = c;
-    logged = logged + 1;
-    putc_to(0, c);
+# the log: the last RECS lines, each with a sequence number, the time-stamp
+# counter when it began, and its level
+val RECS: u64 = 2048;
+val TEXT: u64 = 160;
+
+rec Rec {
+    seq:   u64;
+    tsc:   u64;
+    level: u8;
+    len:   u8;
+    text:  [160]u8;
 }
 
-# copy the log (oldest first) into dst, at most n bytes; how many
-pub fun read_log(dst: *u8, n: u64) u64 {
-    var start: u64 = 0;
-    if (logged > LOG) { start = logged - LOG; }
+var recs: [2048]Rec;
+var next_seq: u64 = 0;   # the next line's number
+var first_seq: u64 = 0;  # the oldest kept (after a clear)
+
+# the line being written
+var line: [160]u8;
+var line_len: u64 = 0;
+var line_level: u64 = 6;
+var line_tsc: u64 = 0;
+var line_shown: u8 = 0;
+var at_start: u8 = 1;
+var console: u64 = 6;    # lines up to this level also reach the console
+
+# the level of the line about to be (or being) written
+pub fun level(l: u64) {
+    if (at_start != 0) { line_level = l; }
+}
+
+pub fun set_console_level(l: u64) { console = l; }
+pub fun console_level() u64 { ret console; }
+
+fun con(c: u8) { putc_to(0, c); }
+
+fun con_str(s: *u8) {
+    var i: u64 = 0;
+    for (s[i] != 0) {
+        con(s[i]);
+        i = i + 1;
+    }
+}
+
+# "[    1.234567] " for the time-stamp count t
+fun stamp(t: u64, out: *u8) u64 {
+    val us: u64 = cpu.us_since_boot(t);
+    var secs: [20]u8;
+    var n: u64 = 0;
+    var x: u64 = us / 1000000;
+    for {
+        secs[n] = 48 + (x % 10)::u8;
+        n = n + 1;
+        x = x / 10;
+        if (x == 0) { brk; }
+    }
     var k: u64 = 0;
-    for (start + k < logged && k < n) {
-        dst[k] = log[(start + k) % LOG];
+    out[k] = 91;
+    k = k + 1;
+    var pad: u64 = n;
+    for (pad < 5) {
+        out[k] = 32;
+        k = k + 1;
+        pad = pad + 1;
+    }
+    for (n > 0) {
+        n = n - 1;
+        out[k] = secs[n];
+        k = k + 1;
+    }
+    out[k] = 46;
+    k = k + 1;
+    var frac: u64 = us % 1000000;
+    var d: u64 = 100000;
+    for (d > 0) {
+        out[k] = 48 + ((frac / d) % 10)::u8;
+        k = k + 1;
+        d = d / 10;
+    }
+    out[k] = 93;
+    out[k + 1] = 32;
+    ret k + 2;
+}
+
+fun commit() {
+    val r: *Rec = ?recs[next_seq % RECS];
+    r.seq = next_seq;
+    r.tsc = line_tsc;
+    r.level = line_level::u8;
+    r.len = line_len::u8;
+    var i: u64 = 0;
+    for (i < line_len) {
+        r.text[i] = line[i];
+        i = i + 1;
+    }
+    next_seq = next_seq + 1;
+    if (next_seq - first_seq > RECS) { first_seq = next_seq - RECS; }
+}
+
+# kernel messages: logged, and shown on tty1 (and the serial port) when
+# their level is within the console's
+pub fun putc(c: u8) {
+    if (at_start != 0) {
+        at_start = 0;
+        line_len = 0;
+        line_tsc = cpu.rdtsc();
+        line_shown = (line_level <= console)::u8;
+        if (line_shown != 0) {
+            var st: [32]u8;
+            val n: u64 = stamp(line_tsc, ?st[0]);
+            con_str("\x1b[90m\0"); # the time in grey
+            var i: u64 = 0;
+            for (i < n) {
+                con(st[i]);
+                i = i + 1;
+            }
+            con_str("\x1b[0m\0");
+            if (line_level <= ERR) { con_str("\x1b[91m\0"); }
+            or (line_level == WARN) { con_str("\x1b[93m\0"); }
+        }
+    }
+    if (c == 10) {
+        commit();
+        if (line_shown != 0) {
+            if (line_level <= WARN) { con_str("\x1b[0m\0"); }
+            con(10);
+        }
+        at_start = 1;
+        line_level = INFO;
+        ret;
+    }
+    if (line_len < TEXT) {
+        line[line_len] = c;
+        line_len = line_len + 1;
+    }
+    if (line_shown != 0) { con(c); }
+}
+
+# the log since sequence `since`, one line per entry, into dst (at most n
+# bytes, whole lines only):  "<level>,<seq>,<microseconds>;<text>\n".
+# how many bytes
+pub fun read_log(dst: *u8, n: u64, since: u64) u64 {
+    var seq: u64 = since;
+    if (seq < first_seq) { seq = first_seq; }
+    var k: u64 = 0;
+    for (seq < next_seq) {
+        val r: *Rec = ?recs[seq % RECS];
+        var head: [64]u8;
+        var h: u64 = 0;
+        head[h] = 60;
+        h = h + 1;
+        head[h] = 48 + r.level;
+        h = h + 1;
+        head[h] = 62;
+        h = h + 1;
+        h = h + fmt(seq, ?head[h]);
+        head[h] = 44;
+        h = h + 1;
+        h = h + fmt(cpu.us_since_boot(r.tsc), ?head[h]);
+        head[h] = 59;
+        h = h + 1;
+        if (k + h + r.len::u64 + 1 > n) { brk; }
+        var i: u64 = 0;
+        for (i < h) {
+            dst[k + i] = head[i];
+            i = i + 1;
+        }
+        k = k + h;
+        i = 0;
+        for (i < r.len::u64) {
+            dst[k + i] = r.text[i];
+            i = i + 1;
+        }
+        k = k + r.len::u64;
+        dst[k] = 10;
+        k = k + 1;
+        seq = seq + 1;
+    }
+    ret k;
+}
+
+# forget everything logged so far (dmesg -c)
+pub fun clear_log() { first_seq = next_seq; }
+
+fun fmt(v: u64, out: *u8) u64 {
+    var buf: [20]u8;
+    var n: u64 = 0;
+    var x: u64 = v;
+    for {
+        buf[n] = 48 + (x % 10)::u8;
+        n = n + 1;
+        x = x / 10;
+        if (x == 0) { brk; }
+    }
+    var k: u64 = 0;
+    for (n > 0) {
+        n = n - 1;
+        out[k] = buf[n];
         k = k + 1;
     }
     ret k;
 }
+
+# a message with a level: "tag: " starts it (the caller finishes the line)
+pub fun log(l: u64, tag: *u8) {
+    level(l);
+    puts(tag);
+    puts(": \0");
+}
+
+pub fun info(tag: *u8) { log(INFO, tag); }
+pub fun warn(tag: *u8) { log(WARN, tag); }
+pub fun debug(tag: *u8) { log(DEBUG, tag); }
+pub fun error(tag: *u8) { log(ERR, tag); }
 
 # a byte for terminal `n`'s screen; tty1 is mirrored on the serial port
 pub fun putc_to(n: u64, c: u8) {
@@ -74,7 +276,10 @@ pub fun dec(v: u64) {
 
 pub fun panic(msg: *u8) {
     fbcon.show_screen(0);
-    puts("\npanic: \0");
+    if (at_start == 0) { putc(10); }
+    console = DEBUG;
+    level(EMERG);
+    puts("panic: \0");
     puts(msg);
     putc(10);
     cpu.halt();

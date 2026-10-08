@@ -291,6 +291,67 @@ pub fun xchg(p: *u64, v: u64) u64 {
     ret old;
 }
 
+# the time-stamp counter: cycles since the cpu started
+pub fun rdtsc() u64 {
+    var lo: u64 = 0;
+    var hi: u64 = 0;
+    asm x86_64 {
+        rdtsc
+        mov {lo}, rax
+        mov {hi}, rdx
+    }
+    ret (lo & 0xFFFFFFFF) | (hi << 32);
+}
+
+var tsc_rate: u64 = 0;   # counts per second, 0 until measured
+var tsc_start: u64 = 0;  # the count when the kernel started
+
+pub fun tsc_begin() { tsc_start = rdtsc(); }
+pub fun set_tsc_hz(hz: u64) { tsc_rate = hz; }
+pub fun tsc_hz() u64 { ret tsc_rate; }
+
+# microseconds since the kernel started (0 until the rate is known)
+pub fun us_since_boot(t: u64) u64 {
+    if (tsc_rate == 0 || t < tsc_start) { ret 0; }
+    val d: u64 = t - tsc_start;
+    ret (d / tsc_rate) * 1000000 + (d % tsc_rate) * 1000000 / tsc_rate;
+}
+
+# what cpuid says the time-stamp counter runs at (leaf 0x16, MHz), or 0
+pub fun tsc_hz_from_cpuid() u64 {
+    var r: [4]u32;
+    cpuid(0, ?r[0]);
+    if (r[0] < 0x16) { ret 0; }
+    cpuid(0x16, ?r[0]);
+    ret (r[0] & 0xFFFF)::u64 * 1000000;
+}
+
+# the vendor string ("GenuineIntel", "AuthenticAMD", ...) into out[12]
+pub fun vendor(out: *u8) {
+    var r: [4]u32;
+    cpuid(0, ?r[0]);
+    var k: u64 = 0;
+    for (k < 4) {
+        out[k] = ((r[1] >> (k * 8)::u32) & 0xFF)::u8;
+        out[4 + k] = ((r[3] >> (k * 8)::u32) & 0xFF)::u8;
+        out[8 + k] = ((r[2] >> (k * 8)::u32) & 0xFF)::u8;
+        k = k + 1;
+    }
+}
+
+# feature bits: leaf 1 ecx/edx and leaf 7 ebx into out[0..3]
+pub fun features(out: *u32) {
+    var r: [4]u32;
+    cpuid(1, ?r[0]);
+    out[0] = r[2];
+    out[1] = r[3];
+    out[2] = 0;
+    if (max_leaf() >= 7) {
+        var c: u32 = 0;
+        out[2] = cpuid7(?c);
+    }
+}
+
 # a spin-wait hint
 pub fun pause() {
     asm x86_64 {

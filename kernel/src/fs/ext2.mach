@@ -11,6 +11,7 @@ use abi:  sdk.abi;
 use blk:  machos.fs.blk;
 use heap: machos.mm.heap;
 use mem:  machos.kern.mem;
+use kprint: machos.kern.kprint;
 use clock: machos.kern.clock;
 
 pub val ROOT_INO: u64 = 2;
@@ -98,7 +99,50 @@ pub fun mount(fs: *Fs, p: *blk.Part) *u8 {
     if (fs.bpg == 0 || fs.ipg == 0 || fs.blocks_count > blk.blocks(p)) { ret "ext2: bad superblock\0"; }
     fs.groups = (fs.blocks_count - fs.first_data + fs.bpg - 1) / fs.bpg;
     fs.was_clean = (sb16(fs, 58) & 1)::u8;
+    report(fs);
     ret nil;
+}
+
+# what the superblock says, for the log
+fun report(fs: *Fs) {
+    kprint.info("ext2\0");
+    var label: u8 = 0;
+    var i: u64 = 0;
+    for (i < 16 && fs.sb[120 + i] != 0) { i = i + 1; }
+    if (i > 0) {
+        kprint.putc(39);
+        var k: u64 = 0;
+        for (k < i) {
+            kprint.putc(fs.sb[120 + k]);
+            k = k + 1;
+        }
+        kprint.puts("', \0");
+        label = 1;
+    }
+    val total: u64 = sb32(fs, 4)::u64;
+    val free: u64 = sb32(fs, 12)::u64;
+    kprint.dec(total * 4 / 1024);
+    kprint.puts(" MiB in \0");
+    kprint.dec(fs.groups);
+    kprint.puts(" group(s), \0");
+    kprint.dec(free * 4 / 1024);
+    kprint.puts(" MiB free, \0");
+    kprint.dec((sb32(fs, 0) - sb32(fs, 16))::u64);
+    kprint.putc(47);
+    kprint.dec(sb32(fs, 0)::u64);
+    kprint.puts(" inodes used, \0");
+    kprint.dec(fs.inode_size);
+    kprint.puts("-byte inodes\n\0");
+    kprint.info("ext2\0");
+    kprint.puts("mounted \0");
+    kprint.dec(sb16(fs, 52)::u64);
+    kprint.puts(" times before, \0");
+    if (fs.was_clean != 0) { kprint.puts("cleanly unmounted\0"); }
+    or { kprint.puts("NOT cleanly unmounted\0"); }
+    if ((sb32(fs, 96) & 2) != 0) { kprint.puts(", filetype\0"); }
+    if ((sb32(fs, 100) & 1) != 0) { kprint.puts(", sparse_super\0"); }
+    if ((sb32(fs, 100) & 2) != 0) { kprint.puts(", large_file\0"); }
+    kprint.putc(10);
 }
 
 fun write_sb(fs: *Fs) u8 { ret blk.write_bytes(fs.part, 1024, 1024, (?fs.sb[0])::u64); }

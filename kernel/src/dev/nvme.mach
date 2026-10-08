@@ -5,6 +5,7 @@
 # callers always speak 512-byte sectors; a 4 KiB-sector namespace is read
 # and written through a bounce buffer when a request does not line up
 
+use kprint: machos.kern.kprint;
 use pci: machos.dev.pci;
 use vmm: machos.mm.vmm;
 use pmm: machos.mm.pmm;
@@ -120,6 +121,17 @@ fun admin(c: *Ctrl, opc: u32, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32) u32 
 
 fun page() u64 { ret pmm.alloc(); }
 
+# an identify string (space padded), trailing spaces dropped
+fun text(p: *u8, n: u64) {
+    var e: u64 = n;
+    for (e > 0 && (p[e - 1] == 32 || p[e - 1] == 0)) { e = e - 1; }
+    var i: u64 = 0;
+    for (i < e) {
+        kprint.putc(p[i]);
+        i = i + 1;
+    }
+}
+
 fun setup(c: *Ctrl, dev: *pci.Device) u8 {
     pci.enable(dev);
     c.regs = vmm.map_phys(pci.bar(dev, 0), 0x4000, 1);
@@ -155,13 +167,40 @@ fun setup(c: *Ctrl, dev: *pci.Device) u8 {
         c.model[i] = idv[24 + i];
         i = i + 1;
     }
+    val vs: u32 = rd(c, 8);
+    kprint.info("nvme\0");
+    kprint.puts("NVMe \0");
+    kprint.dec((vs >> 16)::u64);
+    kprint.putc(46);
+    kprint.dec(((vs >> 8) & 0xFF)::u64);
+    kprint.puts(", \0");
+    text(?idv[24], 40);
+    kprint.puts(", serial \0");
+    text(?idv[4], 20);
+    kprint.puts(", firmware \0");
+    text(?idv[64], 8);
+    kprint.puts(", \0");
+    kprint.dec((@((idv::u64 + 516)::*u32))::u64);
+    kprint.puts(" namespace(s), queues up to \0");
+    kprint.dec(((cap_lo & 0xFFFF) + 1)::u64);
+    kprint.putc(10);
     if (admin(c, 0x06, 1, id, 0, 0) != 0) { ret 0; } # identify namespace 1
     val nsze: u64 = @((idv::u64)::*u64);
     val flbas: u64 = (idv[26] & 0xF)::u64;
     val lbaf: u32 = @((idv::u64 + 128 + flbas * 4)::*u32);
     c.lbads = ((lbaf >> 16) & 0xFF)::u64;
     pmm.free(id);
-    if (c.lbads < 9 || c.lbads > 12 || nsze == 0) { ret 0; }
+    if (c.lbads < 9 || c.lbads > 12 || nsze == 0) {
+        kprint.warn("nvme\0");
+        kprint.puts("namespace 1 has a sector size MachOS cannot use\n\0");
+        ret 0;
+    }
+    kprint.info("nvme\0");
+    kprint.puts("namespace 1: \0");
+    kprint.dec(nsze);
+    kprint.puts(" sectors of \0");
+    kprint.dec(1::u64 << c.lbads);
+    kprint.puts(" bytes\n\0");
     c.sectors = nsze << (c.lbads - 9);
 
     # I/O completion queue 1, then submission queue 1 feeding it

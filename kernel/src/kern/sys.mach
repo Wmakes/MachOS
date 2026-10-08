@@ -939,7 +939,26 @@ fun sys_mount(dva: u64, dlen: u64, pva: u64, plen: u64) u64 {
     if (abi.is_err(n) != 0) { ret n; }
     val at: *vfs.Node = vfs.lookup(?full[0], n);
     if (at == nil) { ret e(abi.E_NOENT); }
-    ret mount.mount_at(b, at);
+    val mr: u64 = mount.mount_at(b, at);
+    kprint.level(kprint.INFO);
+    kprint.puts("mount: \0");
+    var di: u64 = 0;
+    for (di < dn) {
+        kprint.putc(dp[di]);
+        di = di + 1;
+    }
+    kprint.puts(" on \0");
+    var fi: u64 = 0;
+    for (fi < n) {
+        kprint.putc(full[fi]);
+        fi = fi + 1;
+    }
+    if (abi.is_err(mr) != 0) {
+        kprint.puts(" failed: \0");
+        kprint.puts(abi.err_name(mr));
+    }
+    kprint.putc(10);
+    ret mr;
 }
 
 fun sys_mounts(idx: u64, out: u64) u64 {
@@ -970,12 +989,27 @@ fun sys_umount(pva: u64, plen: u64) u64 {
     if (abi.is_err(n) != 0) { ret n; }
     val r: *vfs.Node = vfs.lookup(?full[0], n);
     if (r == nil) { ret e(abi.E_NOENT); }
+    var res: u64 = 0;
     if (r.kind == abi.KIND_DEV) {
         val b: *parts.Bdev = parts.get(r.dev);
         if (b == nil) { ret e(abi.E_INVAL); }
-        ret mount.unmount_dev(b);
+        res = mount.unmount_dev(b);
+    } or {
+        res = mount.unmount(r);
     }
-    ret mount.unmount(r);
+    kprint.level(kprint.INFO);
+    kprint.puts("umount: \0");
+    var i: u64 = 0;
+    for (i < n) {
+        kprint.putc(full[i]);
+        i = i + 1;
+    }
+    if (abi.is_err(res) != 0) {
+        kprint.puts(" failed: \0");
+        kprint.puts(abi.err_name(res));
+    }
+    kprint.putc(10);
+    ret res;
 }
 
 fun put_str(dst: *u8, s: *u8) {
@@ -1187,8 +1221,13 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     }
     if (n == abi.MUNMAP)  { ret mmap.munmap(cur(), a, b); }
     if (n == abi.KLOG) {
+        if ((d & 1) != 0) { # clear
+            if (is_root() == 0) { ret e(abi.E_PERM); }
+            kprint.clear_log();
+            ret 0;
+        }
         if (ok(a, b, 1) == 0) { ret e(abi.E_FAULT); }
-        ret kprint.read_log(a::*u8, b);
+        ret kprint.read_log(a::*u8, b, c);
     }
     if (n == abi.MPROTECT) { ret mmap.mprotect(cur(), a, b, c); }
     if (n == abi.SETFG) {
