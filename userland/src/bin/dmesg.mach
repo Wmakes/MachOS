@@ -8,10 +8,10 @@
 #   -c        clear the log after printing it (root);  -C  clear only
 # on a terminal, errors are red and warnings yellow
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
+use system: userland.lib.system;
 
 var buf: [524288]u8;
 var no_time: u8 = 0;
@@ -60,8 +60,7 @@ fun show(n: u64) {
             at = at + 1; # ,
             val us: u64 = digits(?buf[0], ?at, e);
             at = at + 1; # ;
-            next = seq + 1;
-            if (lv <= max_level) {
+            if (seq >= next && lv <= max_level) {
                 var paint: u8 = 0;
                 if (color != 0 && lv <= 3) { io.out("\x1b[91m\0"); paint = 1; }
                 or (color != 0 && lv == 4) { io.out("\x1b[93m\0"); paint = 1; }
@@ -95,9 +94,19 @@ fun show(n: u64) {
                 if (paint != 0) { io.out("\x1b[0m\0"); }
                 io.putc(10);
             }
+            if (seq >= next) { next = seq + 1; }
         }
         i = e + 1;
     }
+}
+
+# writing to /proc/kmsg empties the log (root only); whether it worked
+fun clear_log() u8 {
+    val h: i64 = io.open_mode("/proc/kmsg", os.O_WRONLY, 0);
+    if (h < 0) { ret 0; }
+    val r: i64 = io.write(h, "c", 1);
+    io.close(h);
+    ret (r > 0)::u8;
 }
 
 fun usage() u64 {
@@ -105,8 +114,10 @@ fun usage() u64 {
     ret 2;
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     var follow: u8 = 0;
     var clear: u8 = 0;
     var clear_only: u8 = 0;
@@ -140,22 +151,21 @@ fun main(argc: u64, argv: **u8) u64 {
         i = i + 1;
     }
     if (clear_only != 0) {
-        if (abi.is_err(sys.klog_clear()) != 0) {
+        if (clear_log() == 0) {
             io.err("dmesg: only root may clear the log\n\0");
             ret 1;
         }
         ret 0;
     }
-    color = sys.isatty(abi.STDOUT);
-    show(sys.klog(?buf[0], 524288, 0));
-    if (clear != 0 && abi.is_err(sys.klog_clear()) != 0) {
+    color = io.isatty(io.STDOUT);
+    show(system.read_file("/proc/kmsg", ?buf[0], 524288));
+    if (clear != 0 && clear_log() == 0) {
         io.err("dmesg: only root may clear the log\n\0");
         ret 1;
     }
     for (follow != 0) {
-        sys.sleep(200);
-        val n: u64 = sys.klog(?buf[0], 524288, next);
-        if (abi.is_err(n) == 0 && n > 0) { show(n); }
+        io.sleep_ms(200);
+        show(system.read_file("/proc/kmsg", ?buf[0], 524288));
     }
     ret 0;
 }

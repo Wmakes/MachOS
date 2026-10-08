@@ -6,6 +6,8 @@
 # callee-saved registers and rsp on one kernel stack and restoring them from
 # another (`switch_to`); the scheduler loop runs on the boot stack
 
+use events: machos.kern.events;
+use pmm:    machos.mm.pmm;
 use smp:  machos.arch.x86_64.smp;
 use abi:     sdk.abi;
 use cpu:     machos.arch.x86_64.cpu;
@@ -32,6 +34,7 @@ pub val CWD_MAX: u64 = 256;
 # wait channels for things that are not a process or a kernel object
 pub val CHAN_TTY:   u64 = 1;
 pub val CHAN_TIMER: u64 = 2;
+pub val CHAN_EVENTS: u64 = 3; # readers of /dev/events
 
 pub rec Proc {
     pid:       u64;
@@ -133,6 +136,26 @@ fun first_entry() {
     }
 }
 pub fun uptime_ticks() u64 { ret ticks; }
+
+# "memory low" when less than a twentieth is free, "memory ok" once a
+# tenth is again (checked every second)
+var memory_low: u8 = 0;
+
+fun watch_memory() {
+    val total: u64 = pmm.total_pages();
+    val free: u64 = pmm.free_pages();
+    if (memory_low == 0 && free * 20 < total) {
+        memory_low = 1;
+        events.begin("memory low \0");
+        events.dec(free * 4);
+        events.end();
+    } or (memory_low != 0 && free * 10 > total) {
+        memory_low = 0;
+        events.begin("memory ok \0");
+        events.dec(free * 4);
+        events.end();
+    }
+}
 pub fun slot(i: u64) *Proc { ret ?table[i]; }
 
 pub fun find(pid: u64) *Proc {
@@ -305,6 +328,7 @@ pub fun sleep_ticks(n: u64) {
 # timer interrupt: wake sleepers whose time has come
 pub fun tick() {
     ticks = ticks + 1;
+    if (ticks % apic.HZ == 0) { watch_memory(); }
     var i: u64 = 0;
     for (i < MAX) {
         val p: *Proc = ?table[i];

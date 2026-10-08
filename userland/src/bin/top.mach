@@ -1,18 +1,20 @@
 # top [-n COUNT]: how busy each core is and which processes use it,
 # refreshed every second (COUNT times, or until ^C)
 
-use abi:   sdk.abi;
-use sys:   sdk.sys;
-use io:    sdk.io;
-use rt:    sdk.rt;
-use users: sdk.users;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
+use users:  userland.lib.accounts;
+use system: userland.lib.system;
+use tmos:   std.terminal.machos;
+use std.types.size.usize;
 
 val MAXP: u64 = 256;
 
 rec Row {
     pid:   u64;
     uid:   u64;
-    state: u64;
+    state: u8;   # R, S, T or Z
     pages: u64;
     ticks: u64;  # cpu ticks in all
     delta: u64;  # cpu ticks in the last interval
@@ -26,35 +28,33 @@ var prev_pid: [256]u64;
 var prev_ticks: [256]u64;
 var nprev: u64 = 0;
 
+fun collect(p: *system.Proc) {
+    if (nrows >= MAXP) { ret; }
+    val w: *Row = ?rows[nrows];
+    w.pid = p.pid;
+    w.uid = p.uid;
+    w.state = p.state;
+    w.pages = p.pages;
+    w.ticks = p.ticks;
+    w.nlen = p.name_len;
+    io.copy(?w.name[0], ?p.name[0], p.name_len);
+    w.delta = p.ticks;
+    var k: u64 = 0;
+    for (k < nprev) {
+        if (prev_pid[k] == p.pid) {
+            w.delta = p.ticks - prev_ticks[k];
+            brk;
+        }
+        k = k + 1;
+    }
+    nrows = nrows + 1;
+}
+
 fun snapshot() {
     nrows = 0;
-    var i: u64 = 0;
-    for (nrows < MAXP) {
-        var p: abi.ProcInfo;
-        val r: u64 = sys.procs(i, ?p);
-        if (abi.is_err(r) != 0 || r == 0) { brk; }
-        val w: *Row = ?rows[nrows];
-        w.pid = p.pid;
-        w.uid = p.uid;
-        w.state = p.state;
-        w.pages = p.pages;
-        w.ticks = p.cpu_ticks;
-        w.nlen = p.name_len;
-        io.copy(?w.name[0], ?p.name[0], p.name_len);
-        w.delta = p.cpu_ticks;
-        var k: u64 = 0;
-        for (k < nprev) {
-            if (prev_pid[k] == p.pid) {
-                w.delta = p.cpu_ticks - prev_ticks[k];
-                brk;
-            }
-            k = k + 1;
-        }
-        nrows = nrows + 1;
-        i = i + 1;
-    }
+    system.processes(collect);
     nprev = nrows;
-    i = 0;
+    var i: u64 = 0;
     for (i < nrows) {
         prev_pid[i] = rows[i].pid;
         prev_ticks[i] = rows[i].ticks;
@@ -90,10 +90,23 @@ fun bar(pct: u64) {
     io.putc(93);
 }
 
-var prev_busy: [16]u64;
-var prev_all: [16]u64;
+var prev_busy: [64]u64;
+var prev_all: [64]u64;
 
-fun screen(inf: *abi.Info, rows_max: u64) {
+# what the header shows, from /proc
+rec Info {
+    uptime_ms: u64;
+    mem:       system.Memory;
+    cpu:       system.Cpus;
+}
+
+fun sample(inf: *Info) {
+    inf.uptime_ms = system.uptime_ms();
+    system.memory(?inf.mem);
+    system.cpus(?inf.cpu);
+}
+
+fun screen(inf: *Info, rows_max: u64) {
     io.out("\x1b[2J\x1b[H\0");
     val secs: u64 = inf.uptime_ms / 1000;
     io.out("\x1b[1mtop\x1b[0m - up \0");
@@ -101,20 +114,20 @@ fun screen(inf: *abi.Info, rows_max: u64) {
     io.putc(58);
     io.dec_pad((secs / 60) % 60, 2);
     io.out(", \0");
-    io.dec(inf.procs);
+    io.dec(nrows);
     io.out(" processes, \0");
-    io.dec(inf.cpus);
+    io.dec(inf.cpu.count);
     io.out(" cores, memory \0");
-    io.dec((inf.mem_total - inf.mem_free) / 1048576);
+    io.dec((inf.mem.total - inf.mem.free) / 1048576);
     io.out(" / \0");
-    io.dec(inf.mem_total / 1048576);
+    io.dec(inf.mem.total / 1048576);
     io.out(" MiB\n\n\0");
     var c: u64 = 0;
-    for (c < inf.cpus && c < 16) {
-        val db: u64 = inf.cpu_busy[c] - prev_busy[c];
-        val da: u64 = inf.cpu_ticks[c] - prev_all[c];
-        prev_busy[c] = inf.cpu_busy[c];
-        prev_all[c] = inf.cpu_ticks[c];
+    for (c < inf.cpu.count) {
+        val db: u64 = inf.cpu.busy[c] - prev_busy[c];
+        val da: u64 = inf.cpu.ticks[c] - prev_all[c];
+        prev_busy[c] = inf.cpu.busy[c];
+        prev_all[c] = inf.cpu.ticks[c];
         var pct: u64 = 0;
         if (da > 0) { pct = db * 100 / da; }
         io.out("  cpu\0");
@@ -135,7 +148,7 @@ fun screen(inf: *abi.Info, rows_max: u64) {
         io.putc(32);
         var nm: [32]u8;
         var nl: u64 = users.user_name(w.uid, ?nm[0]);
-        if (nl == 0 || nl == abi.NO_ID) { nl = io.fmt_dec(w.uid, ?nm[0]); }
+        if (nl == 0) { nl = io.fmt_dec(w.uid, ?nm[0]); }
         if (nl > 8) { nl = 8; }
         io.outn(?nm[0], nl);
         var pad: u64 = nl;
@@ -143,10 +156,9 @@ fun screen(inf: *abi.Info, rows_max: u64) {
             io.putc(32);
             pad = pad + 1;
         }
-        if (w.state == abi.STATE_RUNNING)       { io.out("running \0"); }
-        or (w.state == abi.STATE_RUNNABLE)      { io.out("ready   \0"); }
-        or (w.state == abi.STATE_BLOCKED)       { io.out("waiting \0"); }
-        or (w.state == abi.STATE_STOPPED)       { io.out("stopped \0"); }
+        if (w.state == 82)      { io.out("running \0"); }
+        or (w.state == 83)      { io.out("waiting \0"); }
+        or (w.state == 84)      { io.out("stopped \0"); }
         or                                      { io.out("zombie  \0"); }
         io.dec_pad(w.delta, 5); # ticks per second = percent of one core
         io.out("%\0");
@@ -164,8 +176,10 @@ fun screen(inf: *abi.Info, rows_max: u64) {
     }
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     var count: u64 = 0xFFFFFFFFFFFFFFFF;
     if (argc == 3 && io.streq(argv[1], "-n\0") != 0) {
         var okk: u8 = 0;
@@ -176,25 +190,26 @@ fun main(argc: u64, argv: **u8) u64 {
         }
     }
     var height: u64 = 24;
-    var t: abi.Termios;
-    if (abi.is_err(sys.tcgetattr(abi.STDOUT, ?t)) == 0 && t.rows > 0) { height = t.rows; }
-    var inf: abi.Info;
-    sys.info(?inf);
+    var trows: u64 = 0;
+    var tcols: u64 = 0;
+    if (tmos.size(1, ?trows, ?tcols) >= 0 && trows > 0) { height = trows; }
+    var inf: Info;
+    sample(?inf);
     var c: u64 = 0;
-    for (c < 16) {
-        prev_busy[c] = inf.cpu_busy[c];
-        prev_all[c] = inf.cpu_ticks[c];
+    for (c < inf.cpu.count) {
+        prev_busy[c] = inf.cpu.busy[c];
+        prev_all[c] = inf.cpu.ticks[c];
         c = c + 1;
     }
     snapshot();
     var n: u64 = 0;
     for (n < count) {
-        sys.sleep(1000);
-        sys.info(?inf);
+        io.sleep_ms(1000);
+        sample(?inf);
         snapshot();
         sort();
         var room: u64 = 6;
-        if (height > inf.cpus + 7) { room = height - inf.cpus - 7; }
+        if (height > inf.cpu.count + 7) { room = height - inf.cpu.count - 7; }
         screen(?inf, room);
         n = n + 1;
     }

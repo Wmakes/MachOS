@@ -1,9 +1,9 @@
 # full-screen terminal programs: raw mode, the screen size, cursor control,
 # and keys (escape sequences decoded into KEY_* codes)
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
+use io:   userland.lib.cli;
+use tmos: std.terminal.machos;
+use std.types.size.usize;
 
 pub val KEY_UP:    u64 = 0x101;
 pub val KEY_DOWN:  u64 = 0x102;
@@ -17,28 +17,22 @@ pub val KEY_PGDN:  u64 = 0x109;
 pub val KEY_EOF:   u64 = 0xFFFFFFFFFFFFFFFF;
 pub val KEY_ALT:   u64 = 0x1000; # + the key: alt+key, or escape then key ("M-x")
 
-var tty: u64 = 0;     # where keys come from (a terminal handle)
+var tty: i64 = 0;     # where keys come from (a terminal handle)
 var rows: u64 = 24;
 var cols: u64 = 80;
 
 # take over the terminal `h`: raw mode, and learn its size
-pub fun start(h: u64) u8 {
+pub fun start(h: i64) u8 {
     tty = h;
-    var t: abi.Termios;
-    if (abi.is_err(sys.tcgetattr(h, ?t)) != 0) { ret 0; }
-    rows = t.rows;
-    cols = t.cols;
-    t.lflag = 0;
-    sys.tcsetattr(h, ?t);
+    if (tmos.size(h::usize, ?rows, ?cols) < 0) { ret 0; }
+    tmos.raw(h::usize);
     io.out("\x1b[2J\x1b[H\0");
     ret 1;
 }
 
 # hand the terminal back: line mode, a clean screen
 pub fun stop() {
-    var t: abi.Termios;
-    t.lflag = abi.ISIG | abi.ICANON | abi.ECHO;
-    sys.tcsetattr(tty, ?t);
+    tmos.restore(tty::usize);
     io.out("\x1b[0m\x1b[2J\x1b[H\0");
 }
 
@@ -62,8 +56,8 @@ pub fun reverse(on: u8) {
 
 fun byte() u64 {
     var c: u8 = 0;
-    val r: u64 = sys.read(tty, ?c, 1);
-    if (abi.is_err(r) != 0 || r == 0) { ret KEY_EOF; }
+    val r: i64 = io.read(tty, ?c, 1);
+    if (r <= 0) { ret KEY_EOF; }
     ret c::u64;
 }
 

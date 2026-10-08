@@ -13,6 +13,7 @@ use dsk:  machos.dev.disk;
 use blk:    machos.fs.blk;
 use mount:  machos.fs.mount;
 use parts:  machos.fs.parts;
+use events: machos.kern.events;
 
 pub val NODE:   u64 = 1;
 pub val PIPE_R: u64 = 2;
@@ -41,6 +42,8 @@ pub fun open_node(nd: *vfs.Node, flags: u64) *Handle {
     if (h == nil) { ret nil; }
     h.node = nd;
     h.flags = flags;
+    # /dev/events: what happens from now on (the offset is the next event)
+    if (nd.kind == abi.KIND_DEV && nd.dev == vfs.DEV_EVENTS) { h.offset = events.latest(); }
     nd.opens = nd.opens + 1;
     ret h;
 }
@@ -132,6 +135,7 @@ fun disk_io(h: *Handle, buf: u64, n: u64, write: u8) u64 {
 }
 
 fun console_read(t: u64, buf: u64, n: u64) u64 {
+    if (tty.readable(t) == 0 && tty.nowait(t) != 0) { ret 0; }
     for (tty.readable(t) == 0) {
         if (proc.interrupted(proc.current()) != 0) { ret abi.err(abi.E_INTR); }
         proc.sleep_on(proc.CHAN_TTY);
@@ -149,6 +153,13 @@ pub fun read(h: *Handle, buf: u64, n: u64) u64 {
     if (nd.kind == abi.KIND_DEV) {
         if (vfs.tty_of(nd.dev) != 0xFF) { ret console_read(vfs.tty_of(nd.dev), buf, n); }
         if (nd.dev >= vfs.DEV_DISK) { ret disk_io(h, buf, n, 0); }
+        if (nd.dev == vfs.DEV_EVENTS) {
+            for (events.pending(h.offset) == 0) {
+                if (proc.interrupted(proc.current()) != 0) { ret abi.err(abi.E_INTR); }
+                proc.sleep_on(proc.CHAN_EVENTS);
+            }
+            ret events.read(?h.offset, buf::*u8, n);
+        }
         if (nd.dev == vfs.DEV_ZERO) {
             mem.fill(buf, 0, n);
             ret n;

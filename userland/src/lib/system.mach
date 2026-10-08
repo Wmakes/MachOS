@@ -1,0 +1,285 @@
+# reading what the system tells about itself: the files under /proc
+
+use io: userland.lib.cli;
+use os: std.system.os;
+
+# all of file `path` into buf (at most cap - 1 bytes, NUL-terminated); its
+# length, 0 when it cannot be read
+pub fun read_file(path: *u8, buf: *u8, cap: u64) u64 {
+    buf[0] = 0;
+    val h: i64 = io.open_read(path);
+    if (h < 0) { ret 0; }
+    var n: u64 = 0;
+    for (n + 1 < cap) {
+        val r: i64 = io.read(h, ?buf[n], cap - 1 - n);
+        if (r <= 0) { brk; }
+        n = n + r::u64;
+    }
+    io.close(h);
+    buf[n] = 0;
+    ret n;
+}
+
+# one-line file `path` into buf without its newline; its length
+pub fun line(path: *u8, buf: *u8, cap: u64) u64 {
+    var n: u64 = read_file(path, buf, cap);
+    for (n > 0 && (buf[n - 1] == 10 || buf[n - 1] == 13)) { n = n - 1; }
+    buf[n] = 0;
+    ret n;
+}
+
+# the kernel's version ("0.8.5")
+pub fun release(buf: *u8, cap: u64) u64 { ret line("/proc/sys/kernel/osrelease", buf, cap); }
+
+# --- reading the text ---------------------------------------------------------
+
+fun digit(c: u8) u8 { ret (c >= 48 && c <= 57)::u8; }
+
+# the `idx`-th number (from 0) on the line of buf[0..n] that starts with
+# `key`; 0 when there is none
+pub fun number(buf: *u8, n: u64, key: *u8, idx: u64) u64 {
+    val kl: u64 = io.len(key);
+    var s: u64 = 0;
+    for (s < n) {
+        var e: u64 = s;
+        for (e < n && buf[e] != 10) { e = e + 1; }
+        if (e - s >= kl && io.eq(?buf[s], kl, key, kl) != 0) {
+            var i: u64 = s + kl;
+            var k: u64 = 0;
+            for (i < e) {
+                for (i < e && digit(buf[i]) == 0) { i = i + 1; }
+                var v: u64 = 0;
+                var any: u8 = 0;
+                for (i < e && digit(buf[i]) != 0) {
+                    v = v * 10 + (buf[i] - 48)::u64;
+                    any = 1;
+                    i = i + 1;
+                }
+                if (any == 0) { brk; }
+                if (k == idx) { ret v; }
+                k = k + 1;
+            }
+            ret 0;
+        }
+        s = e + 1;
+    }
+    ret 0;
+}
+
+# what follows `key` and blanks on its line, into out (cap bytes); length
+pub fun text(buf: *u8, n: u64, key: *u8, out: *u8, cap: u64) u64 {
+    val kl: u64 = io.len(key);
+    var s: u64 = 0;
+    out[0] = 0;
+    for (s < n) {
+        var e: u64 = s;
+        for (e < n && buf[e] != 10) { e = e + 1; }
+        if (e - s >= kl && io.eq(?buf[s], kl, key, kl) != 0) {
+            var i: u64 = s + kl;
+            for (i < e && (buf[i] == 9 || buf[i] == 32 || buf[i] == 58)) { i = i + 1; }
+            var k: u64 = 0;
+            for (i < e && k + 1 < cap) {
+                out[k] = buf[i];
+                k = k + 1;
+                i = i + 1;
+            }
+            out[k] = 0;
+            ret k;
+        }
+        s = e + 1;
+    }
+    ret 0;
+}
+
+# --- what /proc says ------------------------------------------------------------
+
+# memory, in bytes
+pub rec Memory {
+    total: u64;
+    free:  u64;
+    heap:  u64; # the kernel's own
+}
+
+pub fun memory(m: *Memory) {
+    var b: [512]u8;
+    val n: u64 = read_file("/proc/meminfo", ?b[0], 512);
+    m.total = number(?b[0], n, "MemTotal:", 0) * 1024;
+    m.free = number(?b[0], n, "MemFree:", 0) * 1024;
+    m.heap = number(?b[0], n, "KernelHeap:", 0) * 1024;
+}
+
+# milliseconds since boot
+pub fun uptime_ms() u64 {
+    var b: [64]u8;
+    val n: u64 = read_file("/proc/uptime", ?b[0], 64);
+    var i: u64 = 0;
+    var s: u64 = 0;
+    for (i < n && digit(b[i]) != 0) {
+        s = s * 10 + (b[i] - 48)::u64;
+        i = i + 1;
+    }
+    var cs: u64 = 0;
+    if (i < n && b[i] == 46) {
+        i = i + 1;
+        var k: u64 = 0;
+        for (k < 2 && i < n && digit(b[i]) != 0) {
+            cs = cs * 10 + (b[i] - 48)::u64;
+            k = k + 1;
+            i = i + 1;
+        }
+        if (k == 1) { cs = cs * 10; }
+    }
+    ret s * 1000 + cs * 10;
+}
+
+# the processor cores at work, and per core the timer ticks spent running
+# programs (busy) and in all
+pub rec Cpus {
+    count: u64;
+    busy:  [64]u64;
+    ticks: [64]u64;
+}
+
+pub fun cpus(c: *Cpus) {
+    var b: [4096]u8;
+    val n: u64 = read_file("/proc/stat", ?b[0], 4096);
+    c.count = 0;
+    var s: u64 = 0;
+    for (s < n && c.count < 64) {
+        var e: u64 = s;
+        for (e < n && b[e] != 10) { e = e + 1; }
+        if (e - s > 3 && b[s] == 99 && b[s + 1] == 112 && b[s + 2] == 117) {
+            var i: u64 = s + 3;
+            for (i < e && digit(b[i]) != 0) { i = i + 1; }
+            var vals: [2]u64;
+            var k: u64 = 0;
+            for (k < 2) {
+                for (i < e && digit(b[i]) == 0) { i = i + 1; }
+                var v: u64 = 0;
+                for (i < e && digit(b[i]) != 0) {
+                    v = v * 10 + (b[i] - 48)::u64;
+                    i = i + 1;
+                }
+                vals[k] = v;
+                k = k + 1;
+            }
+            c.busy[c.count] = vals[0];
+            c.ticks[c.count] = vals[1];
+            c.count = c.count + 1;
+        }
+        s = e + 1;
+    }
+}
+
+# the processor's name
+pub fun cpu_name(out: *u8, cap: u64) u64 {
+    var b: [2048]u8;
+    val n: u64 = read_file("/proc/cpuinfo", ?b[0], 2048);
+    ret text(?b[0], n, "model name", out, cap);
+}
+
+# one process, as /proc/PID/status tells it
+pub rec Proc {
+    pid:      u64;
+    ppid:     u64;
+    group:    u64;
+    session:  u64;
+    uid:      u64;
+    euid:     u64;
+    gid:      u64;
+    egid:     u64;
+    state:    u8;  # R, S, T or Z
+    pages:    u64;
+    ticks:    u64;
+    name:     [32]u8;
+    name_len: u64;
+}
+
+# read /proc/<dir>/status ("self" or a pid); whether it was there
+pub fun process(dir: *u8, p: *Proc) u8 {
+    var path: [64]u8;
+    val dl: u64 = io.len(dir);
+    if (dl > 40) { ret 0; }
+    io.copy(?path[0], "/proc/", 6);
+    io.copy(?path[6], dir, dl);
+    io.copy(?path[6 + dl], "/status", 8);
+    path[14 + dl] = 0;
+    var b: [1024]u8;
+    val n: u64 = read_file(?path[0], ?b[0], 1024);
+    if (n == 0) { ret 0; }
+    p.pid = number(?b[0], n, "Pid:", 0);
+    p.ppid = number(?b[0], n, "PPid:", 0);
+    p.group = number(?b[0], n, "Pgid:", 0);
+    p.session = number(?b[0], n, "Sid:", 0);
+    p.uid = number(?b[0], n, "Uid:", 0);
+    p.euid = number(?b[0], n, "Uid:", 1);
+    p.gid = number(?b[0], n, "Gid:", 0);
+    p.egid = number(?b[0], n, "Gid:", 1);
+    p.pages = number(?b[0], n, "Pages:", 0);
+    p.ticks = number(?b[0], n, "Ticks:", 0);
+    var st: [32]u8;
+    text(?b[0], n, "State:", ?st[0], 32);
+    p.state = st[0];
+    p.name_len = text(?b[0], n, "Name:", ?p.name[0], 32);
+    ret 1;
+}
+
+# every process: call `each` for each one, in pid order
+pub fun processes(each: fun(*Proc)) {
+    # the pids first: /proc lists them as they come
+    var pids: [256]u64;
+    var count: u64 = 0;
+    var d: io.Dir;
+    if (io.dir_open(?d, "/proc") < 0) { ret; }
+    for (io.dir_next(?d) > 0 && count < 256) {
+        var ok: u8 = 0;
+        val pid: u64 = io.parse_dec(d.name, d.len, ?ok);
+        if (ok != 0) {
+            pids[count] = pid;
+            count = count + 1;
+        }
+    }
+    io.dir_close(?d);
+    var i: u64 = 1;
+    for (i < count) {
+        val v: u64 = pids[i];
+        var j: u64 = i;
+        for (j > 0 && pids[j - 1] > v) {
+            pids[j] = pids[j - 1];
+            j = j - 1;
+        }
+        pids[j] = v;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < count) {
+        var name: [24]u8;
+        val nl: u64 = io.fmt_dec(pids[i], ?name[0]);
+        name[nl] = 0;
+        var p: Proc;
+        if (process(?name[0], ?p) != 0) { each(?p); }
+        i = i + 1;
+    }
+}
+
+# how many processes there are
+pub fun process_count() u64 {
+    var count: u64 = 0;
+    var d: io.Dir;
+    if (io.dir_open(?d, "/proc") < 0) { ret 0; }
+    for (io.dir_next(?d) > 0) {
+        if (digit(d.name[0]) != 0) { count = count + 1; }
+    }
+    io.dir_close(?d);
+    ret count;
+}
+
+# which terminal handle h is (1 for tty1 ... 6), 0 when it is none: a
+# terminal's device number is 4 + N - 1, the console's 1
+pub fun tty_number(h: i64) u64 {
+    var st: os.stat_t;
+    if (io.fstat(h, ?st) < 0 || io.kind_of(st.st_mode) != io.KIND_DEV) { ret 0; }
+    if (st.st_rdev == 1) { ret 1; }
+    if (st.st_rdev >= 4 && st.st_rdev < 10) { ret st.st_rdev - 3; }
+    ret 0;
+}

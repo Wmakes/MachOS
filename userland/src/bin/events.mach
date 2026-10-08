@@ -1,0 +1,47 @@
+# events [-n COUNT]: show what happens in the system as it happens (from
+# /dev/events): USB devices and disks coming and going, mounts, programs
+# starting and ending, terminal switches, low memory ... until ^C, or COUNT
+# events
+
+use std.runtime;
+use os: std.system.os;
+use io: userland.lib.cli;
+
+var buf: [4096]u8;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
+    var count: u64 = 0xFFFFFFFFFFFFFFFF;
+    if (argc == 3 && io.streq(argv[1], "-n") != 0) {
+        var ok: u8 = 0;
+        count = io.parse_dec(argv[2], io.len(argv[2]), ?ok);
+        if (ok == 0) {
+            io.err("usage: events [-n COUNT]\n");
+            ret 2;
+        }
+    } or (argc != 1) {
+        io.err("usage: events [-n COUNT]\n");
+        ret 2;
+    }
+    val h: i64 = io.open_read("/dev/events");
+    if (h < 0) {
+        io.fail("events", "/dev/events", h);
+        ret 1;
+    }
+    var seen: u64 = 0;
+    for (seen < count) {
+        val r: i64 = io.read(h, ?buf[0], 4096);
+        if (r <= 0) { brk; }
+        # whole lines: count them, show no more than asked for
+        var k: u64 = 0;
+        for (k < r::u64 && seen < count) {
+            if (buf[k] == 10) { seen = seen + 1; }
+            k = k + 1;
+        }
+        io.outn(?buf[0], k);
+    }
+    io.close(h);
+    ret 0;
+}

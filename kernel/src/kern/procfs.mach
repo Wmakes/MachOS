@@ -1,0 +1,459 @@
+# /proc: what the system tells programs about itself, as files made up
+# whenever they are read, so any program (std's included) can read them
+# without system calls of its own
+#
+#   /proc/version                 "MachOS version 0.8.5 x86_64"
+#   /proc/uptime                  seconds since boot, and idle seconds
+#   /proc/meminfo                 MemTotal, MemFree, MemUsed, KernelHeap (kB)
+#   /proc/cpuinfo                 a block per core: processor, model name
+#   /proc/stat                    "cpuN BUSY TICKS" per core: timer ticks
+#                                 spent running programs, and in all
+#   /proc/screen                  "WIDTH HEIGHT ROWS COLS": the console's pixels
+#                                 (0 0 without a framebuffer) and text size
+#   /proc/mounts                  "DEV DIR TYPE TOTAL FREE" per filesystem
+#                                 (sizes in bytes)
+#   /proc/kmsg                    the kernel log, "<level>seq,us;text" lines;
+#                                 root clears it by writing to it
+#   /proc/sys/kernel/ostype       "MachOS"
+#   /proc/sys/kernel/osrelease    "0.8.5"
+#   /proc/sys/kernel/hostname     the machine's name; root sets it by writing
+#   /proc/sys/kernel/clock        "SECONDS.NANOSECONDS" since 1970 (UTC); root
+#                                 sets the time (and the RTC) by writing seconds
+#   /proc/sys/kernel/rtc_offset   seconds the RTC is ahead of UTC (0, or the
+#                                 zone's offset when it keeps local time)
+#   /proc/PID/status, /proc/self/status
+#                                 Name, State, Pid, PPid, Pgid, Sid, Uid and
+#                                 Gid (real, then effective),
+#                                 Pages (4 KiB pages mapped), Ticks (timer
+#                                 ticks it ran)
+
+use events: machos.kern.events;
+use abi:     sdk.abi;
+use vfs:     machos.fs.vfs;
+use mount:   machos.fs.mount;
+use parts:   machos.fs.parts;
+use proc:    machos.kern.proc;
+use kprint:  machos.kern.kprint;
+use mem:     machos.kern.mem;
+use heap:    machos.mm.heap;
+use pmm:     machos.mm.pmm;
+use apic:    machos.arch.x86_64.apic;
+use cpu:     machos.arch.x86_64.cpu;
+use smp:     machos.arch.x86_64.smp;
+use version: machos.abi.version;
+use fbcon:   machos.dev.fbcon;
+use clock:   machos.kern.clock;
+
+# what each /proc node is (its Node.ino)
+val VERSION:   u64 = 1;
+val UPTIME:    u64 = 2;
+val MEMINFO:   u64 = 3;
+val CPUINFO:   u64 = 4;
+val STAT:      u64 = 5;
+val MOUNTS:    u64 = 6;
+val KMSG:      u64 = 7;
+val OSTYPE:    u64 = 8;
+val OSRELEASE: u64 = 9;
+val HOSTNAME:  u64 = 10;
+val SCREEN:    u64 = 11;
+val CLOCK:     u64 = 12;
+val RTCOFF:    u64 = 13;
+val STATUS:    u64 = 20;
+val ROOT:      u64 = 100;
+val DIR:       u64 = 101; # sys, sys/kernel
+val PIDDIR:    u64 = 103;
+val SELF:      u64 = 104;
+
+var hostname: [64]u8;
+var hostname_len: u64 = 0;
+
+# --- writing the text ---------------------------------------------------------
+
+rec Out {
+    buf: *u8;
+    n:   u64;
+    cap: u64;
+}
+
+fun put(o: *Out, s: *u8, n: u64) {
+    var i: u64 = 0;
+    for (i < n && o.n < o.cap) {
+        o.buf[o.n] = s[i];
+        o.n = o.n + 1;
+        i = i + 1;
+    }
+}
+
+fun puts(o: *Out, s: *u8) { put(o, s, mem.cstrlen(s)); }
+
+fun putc(o: *Out, c: u8) {
+    var b: u8 = c;
+    put(o, ?b, 1);
+}
+
+fun dec(o: *Out, v: u64) {
+    var t: [20]u8;
+    var n: u64 = 0;
+    var x: u64 = v;
+    for {
+        t[n] = 48 + (x % 10)::u8;
+        n = n + 1;
+        x = x / 10;
+        if (x == 0) { brk; }
+    }
+    for (n > 0) {
+        n = n - 1;
+        putc(o, t[n]);
+    }
+}
+
+# hundredths as "S.HH"
+fun cents(o: *Out, v: u64) {
+    dec(o, v / 100);
+    putc(o, 46);
+    if (v % 100 < 10) { putc(o, 48); }
+    dec(o, v % 100);
+}
+
+fun field(o: *Out, name: *u8, v: u64) {
+    puts(o, name);
+    putc(o, 9);
+    dec(o, v);
+    putc(o, 10);
+}
+
+fun kb(o: *Out, name: *u8, bytes: u64) {
+    puts(o, name);
+    var pad: u64 = mem.cstrlen(name);
+    for (pad < 16) {
+        putc(o, 32);
+        pad = pad + 1;
+    }
+    dec(o, bytes / 1024);
+    puts(o, " kB\n\0");
+}
+
+fun state_name(s: u64) *u8 {
+    if (s == proc.RUNNING || s == proc.RUNNABLE) { ret "R (running)\0"; }
+    if (s == proc.BLOCKED) { ret "S (sleeping)\0"; }
+    if (s == proc.STOPPED) { ret "T (stopped)\0"; }
+    if (s == proc.ZOMBIE) { ret "Z (zombie)\0"; }
+    ret "? (unknown)\0";
+}
+
+fun status(o: *Out, p: *proc.Proc) {
+    puts(o, "Name:\t\0");
+    put(o, ?p.name[0], p.name_len);
+    puts(o, "\nState:\t\0");
+    puts(o, state_name(p.state));
+    putc(o, 10);
+    field(o, "Pid:\0", p.pid);
+    field(o, "PPid:\0", p.ppid);
+    field(o, "Pgid:\0", p.group);
+    field(o, "Sid:\0", p.session);
+    puts(o, "Uid:\t\0");
+    dec(o, p.uid);
+    putc(o, 9);
+    dec(o, p.euid);
+    puts(o, "\nGid:\t\0");
+    dec(o, p.gid);
+    putc(o, 9);
+    dec(o, p.egid);
+    putc(o, 10);
+    field(o, "Pages:\0", p.pages);
+    field(o, "Ticks:\0", p.cpu_ticks);
+}
+
+fun mounts(o: *Out) {
+    var i: u64 = 0;
+    for {
+        val m: *mount.Mount = mount.nth(i);
+        if (m == nil) { brk; }
+        var dev: [32]u8;
+        dev[0] = 0;
+        val b: *parts.Bdev = parts.find(m.disk, m.start);
+        if (b != nil) { parts.dev_name(b, ?dev[0]); }
+        if (dev[0] == 0) { puts(o, "none\0"); } or { puts(o, ?dev[0]); }
+        putc(o, 32);
+        if (m.root == nil) { putc(o, 47); }
+        or {
+            var dir: [256]u8;
+            put(o, ?dir[0], vfs.path_of(m.root, ?dir[0]));
+        }
+        putc(o, 32);
+        puts(o, mount.kind_name(m));
+        var total: u64 = 0;
+        var free: u64 = 0;
+        mount.space(m, ?total, ?free);
+        putc(o, 32);
+        dec(o, total);
+        putc(o, 32);
+        dec(o, free);
+        putc(o, 10);
+        i = i + 1;
+    }
+}
+
+# the whole text of node `nd` into o
+fun generate(nd: *vfs.Node, o: *Out) {
+    val id: u64 = nd.ino;
+    if (id == VERSION) {
+        puts(o, "MachOS version \0");
+        puts(o, version.VERSION);
+        puts(o, " x86_64\n\0");
+    } or (id == UPTIME) {
+        val t: u64 = proc.uptime_ticks() * 100 / apic.HZ;
+        var busy: u64 = 0;
+        var all: u64 = 0;
+        var c: u64 = 0;
+        for (c < smp.online()) {
+            busy = busy + proc.busy_ticks(c);
+            all = all + proc.all_ticks(c);
+            c = c + 1;
+        }
+        cents(o, t);
+        putc(o, 32);
+        cents(o, (all - busy) * 100 / apic.HZ);
+        putc(o, 10);
+    } or (id == MEMINFO) {
+        kb(o, "MemTotal:\0", pmm.total_pages() * 4096);
+        kb(o, "MemFree:\0", pmm.free_pages() * 4096);
+        kb(o, "MemUsed:\0", (pmm.total_pages() - pmm.free_pages()) * 4096);
+        kb(o, "KernelHeap:\0", heap.used());
+    } or (id == CPUINFO) {
+        var name: [49]u8;
+        cpu.brand(?name[0]);
+        name[48] = 0;
+        var c: u64 = 0;
+        for (c < smp.online()) {
+            field(o, "processor\0", c);
+            puts(o, "model name\t\0");
+            puts(o, ?name[0]);
+            puts(o, "\n\n\0");
+            c = c + 1;
+        }
+    } or (id == STAT) {
+        var c: u64 = 0;
+        for (c < smp.online()) {
+            puts(o, "cpu\0");
+            dec(o, c);
+            putc(o, 32);
+            dec(o, proc.busy_ticks(c));
+            putc(o, 32);
+            dec(o, proc.all_ticks(c));
+            putc(o, 10);
+            c = c + 1;
+        }
+    } or (id == MOUNTS) {
+        mounts(o);
+    } or (id == KMSG) {
+        o.n = kprint.read_log(o.buf, o.cap, 0);
+    } or (id == SCREEN) {
+        dec(o, fbcon.width_of());
+        putc(o, 32);
+        dec(o, fbcon.height_of());
+        putc(o, 32);
+        var rows: u64 = fbcon.rows_of();
+        var cols: u64 = fbcon.cols_of();
+        if (rows == 0 || cols == 0) {
+            rows = 24;
+            cols = 80;
+        }
+        dec(o, rows);
+        putc(o, 32);
+        dec(o, cols);
+        putc(o, 10);
+    } or (id == OSTYPE) {
+        puts(o, "MachOS\n\0");
+    } or (id == OSRELEASE) {
+        puts(o, version.VERSION);
+        putc(o, 10);
+    } or (id == HOSTNAME) {
+        put(o, ?hostname[0], hostname_len);
+        putc(o, 10);
+    } or (id == CLOCK) {
+        val ns: u64 = clock.real_ns();
+        dec(o, ns / 1000000000);
+        putc(o, 46);
+        var frac: u64 = ns % 1000000000;
+        var div: u64 = 100000000;
+        for (div > 0) {
+            putc(o, 48 + (frac / div)::u8);
+            frac = frac % div;
+            div = div / 10;
+        }
+        putc(o, 10);
+    } or (id == RTCOFF) {
+        val off: i64 = clock.rtc_offset();
+        if (off < 0) {
+            putc(o, 45);
+            dec(o, (0 - off)::u64);
+        } or {
+            dec(o, off::u64);
+        }
+        putc(o, 10);
+    } or (id == STATUS) {
+        var p: *proc.Proc = proc.current();
+        if (nd.pid != 0) { p = proc.find(nd.pid); }
+        if (p != nil) { status(o, p); }
+    }
+}
+
+# --- the vfs's side -------------------------------------------------------------
+
+fun read(nd: *vfs.Node, off: u64, buf: u64, n: u64) u64 {
+    if (nd.kind == abi.KIND_DIR) { ret abi.err(abi.E_ISDIR); }
+    var cap: u64 = 16384;
+    if (nd.ino == KMSG) { cap = 524288; }
+    val b: u64 = heap.alloc(cap);
+    if (b == 0) { ret abi.err(abi.E_NOMEM); }
+    var o: Out;
+    o.buf = b::*u8;
+    o.n = 0;
+    o.cap = cap;
+    generate(nd, ?o);
+    var k: u64 = 0;
+    if (off < o.n) {
+        k = o.n - off;
+        if (k > n) { k = n; }
+        mem.copy(buf, b + off, k);
+    }
+    heap.free(b);
+    ret k;
+}
+
+# a decimal number, maybe negative, at the start of s[0..n]; ok gets 0 when
+# there is none
+fun parse(s: *u8, n: u64, ok: *u8) i64 {
+    @ok = 0;
+    var i: u64 = 0;
+    var neg: u8 = 0;
+    if (n > 0 && s[0] == 45) {
+        neg = 1;
+        i = 1;
+    }
+    var v: i64 = 0;
+    val start: u64 = i;
+    for (i < n && s[i] >= 48 && s[i] <= 57) {
+        v = v * 10 + (s[i] - 48)::i64;
+        i = i + 1;
+    }
+    if (i == start) { ret 0; }
+    @ok = 1;
+    if (neg != 0) { ret 0 - v; }
+    ret v;
+}
+
+fun write(nd: *vfs.Node, buf: u64, n: u64) u64 {
+    if (proc.current().euid != 0) { ret abi.err(abi.E_PERM); }
+    if (nd.ino == CLOCK || nd.ino == RTCOFF) {
+        var ok: u8 = 0;
+        val v: i64 = parse(buf::*u8, n, ?ok);
+        if (ok == 0) { ret abi.err(abi.E_INVAL); }
+        if (nd.ino == RTCOFF) {
+            if (v < -86400 || v > 86400) { ret abi.err(abi.E_INVAL); }
+            clock.set_rtc_offset(v);
+            ret n;
+        }
+        if (v < 946684800 || v > 4102444799) { ret abi.err(abi.E_INVAL); } # 2000-2099
+        clock.set(v::u64);
+        events.begin("clock set \0");
+        events.dec(v::u64);
+        events.end();
+        ret n;
+    }
+    if (nd.ino == KMSG) {
+        kprint.clear_log();
+        ret n;
+    }
+    if (nd.ino == HOSTNAME) {
+        var k: u64 = n;
+        val s: *u8 = buf::*u8;
+        for (k > 0 && (s[k - 1] == 10 || s[k - 1] == 13 || s[k - 1] == 0)) { k = k - 1; }
+        if (k == 0 || k > 63) { ret abi.err(abi.E_INVAL); }
+        mem.copy((?hostname[0])::u64, buf, k);
+        hostname_len = k;
+        events.begin("hostname \0");
+        events.textn(?hostname[0], k);
+        events.end();
+        ret n;
+    }
+    ret abi.err(abi.E_PERM);
+}
+
+fun pid_name(pid: u64, out: *u8) u64 {
+    var t: [20]u8;
+    var n: u64 = 0;
+    var x: u64 = pid;
+    for {
+        t[n] = 48 + (x % 10)::u8;
+        n = n + 1;
+        x = x / 10;
+        if (x == 0) { brk; }
+    }
+    var i: u64 = 0;
+    for (i < n) {
+        out[i] = t[n - 1 - i];
+        i = i + 1;
+    }
+    ret n;
+}
+
+# /proc itself is looked into: a directory for every process there is,
+# none for the ones that are gone
+fun refresh(d: *vfs.Node) {
+    if (d.ino != ROOT) { ret; }
+    var c: *vfs.Node = d.child;
+    for (c != nil) {
+        val next: *vfs.Node = c.next;
+        if (c.ino == PIDDIR && proc.find(c.pid) == nil) { vfs.drop_proc(c); }
+        c = next;
+    }
+    var i: u64 = 0;
+    for (i < proc.MAX) {
+        val p: *proc.Proc = proc.slot(i);
+        if (p.state != proc.FREE) {
+            var have: u8 = 0;
+            c = d.child;
+            for (c != nil && have == 0) {
+                if (c.ino == PIDDIR && c.pid == p.pid) { have = 1; }
+                c = c.next;
+            }
+            if (have == 0) {
+                var name: [20]u8;
+                val n: u64 = pid_name(p.pid, ?name[0]);
+                val pd: *vfs.Node = vfs.make_proc(d, ?name[0], n, abi.KIND_DIR, PIDDIR, p.pid, 0x16D);
+                if (pd != nil) { vfs.make_proc(pd, "status\0", 6, abi.KIND_FILE, STATUS, p.pid, 0x124); }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# make /proc under `root` and hand the vfs its readers
+pub fun init(root: *vfs.Node) {
+    hostname_len = 6;
+    mem.copy((?hostname[0])::u64, "machos\0"::u64, 6);
+    vfs.set_proc(read, write, refresh);
+    val d: *vfs.Node = vfs.make_proc(root, "proc\0", 4, abi.KIND_DIR, ROOT, 0, 0x16D);
+    if (d == nil) { ret; }
+    vfs.make_proc(d, "version\0", 7, abi.KIND_FILE, VERSION, 0, 0x124);
+    vfs.make_proc(d, "uptime\0", 6, abi.KIND_FILE, UPTIME, 0, 0x124);
+    vfs.make_proc(d, "meminfo\0", 7, abi.KIND_FILE, MEMINFO, 0, 0x124);
+    vfs.make_proc(d, "cpuinfo\0", 7, abi.KIND_FILE, CPUINFO, 0, 0x124);
+    vfs.make_proc(d, "stat\0", 4, abi.KIND_FILE, STAT, 0, 0x124);
+    vfs.make_proc(d, "mounts\0", 6, abi.KIND_FILE, MOUNTS, 0, 0x124);
+    vfs.make_proc(d, "screen\0", 6, abi.KIND_FILE, SCREEN, 0, 0x124);
+    vfs.make_proc(d, "kmsg\0", 4, abi.KIND_FILE, KMSG, 0, 0x1A4);
+    val self: *vfs.Node = vfs.make_proc(d, "self\0", 4, abi.KIND_DIR, SELF, 0, 0x16D);
+    if (self != nil) { vfs.make_proc(self, "status\0", 6, abi.KIND_FILE, STATUS, 0, 0x124); }
+    val sys: *vfs.Node = vfs.make_proc(d, "sys\0", 3, abi.KIND_DIR, DIR, 0, 0x16D);
+    if (sys == nil) { ret; }
+    val k: *vfs.Node = vfs.make_proc(sys, "kernel\0", 6, abi.KIND_DIR, DIR, 0, 0x16D);
+    if (k == nil) { ret; }
+    vfs.make_proc(k, "ostype\0", 6, abi.KIND_FILE, OSTYPE, 0, 0x124);
+    vfs.make_proc(k, "osrelease\0", 9, abi.KIND_FILE, OSRELEASE, 0, 0x124);
+    vfs.make_proc(k, "hostname\0", 8, abi.KIND_FILE, HOSTNAME, 0, 0x1A4);
+    vfs.make_proc(k, "clock\0", 5, abi.KIND_FILE, CLOCK, 0, 0x1A4);
+    vfs.make_proc(k, "rtc_offset\0", 10, abi.KIND_FILE, RTCOFF, 0, 0x1A4);
+}

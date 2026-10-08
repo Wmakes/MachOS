@@ -48,7 +48,8 @@ fun draw(left: u64) {
     }
     efi.color(efi.WHITE, efi.BLACK);
     efi.at(2, 7);
-    efi.puts("machboot 0.8.1\0");
+    efi.puts("machboot \0");
+    efi.puts($project.version);
     efi.color(efi.DARKGRAY, efi.BLACK);
     if (files.on_root != 0) { efi.puts("   files from the MachOS root partition\0"); }
     or { efi.puts("   files from the EFI partition\0"); }

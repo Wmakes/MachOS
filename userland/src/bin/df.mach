@@ -1,37 +1,71 @@
-# df: size and free space of every mounted filesystem
+# df: size and free space of every mounted filesystem (from /proc/mounts)
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use std.runtime;
+use io:     userland.lib.cli;
+use system: userland.lib.system;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun col(v: u64, width: u64) { io.dec_pad(v / 1024, width); }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
-    io.out("Filesystem        KiB      Used     Avail Use% Mounted on\n\0");
-    var i: u64 = 0;
-    for {
-        var m: abi.MountInfo;
-        val r: u64 = sys.mounts(i, ?m);
-        if (abi.is_err(r) != 0 || r == 0) { brk; }
-        val dl: u64 = io.len(?m.dev[0]);
-        io.out(?m.dev[0]);
+# the number in word w (from 0) of line b[s..e]
+fun word(b: *u8, s: u64, e: u64, w: u64, at: *u64, len: *u64) {
+    var i: u64 = s;
+    var k: u64 = 0;
+    for (i < e) {
+        for (i < e && b[i] == 32) { i = i + 1; }
+        val start: u64 = i;
+        for (i < e && b[i] != 32) { i = i + 1; }
+        if (k == w) {
+            @at = start;
+            @len = i - start;
+            ret;
+        }
+        k = k + 1;
+    }
+    @at = e;
+    @len = 0;
+}
+
+fun num(b: *u8, s: u64, e: u64, w: u64) u64 {
+    var at: u64 = 0;
+    var n: u64 = 0;
+    word(b, s, e, w, ?at, ?n);
+    var ok: u8 = 0;
+    ret io.parse_dec(?b[at], n, ?ok);
+}
+
+fun run(argc: u64, argv: **u8) u64 {
+    io.out("Filesystem        KiB      Used     Avail Use% Mounted on\n");
+    var b: [8192]u8;
+    val n: u64 = system.read_file("/proc/mounts", ?b[0], 8192);
+    var s: u64 = 0;
+    for (s < n) {
+        var e: u64 = s;
+        for (e < n && b[e] != 10) { e = e + 1; }
+        var at: u64 = 0;
+        var dl: u64 = 0;
+        word(?b[0], s, e, 0, ?at, ?dl);
+        io.outn(?b[at], dl);
         var k: u64 = dl;
         for (k < 12) {
             io.putc(32);
             k = k + 1;
         }
-        col(m.total, 10);
-        col(m.total - m.free, 10);
-        col(m.free, 10);
+        val total: u64 = num(?b[0], s, e, 3);
+        val free: u64 = num(?b[0], s, e, 4);
+        col(total, 10);
+        col(total - free, 10);
+        col(free, 10);
         var pct: u64 = 0;
-        if (m.total > 0) { pct = ((m.total - m.free) * 100 + m.total - 1) / m.total; }
+        if (total > 0) { pct = ((total - free) * 100 + total - 1) / total; }
         io.dec_pad(pct, 4);
-        io.out("% \0");
-        io.out(?m.dir[0]);
+        io.out("% ");
+        word(?b[0], s, e, 1, ?at, ?dl);
+        io.outn(?b[at], dl);
         io.putc(10);
-        i = i + 1;
+        s = e + 1;
     }
     ret 0;
 }

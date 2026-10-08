@@ -1,15 +1,22 @@
 # sync: put every pending write on the disk
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use std.runtime;
+use os: std.system.os;
+use io: userland.lib.cli;
+use std.types.size.usize;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
-    val r: u64 = sys.sync();
-    if (abi.is_err(r) != 0) {
-        io.fail("sync\0", nil, r);
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    # syncing any file makes MachOS write everything out
+    val h: i64 = io.open_read("/");
+    if (h < 0) {
+        io.fail("sync", nil, h);
+        ret 1;
+    }
+    val r: i64 = os.sync_fd(h::usize);
+    io.close(h);
+    if (r < 0) {
+        io.fail("sync", nil, r);
         ret 1;
     }
     ret 0;

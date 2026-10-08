@@ -1,59 +1,141 @@
-# date [+%s]: the current date and time (UTC); +%s: seconds since 1970
+# date [-u] [+%s]: the date and time, in the system's time zone
+#   -u                 in UTC
+#   +%s                seconds since 1970
+#   -s "YYYY-MM-DD HH:MM[:SS]"   set the clock (local time; root), also
+#   -s @SECONDS        the hardware clock
 
-use io:  userland.lib.cli;
 use std.runtime;
-
-val MONTH_DAYS: [12]u64 = [12]u64{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-
-fun leap(y: u64) u8 {
-    if ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) { ret 1; }
-    ret 0;
-}
-
-fun two(v: u64) {
-    if (v < 10) { io.putc(48); }
-    io.dec(v);
-}
+use os:   std.system.os;
+use io:   userland.lib.cli;
+use time: userland.lib.time;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
-fun run(argc: u64, argv: **u8) u64 {
-    val t: u64 = io.time();
-    if (argc > 1 && io.streq(argv[1], "+%s\0") != 0) {
-        io.dec(t);
-        io.putc(10);
-        ret 0;
-    }
-    var days: u64 = t / 86400;
-    val secs: u64 = t % 86400;
-    var year: u64 = 1970;
-    for {
-        var len: u64 = 365;
-        if (leap(year) != 0) { len = 366; }
-        if (days < len) { brk; }
-        days = days - len;
-        year = year + 1;
-    }
-    var month: u64 = 0;
-    for (month < 12) {
-        var len: u64 = MONTH_DAYS[month];
-        if (month == 1 && leap(year) != 0) { len = 29; }
-        if (days < len) { brk; }
-        days = days - len;
-        month = month + 1;
-    }
-    io.dec(year);
+fun two(v: i64) {
+    if (v < 10) { io.putc(48); }
+    io.dec(v::u64);
+}
+
+fun now() i64 {
+    var ts: os.Timespec;
+    os.realtime(?ts);
+    ret ts.sec;
+}
+
+fun show(t: i64, z: *time.Zone) {
+    var tm: time.Tm;
+    val name: *u8 = time.local(z, t, ?tm);
+    io.dec(tm.year::u64);
     io.putc(45);
-    two(month + 1);
+    two(tm.month);
     io.putc(45);
-    two(days + 1);
+    two(tm.day);
     io.putc(32);
-    two(secs / 3600);
+    two(tm.hour);
     io.putc(58);
-    two((secs / 60) % 60);
+    two(tm.min);
     io.putc(58);
-    two(secs % 60);
-    io.out(" UTC\n\0");
+    two(tm.sec);
+    io.putc(32);
+    io.out(name);
+    io.putc(10);
+}
+
+# digits at s[*i..], at most `max` of them
+fun digits(s: *u8, i: *u64, max: u64, ok: *u8) i64 {
+    var v: i64 = 0;
+    var k: u64 = 0;
+    for (k < max && s[@i] >= 48 && s[@i] <= 57) {
+        v = v * 10 + (s[@i] - 48)::i64;
+        @i = @i + 1;
+        k = k + 1;
+    }
+    if (k == 0) { @ok = 0; }
+    ret v;
+}
+
+fun expect(s: *u8, i: *u64, c: u8, ok: *u8) {
+    if (s[@i] == c) { @i = @i + 1; } or { @ok = 0; }
+}
+
+# "YYYY-MM-DD HH:MM[:SS]" (local) or "@SECONDS"; the UTC second, or -1
+fun parse(s: *u8, z: *time.Zone) i64 {
+    var i: u64 = 0;
+    var ok: u8 = 1;
+    if (s[0] == 64) {
+        i = 1;
+        val v: i64 = digits(s, ?i, 12, ?ok);
+        if (ok == 0 || s[i] != 0) { ret -1; }
+        ret v;
+    }
+    var tm: time.Tm;
+    tm.year = digits(s, ?i, 4, ?ok);
+    expect(s, ?i, 45, ?ok);
+    tm.month = digits(s, ?i, 2, ?ok);
+    expect(s, ?i, 45, ?ok);
+    tm.day = digits(s, ?i, 2, ?ok);
+    if (s[i] == 32 || s[i] == 84) { i = i + 1; } or { ok = 0; }
+    tm.hour = digits(s, ?i, 2, ?ok);
+    expect(s, ?i, 58, ?ok);
+    tm.min = digits(s, ?i, 2, ?ok);
+    tm.sec = 0;
+    if (s[i] == 58) {
+        i = i + 1;
+        tm.sec = digits(s, ?i, 2, ?ok);
+    }
+    if (ok == 0 || s[i] != 0) { ret -1; }
+    if (tm.month < 1 || tm.month > 12 || tm.day < 1 || tm.day > 31 || tm.hour > 23 || tm.min > 59 || tm.sec > 59) { ret -1; }
+    ret time.from_local(z, ?tm);
+}
+
+fun usage() u64 {
+    io.err("usage: date [-u] [+%s] [-s \"YYYY-MM-DD HH:MM[:SS]\" | -s @SECONDS]\n");
+    ret 2;
+}
+
+fun run(argc: u64, argv: **u8) u64 {
+    var z: time.Zone;
+    time.system_zone(?z);
+    var i: u64 = 1;
+    for (i < argc) {
+        val a: *u8 = argv[i];
+        if (io.streq(a, "-u") != 0) {
+            time.utc(?z);
+        } or (io.streq(a, "+%s") != 0) {
+            io.dec(now()::u64);
+            io.putc(10);
+            ret 0;
+        } or (io.streq(a, "-s") != 0) {
+            if (i + 1 >= argc) { ret usage(); }
+            val t: i64 = parse(argv[i + 1], ?z);
+            if (t < 0) {
+                io.err("date: not a date: ");
+                io.err(argv[i + 1]);
+                io.err("\n");
+                ret 2;
+            }
+            # the kernel sets its clock and the hardware clock
+            val h: i64 = io.open_mode("/proc/sys/kernel/clock", os.O_WRONLY, 0);
+            if (h < 0) {
+                io.fail("date", "/proc/sys/kernel/clock", h);
+                ret 1;
+            }
+            var b: [24]u8;
+            val n: u64 = io.fmt_dec(t::u64, ?b[0]);
+            val w: i64 = io.write(h, ?b[0], n);
+            io.close(h);
+            if (w < 0) {
+                io.fail("date", "cannot set the clock", w);
+                ret 1;
+            }
+            show(t, ?z);
+            ret 0;
+        } or {
+            ret usage();
+        }
+        i = i + 1;
+    }
+    show(now(), ?z);
     ret 0;
 }

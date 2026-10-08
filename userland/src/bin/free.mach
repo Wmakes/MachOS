@@ -1,23 +1,24 @@
-# free: memory use
+# free: memory use (from /proc/meminfo)
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use std.runtime;
+use io:     userland.lib.cli;
+use system: userland.lib.system;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun row(name: *u8, bytes: u64) {
     io.out(name);
     io.dec_pad(bytes / 1024, 10);
-    io.out(" KiB\n\0");
+    io.out(" KiB\n");
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
-    var i: abi.Info;
-    sys.info(?i);
-    row("total \0", i.mem_total);
-    row("used  \0", i.mem_total - i.mem_free);
-    row("free  \0", i.mem_free);
-    row("kheap \0", i.heap_used);
+fun run(argc: u64, argv: **u8) u64 {
+    var m: system.Memory;
+    system.memory(?m);
+    row("total ", m.total);
+    row("used  ", m.total - m.free);
+    row("free  ", m.free);
+    row("kheap ", m.heap);
     ret 0;
 }

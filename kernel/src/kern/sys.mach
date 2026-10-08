@@ -1,6 +1,7 @@
 # system calls (numbers and records in abi/sys.mach). every user pointer is
 # checked against the caller's page tables before the kernel touches it
 
+use events: machos.kern.events;
 use abi:    sdk.abi;
 use idt:    machos.arch.x86_64.idt;
 use apic:   machos.arch.x86_64.apic;
@@ -112,6 +113,11 @@ fun set_name(p: *proc.Proc, full: *u8, n: u64) {
     if (k > 31) { k = 31; }
     mem.copy((?p.name[0])::u64, (?full[b])::u64, k);
     p.name_len = k;
+    events.begin("start \0");
+    events.dec(p.pid);
+    events.char(32);
+    events.textn(?p.name[0], k);
+    events.end();
 }
 
 pub fun exit_with(code: u64) { exit.exit_with(code); }
@@ -968,6 +974,12 @@ fun sys_mount(dva: u64, dlen: u64, pva: u64, plen: u64) u64 {
     if (abi.is_err(mr) != 0) {
         kprint.puts(" failed: \0");
         kprint.puts(abi.err_name(mr));
+    } or {
+        events.begin("mount \0");
+        events.textn(?dp[0], dn);
+        events.char(32);
+        events.textn(?full[0], n);
+        events.end();
     }
     kprint.putc(10);
     ret mr;
@@ -1017,6 +1029,10 @@ fun sys_umount(pva: u64, plen: u64) u64 {
     if (abi.is_err(res) != 0) {
         kprint.puts(" failed: \0");
         kprint.puts(abi.err_name(res));
+    } or {
+        events.begin("umount \0");
+        events.textn(?full[0], n);
+        events.end();
     }
     kprint.putc(10);
     ret res;

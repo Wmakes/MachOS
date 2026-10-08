@@ -1,7 +1,7 @@
 #!/bin/sh
 # make a MachOS update package: everything `update` (inside MachOS)
 # replaces, as a .tgz: VERSION, boot/kernel.elf, boot/initrd.tar,
-# boot/BOOTX64.EFI (machboot), bin/* and etc/motd
+# boot/BOOTX64.EFI (machboot), bin/*, etc/motd and etc/machos.conf
 # usage: tools/mkupdate.sh [OUT.tgz]   (default out/machos-update-VERSION.tgz)
 set -eu
 cd "$(dirname "$0")/.."
@@ -17,6 +17,7 @@ cp out/release/initrd.tar "$S/boot/initrd.tar"
 cp machboot/out/uefi/release/BOOTX64.EFI "$S/boot/BOOTX64.EFI"
 cp userland/out/machos/release/bin/* "$S/bin/"
 cp root/etc/motd "$S/etc/motd"
+cp root/etc/machos.conf "$S/etc/machos.conf"
 chmod 0755 "$S/bin/"*
 tar --format=ustar --owner=0 --group=0 -C "$S" -cf - . | gzip -9 > "$OUT"
 rm -rf "$S"

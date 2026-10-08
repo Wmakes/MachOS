@@ -1,0 +1,344 @@
+# dates and time zones. a zone is a POSIX TZ rule, as /etc/machos.conf's
+# `timezone` (or $TZ) gives it:
+#
+#   UTC0                          no offset
+#   CET-1CEST,M3.5.0,M10.5.0/3    UTC+1, summer time UTC+2 from the last
+#                                 Sunday of March 02:00 to the last Sunday
+#                                 of October 03:00
+#   EST5EDT,M3.2.0,M11.1.0        UTC-5, summer time UTC-4
+#   <+0330>-3:30                  a zone without a name
+#
+# (the offset is how far behind UTC the zone is, so east of Greenwich it is
+# negative.) a rule date is Mm.w.d (month m, week w (5 = the last), weekday
+# d, 0 = Sunday), Jn (day n of 1..365, no February 29th) or n (0..365), each
+# with an optional /time (default 02:00:00)
+
+use os:   std.system.os;
+use io:   userland.lib.cli;
+use conf: userland.lib.conf;
+
+# a broken-down time
+pub rec Tm {
+    year:  i64;
+    month: i64; # 1..12
+    day:   i64; # 1..31
+    hour:  i64;
+    min:   i64;
+    sec:   i64;
+    wday:  i64; # 0 = Sunday
+    yday:  i64; # 0..365
+}
+
+rec Rule {
+    kind:  u8;  # 77 'M', 74 'J', 78 n
+    month: i64;
+    week:  i64;
+    wday:  i64;
+    day:   i64;
+    time:  i64; # seconds after local midnight
+}
+
+pub rec Zone {
+    std_name: [16]u8;
+    dst_name: [16]u8;
+    std_off:  i64; # seconds east of UTC
+    dst_off:  i64;
+    has_dst:  u8;
+    start:    Rule;
+    end:      Rule;
+}
+
+# --- the calendar ---------------------------------------------------------------
+
+pub fun leap(y: i64) u8 { ret ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)::u8; }
+
+fun month_days(y: i64, m: i64) i64 {
+    if (m == 2) { ret 28 + leap(y)::i64; }
+    if (m == 4 || m == 6 || m == 9 || m == 11) { ret 30; }
+    ret 31;
+}
+
+# days from 1970-01-01 to y-m-d (proleptic Gregorian)
+pub fun days_from_civil(y: i64, m: i64, d: i64) i64 {
+    var yy: i64 = y;
+    if (m <= 2) { yy = yy - 1; }
+    var era: i64 = yy / 400;
+    if (yy < 0 && yy % 400 != 0) { era = era - 1; }
+    val yoe: i64 = yy - era * 400;
+    var mp: i64 = m - 3;
+    if (m <= 2) { mp = m + 9; }
+    val doy: i64 = (153 * mp + 2) / 5 + d - 1;
+    val doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    ret era * 146097 + doe - 719468;
+}
+
+# second t (since 1970, UTC or already shifted to local) broken down
+pub fun civil(t: i64, tm: *Tm) {
+    var days: i64 = t / 86400;
+    var secs: i64 = t % 86400;
+    if (secs < 0) {
+        secs = secs + 86400;
+        days = days - 1;
+    }
+    tm.hour = secs / 3600;
+    tm.min = (secs / 60) % 60;
+    tm.sec = secs % 60;
+    var w: i64 = (days + 4) % 7; # 1970-01-01 was a Thursday
+    if (w < 0) { w = w + 7; }
+    tm.wday = w;
+    val z: i64 = days + 719468;
+    var era: i64 = z / 146097;
+    if (z < 0 && z % 146097 != 0) { era = era - 1; }
+    val doe: i64 = z - era * 146097;
+    val yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    val doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    val mp: i64 = (5 * doy + 2) / 153;
+    tm.day = doy - (153 * mp + 2) / 5 + 1;
+    if (mp < 10) { tm.month = mp + 3; } or { tm.month = mp - 9; }
+    tm.year = yoe + era * 400;
+    if (tm.month <= 2) { tm.year = tm.year + 1; }
+    tm.yday = days - days_from_civil(tm.year, 1, 1);
+}
+
+# the second (since 1970) of a broken-down time, taken as UTC
+pub fun seconds(tm: *Tm) i64 {
+    ret days_from_civil(tm.year, tm.month, tm.day) * 86400 + tm.hour * 3600 + tm.min * 60 + tm.sec;
+}
+
+# --- reading a TZ rule ------------------------------------------------------------
+
+rec Cursor {
+    s: *u8;
+    i: u64;
+}
+
+fun peek(c: *Cursor) u8 { ret c.s[c.i]; }
+
+fun is_digit(ch: u8) u8 { ret (ch >= 48 && ch <= 57)::u8; }
+
+fun alpha(ch: u8) u8 { ret ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122))::u8; }
+
+fun num(c: *Cursor) i64 {
+    var v: i64 = 0;
+    for (is_digit(peek(c)) != 0) {
+        v = v * 10 + (peek(c) - 48)::i64;
+        c.i = c.i + 1;
+    }
+    ret v;
+}
+
+# a zone name: letters, or anything between < and >
+fun name(c: *Cursor, out: *u8) u8 {
+    var k: u64 = 0;
+    if (peek(c) == 60) {
+        c.i = c.i + 1;
+        for (peek(c) != 0 && peek(c) != 62) {
+            if (k < 15) {
+                out[k] = peek(c);
+                k = k + 1;
+            }
+            c.i = c.i + 1;
+        }
+        if (peek(c) != 62) { ret 0; }
+        c.i = c.i + 1;
+    } or {
+        for (alpha(peek(c)) != 0) {
+            if (k < 15) {
+                out[k] = peek(c);
+                k = k + 1;
+            }
+            c.i = c.i + 1;
+        }
+    }
+    out[k] = 0;
+    ret (k > 0)::u8;
+}
+
+# [+-]hh[:mm[:ss]], in seconds
+fun hms(c: *Cursor, ok: *u8) i64 {
+    var sign: i64 = 1;
+    if (peek(c) == 45) {
+        sign = -1;
+        c.i = c.i + 1;
+    } or (peek(c) == 43) {
+        c.i = c.i + 1;
+    }
+    if (is_digit(peek(c)) == 0) {
+        @ok = 0;
+        ret 0;
+    }
+    var v: i64 = num(c) * 3600;
+    if (peek(c) == 58) {
+        c.i = c.i + 1;
+        v = v + num(c) * 60;
+        if (peek(c) == 58) {
+            c.i = c.i + 1;
+            v = v + num(c);
+        }
+    }
+    @ok = 1;
+    ret sign * v;
+}
+
+fun rule(c: *Cursor, r: *Rule) u8 {
+    if (peek(c) == 77) { # Mm.w.d
+        c.i = c.i + 1;
+        r.kind = 77;
+        r.month = num(c);
+        if (peek(c) != 46) { ret 0; }
+        c.i = c.i + 1;
+        r.week = num(c);
+        if (peek(c) != 46) { ret 0; }
+        c.i = c.i + 1;
+        r.wday = num(c);
+        if (r.month < 1 || r.month > 12 || r.week < 1 || r.week > 5 || r.wday > 6) { ret 0; }
+    } or (peek(c) == 74) { # Jn
+        c.i = c.i + 1;
+        r.kind = 74;
+        r.day = num(c);
+    } or (is_digit(peek(c)) != 0) {
+        r.kind = 78;
+        r.day = num(c);
+    } or {
+        ret 0;
+    }
+    r.time = 7200;
+    if (peek(c) == 47) {
+        c.i = c.i + 1;
+        var ok: u8 = 0;
+        r.time = hms(c, ?ok);
+        if (ok == 0) { ret 0; }
+    }
+    ret 1;
+}
+
+# read TZ rule `tz` into z; whether it made sense (z is UTC when not)
+pub fun parse(tz: *u8, z: *Zone) u8 {
+    utc(z);
+    if (tz == nil || tz[0] == 0) { ret 1; }
+    var c: Cursor;
+    c.s = tz;
+    c.i = 0;
+    if (peek(?c) == 58) { c.i = 1; } # ":NAME" means the same here
+    var n: Zone;
+    if (name(?c, ?n.std_name[0]) == 0) { ret 0; }
+    var ok: u8 = 0;
+    n.std_off = 0 - hms(?c, ?ok);
+    if (ok == 0) { ret 0; }
+    n.has_dst = 0;
+    n.dst_name[0] = 0;
+    n.dst_off = n.std_off + 3600;
+    if (peek(?c) != 0) {
+        if (name(?c, ?n.dst_name[0]) == 0) { ret 0; }
+        n.has_dst = 1;
+        if (peek(?c) != 44 && peek(?c) != 0) {
+            n.dst_off = 0 - hms(?c, ?ok);
+            if (ok == 0) { ret 0; }
+        }
+        # no rule: the US one
+        n.start.kind = 77;
+        n.start.month = 3;
+        n.start.week = 2;
+        n.start.wday = 0;
+        n.start.time = 7200;
+        n.end.kind = 77;
+        n.end.month = 11;
+        n.end.week = 1;
+        n.end.wday = 0;
+        n.end.time = 7200;
+        if (peek(?c) == 44) {
+            c.i = c.i + 1;
+            if (rule(?c, ?n.start) == 0) { ret 0; }
+            if (peek(?c) != 44) { ret 0; }
+            c.i = c.i + 1;
+            if (rule(?c, ?n.end) == 0) { ret 0; }
+        }
+    }
+    if (peek(?c) != 0) { ret 0; }
+    @z = n;
+    ret 1;
+}
+
+pub fun utc(z: *Zone) {
+    z.std_name[0] = 85;
+    z.std_name[1] = 84;
+    z.std_name[2] = 67;
+    z.std_name[3] = 0;
+    z.dst_name[0] = 0;
+    z.std_off = 0;
+    z.dst_off = 0;
+    z.has_dst = 0;
+}
+
+# the zone the system is set to: $TZ, else /etc/machos.conf's timezone,
+# else UTC
+pub fun system_zone(z: *Zone) {
+    var buf: [128]u8;
+    val got: i64 = os.getenv("TZ", ?buf[0], 128);
+    if (got > 0 && got < 128) {
+        if (parse(?buf[0], z) != 0) { ret; }
+    }
+    if (conf.get("timezone", ?buf[0], 128) > 0 && parse(?buf[0], z) != 0) { ret; }
+    utc(z);
+}
+
+# --- applying it ----------------------------------------------------------------
+
+# the local second (since 1970, local midnight based) a rule falls on in year y
+fun rule_local(r: *Rule, y: i64) i64 {
+    var day: i64 = 0;
+    if (r.kind == 77) {
+        val first: i64 = days_from_civil(y, r.month, 1);
+        var wd: i64 = (first + 4) % 7;
+        if (wd < 0) { wd = wd + 7; }
+        var d: i64 = first + (r.wday - wd + 7) % 7 + (r.week - 1) * 7;
+        val last: i64 = first + month_days(y, r.month) - 1;
+        for (d > last) { d = d - 7; }
+        day = d;
+    } or (r.kind == 74) {
+        day = days_from_civil(y, 1, 1) + r.day - 1;
+        if (leap(y) != 0 && r.day >= 60) { day = day + 1; }
+    } or {
+        day = days_from_civil(y, 1, 1) + r.day;
+    }
+    ret day * 86400 + r.time;
+}
+
+# whether UTC second t is in summer time
+pub fun is_dst(z: *Zone, t: i64) u8 {
+    if (z.has_dst == 0) { ret 0; }
+    var tm: Tm;
+    civil(t + z.std_off, ?tm);
+    # the switches, in UTC: into summer time from standard time, back from it
+    val start: i64 = rule_local(?z.start, tm.year) - z.std_off;
+    val end: i64 = rule_local(?z.end, tm.year) - z.dst_off;
+    if (start < end) { ret (t >= start && t < end)::u8; }
+    ret (t >= start || t < end)::u8;  # the southern hemisphere: across new year
+}
+
+# seconds east of UTC at UTC second t, and the zone's name then
+pub fun offset(z: *Zone, t: i64, name: **u8) i64 {
+    if (is_dst(z, t) != 0) {
+        if (name != nil) { @name = ?z.dst_name[0]; }
+        ret z.dst_off;
+    }
+    if (name != nil) { @name = ?z.std_name[0]; }
+    ret z.std_off;
+}
+
+# UTC second t as local time; the zone's name then
+pub fun local(z: *Zone, t: i64, tm: *Tm) *u8 {
+    var n: *u8 = nil;
+    val off: i64 = offset(z, t, ?n);
+    civil(t + off, tm);
+    ret n;
+}
+
+# the UTC second of local time tm (in a skipped hour, as if still standard
+# time; in a repeated one, the first)
+pub fun from_local(z: *Zone, tm: *Tm) i64 {
+    val l: i64 = seconds(tm);
+    val as_dst: i64 = l - z.dst_off;
+    if (z.has_dst != 0 && is_dst(z, as_dst) != 0) { ret as_dst; }
+    ret l - z.std_off;
+}

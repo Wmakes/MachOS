@@ -1,10 +1,11 @@
 # update FILE: install a MachOS update package (made by tools/mkupdate.sh:
 # a .tgz with VERSION, boot/kernel.elf, boot/initrd.tar, boot/BOOTX64.EFI,
-# bin/* and etc/motd). the running kernel and initrd are kept as
+# bin/*, etc/motd and etc/machos.conf). the running kernel and initrd are kept as
 # /boot/kernel.old.elf and /boot/initrd.old.tar, and machboot gets an entry
 # "MachOS (previous)" that boots them, in case the new one does not start.
 # the programs in /bin are replaced, machboot too (on the EFI partition as
-# well when it is mounted on /boot/efi); your settings in /etc stay.
+# well when it is mounted on /boot/efi); your settings in /etc stay
+# (/etc/machos.conf is only added when there is none).
 # reboot afterwards to start the new system
 
 use abi: sdk.abi;
@@ -162,6 +163,10 @@ fun main(argc: u64, argv: **u8) u64 {
         if (exists("/boot/efi/EFI/BOOT\0") != 0) { install("boot/BOOTX64.EFI\0", "/boot/efi/EFI/BOOT/BOOTX64.EFI\0"); }
     }
     if (exists("/tmp/update/etc/motd\0") != 0) { install("etc/motd\0", "/etc/motd\0"); }
+    # the settings file only when there is none yet: the one there is yours
+    if (exists("/tmp/update/etc/machos.conf\0") != 0 && exists("/etc/machos.conf\0") == 0) {
+        install("etc/machos.conf\0", "/etc/machos.conf\0");
+    }
 
     # every program
     say("installing the programs\n\0");

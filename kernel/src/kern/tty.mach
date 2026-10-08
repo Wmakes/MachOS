@@ -6,6 +6,7 @@
 # typed, ISIG makes ^C kill the foreground process group. in line mode
 # escape sequences (arrow keys) are dropped
 
+use events: machos.kern.events;
 use abi:    sdk.abi;
 use kprint: machos.kern.kprint;
 use proc:   machos.kern.proc;
@@ -182,6 +183,9 @@ pub fun switch_to(n: u64) {
     if (n >= COUNT || n == active) { ret; }
     active = n;
     fbcon.show_screen(n);
+    events.begin("tty switch \0");
+    events.dec(n + 1);
+    events.end();
 }
 
 pub fun current() u64 { ret active; }
@@ -191,6 +195,12 @@ pub fun readable(n: u64) u8 {
     setup();
     if (terms[n].count > 0 || terms[n].eofs > 0) { ret 1; }
     ret 0;
+}
+
+# whether a read returns at once even with nothing to give (raw, NOWAIT)
+pub fun nowait(n: u64) u8 {
+    setup();
+    ret ((terms[n].lflag & (abi.ICANON | abi.NOWAIT)) == abi.NOWAIT)::u8;
 }
 
 # take up to `len` bytes (in line mode, stopping after a newline); 0 means
@@ -226,6 +236,6 @@ pub fun set_lflag(n: u64, f: u64) {
     val t: *Term = ?terms[n];
     # leaving line mode hands over whatever was half typed
     if ((t.lflag & abi.ICANON) != 0 && (f & abi.ICANON) == 0 && t.line_len > 0) { commit(t); }
-    t.lflag = f & (abi.ISIG | abi.ICANON | abi.ECHO);
+    t.lflag = f & (abi.ISIG | abi.ICANON | abi.ECHO | abi.NOWAIT);
     t.esc = 0;
 }

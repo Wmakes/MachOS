@@ -18,6 +18,7 @@ pub val FS_RAM:  u64 = 0;
 pub val FS_EXT2: u64 = 1;
 pub val FS_FAT:  u64 = 2;   # FAT16/32 (fs/fat.mach)
 pub val FS_EXFAT: u64 = 3;  # exFAT (fs/exfat.mach)
+pub val FS_PROC: u64 = 4;   # /proc: made up when read (kern/procfs.mach)
 
 pub val DEV_CONSOLE: u64 = 1;
 
@@ -30,6 +31,7 @@ pub fun tty_of(dev: u64) u64 {
 pub val DEV_NULL:    u64 = 2;
 pub val DEV_ZERO:    u64 = 3;
 pub val DEV_TTY:     u64 = 4;  # + 0..5: tty1..tty6 (the console is tty1)
+pub val DEV_EVENTS:  u64 = 12; # /dev/events (kern/events.mach)
 pub val DEV_DISK:    u64 = 16; # + the AHCI disk index
 
 pub rec Node {
@@ -61,9 +63,49 @@ pub rec Node {
     fidx:     u64;        # FAT/exFAT: its entry's index in the parent directory
     fcount:   u64;        # FAT: long-name entries before it; exFAT: entries in its set
     xnochain: u8;         # exFAT: the data is one contiguous run
+    pid:      u64;        # FS_PROC: the process a file is about (0: the reader)
 }
 
 var root: *Node = nil;
+
+# /proc's contents come from kern/procfs.mach, which sits above the vfs:
+# it hands over its readers here at boot
+var proc_ready: u8 = 0;
+var proc_read: fun(*Node, u64, u64, u64) u64;
+var proc_write: fun(*Node, u64, u64) u64;
+var proc_refresh: fun(*Node);
+
+pub fun set_proc(r: fun(*Node, u64, u64, u64) u64, w: fun(*Node, u64, u64) u64, f: fun(*Node)) {
+    proc_read = r;
+    proc_write = w;
+    proc_refresh = f;
+    proc_ready = 1;
+}
+
+# a /proc entry: file `id` (procfs's numbering) about process `pid`
+pub fun make_proc(dir: *Node, name: *u8, n: u64, kind: u64, id: u64, pid: u64, mode: u64) *Node {
+    val nd: *Node = new_node(kind, FS_PROC, name, n);
+    if (nd == nil) { ret nil; }
+    nd.ino = id;
+    nd.pid = pid;
+    nd.mode = mode;
+    nd.loaded = 1;
+    attach(dir, nd);
+    ret nd;
+}
+
+# take a /proc entry (and what is in it) away: a process that ended
+pub fun drop_proc(nd: *Node) {
+    var c: *Node = nd.child;
+    for (c != nil) {
+        val next: *Node = c.next;
+        drop_proc(c);
+        c = next;
+    }
+    detach(nd);
+    nd.unlinked = 1;
+    if (nd.opens == 0) { destroy(nd); }
+}
 
 fun e(code: u64) u64 { ret abi.err(code); }
 
@@ -330,6 +372,7 @@ fun load(dir: *Node) {
 pub fun child(dir: *Node, name: *u8, n: u64) *Node {
     if (dir.kind != abi.KIND_DIR) { ret nil; }
     val d: *Node = through(dir);
+    if (d.fs == FS_PROC && proc_ready != 0) { proc_refresh(d); }
     load(d);
     var c: *Node = d.child;
     for (c != nil) {
@@ -347,6 +390,7 @@ pub fun through(nd: *Node) *Node {
 
 pub fun nth_child(dir: *Node, idx: u64) *Node {
     val d: *Node = through(dir);
+    if (d.fs == FS_PROC && proc_ready != 0 && idx == 0) { proc_refresh(d); }
     load(d);
     var c: *Node = d.child;
     var i: u64 = 0;
@@ -405,6 +449,7 @@ pub fun create_ram(dir: *Node, name: *u8, n: u64, kind: u64) *Node {
 # returns 0 and sets *out, or an error
 pub fun create(dir: *Node, name: *u8, n: u64, kind: u64, mode: u64, out: **Node) u64 {
     if (n > abi.NAME_MAX) { ret e(abi.E_NAMETOOLONG); }
+    if (dir.fs == FS_PROC) { ret e(abi.E_PERM); }
     if (dir.fs == FS_RAM) {
         val nd: *Node = create_ram(dir, name, n, kind);
         if (nd == nil) { ret e(abi.E_NOMEM); }
@@ -481,6 +526,7 @@ fun destroy(nd: *Node) {
 
 # take a file or empty directory out of the tree (and off the disk)
 pub fun unlink(nd: *Node) u64 {
+    if (nd.fs == FS_PROC) { ret e(abi.E_PERM); }
     if (nd == root || nd.mount_of != nil) { ret e(abi.E_BUSY); }
     if (nd.mounted != nil) { ret e(abi.E_BUSY); }
     if (nd.kind == abi.KIND_DIR && is_empty(nd) == 0) { ret e(abi.E_NOTEMPTY); }
@@ -585,6 +631,7 @@ fun drop_children(nd: *Node) {
 # move `nd` into `dir` as `name` (which must not exist there yet)
 pub fun rename(nd: *Node, dir: *Node, name: *u8, n: u64) u64 {
     if (n > abi.NAME_MAX) { ret e(abi.E_NAMETOOLONG); }
+    if (nd.fs == FS_PROC || dir.fs == FS_PROC) { ret e(abi.E_PERM); }
     if (nd == root || nd.mount_of != nil || nd.mounted != nil) { ret e(abi.E_BUSY); }
     if (nd.kind == abi.KIND_DIR && within(dir, nd) != 0) { ret e(abi.E_INVAL); }
     if (nd.fs != dir.fs || nd.fsi != dir.fsi) { ret e(abi.E_XDEV); }
@@ -636,6 +683,10 @@ pub fun rename(nd: *Node, dir: *Node, name: *u8, n: u64) u64 {
 }
 
 pub fun read(nd: *Node, off: u64, buf: u64, n: u64) u64 {
+    if (nd.fs == FS_PROC) {
+        if (proc_ready == 0) { ret 0; }
+        ret proc_read(nd, off, buf, n);
+    }
     if (nd.fs == FS_EXT2) { ret ext2.read(nd.fsi, nd.ino, off, buf, n); }
     if (nd.fs == FS_FAT) { ret fat.read(nd.fatfs, nd.ino, nd.size, off, buf, n); }
     if (nd.fs == FS_EXFAT) { ret exfat.read(nd.exfs, nd.ino, nd.xnochain, nd.size, off, buf, n); }
@@ -665,6 +716,10 @@ fun reserve(nd: *Node, need: u64) u8 {
 # write at `off`, growing the file; returns bytes written or an error
 pub fun write(nd: *Node, off: u64, buf: u64, n: u64) u64 {
     if (off + n < off) { ret e(abi.E_INVAL); }
+    if (nd.fs == FS_PROC) {
+        if (proc_ready == 0) { ret e(abi.E_PERM); }
+        ret proc_write(nd, buf, n);
+    }
     if (nd.fs == FS_EXT2) {
         val k: u64 = ext2.write(nd.fsi, nd.ino, off, buf, n);
         if (abi.is_err(k) == 0 && off + k > nd.size) { nd.size = off + k; }
@@ -691,6 +746,7 @@ pub fun write(nd: *Node, off: u64, buf: u64, n: u64) u64 {
 }
 
 pub fun truncate(nd: *Node) {
+    if (nd.fs == FS_PROC) { ret; }
     if (nd.fs == FS_EXT2) { ext2.truncate(nd.fsi, nd.ino); }
     if (nd.fs == FS_FAT) { fat.truncate(nd.fatfs, nd.parent.ino, nd.fidx, ?nd.ino, ?nd.size); }
     if (nd.fs == FS_EXFAT) {

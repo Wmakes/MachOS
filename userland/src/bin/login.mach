@@ -1,6 +1,8 @@
-# login: ask for a user name and password, then become that user and start
-# their shell (as a login shell, "-sh", which shows /etc/motd). init runs it
-# on the console; after three wrong tries it exits and init starts a new one
+# login [-f USER]: ask for a user name and password, then become that user
+# and start their shell (as a login shell, "-sh", which shows /etc/motd).
+# init runs it on each terminal; after three wrong tries it exits and init
+# starts a new one. -f USER (root only: init, for /etc/machos.conf's
+# autologin) logs USER in without asking
 
 use abi:   sdk.abi;
 use sys:   sdk.sys;
@@ -10,9 +12,62 @@ use users: sdk.users;
 use rt:    sdk.rt;
 use logo:  userland.lib.logo;
 
+# the machine's name (/proc/sys/kernel/hostname) into out (64 bytes)
+fun hostname(out: *u8) {
+    io.copy(out, "machos\0", 7);
+    val h: u64 = sys.open("/proc/sys/kernel/hostname\0", 25, abi.O_READ);
+    if (abi.is_err(h) != 0) { ret; }
+    val r: u64 = sys.read(h, out, 63);
+    sys.close(h);
+    if (abi.is_err(r) != 0 || r == 0) { ret; }
+    var n: u64 = r;
+    for (n > 0 && (out[n - 1] == 10 || out[n - 1] == 13)) { n = n - 1; }
+    out[n] = 0;
+}
+
+# become user u and run their shell; returns only when that fails
+fun session(u: *users.User) u64 {
+    if (users.become(u) == 0) {
+        io.out("login: cannot switch to that user\n\0");
+        ret 1;
+    }
+    var home: *u8 = ?u.home[0];
+    if (u.home_len == 0 || abi.is_err(sys.chdir(home, u.home_len)) != 0) {
+        home = "/\0";
+        sys.chdir(home, 1);
+    }
+    env.set("HOME\0", home);
+    env.set("USER\0", ?u.name[0]);
+    env.set("LOGNAME\0", ?u.name[0]);
+    var shell: *u8 = ?u.shell[0];
+    if (u.shell_len == 0) { shell = "/bin/sh\0"; }
+    env.set("SHELL\0", shell);
+    env.set("PATH\0", "/bin\0");
+    # "-sh": a login shell (it shows the message of the day)
+    val r: u64 = sys.execve(shell, io.len(shell), "-sh\0", 4);
+    io.fail("login\0", shell, r);
+    ret 1;
+}
+
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     sys.setsid();
+    if (argc == 3 && io.streq(argv[1], "-f\0") != 0) {
+        if (sys.geteuid() != 0) {
+            io.err("login: -f is for root\n\0");
+            ret 1;
+        }
+        var au: users.User;
+        if (users.by_name(argv[2], io.len(argv[2]), ?au) == 0) {
+            io.err("login: no such user: \0");
+            io.err(argv[2]);
+            io.err("\n\0");
+        } or {
+            ret session(?au);
+        }
+    }
+    var host: [64]u8;
+    hostname(?host[0]);
     var tries: u64 = 0;
     for (tries < 3) {
         var un: abi.Uname;
@@ -28,7 +83,9 @@ fun main(argc: u64, argv: **u8) u64 {
             io.dec(t);
             io.out(")\0");
         }
-        io.out("   alt+F1..F6 switch terminals\n\nmachos login: \0");
+        io.out("   alt+F1..F6 switch terminals\n\n\0");
+        io.out(?host[0]);
+        io.out(" login: \0");
         var name: [32]u8;
         val n: u64 = users.read_line(?name[0], 31);
         if (n == abi.NO_ID) { ret 1; }
@@ -51,26 +108,7 @@ fun main(argc: u64, argv: **u8) u64 {
             io.out("Login incorrect\n\0");
             cnt;
         }
-        if (users.become(?u) == 0) {
-            io.out("login: cannot switch to that user\n\0");
-            ret 1;
-        }
-        var home: *u8 = ?u.home[0];
-        if (u.home_len == 0 || abi.is_err(sys.chdir(home, u.home_len)) != 0) {
-            home = "/\0";
-            sys.chdir(home, 1);
-        }
-        env.set("HOME\0", home);
-        env.set("USER\0", ?u.name[0]);
-        env.set("LOGNAME\0", ?u.name[0]);
-        var shell: *u8 = ?u.shell[0];
-        if (u.shell_len == 0) { shell = "/bin/sh\0"; }
-        env.set("SHELL\0", shell);
-        env.set("PATH\0", "/bin\0");
-        # "-sh": a login shell (it shows the message of the day)
-        val r: u64 = sys.execve(shell, io.len(shell), "-sh\0", 4);
-        io.fail("login\0", shell, r);
-        ret 1;
+        ret session(?u);
     }
     ret 1;
 }

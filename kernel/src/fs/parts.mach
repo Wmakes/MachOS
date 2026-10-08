@@ -5,6 +5,7 @@
 # probe() fills the table at boot, before there is a root to put /dev in;
 # publish() makes the nodes once there is
 
+use events: machos.kern.events;
 use abi:  sdk.abi;
 use dsk:  machos.dev.disk;
 use mem:  machos.kern.mem;
@@ -193,6 +194,26 @@ pub fun find_root(want: *u8) *Bdev {
     ret nil;
 }
 
+# "KIND /dev/NAME" on /dev/events
+fun event(b: *Bdev, kind: *u8) {
+    var name: [32]u8;
+    name[0] = 0;
+    val n: u64 = dev_name(b, ?name[0]);
+    events.begin(kind);
+    events.textn(?name[0], n);
+    events.end();
+}
+
+# every device of disk `d` that has a /dev node
+fun report(d: u64, kind: *u8) {
+    var i: u64 = 0;
+    for (i < MAX) {
+        val b: *Bdev = ?devs[i];
+        if (b.used != 0 && b.disk == d && b.node != nil) { event(b, kind); }
+        i = i + 1;
+    }
+}
+
 # USB disks plugged in (their partitions and /dev nodes appear) or pulled
 # out (their nodes go; anything still mounted from them fails until it is
 # unmounted)
@@ -203,6 +224,7 @@ pub fun usb_hotplug() {
     for (d < first + added) {
         add(d, 0, 0, dsk.disk(d).sectors, nil, nil);
         add_partitions(d);
+        report(d, "disk add \0");
         d = d + 1;
     }
     var i: u64 = 0;
@@ -210,6 +232,7 @@ pub fun usb_hotplug() {
         val b: *Bdev = ?devs[i];
         if (b.used != 0 && dsk.disk(b.disk).gone != 0) {
             if (b.node != nil) {
+                event(b, "disk remove \0");
                 b.node.dev = vfs.DEV_NULL;
                 vfs.unlink(b.node);
                 b.node = nil;

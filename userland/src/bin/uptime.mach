@@ -1,29 +1,29 @@
-# uptime: time since boot and how many processes exist
+# uptime: time since boot and how many processes exist (from /proc)
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use std.runtime;
+use io:     userland.lib.cli;
+use system: userland.lib.system;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
-    var i: abi.Info;
-    sys.info(?i);
-    val s: u64 = i.uptime_ms / 1000;
-    io.out("up \0");
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
+    val ms: u64 = system.uptime_ms();
+    val s: u64 = ms / 1000;
+    io.out("up ");
     if (s >= 3600) {
         io.dec(s / 3600);
-        io.out("h \0");
+        io.out("h ");
     }
     if (s >= 60) {
         io.dec((s / 60) % 60);
-        io.out("m \0");
+        io.out("m ");
     }
     io.dec(s % 60);
-    io.out(".\0");
-    io.dec((i.uptime_ms % 1000) / 100);
-    io.out("s, \0");
-    io.dec(i.procs);
-    io.out(" processes\n\0");
+    io.out(".");
+    io.dec((ms % 1000) / 100);
+    io.out("s, ");
+    io.dec(system.process_count());
+    io.out(" processes\n");
     ret 0;
 }

@@ -112,6 +112,7 @@ def fsck_stick(kind):
 
 def update_stick():
     """a FAT stick carrying an update package"""
+    sh("rm -f out/headless/update.tgz")  # a package that fails to build must not be an old one
     pkg = sh("tools/mkupdate.sh out/headless/update.tgz").strip().splitlines()[-1]
     sh(f"rm -f {USB_STICK}; dd if=/dev/zero of={USB_STICK} bs=1M count=64 status=none")
     sh(f"mkfs.fat -F 32 {USB_STICK}")
@@ -268,7 +269,7 @@ TESTS = [
     ("dualboot", False, False,
      ["--prep", fake_windows, "--boot", DUAL, "--nologin", "sleep:2.5", "keys:<down><down><down>", "sleep:0.5",
       "keys:<ret>", "wait:booting Windows", "wait:login: ", "send:root\\n", "wait:" + P],
-     ["Windows", "machboot: booting Windows", "machboot 0.8.1"]),
+     ["Windows", "machboot: booting Windows", "machboot 0.8.5"]),
 
     # machboot hide: no menu, straight into MachOS
     ("hidden-menu", False, True,
@@ -283,10 +284,10 @@ TESTS = [
      ["--prep", update_stick] + usb_stick() + [
       "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; update /mnt/update.tgz; umount /mnt; machboot\\n",
       "wait:" + P],
-     ["updating MachOS", "installing the programs", "MachOS is updated to 0.8.1", "MachOS (previous)"]),
+     ["updating MachOS", "installing the programs", "MachOS is updated to 0.8.5", "MachOS (previous)"]),
     ("update-reboot", True, True,
      ["wait:" + P, "send:ls /boot; uname -a\\n", "wait:" + P],
-     ["kernel.old.elf", "MachOS 0.8.1"]),
+     ["kernel.old.elf", "MachOS 0.8.5"]),
 
     # MachOS installed on a USB stick, then booted from the stick alone
     ("usb-install", False, False,
@@ -311,7 +312,7 @@ TESTS = [
       "wait:diff=", "wait:" + P,
       "send:find / -name '*.conf'; ls /etc | xargs echo got; seq 1 50 | tail -2 | tee /tmp/t | wc -l; basename /a/b.txt .txt; df\\n",
       "wait:" + P],
-     ["APPLE", "FIG", "PEAR", "20", "19", "-3", "+X", "diff=1", "/boot/machboot.conf", "got group motd passwd shadow",
+     ["APPLE", "FIG", "PEAR", "20", "19", "-3", "+X", "diff=1", "/boot/machboot.conf", "got group machos.conf motd passwd shadow",
       "      2", "b", "/dev/sda2", "%"]),
 
     ("jobs-and-ctrl-c", False, False,
@@ -357,6 +358,39 @@ TESTS = [
      ["hello from mach std on MachOS", "ok args", "ok env", "ok write_bytes", "ok metadata", "ok read",
       "ok remove_file", "ok exists", "ok not_found", "ok create_dir", "ok is_dir", "ok remove_dir",
       "ok clock", "ok monotonic", "ok random", "stdtest: 0 failures"]),
+
+    ("proc", False, False,
+     ["wait:" + P, "send:cat /proc/version; head -2 /proc/meminfo; cat /proc/self/status; ls /proc/sys/kernel; cat /proc/stat\\n",
+      "wait:" + P,
+      "send:uname -a; free; uptime; ps; df; id; whoami; tty; neofetch | grep -c Memory\\n", "wait:" + P],
+     ["MachOS version 0.8.5", "MemTotal:", "Name:", "cat", "Uid:", "hostname", "cpu0",
+      "MachOS 0.8.5 x86_64 on machos", "total", "processes", "PID", "init", "Filesystem", "/dev/sda2",
+      "uid=0(root)", "root", "/dev/tty1", "1"]),
+
+    ("events", False, False,
+     ["wait:" + P, "send:events -n 2 > /tmp/ev &\\n", "sleep:1", "send:true\\n", "wait:" + P, "sleep:1",
+      "send:cat /tmp/ev\\n", "wait:" + P],
+     ["start", "true", "exit"]),
+
+    ("clock", False, False,
+     ["wait:" + P, "send:date -s '2030-01-02 03:04:05'; date +%s\\n", "wait:" + P,
+      "send:echo 'timezone CET-1CEST,M3.5.0,M10.5.0/3' >> /etc/machos.conf; date; date -u; env TZ=JST-9 date\\n",
+      "wait:" + P,
+      "send:date -s '2030-07-01 12:00'; date -u; echo box > /proc/sys/kernel/hostname; uname -n\\n", "wait:" + P],
+     ["2030-01-02 03:04:05 UTC", "18935534", "2030-01-02 04:04", "CET", "2030-01-02 03:04", "UTC",
+      "2030-01-02 12:04", "JST", "2030-07-01 12:00:00 CEST", "2030-07-01 10:00", "UTC", "box"]),
+
+    ("config-write", False, False,
+     ["wait:" + P, "send:echo 'hostname testbox' > /etc/machos.conf; echo 'ttys 2' >> /etc/machos.conf\\n",
+      "wait:" + P,
+      "send:echo 'autologin root' >> /etc/machos.conf; echo 'timezone CET-1CEST,M3.5.0,M10.5.0/3' >> /etc/machos.conf\\n",
+      "wait:" + P, "send:echo 'rtc local' >> /etc/machos.conf; sync\\n", "wait:" + P, "sleep:1"],
+     []),
+
+    ("config-boot", True, False,
+     ["--nologin", "wait:" + P, "send:uname -n; date; cat /proc/sys/kernel/rtc_offset; ps | grep -c login\\n",
+      "wait:" + P],
+     ["testbox", "CE", "00", "1"]),
 
     ("environment", False, False,
      ["wait:" + P,

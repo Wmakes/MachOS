@@ -1,11 +1,11 @@
 # neofetch: the logo and a summary of the system beside it
 
-use abi:  sdk.abi;
-use sys:  sdk.sys;
-use io:   sdk.io;
-use env:  sdk.env;
-use rt:   sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
+use std.types.size.usize;
 use logo: userland.lib.logo;
+use system: userland.lib.system;
 
 var lines: [16][160]u8;
 var lens: [16]u64;
@@ -67,19 +67,39 @@ fun uptime(ms: u64) {
 }
 
 fun programs() u64 {
-    val h: u64 = sys.open("/bin\0", 4, abi.O_READ);
-    if (abi.is_err(h) != 0) { ret 0; }
+    var d: io.Dir;
+    if (io.dir_open(?d, "/bin") < 0) { ret 0; }
     var n: u64 = 0;
-    var i: u64 = 0;
-    for {
-        var e: abi.Entry;
-        val got: u64 = sys.readdir(h, i, ?e);
-        if (abi.is_err(got) != 0 || got == 0) { brk; }
-        i = i + 1;
-        if (e.kind == abi.KIND_FILE) { n = n + 1; }
+    for (io.dir_next(?d) > 0) {
+        if (io.dir_kind(?d) == io.KIND_FILE) { n = n + 1; }
     }
-    sys.close(h);
+    io.dir_close(?d);
     ret n;
+}
+
+# $NAME into buf, or nil when it is not set
+fun getenv(name: *u8, buf: *u8, cap: u64) *u8 {
+    val n: i64 = os.getenv(name, buf, cap::usize);
+    if (n < 0 || n::u64 >= cap) { ret nil; }
+    ret buf;
+}
+
+# the number in word w (from 0) of s
+fun word(s: *u8, w: u64) u64 {
+    var i: u64 = 0;
+    var k: u64 = 0;
+    for (s[i] != 0) {
+        for (s[i] == 32) { i = i + 1; }
+        var v: u64 = 0;
+        for (s[i] >= 48 && s[i] <= 57) {
+            v = v * 10 + (s[i] - 48)::u64;
+            i = i + 1;
+        }
+        if (k == w) { ret v; }
+        k = k + 1;
+        for (s[i] != 0 && s[i] != 32) { i = i + 1; }
+    }
+    ret 0;
 }
 
 # the last part of a path
@@ -105,14 +125,25 @@ fun cpu_name(name: *u8) {
     }
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
-    var un: abi.Uname;
-    sys.uname(?un);
-    var inf: abi.Info;
-    sys.info(?inf);
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
-    var user: *u8 = env.get("USER\0");
+fun run(argc: u64, argv: **u8) u64 {
+    var release: [32]u8;
+    system.release(?release[0], 32);
+    var host: [64]u8;
+    system.line("/proc/sys/kernel/hostname", ?host[0], 64);
+    var mem: system.Memory;
+    system.memory(?mem);
+    var cpus: system.Cpus;
+    system.cpus(?cpus);
+    var cpu: [64]u8;
+    system.cpu_name(?cpu[0], 64);
+    var screen: [64]u8;
+    system.line("/proc/screen", ?screen[0], 64);
+
+    var ubuf: [64]u8;
+    var user: *u8 = getenv("USER", ?ubuf[0], 64);
     if (user == nil) { user = "root\0"; }
     add(logo.COLOR);
     add("\x1b[1m\0");
@@ -120,10 +151,11 @@ fun main(argc: u64, argv: **u8) u64 {
     add(logo.RESET);
     add("@\0");
     add(logo.COLOR);
-    add("\x1b[1mmachos\0");
+    add("\x1b[1m\0");
+    add(?host[0]);
     add(logo.RESET);
     end_line();
-    var k: u64 = io.len(user) + 7;
+    var k: u64 = io.len(user) + 1 + io.len(?host[0]);
     for (k > 0) {
         add("-\0");
         k = k - 1;
@@ -132,18 +164,17 @@ fun main(argc: u64, argv: **u8) u64 {
 
     title("OS\0");
     add("MachOS \0");
-    add(?un.release[0]);
-    add(" \0");
-    add(?un.machine[0]);
+    add(?release[0]);
+    add(" x86_64\0");
     end_line();
 
     title("Kernel\0");
     add("machos \0");
-    add(?un.release[0]);
+    add(?release[0]);
     end_line();
 
     title("Uptime\0");
-    uptime(inf.uptime_ms);
+    uptime(system.uptime_ms());
     end_line();
 
     title("Programs\0");
@@ -152,20 +183,21 @@ fun main(argc: u64, argv: **u8) u64 {
     end_line();
 
     title("Shell\0");
-    var sh: *u8 = env.get("SHELL\0");
+    var sbuf: [128]u8;
+    var sh: *u8 = getenv("SHELL", ?sbuf[0], 128);
     if (sh == nil) { sh = "/bin/sh\0"; }
     add(base(sh));
     end_line();
 
-    if (inf.screen_w > 0) {
+    if (word(?screen[0], 0) > 0) {
         title("Resolution\0");
-        add_dec(inf.screen_w);
+        add_dec(word(?screen[0], 0));
         add("x\0");
-        add_dec(inf.screen_h);
+        add_dec(word(?screen[0], 1));
         end_line();
     }
 
-    val tn: u64 = sys.tty_number(abi.STDIN);
+    val tn: u64 = system.tty_number(io.STDIN);
     if (tn != 0) {
         title("Terminal\0");
         add("tty\0");
@@ -174,17 +206,17 @@ fun main(argc: u64, argv: **u8) u64 {
     }
 
     title("CPU\0");
-    if (inf.cpu_name[0] != 0) { cpu_name(?inf.cpu_name[0]); }
+    if (cpu[0] != 0) { cpu_name(?cpu[0]); }
     or { add("x86_64\0"); }
     add(" (\0");
-    add_dec(inf.cpus);
+    add_dec(cpus.count);
     add(")\0");
     end_line();
 
     title("Memory\0");
-    add_dec((inf.mem_total - inf.mem_free) / 1048576);
+    add_dec((mem.total - mem.free) / 1048576);
     add("MiB / \0");
-    add_dec(inf.mem_total / 1048576);
+    add_dec(mem.total / 1048576);
     add("MiB\0");
     end_line();
 

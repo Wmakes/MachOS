@@ -1,6 +1,7 @@
 # the end of every process: release its fds, then let proc tear it down.
 # the status is what waitpid reports (exit_with / killed_by make one)
 
+use events: machos.kern.events;
 use abi:    sdk.abi;
 use kprint: machos.kern.kprint;
 use proc:   machos.kern.proc;
@@ -20,5 +21,10 @@ pub fun do_exit(status: u64) {
         i = i + 1;
     }
     if (p.pid == 1) { kprint.panic("init exited\0"); }
+    events.begin("exit \0");
+    events.dec(p.pid);
+    events.char(32);
+    events.dec(status);
+    events.end();
     proc.exit(status);
 }

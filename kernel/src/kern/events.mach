@@ -1,0 +1,141 @@
+# what happens in the system, for programs to follow: /dev/events gives
+# one line per event, as they happen (a reader sees those after it opened
+# it). the kinds:
+#
+#   usb add 1-2.3 VID:PID CLASS WHAT    a USB device was plugged in
+#   usb remove 1-2.3                    ... pulled out
+#   disk add /dev/sdb1                  a disk or partition appeared
+#   disk remove /dev/sdb1               ... went away
+#   mount DEV DIR                       a filesystem was mounted
+#   umount DIR                          ... unmounted
+#   start PID NAME                      a program started (spawn, exec)
+#   exit PID STATUS                     a process ended (its wait status)
+#   tty switch N                        the screen shows ttyN now
+#   memory low FREE_KB                  less than a twentieth is left
+#   memory ok FREE_KB                   a tenth is free again
+#   hostname NAME                       the machine got a new name
+#   clock set SECONDS                   the time was set
+#
+# a line is put together with begin, text and dec, and published with end.
+# this module imports nothing, so anything in the kernel may report to it;
+# whoever waits for events hands over how to wake them (set_wake)
+
+val SLOTS: u64 = 256;
+val LINE:  u64 = 120;
+
+rec Event {
+    len:  u64;
+    text: [120]u8;
+}
+
+var ring: [256]Event;
+var next_seq: u64 = 1; # the sequence number the next event gets
+var line: [120]u8;
+var line_len: u64 = 0;
+
+var have_wake: u8 = 0;
+var wake: fun();
+
+pub fun set_wake(f: fun()) {
+    wake = f;
+    have_wake = 1;
+}
+
+pub fun begin(kind: *u8) {
+    line_len = 0;
+    text(kind);
+}
+
+pub fun text(s: *u8) {
+    var i: u64 = 0;
+    for (s[i] != 0 && line_len < LINE - 1) {
+        line[line_len] = s[i];
+        line_len = line_len + 1;
+        i = i + 1;
+    }
+}
+
+pub fun textn(s: *u8, n: u64) {
+    var i: u64 = 0;
+    for (i < n && line_len < LINE - 1) {
+        line[line_len] = s[i];
+        line_len = line_len + 1;
+        i = i + 1;
+    }
+}
+
+pub fun char(c: u8) {
+    if (line_len < LINE - 1) {
+        line[line_len] = c;
+        line_len = line_len + 1;
+    }
+}
+
+pub fun dec(v: u64) {
+    var t: [20]u8;
+    var n: u64 = 0;
+    var x: u64 = v;
+    for {
+        t[n] = 48 + (x % 10)::u8;
+        n = n + 1;
+        x = x / 10;
+        if (x == 0) { brk; }
+    }
+    for (n > 0) {
+        n = n - 1;
+        char(t[n]);
+    }
+}
+
+# publish the line begun with begin
+pub fun end() {
+    val e: *Event = ?ring[next_seq % SLOTS];
+    var i: u64 = 0;
+    for (i < line_len) {
+        e.text[i] = line[i];
+        i = i + 1;
+    }
+    e.text[line_len] = 10;
+    e.len = line_len + 1;
+    next_seq = next_seq + 1;
+    line_len = 0;
+    if (have_wake != 0) { wake(); }
+}
+
+# where a new reader starts: at the next event
+pub fun latest() u64 { ret next_seq; }
+
+# whether there is an event at or after `cursor`
+pub fun pending(cursor: u64) u8 { ret (cursor < next_seq)::u8; }
+
+# whole lines from `cursor` on into buf (at most n bytes; at least one line
+# when there is one, cut if it does not fit); advances the cursor. events
+# too old to be kept any more are skipped
+pub fun read(cursor: *u64, buf: *u8, n: u64) u64 {
+    var seq: u64 = @cursor;
+    if (next_seq > SLOTS && seq < next_seq - SLOTS) { seq = next_seq - SLOTS; }
+    var k: u64 = 0;
+    for (seq < next_seq) {
+        val e: *Event = ?ring[seq % SLOTS];
+        if (k + e.len > n) {
+            if (k > 0) { brk; }
+            var i: u64 = 0;
+            for (i < n) {
+                buf[i] = e.text[i];
+                i = i + 1;
+            }
+            k = n;
+            seq = seq + 1;
+            brk;
+        }
+        var i: u64 = 0;
+        for (i < e.len) {
+            buf[k + i] = e.text[i];
+            i = i + 1;
+        }
+        k = k + e.len;
+        seq = seq + 1;
+    }
+    @cursor = seq;
+    ret k;
+}

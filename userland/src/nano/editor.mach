@@ -10,10 +10,10 @@
 # show as spaces to the next multiple of 8. only screen rows that changed
 # are redrawn
 
-use abi:  sdk.abi;
-use sys:  sdk.sys;
-use io:   sdk.io;
+use os:  std.system.os;
+use io:  userland.lib.cli;
 use term: userland.ui.term;
+use system: userland.lib.system;
 
 val CAP: u64 = 1048576;   # largest file: 1 MiB
 val MAXROWS: u64 = 128;
@@ -301,35 +301,47 @@ fun redo() {
 
 # --- files ------------------------------------------------------------------
 
+# the first n bytes of p as a NUL-terminated path
+fun zpath(p: *u8, n: u64, out: *u8) {
+    var k: u64 = n;
+    if (k > 255) { k = 255; }
+    io.copy(out, p, k);
+    out[k] = 0;
+}
+
 # read the file `p` in at `at` (recorded as edits when rec_); bytes read,
 # or NONE when it cannot be opened
 fun read_in(p: *u8, pn: u64, at: u64, rec_: u8) u64 {
-    val h: u64 = sys.open(p, pn, abi.O_READ);
-    if (abi.is_err(h) != 0) {
-        say(abi.err_name(h));
+    var zp: [256]u8;
+    zpath(p, pn, ?zp[0]);
+    val h: i64 = io.open_read(?zp[0]);
+    if (h < 0) {
+        say(io.reason(h));
         ret NONE;
     }
     var chunk: [8192]u8;
     var got: u64 = 0;
     for {
-        val r: u64 = sys.read(h, ?chunk[0], 8192);
-        if (abi.is_err(r) != 0 || r == 0) { brk; }
-        if (ins(at + got, ?chunk[0], r, rec_) == 0) { brk; }
-        got = got + r;
+        val r: i64 = io.read(h, ?chunk[0], 8192);
+        if (r <= 0) { brk; }
+        if (ins(at + got, ?chunk[0], r::u64, rec_) == 0) { brk; }
+        got = got + r::u64;
     }
-    sys.close(h);
+    io.close(h);
     ret got;
 }
 
 # write the text to `p`; whether it worked
 fun write_out(p: *u8, pn: u64) u8 {
-    val h: u64 = sys.open(p, pn, abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC);
-    if (abi.is_err(h) != 0) {
-        say(abi.err_name(h));
+    var zp: [256]u8;
+    zpath(p, pn, ?zp[0]);
+    val h: i64 = io.open_mode(?zp[0], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666);
+    if (h < 0) {
+        say(io.reason(h));
         ret 0;
     }
     val ok: u8 = io.write_all(h, ?text[0], len);
-    sys.close(h);
+    io.close(h);
     if (ok == 0) {
         say("Error writing the file\0");
         ret 0;
@@ -970,17 +982,15 @@ pub fun run(argc: u64, argv: **u8, prog: *u8) u64 {
         io.err(" [FILE]\n\0");
         ret 2;
     }
-    var un: abi.Uname;
-    sys.uname(?un);
-    io.copy(?release[0], ?un.release[0], io.len(?un.release[0]) + 1);
+    system.release(?release[0], 64);
     setup_labels();
     if (argc == 2) {
         name_len = io.len(argv[1]);
         if (name_len > 254) { name_len = 254; }
         io.copy(?name[0], argv[1], name_len);
         name[name_len] = 0;
-        var st: abi.Stat;
-        if (abi.is_err(sys.stat(?name[0], name_len, ?st)) == 0 && st.kind != abi.KIND_FILE) {
+        var st: os.stat_t;
+        if (io.stat(?name[0], ?st) >= 0 && io.kind_of(st.st_mode) != io.KIND_FILE) {
             io.err(prog);
             io.err(": not a regular file\n\0");
             ret 1;
@@ -999,7 +1009,7 @@ pub fun run(argc: u64, argv: **u8, prog: *u8) u64 {
         }
         dirty = 0;
     }
-    if (term.start(abi.STDIN) == 0) {
+    if (term.start(io.STDIN) == 0) {
         io.err(prog);
         io.err(": stdin is not a terminal\n\0");
         ret 1;

@@ -1,14 +1,19 @@
 # whoami: the name of the user running it (the effective one)
 
-use sys:   sdk.sys;
-use io:    sdk.io;
-use users: sdk.users;
-use rt:    sdk.rt;
+use std.runtime;
+use io:     userland.lib.cli;
+use system: userland.lib.system;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+use users: userland.lib.accounts;
+
+fun run(argc: u64, argv: **u8) u64 {
+    var me: system.Proc;
+    if (system.process("self", ?me) == 0) { ret 1; }
     var name: [32]u8;
-    io.outn(?name[0], users.user_name(sys.geteuid(), ?name[0]));
+    io.outn(?name[0], users.user_name(me.euid, ?name[0]));
     io.putc(10);
     ret 0;
 }

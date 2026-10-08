@@ -2,6 +2,7 @@
 
 use os:  std.system.os;
 use io:  userland.lib.cli;
+use time: userland.lib.time;
 
 # all of `h` into buf (at most cap bytes); the length
 pub fun read_all(h: i64, buf: *u8, cap: u64) u64 {
@@ -40,47 +41,33 @@ pub fun split_lines(buf: *u8, n: u64, starts: *u64, lens: *u64, max: u64) u64 {
     ret count;
 }
 
-fun leap(y: u64) u8 {
-    if ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) { ret 1; }
-    ret 0;
-}
-
-val MONTH_DAYS: [12]u64 = [12]u64{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-
 fun two(out: *u8, v: u64) {
     out[0] = 48 + (v / 10)::u8;
     out[1] = 48 + (v % 10)::u8;
 }
 
 # "YYYY-MM-DD HH:MM" (UTC) of Unix time t into out (16 bytes)
+var zone: time.Zone;
+var zone_loaded: u8 = 0;
+
+# second t as "YYYY-MM-DD HH:MM" in the system's time zone, into out (16
+# bytes); 16
 pub fun fmt_time(t: u64, out: *u8) u64 {
-    var days: u64 = t / 86400;
-    val secs: u64 = t % 86400;
-    var year: u64 = 1970;
-    for {
-        var len: u64 = 365;
-        if (leap(year) != 0) { len = 366; }
-        if (days < len) { brk; }
-        days = days - len;
-        year = year + 1;
+    if (zone_loaded == 0) {
+        time.system_zone(?zone);
+        zone_loaded = 1;
     }
-    var month: u64 = 0;
-    for (month < 12) {
-        var len: u64 = MONTH_DAYS[month];
-        if (month == 1 && leap(year) != 0) { len = 29; }
-        if (days < len) { brk; }
-        days = days - len;
-        month = month + 1;
-    }
-    io.fmt_dec(year, out);
+    var tm: time.Tm;
+    time.local(?zone, t::i64, ?tm);
+    io.fmt_dec(tm.year::u64, out);
     out[4] = 45;
-    two(?out[5], month + 1);
+    two(?out[5], tm.month::u64);
     out[7] = 45;
-    two(?out[8], days + 1);
+    two(?out[8], tm.day::u64);
     out[10] = 32;
-    two(?out[11], secs / 3600);
+    two(?out[11], tm.hour::u64);
     out[13] = 58;
-    two(?out[14], (secs / 60) % 60);
+    two(?out[14], tm.min::u64);
     ret 16;
 }
 

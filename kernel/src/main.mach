@@ -19,6 +19,8 @@ use syscall: machos.arch.x86_64.syscall;
 use proc:   machos.kern.proc;
 use sys:    machos.kern.sys;
 use abi:    sdk.abi;
+use procfs: machos.kern.procfs;
+use events: machos.kern.events;
 use vfs:    machos.fs.vfs;
 use mount:  machos.fs.mount;
 use blk:    machos.fs.blk;
@@ -212,7 +214,10 @@ fun kmain(handoff: u64) {
     }
     make_dev(dev, "null\0", 4, vfs.DEV_NULL);
     make_dev(dev, "zero\0", 4, vfs.DEV_ZERO);
+    make_dev(dev, "events\0", 6, vfs.DEV_EVENTS);
+    events.set_wake(wake_event_readers);
     parts.publish(dev);
+    procfs.init(vfs.get_root());
     mount_esp();
     if (vfs.child(vfs.get_root(), "tmp\0", 3) == nil) {
         val tmp: *vfs.Node = vfs.create_ram(vfs.get_root(), "tmp\0", 3, abi.KIND_DIR);
@@ -393,6 +398,8 @@ fun start_cpus() {
     }
     kprint.putc(10);
 }
+
+fun wake_event_readers() { proc.wakeup(proc.CHAN_EVENTS); }
 
 fun make_dev(dir: *vfs.Node, name: *u8, n: u64, id: u64) {
     val d: *vfs.Node = vfs.create_ram(dir, name, n, abi.KIND_DEV);

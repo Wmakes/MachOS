@@ -6,6 +6,7 @@
 # keyboard is driven in the HID boot protocol (8-byte reports), so no
 # report descriptor needs parsing
 
+use events: machos.kern.events;
 use kprint: machos.kern.kprint;
 use pci:  machos.dev.pci;
 use vmm:  machos.mm.vmm;
@@ -534,6 +535,30 @@ fun hex4(v: u64) {
     }
 }
 
+# "1-2.3" for device d on /dev/events, as name() puts it in the log
+fun event_name(d: *Dev) {
+    var ci: u64 = 0;
+    for (ci < nctrl && ?ctrls[ci] != d.ctrl) { ci = ci + 1; }
+    events.dec(ci + 1);
+    events.char(45);
+    events.dec(d.root);
+    var k: u64 = 0;
+    for (k < d.depth) {
+        events.char(46);
+        events.dec(((d.route >> (k * 4)::u32) & 0xF)::u64);
+        k = k + 1;
+    }
+}
+
+fun event_hex4(v: u64) {
+    val digits: *u8 = "0123456789abcdef\0";
+    var sh: u64 = 16;
+    for (sh > 0) {
+        sh = sh - 4;
+        events.char(digits[(v >> sh) & 15]);
+    }
+}
+
 fun announce(d: *Dev, class: u8, what: *u8) {
     kprint.level(kprint.INFO);
     name(d);
@@ -549,6 +574,17 @@ fun announce(d: *Dev, class: u8, what: *u8) {
     kprint.puts(what);
     kprint.putc(10);
     d.announced = 1;
+    events.begin("usb add \0");
+    event_name(d);
+    events.char(32);
+    event_hex4(d.vid::u64);
+    events.char(58);
+    event_hex4(d.pid::u64);
+    events.char(32);
+    events.dec(class::u64);
+    events.char(32);
+    events.text(what);
+    events.end();
 }
 
 fun drop(d: *Dev) {
@@ -557,6 +593,9 @@ fun drop(d: *Dev) {
         kprint.level(kprint.INFO);
         name(d);
         kprint.puts(": disconnected\n\0");
+        events.begin("usb remove \0");
+        event_name(d);
+        events.end();
     }
     if (d.st != 0) {
         val sd: *Stor = ?stors[d.st - 1];

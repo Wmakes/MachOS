@@ -373,6 +373,7 @@ pub rec Info {
 pub val ISIG:   u64 = 1; # ^C kills the foreground group instead of being read
 pub val ICANON: u64 = 2; # line editing; read returns whole lines
 pub val ECHO:   u64 = 8; # typed characters are shown
+pub val NOWAIT: u64 = 16; # without ICANON: a read returns 0 at once when no key waits
 
 pub rec Termios {
     lflag: u64;

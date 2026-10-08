@@ -278,7 +278,12 @@ pub fun boot(e: *conf.Entry) u8 {
     h.magic = ho.MAGIC;
     h.version = ho.VERSION;
     h.hhdm = ho.HHDM;
-    copy_str((?h.loader[0])::u64, "machboot 0.8.1\0", 14);
+    # "machboot VERSION" ([project].version in mach.toml)
+    copy_str((?h.loader[0])::u64, "machboot \0", 9);
+    val ver: *u8 = $project.version;
+    var vn: u64 = 0;
+    for (ver[vn] != 0 && vn < 20) { vn = vn + 1; }
+    copy_str((?h.loader[9])::u64, ver, vn);
 
     var kf: u64 = 0;
     var kl: u64 = 0;

@@ -5,10 +5,9 @@
 #   /TEXT           find           n              find again      q  quit
 # when stdout is not a terminal it just copies its input
 
-use abi:  sdk.abi;
-use sys:  sdk.sys;
-use io:   sdk.io;
-use rt:   sdk.rt;
+use os:  std.system.os;
+use io:  userland.lib.cli;
+use std.runtime;
 use term: userland.ui.term;
 
 val CAP: u64 = 4194304; # 4 MiB
@@ -22,11 +21,11 @@ var pattern: [128]u8;
 var plen: u64 = 0;
 var note: *u8 = nil;
 
-fun slurp(h: u64) {
+fun slurp(h: i64) {
     for (len < CAP) {
-        val r: u64 = sys.read(h, ?text[len], CAP - len);
-        if (abi.is_err(r) != 0 || r == 0) { brk; }
-        len = len + r;
+        val r: i64 = io.read(h, ?text[len], CAP - len);
+        if (r <= 0) { brk; }
+        len = len + r::u64;
     }
 }
 
@@ -57,7 +56,7 @@ fun draw() {
     var r: u64 = 0;
     for (r < page()) {
         term.go(r, 0);
-        val ln: u64 = top + r;
+        val ln: u64 = top + r::u64;
         if (ln < nlines) {
             var i: u64 = starts[ln];
             var n: u64 = 0;
@@ -137,28 +136,30 @@ fun ask() {
     if (plen > 0) { search(); }
 }
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
     name = "stdin\0";
     if (argc > 1) {
         name = argv[1];
-        val h: u64 = sys.open(name, io.len(name), abi.O_READ);
-        if (abi.is_err(h) != 0) {
+        val h: i64 = io.open_mode(name, os.O_RDONLY, 0o666);
+        if (h < 0) {
             io.fail("less\0", name, h);
             ret 1;
         }
         slurp(h);
-        sys.close(h);
+        io.close(h);
     } or {
-        slurp(abi.STDIN);
+        slurp(io.STDIN);
     }
-    if (sys.isatty(abi.STDOUT) == 0) {
-        io.write_all(abi.STDOUT, ?text[0], len);
+    if (io.isatty(io.STDOUT) == 0) {
+        io.write_all(io.STDOUT, ?text[0], len);
         ret 0;
     }
     # keys come from the terminal even when the text came through a pipe
-    val tty: u64 = sys.open("/dev/console\0", 12, abi.O_READ);
-    if (abi.is_err(tty) != 0 || term.start(tty) == 0) {
+    val tty: i64 = io.open_mode("/dev/console\0", os.O_RDONLY, 0o666);
+    if (tty < 0 || term.start(tty) == 0) {
         io.err("less: no terminal\n\0");
         ret 1;
     }

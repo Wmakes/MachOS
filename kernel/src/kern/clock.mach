@@ -1,18 +1,19 @@
-# wall-clock time: the RTC reading at boot plus the timer ticks since
+# wall-clock time: the RTC reading at boot plus the time since, which can
+# be set (writing the RTC too). the RTC may keep local time rather than UTC
+# (as Windows has it): rtc_offset says how far it is ahead of UTC
 
 use rtc:  machos.dev.rtc;
 use apic: machos.arch.x86_64.apic;
 use proc: machos.kern.proc;
 use cpu:  machos.arch.x86_64.cpu;
 
-var boot_epoch: u64 = 0;
-var boot_ticks: u64 = 0;
-var boot_ns:    u64 = 0; # nanoseconds since boot when the RTC was read
+var base_ns: u64 = 0;  # UTC nanoseconds at mono_ns() == boot_ns
+var boot_ns: u64 = 0;
+var offset:  i64 = 0;  # seconds the RTC is ahead of UTC
 
 pub fun init() {
-    boot_epoch = rtc.read_epoch();
-    boot_ticks = proc.uptime_ticks();
     boot_ns = mono_ns();
+    base_ns = rtc.read_epoch() * 1000000000;
 }
 
 # nanoseconds since boot: the time-stamp counter, or the timer ticks
@@ -25,10 +26,25 @@ pub fun mono_ns() u64 {
 
 # nanoseconds since 1970-01-01 UTC
 pub fun real_ns() u64 {
-    ret boot_epoch * 1000000000 + (mono_ns() - boot_ns);
+    ret base_ns + (mono_ns() - boot_ns);
 }
 
 # seconds since 1970-01-01 UTC
 pub fun now() u64 {
-    ret boot_epoch + (proc.uptime_ticks() - boot_ticks) / apic.HZ;
+    ret real_ns() / 1000000000;
+}
+
+# the time is now Unix second t: the clock and the RTC
+pub fun set(t: u64) {
+    base_ns = t * 1000000000 - (mono_ns() - boot_ns);
+    rtc.write_epoch((t::i64 + offset)::u64);
+}
+
+pub fun rtc_offset() i64 { ret offset; }
+
+# the RTC keeps UTC + seconds: what was read at boot is that far off
+pub fun set_rtc_offset(seconds: i64) {
+    val change: i64 = seconds - offset;
+    base_ns = (base_ns::i64 - change * 1000000000)::u64;
+    offset = seconds;
 }

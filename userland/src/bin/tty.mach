@@ -1,19 +1,20 @@
 # tty: the name of the terminal on standard input (/dev/tty1 ... /dev/tty6)
 
-use abi: sdk.abi;
-use sys: sdk.sys;
-use io:  sdk.io;
-use rt:  sdk.rt;
+use std.runtime;
+use io:     userland.lib.cli;
+use system: userland.lib.system;
 
-#[symbol("umain")]
-fun main(argc: u64, argv: **u8) u64 {
-    val n: u64 = sys.tty_number(abi.STDIN);
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
+    val n: u64 = system.tty_number(io.STDIN);
     if (n != 0) {
-        io.out("/dev/tty\0");
+        io.out("/dev/tty");
         io.dec(n);
         io.putc(10);
         ret 0;
     }
-    io.out("not a tty\n\0");
+    io.out("not a tty\n");
     ret 1;
 }
