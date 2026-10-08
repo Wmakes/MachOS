@@ -317,6 +317,35 @@ pub fun us_since_boot(t: u64) u64 {
     ret (d / tsc_rate) * 1000000 + (d % tsc_rate) * 1000000 / tsc_rate;
 }
 
+# nanoseconds since the kernel started (0 until the rate is known)
+pub fun ns_since_boot(t: u64) u64 {
+    if (tsc_rate == 0 || t < tsc_start) { ret 0; }
+    val d: u64 = t - tsc_start;
+    ret (d / tsc_rate) * 1000000000 + (d % tsc_rate) * 1000000000 / tsc_rate;
+}
+
+# a random 64-bit number from the cpu (RDRAND), or 0 if it has none or it
+# ran dry; ok gets 1 when it worked
+pub fun rdrand(ok: *u8) u64 {
+    @ok = 0;
+    var r: [4]u32;
+    cpuid(1, ?r[0]);
+    if ((r[2] & (1 << 30)) == 0) { ret 0; }
+    var v: u64 = 0;
+    var good: u64 = 0;
+    var tries: u64 = 0;
+    for (tries < 10 && good == 0) {
+        asm x86_64 {
+            .byte 0x48, 0x0f, 0xc7, 0xf0, 0x0f, 0x92, 0xc1, 0x48, 0x0f, 0xb6, 0xc9 :: writes()
+            mov {v}, rax
+            mov {good}, rcx
+        }
+        tries = tries + 1;
+    }
+    @ok = good::u8;
+    ret v;
+}
+
 # wait about `us` microseconds (on the time-stamp counter; a rough spin
 # before it is measured)
 pub fun delay_us(us: u64) {

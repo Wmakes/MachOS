@@ -3,13 +3,29 @@
 use rtc:  machos.dev.rtc;
 use apic: machos.arch.x86_64.apic;
 use proc: machos.kern.proc;
+use cpu:  machos.arch.x86_64.cpu;
 
 var boot_epoch: u64 = 0;
 var boot_ticks: u64 = 0;
+var boot_ns:    u64 = 0; # nanoseconds since boot when the RTC was read
 
 pub fun init() {
     boot_epoch = rtc.read_epoch();
     boot_ticks = proc.uptime_ticks();
+    boot_ns = mono_ns();
+}
+
+# nanoseconds since boot: the time-stamp counter, or the timer ticks
+# before it is measured
+pub fun mono_ns() u64 {
+    val t: u64 = cpu.ns_since_boot(cpu.rdtsc());
+    if (t != 0) { ret t; }
+    ret proc.uptime_ticks() * (1000000000 / apic.HZ);
+}
+
+# nanoseconds since 1970-01-01 UTC
+pub fun real_ns() u64 {
+    ret boot_epoch * 1000000000 + (mono_ns() - boot_ns);
 }
 
 # seconds since 1970-01-01 UTC

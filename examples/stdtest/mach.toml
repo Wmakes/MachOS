@@ -1,0 +1,47 @@
+# mach's standard library on MachOS, checked: run by tools/test.py (it
+# builds this and copies it onto the test disk); prints "ok NAME" or
+# "FAIL NAME", then "stdtest: N failures"
+[project]
+id = "stdtest"
+version = "0.1.0"
+mach = "^6.10"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+# a MachOS program: a static x86_64 ELF linked at 4 MiB. `platform` is what
+# selects std's MachOS layer
+[target.machos]
+isa      = "x86_64"
+os       = "freestanding"
+abi      = "sysv64"
+of       = "elf"
+base     = 0x400000
+platform = "machos"
+
+[artifact.stdtest]
+kind = "bin"
+entry = "main.mach"
+out = "stdtest"
+targets = ["machos"]
+link = []
+need = []
+
+# std with its MachOS layer, until mach-std has a way to add one from outside
+[dep.std]
+git = "https://github.com/Wmakes/machos-std"
+ref = "branch/machos"

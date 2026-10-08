@@ -67,7 +67,21 @@ pub val MUNMAP:  u64 = 60; # (addr, len)
 pub val MPROTECT: u64 = 61; # (addr, len, prot)
 pub val KLOG:    u64 = 62; # (buf, len, since, flags)             -> bytes: the kernel's log from line
                            # `since` on, one line each: "<level>seq,microseconds;text\n" (flags 1: clear it, root)
-pub val COUNT:   u64 = 63;
+pub val CLOCK:   u64 = 63; # (CLOCK_*, *Timespec)                 nanosecond clocks
+pub val GETRANDOM: u64 = 64; # (buf, len)                         -> bytes: random, from the cpu and the timer
+pub val PREAD:   u64 = 65; # (fd, buf, len, offset)               -> bytes; the handle's offset stays
+pub val PWRITE:  u64 = 66; # (fd, buf, len, offset)               -> bytes; the handle's offset stays
+pub val FDPATH:  u64 = 67; # (fd, buf, len)                       -> length: the path a handle was opened at
+pub val COUNT:   u64 = 68;
+
+# CLOCK: the wall clock (since 1970-01-01 UTC) or the time since boot
+pub val CLOCK_REALTIME:  u64 = 0;
+pub val CLOCK_MONOTONIC: u64 = 1;
+
+pub rec Timespec {
+    sec:  u64;
+    nsec: u64;
+}
 
 # mmap: what the pages allow, and what kind of mapping. anonymous pages
 # start zeroed and only take memory once touched; a file mapping is a
@@ -158,6 +172,9 @@ pub val O_CREATE: u64 = 4;
 pub val O_TRUNC:  u64 = 8;
 pub val O_APPEND: u64 = 16;
 pub val O_CLOEXEC: u64 = 32; # closed in the new program after exec
+pub val O_EXCL:   u64 = 64;  # with O_CREATE: fail with E_EXIST if it is there
+pub val O_DIRECTORY: u64 = 128; # fail with E_NOTDIR unless it is a directory
+pub val O_NOFOLLOW: u64 = 256; # accepted; MachOS has no symbolic links
 
 # errors, returned negated
 pub val E_NOENT:    u64 = 1;  # no such file or directory
@@ -186,6 +203,24 @@ pub val E_INTR:     u64 = 23; # interrupted by a signal
 pub val E_PERM:     u64 = 24; # not allowed
 pub val E_ACCES:    u64 = 25; # permission denied
 pub val E_NOTSUP:   u64 = 26; # not supported
+pub val E_ROFS:     u64 = 27; # read-only filesystem
+pub val E_LOOP:     u64 = 28; # too many symbolic links
+pub val E_RANGE:    u64 = 29; # result out of range
+pub val E_TIMEDOUT: u64 = 30; # timed out
+pub val E_NXIO:     u64 = 31; # no such device or address
+pub val E_NODEV:    u64 = 32; # no such device
+pub val E_2BIG:     u64 = 33; # argument list too long
+pub val E_NFILE:    u64 = 34; # too many open files in the system
+pub val E_SPIPE:    u64 = 35; # cannot seek on it
+pub val E_TXTBSY:   u64 = 36; # a running program's file
+pub val E_ADDRINUSE: u64 = 37; # (network, from 0.10)
+pub val E_NETUNREACH: u64 = 38;
+pub val E_CONNABORTED: u64 = 39;
+pub val E_CONNRESET: u64 = 40;
+pub val E_NOTCONN:  u64 = 41;
+pub val E_CONNREFUSED: u64 = 42;
+pub val E_HOSTUNREACH: u64 = 43;
+pub val E_CANCELED: u64 = 44; # cancelled
 
 pub val ERR_MIN: u64 = 0xFFFFFFFFFFFFF000;
 
@@ -226,6 +261,24 @@ pub fun err_name(v: u64) *u8 {
     if (e == E_PERM)     { ret "operation not permitted\0"; }
     if (e == E_ACCES)    { ret "permission denied\0"; }
     if (e == E_NOTSUP)   { ret "not supported\0"; }
+    if (e == E_ROFS)     { ret "read-only filesystem\0"; }
+    if (e == E_LOOP)     { ret "too many symbolic links\0"; }
+    if (e == E_RANGE)    { ret "result out of range\0"; }
+    if (e == E_TIMEDOUT) { ret "timed out\0"; }
+    if (e == E_NXIO)     { ret "no such device or address\0"; }
+    if (e == E_NODEV)    { ret "no such device\0"; }
+    if (e == E_2BIG)     { ret "argument list too long\0"; }
+    if (e == E_NFILE)    { ret "too many open files in the system\0"; }
+    if (e == E_SPIPE)    { ret "cannot seek\0"; }
+    if (e == E_TXTBSY)   { ret "text file busy\0"; }
+    if (e == E_ADDRINUSE) { ret "address in use\0"; }
+    if (e == E_NETUNREACH) { ret "network unreachable\0"; }
+    if (e == E_CONNABORTED) { ret "connection aborted\0"; }
+    if (e == E_CONNRESET) { ret "connection reset\0"; }
+    if (e == E_NOTCONN)  { ret "not connected\0"; }
+    if (e == E_CONNREFUSED) { ret "connection refused\0"; }
+    if (e == E_HOSTUNREACH) { ret "host unreachable\0"; }
+    if (e == E_CANCELED) { ret "cancelled\0"; }
     ret "unknown error\0";
 }
 
@@ -272,6 +325,9 @@ pub rec Stat {
     gid:   u64;
     sector: u64; # a disk's (or partition's) sector size, 0 otherwise
     rdev:  u64; # a device's number (DEV_*), 0 otherwise
+    dev:   u64; # with ino: which file it is (equal for two names of one file)
+    ino:   u64;
+    nlink: u64;
 }
 
 # device numbers (Stat.rdev)

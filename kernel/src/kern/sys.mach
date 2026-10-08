@@ -500,9 +500,11 @@ fun sys_open(pva: u64, plen: u64, flags: u64, mode: u64) u64 {
     var f: u64 = flags;
     if ((f & (abi.O_READ | abi.O_WRITE)) == 0) { f = f | abi.O_READ; }
     var nd: *vfs.Node = vfs.lookup(?full[0], n);
+    if (nd != nil && (flags & (abi.O_CREATE | abi.O_EXCL)) == (abi.O_CREATE | abi.O_EXCL)) { ret e(abi.E_EXIST); }
+    if (nd != nil && (flags & abi.O_DIRECTORY) != 0 && nd.kind != abi.KIND_DIR) { ret e(abi.E_NOTDIR); }
     if (nd == nil) {
         if (vfs.was_denied() != 0) { ret e(abi.E_ACCES); }
-        if ((flags & abi.O_CREATE) == 0) { ret e(abi.E_NOENT); }
+        if ((flags & abi.O_CREATE) == 0 || (flags & abi.O_DIRECTORY) != 0) { ret e(abi.E_NOENT); }
         val dir: *vfs.Node = vfs.parent_dir(?full[0], n);
         if (dir == nil) { ret e(abi.E_NOENT); }
         val ch: u64 = may_change(dir, nil);
@@ -582,6 +584,16 @@ fun fill_stat(nd: *vfs.Node, st: *abi.Stat) {
     st.mode = nd.mode;
     st.uid = nd.uid;
     st.gid = nd.gid;
+    # which file: ext2 has inode numbers; elsewhere the node itself names it
+    # for as long as it is in the tree
+    st.dev = nd.fs + 1;
+    st.ino = nd::u64;
+    if (nd.fs == vfs.FS_EXT2) {
+        st.dev = nd.fsi::u64;
+        st.ino = nd.ino;
+    }
+    st.nlink = 1;
+    if (nd.unlinked != 0) { st.nlink = 0; }
 }
 
 fun sys_mkdir(pva: u64, plen: u64, mode: u64) u64 {
@@ -1070,6 +1082,86 @@ fun sys_seek(h: u64, off: u64, whence: u64) u64 {
     ret to;
 }
 
+# PREAD / PWRITE: at `off`, leaving the handle's own offset where it was
+fun sys_pread(h: u64, buf: u64, n: u64, off: u64, writing: u8) u64 {
+    val f: *file.Handle = handle(h);
+    if (f == nil) { ret e(abi.E_BADF); }
+    if (f.kind != file.NODE) { ret e(abi.E_SPIPE); }
+    if (off >= abi.ERR_MIN) { ret e(abi.E_INVAL); }
+    if (n == 0) { ret 0; }
+    if (ok(buf, n, (writing == 0)::u8) == 0) { ret e(abi.E_FAULT); }
+    val saved: u64 = f.offset;
+    val flags: u64 = f.flags;
+    f.offset = off;
+    f.flags = f.flags & ~abi.O_APPEND;
+    var r: u64 = 0;
+    if (writing != 0) { r = file.write(f, buf, n); } or { r = file.read(f, buf, n); }
+    f.offset = saved;
+    f.flags = flags;
+    ret r;
+}
+
+# FDPATH: the absolute path of the file or directory a handle is open on
+fun sys_fdpath(h: u64, buf: u64, len: u64) u64 {
+    val f: *file.Handle = handle(h);
+    if (f == nil) { ret e(abi.E_BADF); }
+    if (f.kind != file.NODE) { ret e(abi.E_INVAL); }
+    if (f.node.unlinked != 0) { ret e(abi.E_NOENT); }
+    var p: [256]u8;
+    val n: u64 = vfs.path_of(f.node, ?p[0]);
+    var k: u64 = n;
+    if (k > len) { k = len; }
+    if (ok(buf, k, 1) == 0) { ret e(abi.E_FAULT); }
+    mem.copy(buf, (?p[0])::u64, k);
+    ret n;
+}
+
+# CLOCK: CLOCK_REALTIME or CLOCK_MONOTONIC, in seconds and nanoseconds
+fun sys_clock(id: u64, out: u64) u64 {
+    if (ok(out, $size_of(abi.Timespec)::u64, 1) == 0) { ret e(abi.E_FAULT); }
+    var ns: u64 = 0;
+    if (id == abi.CLOCK_REALTIME) { ns = clock.real_ns(); }
+    or (id == abi.CLOCK_MONOTONIC) { ns = clock.mono_ns(); }
+    or { ret e(abi.E_INVAL); }
+    val ts: *abi.Timespec = out::*abi.Timespec;
+    ts.sec = ns / 1000000000;
+    ts.nsec = ns % 1000000000;
+    ret 0;
+}
+
+# GETRANDOM: the cpu's random numbers (RDRAND) when it has them, stirred
+# with the time-stamp counter's jitter through splitmix64
+var rng: u64 = 0x9E3779B97F4A7C15;
+
+fun random64() u64 {
+    var good: u8 = 0;
+    val hw: u64 = cpu.rdrand(?good);
+    rng = rng + 0x9E3779B97F4A7C15 + (hw ^ cpu.rdtsc());
+    var z: u64 = rng;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
+    z = z ^ (z >> 31);
+    if (good != 0) { ret z ^ hw; }
+    ret z;
+}
+
+fun sys_getrandom(buf: u64, n: u64) u64 {
+    if (n > 0x100000) { ret e(abi.E_INVAL); }
+    if (ok(buf, n, 1) == 0) { ret e(abi.E_FAULT); }
+    var i: u64 = 0;
+    for (i < n) {
+        var v: u64 = random64();
+        var k: u64 = 0;
+        for (k < 8 && i < n) {
+            @((buf + i)::*u8) = (v & 0xFF)::u8;
+            v = v >> 8;
+            k = k + 1;
+            i = i + 1;
+        }
+    }
+    ret n;
+}
+
 fun sys_dup2(h: u64, to: u64) u64 {
     val f: *file.Handle = handle(h);
     if (f == nil || to >= abi.MAX_HANDLES) { ret e(abi.E_BADF); }
@@ -1117,6 +1209,9 @@ fun sys_fstat(h: u64, out: u64) u64 {
         st.mtime = 0;
         st.sector = 0;
         st.rdev = 0;
+        st.dev = 0;
+        st.ino = f.pipe::u64;
+        st.nlink = 1;
     }
     ret 0;
 }
@@ -1245,6 +1340,11 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.FCNTL)   { ret sys_fcntl(a, b, c); }
     if (n == abi.FSTAT)   { ret sys_fstat(a, b); }
     if (n == abi.TIME)    { ret clock.now(); }
+    if (n == abi.CLOCK)   { ret sys_clock(a, b); }
+    if (n == abi.GETRANDOM) { ret sys_getrandom(a, b); }
+    if (n == abi.PREAD)   { ret sys_pread(a, b, c, d, 0); }
+    if (n == abi.PWRITE)  { ret sys_pread(a, b, c, d, 1); }
+    if (n == abi.FDPATH)  { ret sys_fdpath(a, b, c); }
     if (n == abi.MOUNT)   { ret sys_mount(a, b, c, d); }
     if (n == abi.UMOUNT)  { ret sys_umount(a, b); }
     if (n == abi.UNAME)   { ret sys_uname(a); }

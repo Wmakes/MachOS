@@ -48,6 +48,15 @@ def with_posixtest():
     sh(f"tools/put.sh examples/posixtest/out/machos/{p}/posixtest /bin/posixtest {disk()}")
 
 
+def with_stdtest():
+    """a fresh dev disk with examples/stdtest (mach's std on MachOS) on it
+    as /bin/stdtest"""
+    p = PROFILE[0]
+    sh(f"tools/mkimage.sh {p} --fresh")
+    sh(f"cd examples/stdtest && mach dep pull . && mach build . -t machos -p {p}")
+    sh(f"tools/put.sh examples/stdtest/out/machos/{p}/stdtest /bin/stdtest {disk()}")
+
+
 def make_broken():
     """a copy of a fresh dev disk with three faults put in by debugfs"""
     sh("tools/mkimage.sh --fresh")
@@ -341,6 +350,13 @@ TESTS = [
       "send:echo to-stderr >&2 2>/dev/null; echo kept 3>/tmp/three; cat < /etc/motd 0<&- | wc -c\\n", "wait:" + P],
      ["exec-works", "posixtest: 0 failures", "cat: /nope: no such file", "      1", "no such file", "motd",
       "kept"]),
+
+    ("std", False, False,
+     ["--prep", with_stdtest, "--boot", disk,
+      "wait:" + P, "send:stdtest one two\\n", "wait:failures", "wait:" + P],
+     ["hello from mach std on MachOS", "ok args", "ok env", "ok write_bytes", "ok metadata", "ok read",
+      "ok remove_file", "ok exists", "ok not_found", "ok create_dir", "ok is_dir", "ok remove_dir",
+      "ok clock", "ok monotonic", "ok random", "stdtest: 0 failures"]),
 
     ("environment", False, False,
      ["wait:" + P,

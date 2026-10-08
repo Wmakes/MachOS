@@ -1,0 +1,112 @@
+# mach's standard library on MachOS: each check prints "ok NAME" or
+# "FAIL NAME", and the last line counts the failures
+
+use std.runtime;
+use std.print;
+use std.filesystem;
+use std.types.path.Path;
+use std.types.result.res;
+use std.types.error.err;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.option.opt;
+use io_error: std.io.error;
+use env:      std.process.env;
+use time:     std.chrono.time;
+use rand:     std.crypto.rand;
+
+var failures: u64 = 0;
+
+fun check(name: str, good: bool) {
+    if (good) { print.printlnf("ok {}", name); }
+    or {
+        print.printlnf("FAIL {}", name);
+        failures = failures + 1;
+    }
+}
+
+fun same(a: *u8, b: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.println("hello from mach std on MachOS");
+    check("args", argc == 3 && same(argv[1], "one", 4) && same(argv[2], "two", 4));
+
+    var home: [64]u8;
+    val got: res[opt[usize], env.EnvError] = env.get("HOME", ?home[0], 64);
+    var env_ok: bool = false;
+    if (sel got.ok) {
+        val v: opt[usize] = got.ok;
+        if (sel v.some) { env_ok = home[0] == '/'; }
+    }
+    check("env", env_ok);
+
+    val p: Path = "/tmp/stdtest.txt";
+    val wrote: err[filesystem.FsError] = filesystem.write_bytes(p, "written by std", 14, 0o644);
+    check("write_bytes", sel wrote.ok);
+    val meta: res[filesystem.Metadata, io_error.Error] = filesystem.metadata(p);
+    var meta_ok: bool = false;
+    if (sel meta.ok) { meta_ok = meta.ok.size == 14 && meta.ok.kind == filesystem.KIND_FILE; }
+    check("metadata", meta_ok);
+    val f: res[filesystem.File, io_error.Error] = filesystem.open(p);
+    check("open", sel f.ok);
+    if (sel f.ok) {
+        var buf: [32]u8;
+        var file: filesystem.File = f.ok;
+        val n: res[usize, io_error.Error] = filesystem.read(file, ?buf[0], 32);
+        var read_ok: bool = false;
+        if (sel n.ok) { read_ok = n.ok == 14 && same(?buf[0], "written by std", 14); }
+        check("read", read_ok);
+        filesystem.close(?file);
+    }
+    val removed: err[io_error.Error] = filesystem.remove_file(p);
+    check("remove_file", sel removed.ok);
+    val gone: res[bool, io_error.Error] = filesystem.exists(p);
+    var gone_ok: bool = false;
+    if (sel gone.ok) { gone_ok = !gone.ok; }
+    check("exists", gone_ok);
+    val missing: res[filesystem.File, io_error.Error] = filesystem.open("/tmp/nope");
+    var missing_ok: bool = false;
+    if (sel missing.err) { missing_ok = missing.err.kind == io_error.NOT_FOUND; }
+    check("not_found", missing_ok);
+
+    val made: err[io_error.Error] = filesystem.create_dir("/tmp/stdtest.d", 0o755);
+    check("create_dir", sel made.ok);
+    val isdir: res[bool, io_error.Error] = filesystem.is_dir("/tmp/stdtest.d");
+    var isdir_ok: bool = false;
+    if (sel isdir.ok) { isdir_ok = isdir.ok; }
+    check("is_dir", isdir_ok);
+    val unmade: err[io_error.Error] = filesystem.remove_dir("/tmp/stdtest.d");
+    check("remove_dir", sel unmade.ok);
+
+    val now: time.Clock = time.now();
+    var now_ok: bool = false;
+    if (sel now.ok) { now_ok = now.ok.sec > 1700000000; }
+    check("clock", now_ok);
+    val a: time.InstantClock = time.instant();
+    val b: time.InstantClock = time.instant();
+    var mono_ok: bool = false;
+    if (sel a.ok) {
+        if (sel b.ok) { mono_ok = b.ok.sec > a.ok.sec || (b.ok.sec == a.ok.sec && b.ok.nsec >= a.ok.nsec); }
+    }
+    check("monotonic", mono_ok);
+
+    var r1: [16]u8;
+    var r2: [16]u8;
+    val f1: err[io_error.Error] = rand.fill(?r1[0], 16);
+    val f2: err[io_error.Error] = rand.fill(?r2[0], 16);
+    check("random", sel f1.ok && sel f2.ok && !same(?r1[0], ?r2[0], 16));
+
+    print.printlnf("stdtest: {} failures", failures);
+    ret failures::i64;
+}
