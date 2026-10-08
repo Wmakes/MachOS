@@ -49,6 +49,14 @@ def keyname(c):
     return KEYNAMES.get(c, c)
 
 
+started = [time.time()]
+
+
+def progress(what):
+    """what the run is doing, live on stderr (tools/test.py shows it)"""
+    print(f"[{time.time() - started[0]:6.1f}s] {what}", file=sys.stderr, flush=True)
+
+
 def disk_args(path, ident, nvme):
     """QEMU arguments attaching a raw image as a SATA (q35's AHCI) or NVMe
     disk; an "nvme4k:" path is an NVMe disk with 4 KiB sectors"""
@@ -93,6 +101,7 @@ def main():
     if a.boot:
         img = a.boot
     else:
+        progress("building the disk image")
         mk = ["tools/mkimage.sh", a.profile] + ([] if a.keep else ["--fresh"]) + (["--rescue"] if a.rescue else [])
         img = subprocess.run(mk, check=True, stdout=subprocess.PIPE, text=True).stdout.strip().splitlines()[-1]
     out = os.path.join("out", "headless")
@@ -105,6 +114,8 @@ def main():
     vars_fd = os.path.join(out, "vars.fd")
     subprocess.run(["cp", OVMF_VARS, vars_fd], check=True)
 
+    progress("starting QEMU")
+    started[0] = time.time()
     qemu = subprocess.Popen([
         "qemu-system-x86_64", "-M", "q35", "-cpu", os.environ.get("QEMU_CPU", "max"), "-m", "256M",
         "-display", "none",
@@ -151,6 +162,7 @@ def main():
         mark = 0
         for step in a.steps:
             kind, _, arg = step.partition(":")
+            progress(step if len(step) < 100 else step[:97] + "...")
             if kind == "wait":
                 rx = re.compile(arg.encode())
                 end = time.time() + a.timeout

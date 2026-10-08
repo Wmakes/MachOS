@@ -1,8 +1,8 @@
 #!/bin/sh
 # build the kernel and the userland, then make or update the dev disk
 # out/<profile>/disk.img. it has the same layout `install` writes:
-#   GPT, partition 1 = EFI system partition (FAT32, 64 MiB: machboot, and a copy
-#                      of its config, the kernel and the initrd)
+#   GPT, partition 1 = EFI system partition (FAT32, 64 MiB: only machboot; it
+#                      reads its config, the kernel and the initrd from /boot)
 #        partition 2 = MachOS root (ext2, 4 KiB blocks: root/ plus /bin)
 # an existing disk is updated in place (EFI files replaced, /bin and /boot
 # refreshed) so files created inside MachOS survive rebuilds; --fresh starts
@@ -46,7 +46,7 @@ MACHBOOT=$(tools/machboot.sh release)
 # puts on a new disk's EFI partition in /boot
 ROOTFS="$OUT/rootfs"
 rm -rf "$ROOTFS"
-mkdir -p "$ROOTFS/bin" "$ROOTFS/boot"
+mkdir -p "$ROOTFS/bin" "$ROOTFS/boot" "$ROOTFS/boot/efi"
 cp -r root/. "$ROOTFS/"
 cp "$BIN/"* "$ROOTFS/bin/"
 cp "$KERNEL" "$ROOTFS/boot/kernel.elf"
@@ -58,7 +58,8 @@ fi
 mkdir -p "$ROOTFS/root" "$ROOTFS/home"
 chmod 0755 "$ROOTFS" "$ROOTFS/bin" "$ROOTFS/boot" "$ROOTFS/etc" "$ROOTFS/home"
 chmod 0700 "$ROOTFS/root"
-chmod 0644 "$ROOTFS/etc/"* "$ROOTFS/boot/"*
+chmod 0644 "$ROOTFS/etc/"* "$ROOTFS/boot/"*.*
+chmod 0755 "$ROOTFS/boot/efi"
 chmod 0600 "$ROOTFS/etc/shadow"
 chmod 0755 "$ROOTFS/bin/"*
 chmod 4755 "$ROOTFS/bin/su" "$ROOTFS/bin/passwd"
@@ -114,6 +115,7 @@ else
     fi
     for d in bin boot; do
         for f in "$ROOTFS/$d"/*; do
+            [ -f "$f" ] || continue
             n=$(basename "$f")
             if [ "$d/$n" = boot/machboot.conf ] && [ "$KEEP_CONF" = 1 ] && [ "$RESCUE" = 0 ] \
                && [ ! -f "$OUT/rescue-conf" ]; then continue; fi
@@ -134,11 +136,8 @@ ESP="$OUT/esp.img"
 rm -f "$ESP"
 dd if=/dev/zero of="$ESP" bs=512 count="$ESP_SECTORS" 2>/dev/null
 mformat -i "$ESP" -F -c 1 ::
-mmd   -i "$ESP" ::/EFI ::/EFI/BOOT ::/boot
+mmd   -i "$ESP" ::/EFI ::/EFI/BOOT
 mcopy -i "$ESP" "$MACHBOOT" ::/EFI/BOOT/BOOTX64.EFI
-mcopy -i "$ESP" "$ROOTFS/boot/machboot.conf" ::/boot/machboot.conf
-mcopy -i "$ESP" "$KERNEL" ::/boot/kernel.elf
-mcopy -i "$ESP" "$OUT/initrd.tar" ::/boot/initrd.tar
 dd if="$ESP" of="$IMG" bs=512 seek="$ESP_START" conv=notrunc 2>/dev/null
 rm -f "$ESP"
 echo "$IMG"

@@ -1,0 +1,212 @@
+# update FILE: install a MachOS update package (made by tools/mkupdate.sh:
+# a .tgz with VERSION, boot/kernel.elf, boot/initrd.tar, boot/BOOTX64.EFI,
+# bin/* and etc/motd). the running kernel and initrd are kept as
+# /boot/kernel.old.elf and /boot/initrd.old.tar, and machboot gets an entry
+# "MachOS (previous)" that boots them, in case the new one does not start.
+# the programs in /bin are replaced, machboot too (on the EFI partition as
+# well when it is mounted on /boot/efi); your settings in /etc stay.
+# reboot afterwards to start the new system
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io:  sdk.io;
+use rt:  sdk.rt;
+
+val STAGE: *u8 = "/tmp/update\0";
+var buf: [65536]u8;
+var failures: u64 = 0;
+
+fun fail(what: *u8) u64 {
+    io.err("update: \0");
+    io.err(what);
+    io.err("\n\0");
+    ret 1;
+}
+
+fun say(a: *u8) { io.out(a); }
+
+# run a program with NUL-separated args (args[0] first); its exit status
+fun run(prog: *u8, args: *u8, n: u64) u64 {
+    val pid: u64 = sys.spawn(prog, io.len(prog), args, n, nil);
+    if (abi.is_err(pid) != 0) { ret 127; }
+    ret sys.wait(pid);
+}
+
+# the args builder
+var a: [1024]u8;
+var an: u64 = 0;
+
+fun arg(s: *u8) {
+    val l: u64 = io.len(s);
+    io.copy(?a[an], s, l);
+    a[an + l] = 0;
+    an = an + l + 1;
+}
+
+fun path(dst: *u8, x: *u8, y: *u8) u64 {
+    val xl: u64 = io.len(x);
+    io.copy(dst, x, xl);
+    val yl: u64 = io.len(y);
+    io.copy(?dst[xl], y, yl);
+    dst[xl + yl] = 0;
+    ret xl + yl;
+}
+
+fun exists(p: *u8) u8 {
+    var st: abi.Stat;
+    ret (abi.is_err(sys.stat(p, io.len(p), ?st)) == 0)::u8;
+}
+
+# copy file src to dst (through dst.new and a rename, so a half-written file
+# never takes the old one's place); whether it worked
+fun copy(src: *u8, dst: *u8) u8 {
+    val h: u64 = sys.open(src, io.len(src), abi.O_READ);
+    if (abi.is_err(h) != 0) { ret 0; }
+    var st: abi.Stat;
+    sys.fstat(h, ?st);
+    var tmp: [256]u8;
+    path(?tmp[0], dst, ".new\0");
+    val o: u64 = sys.open_mode(?tmp[0], io.len(?tmp[0]), abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC, st.mode & 0xFFF);
+    if (abi.is_err(o) != 0) {
+        sys.close(h);
+        ret 0;
+    }
+    var good: u8 = 1;
+    for {
+        val r: u64 = sys.read(h, ?buf[0], 65536);
+        if (abi.is_err(r) != 0) { good = 0; brk; }
+        if (r == 0) { brk; }
+        if (io.write_all(o, ?buf[0], r) == 0) { good = 0; brk; }
+    }
+    sys.close(h);
+    sys.close(o);
+    if (good == 0) {
+        sys.remove(?tmp[0], io.len(?tmp[0]));
+        ret 0;
+    }
+    sys.remove(dst, io.len(dst));
+    if (abi.is_err(sys.rename(?tmp[0], io.len(?tmp[0]), dst, io.len(dst))) != 0) { ret 0; }
+    sys.chmod(dst, io.len(dst), st.mode & 0xFFF);
+    ret 1;
+}
+
+fun install(src_rel: *u8, dst: *u8) {
+    var src: [256]u8;
+    path(?src[0], "/tmp/update/\0", src_rel);
+    if (copy(?src[0], dst) == 0) {
+        io.err("update: could not install \0");
+        io.err(dst);
+        io.err("\n\0");
+        failures = failures + 1;
+    }
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc != 2) {
+        io.err("usage: update FILE.tgz   (a MachOS update package)\n\0");
+        ret 2;
+    }
+    if (sys.geteuid() != 0) { ret fail("only root may update the system\0"); }
+    val pkg: *u8 = argv[1];
+    if (exists(pkg) == 0) { ret fail("no such file\0"); }
+
+    # unpack it into /tmp/update
+    an = 0;
+    arg("rm\0"); arg("-r\0"); arg(STAGE);
+    run("/bin/rm\0", ?a[0], an);
+    sys.mkdir(STAGE, io.len(STAGE));
+    var cmd: [600]u8;
+    var cl: u64 = path(?cmd[0], "cd /tmp/update && gunzip -c \0", pkg);
+    cl = cl + path(?cmd[cl], " | tar -xf -\0", "\0");
+    an = 0;
+    arg("sh\0"); arg("-c\0"); arg(?cmd[0]);
+    say("unpacking...\n\0");
+    if (run("/bin/sh\0", ?a[0], an) != 0) { ret fail("the package could not be unpacked (is it a .tgz?)\0"); }
+
+    # what it is
+    val vh: u64 = sys.open("/tmp/update/VERSION\0", 19, abi.O_READ);
+    if (abi.is_err(vh) != 0) { ret fail("this is not a MachOS update package (no VERSION)\0"); }
+    var ver: [64]u8;
+    var vl: u64 = sys.read(vh, ?ver[0], 63);
+    sys.close(vh);
+    if (abi.is_err(vl) != 0) { vl = 0; }
+    for (vl > 0 && (ver[vl - 1] == 10 || ver[vl - 1] == 13 || ver[vl - 1] == 32)) { vl = vl - 1; }
+    ver[vl] = 0;
+    val kh: u64 = sys.open("/tmp/update/boot/kernel.elf\0", 27, abi.O_READ);
+    if (abi.is_err(kh) != 0) { ret fail("the package has no kernel\0"); }
+    var magic: [4]u8;
+    sys.read(kh, ?magic[0], 4);
+    sys.close(kh);
+    if (magic[0] != 0x7F || magic[1] != 69 || magic[2] != 76 || magic[3] != 70) { ret fail("the package's kernel is not an ELF file\0"); }
+    var un: abi.Uname;
+    sys.uname(?un);
+    say("updating MachOS \0");
+    say(?un.release[0]);
+    say(" to \0");
+    say(?ver[0]);
+    say("\n\0");
+
+    # the running kernel and initrd stay, as the fallback
+    say("keeping the current kernel as /boot/kernel.old.elf\n\0");
+    if (exists("/boot/kernel.elf\0") != 0 && copy("/boot/kernel.elf\0", "/boot/kernel.old.elf\0") == 0) {
+        ret fail("could not keep the current kernel (disk full?)\0");
+    }
+    if (exists("/boot/initrd.tar\0") != 0) { copy("/boot/initrd.tar\0", "/boot/initrd.old.tar\0"); }
+
+    say("installing the kernel, the initrd and machboot\n\0");
+    install("boot/kernel.elf\0", "/boot/kernel.elf\0");
+    if (exists("/tmp/update/boot/initrd.tar\0") != 0) { install("boot/initrd.tar\0", "/boot/initrd.tar\0"); }
+    if (exists("/tmp/update/boot/BOOTX64.EFI\0") != 0) {
+        install("boot/BOOTX64.EFI\0", "/boot/BOOTX64.EFI\0");
+        if (exists("/boot/efi/EFI/BOOT\0") != 0) { install("boot/BOOTX64.EFI\0", "/boot/efi/EFI/BOOT/BOOTX64.EFI\0"); }
+    }
+    if (exists("/tmp/update/etc/motd\0") != 0) { install("etc/motd\0", "/etc/motd\0"); }
+
+    # every program
+    say("installing the programs\n\0");
+    val dh: u64 = sys.open("/tmp/update/bin\0", 15, abi.O_READ);
+    var programs: u64 = 0;
+    if (abi.is_err(dh) == 0) {
+        var i: u64 = 0;
+        for {
+            var e: abi.Entry;
+            val got: u64 = sys.readdir(dh, i, ?e);
+            if (abi.is_err(got) != 0 || got == 0) { brk; }
+            i = i + 1;
+            if (e.kind != abi.KIND_FILE) { cnt; }
+            var rel: [96]u8;
+            io.copy(?rel[0], "bin/\0", 4);
+            io.copy(?rel[4], ?e.name[0], e.name_len);
+            rel[4 + e.name_len] = 0;
+            var dst: [96]u8;
+            io.copy(?dst[0], "/bin/\0", 5);
+            io.copy(?dst[5], ?e.name[0], e.name_len);
+            dst[5 + e.name_len] = 0;
+            install(?rel[0], ?dst[0]);
+            programs = programs + 1;
+        }
+        sys.close(dh);
+    }
+    io.dec(programs);
+    say(" programs\n\0");
+
+    # machboot's way back
+    an = 0;
+    arg("machboot\0"); arg("ensure\0"); arg("MachOS (previous)\0");
+    arg("/boot/kernel.old.elf\0"); arg("/boot/initrd.old.tar\0");
+    run("/bin/machboot\0", ?a[0], an);
+
+    an = 0;
+    arg("rm\0"); arg("-r\0"); arg(STAGE);
+    run("/bin/rm\0", ?a[0], an);
+    sys.sync();
+    if (failures > 0) {
+        io.dec(failures);
+        ret fail(" file(s) could not be installed: the system may be half updated\0");
+    }
+    say("MachOS is updated to \0");
+    say(?ver[0]);
+    say(". Reboot to start it; machboot's \"MachOS (previous)\" boots the old one.\n\0");
+    ret 0;
+}

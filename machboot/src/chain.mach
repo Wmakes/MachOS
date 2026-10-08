@@ -1,0 +1,283 @@
+# other systems: find the boot loaders of Windows, Linux and the like on
+# every EFI partition, and start one (the firmware loads and runs it; if
+# it returns, so does machboot's menu)
+
+use efi:  machboot.efi;
+use conf: machboot.conf;
+
+# known loaders, by the file each system puts in \EFI\<dir>\
+fun loader_file(i: u64) *u8 {
+    if (i == 0) { ret "bootmgfw.efi\0"; }        # Windows
+    if (i == 1) { ret "shimx64.efi\0"; }         # Ubuntu, Fedora, ... with Secure Boot
+    if (i == 2) { ret "grubx64.efi\0"; }
+    if (i == 3) { ret "systemd-bootx64.efi\0"; }
+    if (i == 4) { ret "refind_x64.efi\0"; }
+    ret nil;
+}
+
+fun to_wide(s: *u8, out: *u16, cap: u64) u64 {
+    var i: u64 = 0;
+    for (s[i] != 0 && i + 1 < cap) {
+        if (s[i] == 47) { out[i] = 92; } or { out[i] = s[i]::u16; }
+        i = i + 1;
+    }
+    out[i] = 0;
+    ret i;
+}
+
+fun lower(c: u16) u16 {
+    if (c >= 65 && c <= 90) { ret c + 32; }
+    ret c;
+}
+
+fun same_name(a: *u16, b: *u8) u8 {
+    var i: u64 = 0;
+    for (b[i] != 0) {
+        if (lower(a[i]) != lower(b[i]::u16)) { ret 0; }
+        i = i + 1;
+    }
+    ret (a[i] == 0)::u8;
+}
+
+# open file `path` (UTF-16, \-separated) on volume root `r`; 0 if missing
+fun open(r: *efi.File, path: *u16) u64 {
+    var fh: u64 = 0;
+    if (efi.failed(r.open(r, ?fh, path, 1, 0)) != 0) { ret 0; }
+    ret fh;
+}
+
+fun add_entry(handle: u64, dir: *u16, sub: u8, file: *u8, kind: u64) {
+    if (conf.count >= conf.MAX) { ret; }
+    val e: *conf.Entry = ?conf.entries[conf.count];
+    # the path: \EFI\<dir>\<file>
+    var p: [128]u16;
+    var n: u64 = to_wide("\\EFI\\\0", ?p[0], 128);
+    var i: u64 = 0;
+    for (dir[i] != 0 && n < 100) {
+        p[n] = dir[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    p[n] = 92;
+    n = n + 1;
+    if (sub != 0) { # \Boot\ as Windows has it
+        val bd: *u8 = "Boot\\\0";
+        var b: u64 = 0;
+        for (bd[b] != 0) {
+            p[n] = bd[b]::u16;
+            n = n + 1;
+            b = b + 1;
+        }
+    }
+    i = 0;
+    for (file[i] != 0 && n < 126) {
+        p[n] = file[i]::u16;
+        n = n + 1;
+        i = i + 1;
+    }
+    p[n] = 0;
+    i = 0;
+    for (i <= n) {
+        e.efi_path[i] = p[i];
+        i = i + 1;
+    }
+    e.efi_handle = handle;
+    e.chain = 1;
+    e.cmdline_len = 0;
+    e.cmdline[0] = 0;
+    # the menu name
+    var nm: [64]u8;
+    var k: u64 = 0;
+    if (kind == 0) {
+        val w: *u8 = "Windows\0";
+        for (w[k] != 0) { nm[k] = w[k]; k = k + 1; }
+    } or {
+        i = 0;
+        for (dir[i] != 0 && k < 30) {
+            var c: u8 = (dir[i] & 0x7F)::u8;
+            if (i == 0 && c >= 97 && c <= 122) { c = c - 32; }
+            nm[k] = c;
+            k = k + 1;
+            i = i + 1;
+        }
+        var how: *u8 = " (GRUB)\0";
+        if (kind == 1) { how = " (shim)\0"; }
+        if (kind == 3) { how = " (systemd-boot)\0"; }
+        if (kind == 4) { how = " (rEFInd)\0"; }
+        var j: u64 = 0;
+        for (how[j] != 0) { nm[k] = how[j]; k = k + 1; j = j + 1; }
+    }
+    i = 0;
+    for (i < k) {
+        e.name[i] = nm[i];
+        i = i + 1;
+    }
+    e.name_len = k;
+    conf.count = conf.count + 1;
+}
+
+# one EFI volume: every \EFI\<dir> but BOOT and machos holding a known
+# loader, in it or in its Boot subdirectory (where Windows keeps it)
+fun scan_volume(handle: u64, root: *efi.File) {
+    var dp: [8]u16;
+    to_wide("\\EFI\0", ?dp[0], 8);
+    val dh: u64 = open(root, ?dp[0]);
+    if (dh == 0) { ret; }
+    val d: *efi.File = dh::*efi.File;
+    var info: [1024]u8;
+    for {
+        var size: u64 = 1024;
+        if (efi.failed(d.read(d, ?size, (?info[0])::u64)) != 0 || size == 0) { brk; }
+        val attr: u64 = @((?info[72])::*u64);
+        val name: *u16 = (?info[80])::*u16;
+        if ((attr & 0x10) == 0 || name[0] == 46) { cnt; }
+        if (same_name(name, "BOOT\0") != 0 || same_name(name, "machos\0") != 0) { cnt; }
+        var k: u64 = 0;
+        var found: u8 = 0;
+        for (loader_file(k) != nil && found == 0) {
+          var sub: u8 = 0;
+          for (sub < 2 && found == 0) {
+            # \EFI\<dir>\<file> or \EFI\<dir>\Boot\<file>
+            var p: [160]u16;
+            var n: u64 = to_wide("\\EFI\\\0", ?p[0], 160);
+            var i: u64 = 0;
+            for (name[i] != 0 && n < 120) {
+                p[n] = name[i];
+                n = n + 1;
+                i = i + 1;
+            }
+            p[n] = 92;
+            n = n + 1;
+            if (sub != 0) {
+                val bd: *u8 = "Boot\\\0";
+                var b: u64 = 0;
+                for (bd[b] != 0) {
+                    p[n] = bd[b]::u16;
+                    n = n + 1;
+                    b = b + 1;
+                }
+            }
+            val f: *u8 = loader_file(k);
+            i = 0;
+            for (f[i] != 0) {
+                p[n] = f[i]::u16;
+                n = n + 1;
+                i = i + 1;
+            }
+            p[n] = 0;
+            val fh: u64 = open(root, ?p[0]);
+            if (fh != 0) {
+                (fh::*efi.File).close(fh::*efi.File);
+                add_entry(handle, name, sub, f, k);
+                found = 1; # one entry per system (shim before grub)
+            }
+            sub = sub + 1;
+          }
+          k = k + 1;
+        }
+    }
+    d.close(d);
+}
+
+# add an entry for every other system found on any EFI partition
+pub fun detect() {
+    var g: efi.Guid;
+    efi.simple_fs_guid(?g);
+    var n: u64 = 0;
+    var handles: u64 = 0;
+    if (efi.failed(efi.bs.locate_handle_buffer(2, ?g, 0, ?n, ?handles)) != 0) { ret; }
+    var i: u64 = 0;
+    for (i < n) {
+        val h: u64 = @((handles + i * 8)::*u64);
+        var sfs: u64 = 0;
+        if (efi.failed(efi.bs.handle_protocol(h, ?g, ?sfs)) == 0) {
+            val s: *efi.SimpleFs = sfs::*efi.SimpleFs;
+            var root: u64 = 0;
+            if (efi.failed(s.open_volume(s, ?root)) == 0) {
+                scan_volume(h, root::*efi.File);
+                (root::*efi.File).close(root::*efi.File);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# a manual `efi PATH` entry: the first EFI volume that has PATH
+pub fun resolve(e: *conf.Entry) u8 {
+    var g: efi.Guid;
+    efi.simple_fs_guid(?g);
+    var n: u64 = 0;
+    var handles: u64 = 0;
+    if (efi.failed(efi.bs.locate_handle_buffer(2, ?g, 0, ?n, ?handles)) != 0) { ret 0; }
+    var i: u64 = 0;
+    for (i < n) {
+        val h: u64 = @((handles + i * 8)::*u64);
+        var sfs: u64 = 0;
+        if (efi.failed(efi.bs.handle_protocol(h, ?g, ?sfs)) == 0) {
+            val s: *efi.SimpleFs = sfs::*efi.SimpleFs;
+            var root: u64 = 0;
+            if (efi.failed(s.open_volume(s, ?root)) == 0) {
+                val fh: u64 = open(root::*efi.File, ?e.efi_path[0]);
+                (root::*efi.File).close(root::*efi.File);
+                if (fh != 0) {
+                    (fh::*efi.File).close(fh::*efi.File);
+                    e.efi_handle = h;
+                    ret 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+var dpbuf: [1024]u8;
+
+# start the loader of entry `e`; returns if it could not, or when it exits
+pub fun start(e: *conf.Entry) *u8 {
+    if (e.efi_handle == 0 && resolve(e) == 0) { ret "that loader is not on any EFI partition\0"; }
+    # its device path: the volume's, then a file node, then the end
+    var dg: efi.Guid;
+    efi.device_path_guid(?dg);
+    var vdp: u64 = 0;
+    if (efi.failed(efi.bs.handle_protocol(e.efi_handle, ?dg, ?vdp)) != 0) { ret "the EFI partition has no device path\0"; }
+    var at: u64 = 0;
+    var node: u64 = vdp;
+    for (at < 800) {
+        val t: u8 = @(node::*u8);
+        val len: u64 = (@((node + 2)::*u16))::u64;
+        if (t == 0x7F || len < 4) { brk; }
+        var k: u64 = 0;
+        for (k < len) {
+            dpbuf[at + k] = @((node + k)::*u8);
+            k = k + 1;
+        }
+        at = at + len;
+        node = node + len;
+    }
+    var plen: u64 = 0;
+    for (e.efi_path[plen] != 0) { plen = plen + 1; }
+    val flen: u64 = 4 + (plen + 1) * 2;
+    if (at + flen + 4 > 1024) { ret "path too long\0"; }
+    dpbuf[at] = 4;       # media
+    dpbuf[at + 1] = 4;   # file path
+    @((?dpbuf[at + 2])::*u16) = flen::u16;
+    var i: u64 = 0;
+    for (i <= plen) {
+        @((?dpbuf[at + 4 + i * 2])::*u16) = e.efi_path[i];
+        i = i + 1;
+    }
+    at = at + flen;
+    dpbuf[at] = 0x7F;    # end of the whole path
+    dpbuf[at + 1] = 0xFF;
+    dpbuf[at + 2] = 4;
+    dpbuf[at + 3] = 0;
+    var img: u64 = 0;
+    if (efi.failed(efi.bs.load_image(0, efi.image, (?dpbuf[0])::u64, 0, 0, ?img)) != 0) {
+        ret "the firmware would not load it (Secure Boot?)\0";
+    }
+    efi.color(efi.LIGHTGRAY, efi.BLACK);
+    efi.clear();
+    efi.bs.start_image(img, 0, 0);
+    ret "it exited\0";
+}

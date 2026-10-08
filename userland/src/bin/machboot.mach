@@ -2,13 +2,19 @@
 #   machboot                          the menu: timeout, default, entries
 #   machboot default N                boot entry N unless another is picked
 #   machboot timeout SECONDS          how long the menu waits (0: no menu)
+#   machboot hide | show              no menu at all: boot the default at once
+#                                     (hold a key while it starts to see it)
+#   machboot dualboot on | off        offer other systems found on EFI partitions
 #   machboot cmdline N [TEXT...]      entry N's kernel command line
 #   machboot add NAME [KERNEL [INITRD [CMDLINE...]]]   a new entry
 #   machboot remove N                 drop entry N
 #   machboot edit                     open the file in nano
-#   machboot install PARTITION        write machboot (and copies of the
-#                                     config, kernel and initrd) to an EFI
-#                                     system partition: it is reformatted
+#   machboot ensure NAME KERNEL [INITRD]   add that entry unless one has NAME
+#   machboot update                   put /boot/BOOTX64.EFI (the machboot
+#                                     programs here) on the EFI partition,
+#                                     which MachOS mounts on /boot/efi
+#   machboot install PARTITION        format an EFI system partition with
+#                                     only machboot on it (it is erased)
 # entries count from 1. changing anything needs root
 
 use abi: sdk.abi;
@@ -28,12 +34,18 @@ rec Entry {
     ilen:    u64;
     cmdline: [256]u8;
     clen:    u64;
+    efi:     [128]u8;   # another system's loader (then no kernel)
+    elen:    u64;
+    help:    [96]u8;    # shown in the menu when the entry is highlighted
+    hlen:    u64;
 }
 
 var entries: [16]Entry;
 var count: u64 = 0;
 var timeout: u64 = 3;
 var default: u64 = 1;
+var hidden: u8 = 0;
+var dualboot: u8 = 1;
 var text: [16384]u8;
 
 fun fail(why: *u8) u64 {
@@ -86,6 +98,8 @@ fun load() u8 {
             var okk: u8 = 0;
             if (is(key, kn, "timeout\0") != 0) { timeout = num(v, vn, ?okk); }
             or (is(key, kn, "default\0") != 0) { default = num(v, vn, ?okk); }
+            or (is(key, kn, "menu\0") != 0) { hidden = is(v, vn, "hidden\0"); }
+            or (is(key, kn, "dualboot\0") != 0) { dualboot = (is(v, vn, "no\0") == 0)::u8; }
             or (is(key, kn, "entry\0") != 0) {
                 if (count < MAX) {
                     val en: *Entry = ?entries[count];
@@ -93,6 +107,8 @@ fun load() u8 {
                     en.klen = 0;
                     en.ilen = 0;
                     en.clen = 0;
+                    en.elen = 0;
+                    en.hlen = 0;
                     count = count + 1;
                 }
             } or (count > 0) {
@@ -100,6 +116,8 @@ fun load() u8 {
                 if (is(key, kn, "kernel\0") != 0) { en.klen = set(?en.kernel[0], 128, v, vn); }
                 or (is(key, kn, "initrd\0") != 0) { en.ilen = set(?en.initrd[0], 128, v, vn); }
                 or (is(key, kn, "cmdline\0") != 0) { en.clen = set(?en.cmdline[0], 256, v, vn); }
+                or (is(key, kn, "efi\0") != 0) { en.elen = set(?en.efi[0], 128, v, vn); }
+                or (is(key, kn, "help\0") != 0) { en.hlen = set(?en.help[0], 96, v, vn); }
             }
         }
         i = e + 1;
@@ -128,11 +146,24 @@ fun save() u64 {
     put(h, "\ndefault \0");
     put_num(h, default);
     put(h, "\n\0");
+    if (hidden != 0) { put(h, "menu hidden\n\0"); }
+    if (dualboot == 0) { put(h, "dualboot no\n\0"); }
     var i: u64 = 0;
     for (i < count) {
         val e: *Entry = ?entries[i];
         put(h, "\nentry \0");
         putn(h, ?e.name[0], e.nlen);
+        if (e.hlen > 0) {
+            put(h, "\n    help    \0");
+            putn(h, ?e.help[0], e.hlen);
+        }
+        if (e.elen > 0) {
+            put(h, "\n    efi \0");
+            putn(h, ?e.efi[0], e.elen);
+            put(h, "\n\0");
+            i = i + 1;
+            cnt;
+        }
         put(h, "\n    kernel  \0");
         putn(h, ?e.kernel[0], e.klen);
         if (e.ilen > 0) {
@@ -156,7 +187,10 @@ fun list() u64 {
     io.dec(timeout);
     io.out(" s, boots entry \0");
     io.dec(default);
-    io.out(" unless another is picked\n\n\0");
+    io.out(" unless another is picked\n\0");
+    if (hidden != 0) { io.out("  the menu is hidden: hold a key while the machine starts to see it\n\0"); }
+    if (dualboot != 0) { io.out("  other systems on EFI partitions are offered too\n\0"); }
+    io.putc(10);
     var i: u64 = 0;
     for (i < count) {
         val e: *Entry = ?entries[i];
@@ -164,6 +198,17 @@ fun list() u64 {
         io.dec(i + 1);
         io.out("  \x1b[1m\0");
         io.outn(?e.name[0], e.nlen);
+        if (e.hlen > 0) {
+            io.out("\x1b[0m - \0");
+            io.outn(?e.help[0], e.hlen);
+        }
+        if (e.elen > 0) {
+            io.out("\x1b[0m\n        another system: \0");
+            io.outn(?e.efi[0], e.elen);
+            io.putc(10);
+            i = i + 1;
+            cnt;
+        }
         io.out("\x1b[0m\n        kernel \0");
         io.outn(?e.kernel[0], e.klen);
         if (e.ilen > 0) {
@@ -214,6 +259,28 @@ fun run(prog: *u8, args: *u8, alen: u64) u64 {
     ret sys.wait(pid);
 }
 
+# the machboot program here (/boot/BOOTX64.EFI) onto the mounted EFI
+# partition, as the firmware's fallback loader
+fun update_esp() u64 {
+    var st: abi.Stat;
+    if (abi.is_err(sys.stat("/boot/efi/EFI\0", 13, ?st)) != 0) {
+        ret fail("the EFI partition is not mounted on /boot/efi\0");
+    }
+    sys.mkdir("/boot/efi/EFI/BOOT\0", 18);
+    var a: [128]u8;
+    var n: u64 = 0;
+    io.copy(?a[n], "cp\0", 3);
+    n = n + 3;
+    io.copy(?a[n], "/boot/BOOTX64.EFI\0", 18);
+    n = n + 18;
+    io.copy(?a[n], "/boot/efi/EFI/BOOT/BOOTX64.EFI\0", 31);
+    n = n + 31;
+    if (run("/bin/cp\0", ?a[0], n) != 0) { ret fail("copying it failed\0"); }
+    sys.sync();
+    io.out("machboot on the EFI partition is now /boot/BOOTX64.EFI\n\0");
+    ret 0;
+}
+
 # put machboot on EFI system partition `part` (reformatting it)
 fun install(part: *u8) u64 {
     var st: abi.Stat;
@@ -222,7 +289,8 @@ fun install(part: *u8) u64 {
     }
     io.out("This reformats \0");
     io.out(part);
-    io.out(" (everything on it is lost) and puts machboot there.\n\0");
+    io.out(" (everything on it is lost) and puts machboot there\n\0");
+    io.out("(machboot reads its settings, the kernel and the initrd from /boot).\n\0");
     var cargs: [64]u8;
     var cl: u64 = 0;
     io.copy(?cargs[0], "confirm\0", 8);
@@ -241,15 +309,6 @@ fun install(part: *u8) u64 {
     val f1: *u8 = "/boot/BOOTX64.EFI:EFI/BOOT/BOOTX64.EFI\0";
     io.copy(?a[n], f1, io.len(f1) + 1);
     n = n + io.len(f1) + 1;
-    val f2: *u8 = "/boot/machboot.conf:boot/machboot.conf\0";
-    io.copy(?a[n], f2, io.len(f2) + 1);
-    n = n + io.len(f2) + 1;
-    val f3: *u8 = "/boot/kernel.elf:boot/kernel.elf\0";
-    io.copy(?a[n], f3, io.len(f3) + 1);
-    n = n + io.len(f3) + 1;
-    val f4: *u8 = "?/boot/initrd.tar:boot/initrd.tar\0";
-    io.copy(?a[n], f4, io.len(f4) + 1);
-    n = n + io.len(f4) + 1;
     if (run("/bin/mkfat\0", ?a[0], n) != 0) { ret fail("writing the EFI partition failed\0"); }
     io.out("machboot is installed on \0");
     io.out(part);
@@ -268,6 +327,20 @@ fun main(argc: u64, argv: **u8) u64 {
         val n: u64 = entry_arg(argv[2]);
         if (n == 0) { ret fail("no such entry\0"); }
         default = n;
+        ret save();
+    }
+    if (io.streq(cmd, "hide\0") != 0 && argc == 2) {
+        hidden = 1;
+        ret save();
+    }
+    if (io.streq(cmd, "show\0") != 0 && argc == 2) {
+        hidden = 0;
+        ret save();
+    }
+    if (io.streq(cmd, "dualboot\0") != 0 && argc == 3) {
+        if (io.streq(argv[2], "on\0") != 0) { dualboot = 1; }
+        or (io.streq(argv[2], "off\0") != 0) { dualboot = 0; }
+        or { ret fail("dualboot on or off\0"); }
         ret save();
     }
     if (io.streq(cmd, "timeout\0") != 0 && argc == 3) {
@@ -318,8 +391,28 @@ fun main(argc: u64, argv: **u8) u64 {
         ret run("/bin/nano\0", ?a[0], 5 + io.len(PATH) + 1);
     }
     if (io.streq(cmd, "install\0") != 0 && argc == 3) { ret install(argv[2]); }
-    io.err("usage: machboot [list | default N | timeout SECONDS | cmdline N [TEXT...] |\n\0");
+    if (io.streq(cmd, "update\0") != 0 && argc == 2) { ret update_esp(); }
+    if (io.streq(cmd, "ensure\0") != 0 && argc >= 4) {
+        var j: u64 = 0;
+        for (j < count) {
+            if (io.eq(?entries[j].name[0], entries[j].nlen, argv[2], io.len(argv[2])) != 0) { ret 0; }
+            j = j + 1;
+        }
+        if (count == MAX) { ret fail("no room for more entries\0"); }
+        val e: *Entry = ?entries[count];
+        e.nlen = set(?e.name[0], 64, argv[2], io.len(argv[2]));
+        e.klen = set(?e.kernel[0], 128, argv[3], io.len(argv[3]));
+        e.ilen = 0;
+        if (argc >= 5) { e.ilen = set(?e.initrd[0], 128, argv[4], io.len(argv[4])); }
+        e.clen = 0;
+        e.elen = 0;
+        e.hlen = set(?e.help[0], 96, "the system as it was before the last update\0", 43);
+        count = count + 1;
+        ret save();
+    }
+    io.err("usage: machboot [list | default N | timeout SECONDS | hide | show | dualboot on|off |\n\0");
+    io.err("                cmdline N [TEXT...] |\n\0");
     io.err("                add NAME [KERNEL [INITRD|- [CMDLINE...]]] | remove N | edit |\n\0");
-    io.err("                install PARTITION]\n\0");
+    io.err("                ensure NAME KERNEL [INITRD] | update | install PARTITION]\n\0");
     ret 2;
 }

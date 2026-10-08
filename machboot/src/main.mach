@@ -3,11 +3,15 @@
 # partition), shows a menu, and boots the chosen entry
 #   up/down choose   enter boot   e edit the command line
 #   r restart        p power off  (any key stops the countdown)
+# it also offers the other systems it finds on EFI partitions (Windows,
+# Linux loaders...). with `menu hidden` it boots the default straight away
+# unless a key is held while it starts
 
 use efi:   machboot.efi;
 use files: machboot.files;
 use conf:  machboot.conf;
 use boot:  machboot.boot;
+use chain: machboot.chain;
 
 val LOGO_LINES: u64 = 5;
 
@@ -44,7 +48,7 @@ fun draw(left: u64) {
     }
     efi.color(efi.WHITE, efi.BLACK);
     efi.at(2, 7);
-    efi.puts("machboot 0.8.0\0");
+    efi.puts("machboot 0.8.1\0");
     efi.color(efi.DARKGRAY, efi.BLACK);
     if (files.on_root != 0) { efi.puts("   files from the MachOS root partition\0"); }
     or { efi.puts("   files from the EFI partition\0"); }
@@ -57,13 +61,13 @@ fun draw(left: u64) {
         efi.puts("  \0");
         efi.putn(?e.name[0], e.name_len);
         var used: u64 = 2 + e.name_len;
-        if (e.cmdline_len > 0) {
-            efi.puts("  (\0");
-            efi.putn(?e.cmdline[0], e.cmdline_len);
-            efi.puts(")\0");
-            used = used + 4 + e.cmdline_len;
+        # the highlighted entry also says what it is for
+        if (i == chosen && e.help_len > 0) {
+            efi.puts(" - \0");
+            efi.putn(?e.help[0], e.help_len);
+            used = used + 3 + e.help_len;
         }
-        for (used < 50) {
+        for (used < 76) {
             efi.putc(32);
             used = used + 1;
         }
@@ -117,6 +121,10 @@ fun run(e: *conf.Entry) {
     efi.puts("machboot: booting \0");
     efi.putn(?e.name[0], e.name_len);
     efi.puts("\n\0");
+    if (e.chain != 0) {
+        msg = chain.start(e);
+        ret;
+    }
     boot.boot(e);
     msg = boot.error(); # only back here if it failed
 }
@@ -174,11 +182,19 @@ fun efi_main(image: u64, table: *efi.SystemTable) u64 {
         conf.fallback();
         msg = "no /boot/machboot.conf: using the built-in entry\0";
     }
+    if (conf.dualboot != 0) { chain.detect(); }
     chosen = conf.default;
-    if (conf.timeout == 0) {
-        # straight away, unless that fails
+    if (conf.timeout == 0 || conf.hidden != 0) {
+        # straight away, unless a key is down (looked at for a moment)
         var k: efi.Key;
-        if (efi.poll_key(?k) == 0) { run(?conf.entries[chosen]); }
+        var held: u8 = 0;
+        var t: u64 = 0;
+        for (t < 30 && held == 0) {
+            held = efi.poll_key(?k);
+            efi.stall(10000);
+            t = t + 1;
+        }
+        if (held == 0) { run(?conf.entries[chosen]); }
     }
     menu();
     ret 0;

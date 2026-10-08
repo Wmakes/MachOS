@@ -16,7 +16,6 @@ use syscall: machos.arch.x86_64.syscall;
 use vmm:     machos.mm.vmm;
 use heap:    machos.mm.heap;
 use mem:     machos.kern.mem;
-use blk:     machos.fs.blk;
 
 pub val MAX: u64 = 256;
 pub val KSTACK: u64 = 16384;
@@ -93,6 +92,16 @@ var sched_ksp: [16]u64;
 var running: [16]*Proc;
 
 pub fun current() *Proc { ret cur; }
+
+# what cpu 0 does when it has nothing to run (main sets it: write dirty
+# disk blocks back). a hook, so the scheduler need not know the disks
+var idle_work: fun() u8;
+var have_idle: u8 = 0;
+
+pub fun set_idle_work(f: fun() u8) {
+    idle_work = f;
+    have_idle = 1;
+}
 
 var busy: [16]u64;
 var all: [16]u64;
@@ -426,7 +435,7 @@ pub fun scheduler(me: u64) {
         }
         if (picked == nil) {
             # nothing to run: a good moment to put dirty disk blocks on the disk
-            if (me == 0) { blk.sync(); }
+            if (me == 0 && have_idle != 0) { idle_work(); }
             smp.set_idle(me, 1);
             smp.unlock();
             cpu.wait();

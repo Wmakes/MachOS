@@ -17,17 +17,20 @@ cat > out/live.conf <<CONF
 timeout 5
 default 1
 
-entry MachOS live (runs from memory)
+entry MachOS live
+    help    runs from memory: nothing on the disks is touched
     kernel  /boot/kernel.elf
     initrd  /boot/initrd.tar
     cmdline live
 
-entry MachOS live, verbose (every kernel message on the screen)
+entry MachOS live (verbose)
+    help    every kernel message on the screen
     kernel  /boot/kernel.elf
     initrd  /boot/initrd.tar
     cmdline live debug
 
-entry MachOS rescue shell (root shell, disks unmounted)
+entry MachOS (rescue)
+    help    a root shell, the disks unmounted, to repair them
     kernel  /boot/kernel.elf
     initrd  /boot/initrd.tar
     cmdline rescue

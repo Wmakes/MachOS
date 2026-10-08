@@ -114,6 +114,7 @@ rec Dev {
     vid:      u16;
     pid:      u16;
     announced: u8;  # its arrival was logged (so its leaving is too)
+    st:       u64;  # a storage device: its index in stors + 1 (0: not one)
 }
 
 var devs: [32]Dev;
@@ -206,12 +207,15 @@ fun next_event(c: *Ctrl, out: *u32) u8 {
 # wait for an event of `type` (for transfers: on endpoint 0 of `slot`);
 # other events are handed to the keyboards. its completion code, or 0 after
 # a timeout. the event lands in out
-fun wait_event(c: *Ctrl, type: u32, slot: u64, out: *u32) u32 {
+fun wait_event(c: *Ctrl, type: u32, slot: u64, out: *u32) u32 { ret wait_ep(c, type, slot, 1, out); }
+
+# the same for a transfer on endpoint context `dci` of `slot`
+fun wait_ep(c: *Ctrl, type: u32, slot: u64, dci: u64, out: *u32) u32 {
     var spins: u64 = 0;
     for (spins < 50000000) {
         if (next_event(c, out) != 0) {
             val t: u32 = (out[3] >> 10) & 0x3F;
-            val mine: u8 = (type != T_TRANSFER_EV || ((out[3] >> 24)::u64 == slot && ((out[3] >> 16) & 0x1F) == 1))::u8;
+            val mine: u8 = (type != T_TRANSFER_EV || ((out[3] >> 24)::u64 == slot && ((out[3] >> 16) & 0x1F)::u64 == dci))::u8;
             if (t == type && mine != 0) { ret out[2] >> 24; }
             handle(c, out);
         }
@@ -554,6 +558,16 @@ fun drop(d: *Dev) {
         name(d);
         kprint.puts(": disconnected\n\0");
     }
+    if (d.st != 0) {
+        val sd: *Stor = ?stors[d.st - 1];
+        sd.gone = 1;
+        sd.dev = nil;
+        free_page(sd.in_ring.phys);
+        free_page(sd.out_ring.phys);
+        free_page(sd.page);
+        st_changed = 1;
+        d.st = 0;
+    }
     var i: u64 = 0;
     for (i < nkbd) {
         val k: *Kbd = ?kbds[i];
@@ -721,6 +735,12 @@ fun device(c: *Ctrl, at: *Place, speed: u32) {
     var any_mps: u16 = 0;
     var any_int: u8 = 0;
     var in_kbd: u8 = 0;
+    var in_st: u8 = 0;      # a mass storage interface (SCSI over bulk-only transport)
+    var st_iface: u8 = 0xFF;
+    var st_in: u8 = 0;
+    var st_out: u8 = 0;
+    var st_in_mps: u16 = 0;
+    var st_out_mps: u16 = 0;
     var pos: u64 = 0;
     for (pos + 2 <= total::u64) {
         val len: u64 = dd[pos]::u64;
@@ -729,6 +749,13 @@ fun device(c: *Ctrl, at: *Place, speed: u32) {
         if (dt == 4) { # interface: class 3 (HID), subclass 1 (boot), protocol 1 (keyboard)
             in_kbd = (dd[pos + 5] == 3 && dd[pos + 6] == 1 && dd[pos + 7] == 1)::u8;
             if (in_kbd != 0 && iface == 0xFF) { iface = dd[pos + 2]; }
+            # class 8 (mass storage), subclass 6 (SCSI), protocol 0x50 (bulk only)
+            in_st = (dd[pos + 5] == 8 && dd[pos + 6] == 6 && dd[pos + 7] == 0x50 && st_iface == 0xFF)::u8;
+            if (in_st != 0) { st_iface = dd[pos + 2]; }
+        } or (dt == 5 && in_st != 0 && (dd[pos + 3] & 3) == 2) { # a bulk endpoint
+            val m: u16 = (dd[pos + 4]::u16 | (dd[pos + 5]::u16 << 8)) & 0x7FF;
+            if ((dd[pos + 2] & 0x80) != 0 && st_in == 0) { st_in = dd[pos + 2]; st_in_mps = m; }
+            if ((dd[pos + 2] & 0x80) == 0 && st_out == 0) { st_out = dd[pos + 2]; st_out_mps = m; }
         } or (dt == 5 && (dd[pos + 2] & 0x80) != 0 && (dd[pos + 3] & 3) == 3) {
             val a: u8 = dd[pos + 2];
             val m: u16 = (dd[pos + 4]::u16 | (dd[pos + 5]::u16 << 8)) & 0x7FF;
@@ -750,6 +777,12 @@ fun device(c: *Ctrl, at: *Place, speed: u32) {
             d.kind = D_HUB;
             announce(d, class, "hub\0");
             hub(d, any_addr, any_mps, any_int);
+        }
+        ret;
+    }
+    if (st_iface != 0xFF && st_in != 0 && st_out != 0) {
+        if (ok(control(c, slot, ?d.ep0, 0x00, 9, config::u16, 0, 0, 0)) != 0) {
+            storage(d, st_in, st_in_mps, st_out, st_out_mps, class);
         }
         ret;
     }
@@ -943,6 +976,271 @@ fun root_port(c: *Ctrl, p: u64, hotplug: u8) {
     at.tt_slot = 0;
     at.tt_port = 0;
     device(c, ?at, (v >> 10) & 0xF);
+}
+
+# --- USB storage: SCSI over the bulk-only transport ---------------------------
+
+pub val MAX_STOR: u64 = 8;
+
+rec Stor {
+    used:     u8;
+    gone:     u8;     # unplugged: every transfer fails
+    known:    u8;     # the disk layer has it
+    dev:      *Dev;
+    in_dci:   u64;
+    out_dci:  u64;
+    in_addr:  u8;
+    out_addr: u8;
+    in_ring:  Ring;
+    out_ring: Ring;
+    page:     u64;    # physical: the command block (0), status (64), small data (512)
+    tag:      u32;
+    blocks:   u64;
+    bsize:    u64;
+    model:    [40]u8;
+}
+
+var stors: [8]Stor;
+var st_changed: u8 = 0;
+
+fun ep_ctx(input: u64, c: *Ctrl, dci: u64, ring: *Ring, ep_type: u32, mps: u16) {
+    val ec: *u32 = ctx(input, c, 1 + dci);
+    ec[0] = 0;
+    ec[1] = (3 << 1) | (ep_type << 3) | (mps::u32 << 16); # CErr 3
+    ec[2] = ((ring.phys & 0xFFFFFFFF) | 1)::u32;
+    ec[3] = (ring.phys >> 32)::u32;
+    ec[4] = 3072;
+}
+
+# a bulk transfer of `n` bytes at kernel address `va` on stor `s`'s IN or
+# OUT endpoint (one TRB per page, chained); the completion code
+fun bulk(s: *Stor, in_dir: u8, va: u64, n: u64) u32 {
+    if (s.gone != 0 || s.dev == nil) { ret 0; }
+    val d: *Dev = s.dev;
+    var r: *Ring = ?s.out_ring;
+    var dci: u64 = s.out_dci;
+    if (in_dir != 0) {
+        r = ?s.in_ring;
+        dci = s.in_dci;
+    }
+    var done: u64 = 0;
+    for (done < n) {
+        val at: u64 = va + done;
+        var k: u64 = 4096 - (at & 4095);
+        if (k > n - done) { k = n - done; }
+        var flags: u32 = (T_NORMAL << 10) | (1 << 2); # ISP: report short packets
+        if (done + k < n) { flags = flags | (1 << 4); } # chain to the next
+        or { flags = flags | (1 << 5); }               # IOC on the last
+        enqueue(r, vmm.kernel_phys(at), k::u32, flags);
+        done = done + k;
+    }
+    doorbell(d.ctrl, d.slot, dci::u32);
+    var ev: [4]u32;
+    ret wait_ep(d.ctrl, T_TRANSFER_EV, d.slot, dci, ?ev[0]);
+}
+
+# a halted endpoint: reset it, point it past what is queued, clear the halt
+fun unstall(s: *Stor, in_dir: u8) {
+    val d: *Dev = s.dev;
+    if (d == nil) { ret; }
+    val c: *Ctrl = d.ctrl;
+    var r: *Ring = ?s.out_ring;
+    var dci: u64 = s.out_dci;
+    var addr: u8 = s.out_addr;
+    if (in_dir != 0) {
+        r = ?s.in_ring;
+        dci = s.in_dci;
+        addr = s.in_addr;
+    }
+    var ev: [4]u32;
+    command(c, 0, (14 << 10) | (dci::u32 << 16) | (d.slot::u32 << 24), ?ev[0]);    # Reset Endpoint
+    val deq: u64 = (r.phys + r.idx * 16) | r.cycle::u64;
+    command(c, deq, (16 << 10) | (dci::u32 << 16) | (d.slot::u32 << 24), ?ev[0]);  # Set TR Dequeue
+    control(c, d.slot, ?d.ep0, 0x02, 1, 0, addr::u16, 0, 0);                     # CLEAR_FEATURE(halt)
+}
+
+# one SCSI command: the command block, data (in or out, `n` bytes at `va`),
+# then the status. 0 if it worked
+fun scsi(s: *Stor, cdb: *u8, clen: u64, in_dir: u8, va: u64, n: u64) u8 {
+    if (s.gone != 0) { ret 0; }
+    val cbw: u64 = vmm.phys_to_virt(s.page);
+    mem.fill(cbw, 0, 64);
+    s.tag = s.tag + 1;
+    @(cbw::*u32) = 0x43425355;           # "USBC"
+    @((cbw + 4)::*u32) = s.tag;
+    @((cbw + 8)::*u32) = n::u32;
+    if (in_dir != 0) { @((cbw + 12)::*u8) = 0x80; }
+    @((cbw + 14)::*u8) = clen::u8;
+    mem.copy(cbw + 15, cdb::u64, clen);
+    if (ok(bulk(s, 0, cbw, 31)) == 0) {
+        unstall(s, 0);
+        ret 0;
+    }
+    if (n > 0) {
+        val code: u32 = bulk(s, in_dir, va, n);
+        if (code == 6) { unstall(s, in_dir); } # stalled: the status still follows
+        or (ok(code) == 0) { ret 0; }
+    }
+    val csw: u64 = cbw + 64;
+    var code: u32 = bulk(s, 1, csw, 13);
+    if (code == 6) {
+        unstall(s, 1);
+        code = bulk(s, 1, csw, 13);
+    }
+    if (ok(code) == 0) { ret 0; }
+    if (@(csw::*u32) != 0x53425355 || @((csw + 4)::*u32) != s.tag) { ret 0; }
+    ret (@((csw + 12)::*u8) == 0)::u8;
+}
+
+fun be32(p: u64) u64 {
+    val b: *u8 = p::*u8;
+    ret (b[0]::u64 << 24) | (b[1]::u64 << 16) | (b[2]::u64 << 8) | b[3]::u64;
+}
+
+# set up the storage device d: endpoints, then what the disk is
+fun storage(d: *Dev, in_addr: u8, in_mps: u16, out_addr: u8, out_mps: u16, class: u8) {
+    val c: *Ctrl = d.ctrl;
+    var si: u64 = 0;
+    for (si < MAX_STOR && stors[si].used != 0) { si = si + 1; }
+    if (si == MAX_STOR) {
+        announce(d, class, "storage, but no room for more disks\0");
+        ret;
+    }
+    val s: *Stor = ?stors[si];
+    mem.fill(s::u64, 0, $size_of(Stor)::u64);
+    s.dev = d;
+    s.in_addr = in_addr;
+    s.out_addr = out_addr;
+    s.in_dci = ((in_addr & 0xF)::u64) * 2 + 1;
+    s.out_dci = ((out_addr & 0xF)::u64) * 2;
+    s.page = pmm.alloc();
+    if (s.page == 0 || ring_new(?s.in_ring) == 0 || ring_new(?s.out_ring) == 0) {
+        free_page(s.page);
+        free_page(s.in_ring.phys);
+        free_page(s.out_ring.phys);
+        ret;
+    }
+    # the two bulk endpoints
+    val input: u64 = d.input;
+    mem.fill(vmm.phys_to_virt(input), 0, 4096);
+    val icc: *u32 = ctx(input, c, 0);
+    icc[1] = 1 | (1::u32 << s.in_dci::u32) | (1::u32 << s.out_dci::u32);
+    val sc: *u32 = ctx(input, c, 1);
+    mem.copy(sc::u64, vmm.phys_to_virt(d.out), c.csz);
+    var top: u64 = s.in_dci;
+    if (s.out_dci > top) { top = s.out_dci; }
+    sc[0] = (sc[0] & 0x07FFFFFF) | ((top::u32) << 27);
+    ep_ctx(input, c, s.in_dci, ?s.in_ring, 6, in_mps);   # bulk IN
+    ep_ctx(input, c, s.out_dci, ?s.out_ring, 2, out_mps); # bulk OUT
+    var ev: [4]u32;
+    if (command(c, input, (T_CONFIGURE << 10) | (d.slot::u32 << 24), ?ev[0]) != 1) {
+        announce(d, class, "storage, but its endpoints would not configure\0");
+        ret;
+    }
+    s.used = 1;
+    d.st = si + 1;
+    d.kind = D_OTHER;
+    val data: u64 = vmm.phys_to_virt(s.page) + 512;
+    var cdb: [16]u8;
+    # what it is
+    mem.fill((?cdb[0])::u64, 0, 16);
+    cdb[0] = 0x12; # INQUIRY
+    cdb[4] = 36;
+    mem.fill((?s.model[0])::u64, 32, 40);
+    if (scsi(s, ?cdb[0], 6, 1, data, 36) != 0) {
+        mem.copy((?s.model[0])::u64, data + 8, 8);
+        s.model[8] = 32;
+        mem.copy((?s.model[9])::u64, data + 16, 16);
+    }
+    # ready? (some sticks need a moment after reset)
+    var tries: u64 = 0;
+    for (tries < 20) {
+        mem.fill((?cdb[0])::u64, 0, 16);   # TEST UNIT READY
+        if (scsi(s, ?cdb[0], 6, 0, 0, 0) != 0) { brk; }
+        mem.fill((?cdb[0])::u64, 0, 16);
+        cdb[0] = 0x03; # REQUEST SENSE clears the condition
+        cdb[4] = 18;
+        scsi(s, ?cdb[0], 6, 1, data, 18);
+        sleep_ms(50);
+        tries = tries + 1;
+    }
+    mem.fill((?cdb[0])::u64, 0, 16);
+    cdb[0] = 0x25; # READ CAPACITY(10)
+    if (scsi(s, ?cdb[0], 10, 1, data, 8) == 0) {
+        announce(d, class, "storage, but it will not say its size (no medium?)\0");
+        ret;
+    }
+    s.blocks = be32(data) + 1;
+    s.bsize = be32(data + 4);
+    if (s.bsize != 512) {
+        announce(d, class, "storage with sectors other than 512 bytes: not supported\0");
+        ret;
+    }
+    announce(d, class, "mass storage (SCSI, bulk-only)\0");
+    kprint.level(kprint.INFO);
+    name(d);
+    kprint.puts(": \0");
+    kprint.dec(s.blocks / 2048);
+    kprint.puts(" MiB, \0");
+    var mi: u64 = 0;
+    for (mi < 25) {
+        if (s.model[mi] >= 32 && s.model[mi] < 127) { kprint.putc(s.model[mi]); }
+        mi = mi + 1;
+    }
+    kprint.putc(10);
+    st_changed = 1;
+}
+
+# the storage devices, for the disk layer (dev/disk.mach)
+pub fun stor_changed() u8 {
+    val v: u8 = st_changed;
+    st_changed = 0;
+    ret v;
+}
+
+# storage device i: usable (not gone, size known)
+pub fun stor_ready(i: u64) u8 { ret (stors[i].used != 0 && stors[i].gone == 0 && stors[i].bsize == 512)::u8; }
+pub fun stor_gone(i: u64) u8 { ret (stors[i].used != 0 && stors[i].gone != 0)::u8; }
+pub fun stor_forget(i: u64) { stors[i].used = 0; }
+pub fun stor_known(i: u64) u8 { ret stors[i].known; }
+pub fun stor_set_known(i: u64) { stors[i].known = 1; }
+pub fun stor_sectors(i: u64) u64 { ret stors[i].blocks; }
+pub fun stor_model(i: u64) *u8 { ret ?stors[i].model[0]; }
+
+val CHUNK: u64 = 128; # sectors per command: 64 KiB
+
+fun rw(i: u64, lba: u64, n: u64, buf: u64, write: u8) u8 {
+    val s: *Stor = ?stors[i];
+    var done: u64 = 0;
+    for (done < n) {
+        var k: u64 = n - done;
+        if (k > CHUNK) { k = CHUNK; }
+        val at: u64 = lba + done;
+        var cdb: [16]u8;
+        mem.fill((?cdb[0])::u64, 0, 16);
+        if (write != 0) { cdb[0] = 0x2A; } or { cdb[0] = 0x28; } # WRITE(10) / READ(10)
+        cdb[2] = ((at >> 24) & 0xFF)::u8;
+        cdb[3] = ((at >> 16) & 0xFF)::u8;
+        cdb[4] = ((at >> 8) & 0xFF)::u8;
+        cdb[5] = (at & 0xFF)::u8;
+        cdb[7] = ((k >> 8) & 0xFF)::u8;
+        cdb[8] = (k & 0xFF)::u8;
+        if (scsi(s, ?cdb[0], 10, (write == 0)::u8, buf + done * 512, k * 512) == 0) { ret 0; }
+        done = done + k;
+    }
+    ret 1;
+}
+
+pub fun stor_read(i: u64, lba: u64, n: u64, buf: u64) u8 { ret rw(i, lba, n, buf, 0); }
+pub fun stor_write(i: u64, lba: u64, n: u64, buf: u64) u8 { ret rw(i, lba, n, buf, 1); }
+
+pub fun stor_flush(i: u64) u8 {
+    val s: *Stor = ?stors[i];
+    var cdb: [16]u8;
+    mem.fill((?cdb[0])::u64, 0, 16);
+    cdb[0] = 0x35; # SYNCHRONIZE CACHE(10); a stick without a cache may refuse it
+    scsi(s, ?cdb[0], 10, 0, 0, 0);
+    ret (s.gone == 0)::u8;
 }
 
 # take the controller from the firmware (the USB legacy support capability)

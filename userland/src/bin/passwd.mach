@@ -1,5 +1,8 @@
 # passwd [USER]: change a password. installed set-user-id root; users
-# change their own (after giving the current one), root changes anyone's
+# change their own (after giving the current one), root changes anyone's.
+# passwd -R DIR USER (root): set USER's password in the system at DIR
+# (DIR/etc/shadow), as `install` does for the new disk: an empty password
+# is refused, and it asks until the two entries match
 
 use abi:   sdk.abi;
 use sys:   sdk.sys;
@@ -7,8 +10,51 @@ use io:    sdk.io;
 use users: sdk.users;
 use rt:    sdk.rt;
 
+# -R: another system's root password, which must not be empty
+fun for_install(dir: *u8, name: *u8) u64 {
+    if (sys.getuid() != 0) {
+        io.err("passwd: only root may use -R\n\0");
+        ret 1;
+    }
+    var shadow: [256]u8;
+    val dl: u64 = io.len(dir);
+    if (dl > 200) { ret 1; }
+    io.copy(?shadow[0], dir, dl);
+    io.copy(?shadow[dl], "/etc/shadow\0", 12);
+    val nl: u64 = io.len(name);
+    for {
+        var a: [128]u8;
+        var b: [128]u8;
+        io.out("Choose a password for \0");
+        io.out(name);
+        io.out(" on the new system\n\0");
+        val an: u64 = users.read_secret("New password: \0", ?a[0], 127);
+        if (an == abi.NO_ID) { ret 1; }
+        if (an == 0) {
+            io.out("It cannot be empty.\n\0");
+            cnt;
+        }
+        val bn: u64 = users.read_secret("Again: \0", ?b[0], 127);
+        if (bn == abi.NO_ID) { ret 1; }
+        if (io.eq(?a[0], an, ?b[0], bn) == 0) {
+            io.out("They do not match; once more.\n\0");
+            cnt;
+        }
+        if (users.set_password_in(?shadow[0], name, nl, ?a[0], an) == 0) {
+            io.err("passwd: cannot write \0");
+            io.err(?shadow[0]);
+            io.err("\n\0");
+            ret 1;
+        }
+        io.out("Password set.\n\0");
+        ret 0;
+    }
+    ret 1;
+}
+
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
+    if (argc == 4 && io.streq(argv[1], "-R\0") != 0) { ret for_install(argv[2], argv[3]); }
     val real: u64 = sys.getuid();
     var me: [32]u8;
     val mn: u64 = users.user_name(real, ?me[0]);

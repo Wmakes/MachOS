@@ -1,0 +1,649 @@
+# exFAT on a blk.Part, read and write: the boot sector, the allocation
+# bitmap, cluster chains (or the contiguous runs exFAT marks "no FAT
+# chain"), and directory entry sets (file + stream extension + name
+# entries, UTF-16 names, a checksum over the set). a file that grows gets a
+# real FAT chain. names are hashed with ASCII up-casing
+
+use abi:   sdk.abi;
+use blk:   machos.fs.blk;
+use mem:   machos.kern.mem;
+use clock: machos.kern.clock;
+
+pub rec Fs {
+    part:      *blk.Part;
+    csize:     u64;   # bytes per cluster
+    fat_off:   u64;
+    heap_off:  u64;   # cluster 2
+    clusters:  u64;
+    root:      u64;   # the root directory's first cluster
+    label:     [24]u8;
+    bitmap:    u64;   # the allocation bitmap's first cluster (chained)
+    bitmap_len: u64;
+    hint:      u64;
+}
+
+# a directory, as the writers need it: where its entries are, and where its
+# own stream entry is in its parent (to record it growing)
+pub rec Dir {
+    first:      u64;
+    nochain:    u8;
+    size:       u64;  # 0 for the root: it runs to the end of its chain
+    up_first:   u64;  # the parent
+    up_nochain: u8;
+    up_size:    u64;
+    idx:        u64;  # its file entry's index in the parent
+    root:       u8;
+}
+
+pub rec Found {
+    name:    [64]u8;
+    nlen:    u64;
+    first:   u64;
+    size:    u64;
+    dir:     u8;
+    nochain: u8;   # the data is one contiguous run from `first`
+    mtime:   u64;
+    idx:     u64;  # the file entry's index in the directory
+    count:   u64;  # entries in its set (1 + secondaries)
+}
+
+fun rd(fs: *Fs, off: u64, n: u64, dst: u64) u8 { ret blk.read_bytes(fs.part, off, n, dst); }
+
+pub fun mount(fs: *Fs, p: *blk.Part) *u8 {
+    fs.part = p;
+    var b: [512]u8;
+    if (blk.read_bytes(p, 0, 512, (?b[0])::u64) == 0) { ret "exfat: cannot read the boot sector\0"; }
+    if (b[3] != 69 || b[4] != 88 || b[5] != 70 || b[6] != 65 || b[7] != 84) { ret "exfat: not exFAT\0"; }
+    val bps: u64 = 1::u64 << b[108]::u64;
+    fs.csize = bps << b[109]::u64;
+    fs.fat_off = (@((?b[80])::*u32))::u64 * bps;
+    fs.heap_off = (@((?b[88])::*u32))::u64 * bps;
+    fs.clusters = (@((?b[92])::*u32))::u64;
+    fs.root = (@((?b[96])::*u32))::u64;
+    if (fs.csize > 33554432 || fs.root < 2) { ret "exfat: damaged boot sector\0"; }
+    fs.label[0] = 0;
+    fs.hint = 2;
+    # the root's allocation bitmap entry (0x81)
+    var idx: u64 = 0;
+    var ent: [32]u8;
+    for (entry(fs, fs.root, 0, 0, idx, ?ent[0]) != 0 && ent[0] != 0) {
+        if (ent[0] == 0x81) {
+            fs.bitmap = (@((?ent[20])::*u32))::u64;
+            fs.bitmap_len = @((?ent[24])::*u64);
+        }
+        idx = idx + 1;
+    }
+    if (fs.bitmap < 2) { ret "exfat: no allocation bitmap\0"; }
+    ret nil;
+}
+
+fun next_cluster(fs: *Fs, c: u64) u64 {
+    var v: u32 = 0;
+    rd(fs, fs.fat_off + c * 4, 4, (?v)::u64);
+    ret v::u64;
+}
+
+fun is_end(v: u64) u8 { ret (v < 2 || v >= 0xFFFFFFF7)::u8; }
+
+# the cluster holding byte `off` of data starting at `first`
+fun cluster_at(fs: *Fs, first: u64, nochain: u8, off: u64) u64 {
+    val n: u64 = off / fs.csize;
+    if (nochain != 0) { ret first + n; }
+    var c: u64 = first;
+    var i: u64 = 0;
+    for (i < n) {
+        c = next_cluster(fs, c);
+        if (is_end(c) != 0) { ret 0; }
+        i = i + 1;
+    }
+    ret c;
+}
+
+fun cluster_off(fs: *Fs, c: u64) u64 { ret fs.heap_off + (c - 2) * fs.csize; }
+
+pub fun read(fs: *Fs, first: u64, nochain: u8, size: u64, off: u64, dst: u64, n: u64) u64 {
+    if (off >= size || first < 2) { ret 0; }
+    var k: u64 = size - off;
+    if (k > n) { k = n; }
+    var done: u64 = 0;
+    for (done < k) {
+        val at: u64 = off + done;
+        val c: u64 = cluster_at(fs, first, nochain, at);
+        if (c == 0) { brk; }
+        var m: u64 = fs.csize - at % fs.csize;
+        if (m > k - done) { m = k - done; }
+        if (rd(fs, cluster_off(fs, c) + at % fs.csize, m, dst + done) == 0) { ret abi.err(abi.E_IO); }
+        done = done + m;
+    }
+    ret done;
+}
+
+# entry `idx` of a directory (32 bytes each) into ent; 0 past the end
+fun entry(fs: *Fs, dir: u64, nochain: u8, size: u64, idx: u64, ent: *u8) u8 {
+    val off: u64 = idx * 32;
+    if (size != 0 && off >= size) { ret 0; }
+    val c: u64 = cluster_at(fs, dir, nochain, off);
+    if (c == 0) { ret 0; }
+    ret rd(fs, cluster_off(fs, c) + off % fs.csize, 32, ent::u64);
+}
+
+fun put_utf8(u: u64, name: *u8, n: *u64) {
+    if (u < 0x80) {
+        if (@n < 60) { name[@n] = u::u8; @n = @n + 1; }
+    } or (u < 0x800) {
+        if (@n + 2 <= 60) {
+            name[@n] = (0xC0 | (u >> 6))::u8;
+            name[@n + 1] = (0x80 | (u & 0x3F))::u8;
+            @n = @n + 2;
+        }
+    } or {
+        if (@n + 3 <= 60) {
+            name[@n] = (0xE0 | (u >> 12))::u8;
+            name[@n + 1] = (0x80 | ((u >> 6) & 0x3F))::u8;
+            name[@n + 2] = (0x80 | (u & 0x3F))::u8;
+            @n = @n + 3;
+        }
+    }
+}
+
+fun leap(y: u64) u8 { ret ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)::u8; }
+
+# a DOS-format timestamp (date in the high 16 bits) as seconds since 1970
+fun to_epoch(ts: u64) u64 {
+    val date: u64 = ts >> 16;
+    val time: u64 = ts & 0xFFFF;
+    val y: u64 = 1980 + (date >> 9);
+    val m: u64 = (date >> 5) & 15;
+    val d: u64 = date & 31;
+    if (m < 1 || m > 12 || d < 1) { ret 0; }
+    var days: u64 = 0;
+    var yy: u64 = 1970;
+    for (yy < y) {
+        days = days + 365 + leap(yy)::u64;
+        yy = yy + 1;
+    }
+    var mm: u64 = 1;
+    for (mm < m) {
+        if (mm == 2) { days = days + 28 + leap(y)::u64; }
+        or (mm == 4 || mm == 6 || mm == 9 || mm == 11) { days = days + 30; }
+        or { days = days + 31; }
+        mm = mm + 1;
+    }
+    days = days + d - 1;
+    ret days * 86400 + (time >> 11) * 3600 + ((time >> 5) & 63) * 60 + (time & 31) * 2;
+}
+
+# the next file or directory after *pos in directory (dir, nochain, size;
+# size 0 for the root, which runs to the end of its chain)
+pub fun dir_next(fs: *Fs, dir: u64, nochain: u8, size: u64, pos: *u64, out: *Found) u8 {
+    var idx: u64 = @pos;
+    var ent: [32]u8;
+    for {
+        if (entry(fs, dir, nochain, size, idx, ?ent[0]) == 0) { ret 0; }
+        if (ent[0] == 0) { ret 0; }
+        idx = idx + 1;
+        if (ent[0] != 0x85) { cnt; } # only file entries start a set
+        out.idx = idx - 1;
+        out.count = ent[1]::u64 + 1;
+        val secondary: u64 = ent[1]::u64;
+        val attr: u64 = (@((?ent[4])::*u16))::u64;
+        out.mtime = to_epoch((@((?ent[12])::*u32))::u64);
+        out.dir = ((attr & 0x10) != 0)::u8;
+        var stream: [32]u8;
+        if (secondary < 2 || entry(fs, dir, nochain, size, idx, ?stream[0]) == 0 || stream[0] != 0xC0) { cnt; }
+        val namelen: u64 = stream[3]::u64;
+        out.nochain = ((stream[1] & 2) != 0)::u8;
+        out.first = (@((?stream[20])::*u32))::u64;
+        out.size = @((?stream[24])::*u64);
+        var n: u64 = 0;
+        var got: u64 = 0;
+        var k: u64 = 1;
+        for (k < secondary && got < namelen) {
+            var nm: [32]u8;
+            if (entry(fs, dir, nochain, size, idx + k, ?nm[0]) == 0) { brk; }
+            if (nm[0] == 0xC1) {
+                var c: u64 = 0;
+                for (c < 15 && got < namelen) {
+                    put_utf8((@((?nm[2 + c * 2])::*u16))::u64, ?out.name[0], ?n);
+                    c = c + 1;
+                    got = got + 1;
+                }
+            }
+            k = k + 1;
+        }
+        idx = idx + secondary;
+        out.nlen = n;
+        @pos = idx;
+        ret 1;
+    }
+    ret 0;
+}
+
+# --- writing -----------------------------------------------------------------
+
+fun e(code: u64) u64 { ret abi.err(code); }
+fun wr(fs: *Fs, off: u64, n: u64, src: u64) u8 { ret blk.write_bytes(fs.part, off, n, src); }
+
+fun set_next(fs: *Fs, c: u64, v: u64) {
+    var x: u32 = v::u32;
+    wr(fs, fs.fat_off + c * 4, 4, (?x)::u64);
+}
+
+# the bitmap byte holding cluster c's bit: its offset
+fun bit_off(fs: *Fs, c: u64) u64 {
+    val byte: u64 = (c - 2) / 8;
+    val bc: u64 = cluster_at(fs, fs.bitmap, 0, byte);
+    ret cluster_off(fs, bc) + byte % fs.csize;
+}
+
+fun used(fs: *Fs, c: u64) u8 {
+    var b: u8 = 0;
+    rd(fs, bit_off(fs, c), 1, (?b)::u64);
+    ret ((b >> ((c - 2) % 8)::u8) & 1);
+}
+
+fun mark(fs: *Fs, c: u64, on: u8) {
+    val o: u64 = bit_off(fs, c);
+    var b: u8 = 0;
+    rd(fs, o, 1, (?b)::u64);
+    val bit: u8 = (1::u8) << ((c - 2) % 8)::u8;
+    if (on != 0) { b = b | bit; } or { b = b & ~bit; }
+    wr(fs, o, 1, (?b)::u64);
+}
+
+var zeros: [4096]u8;
+
+fun zero_cluster(fs: *Fs, c: u64) {
+    var z: u64 = 0;
+    for (z < fs.csize) {
+        var k: u64 = fs.csize - z;
+        if (k > 4096) { k = 4096; }
+        wr(fs, cluster_off(fs, c) + z, k, (?zeros[0])::u64);
+        z = z + k;
+    }
+}
+
+# a free cluster, zeroed, the end of a chain; 0 when full
+fun alloc(fs: *Fs) u64 {
+    var tried: u64 = 0;
+    var c: u64 = fs.hint;
+    for (tried < fs.clusters) {
+        if (c >= fs.clusters + 2) { c = 2; }
+        if (used(fs, c) == 0) {
+            mark(fs, c, 1);
+            set_next(fs, c, 0xFFFFFFFF);
+            fs.hint = c + 1;
+            zero_cluster(fs, c);
+            ret c;
+        }
+        c = c + 1;
+        tried = tried + 1;
+    }
+    ret 0;
+}
+
+# the clusters of data (first, nochain, size) back to free
+pub fun free_data(fs: *Fs, first: u64, nochain: u8, size: u64) {
+    if (first < 2) { ret; }
+    if (nochain != 0) {
+        val n: u64 = (size + fs.csize - 1) / fs.csize;
+        var i: u64 = 0;
+        for (i < n) {
+            mark(fs, first + i, 0);
+            i = i + 1;
+        }
+        ret;
+    }
+    var c: u64 = first;
+    var guard: u64 = 0;
+    for (is_end(c) == 0 && guard <= fs.clusters) {
+        val next: u64 = next_cluster(fs, c);
+        mark(fs, c, 0);
+        set_next(fs, c, 0);
+        if (c < fs.hint) { fs.hint = c; }
+        c = next;
+        guard = guard + 1;
+    }
+}
+
+# a contiguous run becomes a real chain, so it can grow anywhere
+fun to_chain(fs: *Fs, first: u64, size: u64) {
+    val n: u64 = (size + fs.csize - 1) / fs.csize;
+    var i: u64 = 0;
+    for (i + 1 < n) {
+        set_next(fs, first + i, first + i + 1);
+        i = i + 1;
+    }
+    if (n > 0) { set_next(fs, first + n - 1, 0xFFFFFFFF); }
+}
+
+# the last cluster of a chain
+fun last_of(fs: *Fs, first: u64) u64 {
+    var c: u64 = first;
+    var guard: u64 = 0;
+    for (guard <= fs.clusters) {
+        val next: u64 = next_cluster(fs, c);
+        if (is_end(next) != 0) { ret c; }
+        c = next;
+        guard = guard + 1;
+    }
+    ret c;
+}
+
+fun leapy(y: u64) u8 { ret ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)::u8; }
+
+fun mdays(y: u64, m: u64) u64 {
+    if (m == 2) { ret 28 + leapy(y)::u64; }
+    if (m == 4 || m == 6 || m == 9 || m == 11) { ret 30; }
+    ret 31;
+}
+
+# now as an exFAT (DOS) timestamp
+fun now_stamp() u32 {
+    var t: u64 = clock.now();
+    var days: u64 = t / 86400;
+    val secs: u64 = t % 86400;
+    var y: u64 = 1970;
+    for (days >= 365 + leapy(y)::u64) {
+        days = days - 365 - leapy(y)::u64;
+        y = y + 1;
+    }
+    var m: u64 = 1;
+    for (days >= mdays(y, m)) {
+        days = days - mdays(y, m);
+        m = m + 1;
+    }
+    if (y < 1980) { y = 1980; }
+    val date: u64 = ((y - 1980) << 9) | (m << 5) | (days + 1);
+    val time: u64 = ((secs / 3600) << 11) | (((secs / 60) % 60) << 5) | ((secs % 60) / 2);
+    ret ((date << 16) | time)::u32;
+}
+
+fun dir_entry_off(fs: *Fs, d: *Dir, idx: u64) u64 {
+    val off: u64 = idx * 32;
+    if (d.root == 0 && off >= d.size) { ret 0; }
+    val c: u64 = cluster_at(fs, d.first, d.nochain, off);
+    if (c == 0) { ret 0; }
+    ret cluster_off(fs, c) + off % fs.csize;
+}
+
+fun set_sum(set: *u8, count: u64) u16 {
+    var sum: u16 = 0;
+    var i: u64 = 0;
+    for (i < count * 32) {
+        if (i != 2 && i != 3) {
+            var hi: u16 = 0;
+            if ((sum & 1) != 0) { hi = 0x8000; }
+            sum = hi + (sum >> 1) + set[i]::u16;
+        }
+        i = i + 1;
+    }
+    ret sum;
+}
+
+fun up(c: u16) u16 {
+    if (c >= 97 && c <= 122) { ret c - 32; }
+    ret c;
+}
+
+fun name_hash(name: *u16, n: u64) u16 {
+    var h: u16 = 0;
+    var i: u64 = 0;
+    for (i < n) {
+        val c: u16 = up(name[i]);
+        var hi: u16 = 0;
+        if ((h & 1) != 0) { hi = 0x8000; }
+        h = hi + (h >> 1) + (c & 0xFF);
+        hi = 0;
+        if ((h & 1) != 0) { hi = 0x8000; }
+        h = hi + (h >> 1) + (c >> 8);
+        i = i + 1;
+    }
+    ret h;
+}
+
+var setbuf: [640]u8;  # up to 20 entries
+
+fun read_set(fs: *Fs, d: *Dir, idx: u64, count: u64) u8 {
+    var i: u64 = 0;
+    for (i < count) {
+        val o: u64 = dir_entry_off(fs, d, idx + i);
+        if (o == 0 || rd(fs, o, 32, (?setbuf[i * 32])::u64) == 0) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+fun write_set(fs: *Fs, d: *Dir, idx: u64, count: u64) u8 {
+    @((?setbuf[2])::*u16) = set_sum(?setbuf[0], count);
+    var i: u64 = 0;
+    for (i < count) {
+        val o: u64 = dir_entry_off(fs, d, idx + i);
+        if (o == 0 || wr(fs, o, 32, (?setbuf[i * 32])::u64) == 0) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# a file's stream entry says (first, nochain, size) now
+pub fun update(fs: *Fs, d: *Dir, idx: u64, first: u64, nochain: u8, size: u64) {
+    var head: [32]u8;
+    val o: u64 = dir_entry_off(fs, d, idx);
+    if (o == 0 || rd(fs, o, 32, (?head[0])::u64) == 0) { ret; }
+    val count: u64 = head[1]::u64 + 1;
+    if (count > 20 || read_set(fs, d, idx, count) == 0) { ret; }
+    @((?setbuf[12])::*u32) = now_stamp();
+    var flags: u8 = 1;
+    if (nochain != 0) { flags = 3; }
+    if (first < 2) { flags = 1; }
+    setbuf[33] = flags;
+    @((?setbuf[40])::*u64) = size;       # valid data length
+    @((?setbuf[52])::*u32) = first::u32;
+    @((?setbuf[56])::*u64) = size;       # data length
+    write_set(fs, d, idx, count);
+}
+
+pub fun write(fs: *Fs, d: *Dir, idx: u64, first: *u64, nochain: *u8, size: *u64, off: u64, src: u64, n: u64) u64 {
+    if (n == 0) { ret 0; }
+    if (@first < 2) {
+        val c: u64 = alloc(fs);
+        if (c == 0) { ret e(abi.E_NOSPC); }
+        @first = c;
+        @nochain = 0;
+    } or (@nochain != 0) {
+        # it may need to grow past its run: make it a chain first
+        to_chain(fs, @first, @size);
+        @nochain = 0;
+    }
+    # clusters until `off + n` is covered
+    var have: u64 = 0;
+    var c: u64 = @first;
+    for {
+        have = have + 1;
+        val next: u64 = next_cluster(fs, c);
+        if (is_end(next) != 0) { brk; }
+        c = next;
+    }
+    for (have * fs.csize < off + n) {
+        val add: u64 = alloc(fs);
+        if (add == 0) { brk; }
+        set_next(fs, c, add);
+        c = add;
+        have = have + 1;
+    }
+    var end: u64 = off + n;
+    if (end > have * fs.csize) { end = have * fs.csize; }
+    if (end <= off) { ret e(abi.E_NOSPC); }
+    var done: u64 = 0;
+    for (off + done < end) {
+        val at: u64 = off + done;
+        val cl: u64 = cluster_at(fs, @first, 0, at);
+        var m: u64 = fs.csize - at % fs.csize;
+        if (m > end - at) { m = end - at; }
+        if (wr(fs, cluster_off(fs, cl) + at % fs.csize, m, src + done) == 0) { ret e(abi.E_IO); }
+        done = done + m;
+    }
+    if (end > @size) { @size = end; }
+    update(fs, d, idx, @first, @nochain, @size);
+    ret done;
+}
+
+pub fun truncate(fs: *Fs, d: *Dir, idx: u64, first: *u64, nochain: *u8, size: *u64) {
+    free_data(fs, @first, @nochain, @size);
+    @first = 0;
+    @nochain = 0;
+    @size = 0;
+    update(fs, d, idx, 0, 0, 0);
+}
+
+# a run of `count` free entries in directory d (growing it if needed); the
+# index of the first, or NONE. d.size grows with it
+val NONE: u64 = 0xFFFFFFFFFFFFFFFF;
+
+fun room(fs: *Fs, d: *Dir, count: u64) u64 {
+    var idx: u64 = 0;
+    var run: u64 = 0;
+    var ent: [1]u8;
+    for {
+        val o: u64 = dir_entry_off(fs, d, idx);
+        if (o == 0) { brk; }
+        rd(fs, o, 1, (?ent[0])::u64);
+        if (ent[0] < 0x80) { # unused (0x00) or deleted
+            run = run + 1;
+            if (run == count) { ret idx + 1 - count; }
+        } or { run = 0; }
+        idx = idx + 1;
+    }
+    # grow it a cluster at a time; the run starts where the free entries at
+    # its end start
+    val start: u64 = idx - run;
+    if (d.nochain != 0) {
+        to_chain(fs, d.first, d.size);
+        d.nochain = 0;
+    }
+    var last: u64 = last_of(fs, d.first);
+    for (run < count) {
+        val c: u64 = alloc(fs);
+        if (c == 0) { ret NONE; }
+        set_next(fs, last, c);
+        last = c;
+        run = run + fs.csize / 32;
+        if (d.root == 0) { d.size = d.size + fs.csize; }
+    }
+    if (d.root == 0) {
+        # the directory's own stream entry, in its parent
+        var parent: Dir;
+        parent.first = d.up_first;
+        parent.nochain = d.up_nochain;
+        parent.size = d.up_size;
+        parent.root = (d.up_size == 0)::u8;
+        update(fs, ?parent, d.idx, d.first, 0, d.size);
+    }
+    ret start;
+}
+
+fun utf16(name: *u8, n: u64, out: *u16, cap: u64) u64 {
+    var k: u64 = 0;
+    var i: u64 = 0;
+    for (i < n && k < cap) {
+        val c: u8 = name[i];
+        var u: u64 = c::u64;
+        if (c >= 0xE0 && i + 2 < n) {
+            u = ((c & 0x0F)::u64 << 12) | ((name[i + 1] & 0x3F)::u64 << 6) | (name[i + 2] & 0x3F)::u64;
+            i = i + 2;
+        } or (c >= 0xC0 && i + 1 < n) {
+            u = ((c & 0x1F)::u64 << 6) | (name[i + 1] & 0x3F)::u64;
+            i = i + 1;
+        }
+        out[k] = u::u16;
+        k = k + 1;
+        i = i + 1;
+    }
+    ret k;
+}
+
+# a new entry set `name` in d: an empty file, a directory with one zeroed
+# cluster, or (keep_first) an existing file's data (rename). its file
+# entry's index and set size go to *idx and *count
+pub fun create(fs: *Fs, d: *Dir, name: *u8, n: u64, is_dir: u8, keep: u8, kfirst: u64, knochain: u8, ksize: u64, idx: *u64, count: *u64, first: *u64, size: *u64) u64 {
+    var w: [255]u16;
+    val wn: u64 = utf16(name, n, ?w[0], 255);
+    if (wn == 0) { ret e(abi.E_NAMETOOLONG); }
+    val names: u64 = (wn + 14) / 15;
+    val total: u64 = 2 + names;
+    if (total > 20) { ret e(abi.E_NAMETOOLONG); }
+    var c: u64 = kfirst;
+    var sz: u64 = ksize;
+    var nc: u8 = knochain;
+    if (keep == 0) {
+        c = 0;
+        sz = 0;
+        nc = 0;
+        if (is_dir != 0) {
+            c = alloc(fs);
+            if (c == 0) { ret e(abi.E_NOSPC); }
+            sz = fs.csize;
+        }
+    }
+    val at: u64 = room(fs, d, total);
+    if (at == NONE) { ret e(abi.E_NOSPC); }
+    mem.fill((?setbuf[0])::u64, 0, total * 32);
+    setbuf[0] = 0x85;
+    setbuf[1] = (total - 1)::u8;
+    if (is_dir != 0) { setbuf[4] = 0x10; } or { setbuf[4] = 0x20; }
+    val now: u32 = now_stamp();
+    @((?setbuf[8])::*u32) = now;
+    @((?setbuf[12])::*u32) = now;
+    @((?setbuf[16])::*u32) = now;
+    setbuf[32] = 0xC0;
+    setbuf[33] = 1;
+    if (nc != 0 && c >= 2) { setbuf[33] = 3; }
+    setbuf[35] = wn::u8;
+    @((?setbuf[36])::*u16) = name_hash(?w[0], wn);
+    @((?setbuf[40])::*u64) = sz;
+    @((?setbuf[52])::*u32) = c::u32;
+    @((?setbuf[56])::*u64) = sz;
+    var k: u64 = 0;
+    for (k < names) {
+        val b: u64 = (2 + k) * 32;
+        setbuf[b] = 0xC1;
+        var j: u64 = 0;
+        for (j < 15 && k * 15 + j < wn) {
+            @((?setbuf[b + 2 + j * 2])::*u16) = w[k * 15 + j];
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    if (write_set(fs, d, at, total) == 0) { ret e(abi.E_IO); }
+    @idx = at;
+    @count = total;
+    @first = c;
+    @size = sz;
+    ret 0;
+}
+
+# remove the set at idx; its data is freed unless `keep` (a rename)
+pub fun remove(fs: *Fs, d: *Dir, idx: u64, count: u64, first: u64, nochain: u8, size: u64, keep: u8) {
+    var i: u64 = 0;
+    for (i < count) {
+        val o: u64 = dir_entry_off(fs, d, idx + i);
+        if (o != 0) {
+            var t: u8 = 0;
+            rd(fs, o, 1, (?t)::u64);
+            t = t & 0x7F;
+            wr(fs, o, 1, (?t)::u64);
+        }
+        i = i + 1;
+    }
+    if (keep == 0) { free_data(fs, first, nochain, size); }
+}
+
+pub fun free_space(fs: *Fs) u64 {
+    var n: u64 = 0;
+    var c: u64 = 2;
+    for (c < fs.clusters + 2) {
+        if (used(fs, c) == 0) { n = n + 1; }
+        c = c + 1;
+    }
+    ret n * fs.csize;
+}

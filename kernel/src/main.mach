@@ -21,6 +21,7 @@ use sys:    machos.kern.sys;
 use abi:    sdk.abi;
 use vfs:    machos.fs.vfs;
 use mount:  machos.fs.mount;
+use blk:    machos.fs.blk;
 use parts:  machos.fs.parts;
 use acpi:   machos.acpi.acpi;
 use mem:    machos.kern.mem;
@@ -212,12 +213,14 @@ fun kmain(handoff: u64) {
     make_dev(dev, "null\0", 4, vfs.DEV_NULL);
     make_dev(dev, "zero\0", 4, vfs.DEV_ZERO);
     parts.publish(dev);
+    mount_esp();
     if (vfs.child(vfs.get_root(), "tmp\0", 3) == nil) {
         val tmp: *vfs.Node = vfs.create_ram(vfs.get_root(), "tmp\0", 3, abi.KIND_DIR);
         if (tmp == nil) { kprint.panic("vfs: out of memory\0"); }
         tmp.mode = 0x3FF; # 01777: everyone may make files, only owners remove them
     }
 
+    proc.set_idle_work(blk.sync);
     start_cpus();
     kprint.info("boot\0");
     kprint.puts("kernel ready after \0");
@@ -398,6 +401,39 @@ fun make_dev(dir: *vfs.Node, name: *u8, n: u64, id: u64) {
     d.mode = 0x1B6; # 0666: anyone may use the console, null and zero
 }
 
+var root_disk: u64 = 0xFFFFFFFFFFFFFFFF;  # the disk the root is on, when it is a disk
+
+# the EFI system partition next to the root, at /boot/efi (where machboot
+# lives, so MachOS can update it)
+fun mount_esp() {
+    if (root_disk == 0xFFFFFFFFFFFFFFFF) { ret; }
+    val esp: *parts.Bdev = parts.find_esp(root_disk);
+    if (esp == nil) { ret; }
+    val bootdir: *vfs.Node = vfs.lookup("/boot\0", 5);
+    if (bootdir == nil) { ret; }
+    var at: *vfs.Node = vfs.child(bootdir, "efi\0", 3);
+    if (at == nil) {
+        var made: *vfs.Node = nil;
+        if (abi.is_err(vfs.create(bootdir, "efi\0", 3, abi.KIND_DIR, 0x1ED, ?made)) != 0) { ret; }
+        at = made;
+    }
+    val r: u64 = mount.mount_at(esp, at);
+    var dn: [32]u8;
+    val dl: u64 = parts.dev_name(esp, ?dn[0]);
+    dn[dl] = 0;
+    if (abi.is_err(r) != 0) {
+        kprint.warn("esp\0");
+        kprint.puts(?dn[0]);
+        kprint.puts(": cannot mount the EFI partition: \0");
+        kprint.puts(abi.err_name(r));
+        kprint.putc(10);
+        ret;
+    }
+    kprint.info("esp\0");
+    kprint.puts(?dn[0]);
+    kprint.puts(" (the EFI partition, machboot's home) on /boot/efi\n\0");
+}
+
 # a word of the boot command line, or nil
 fun cmdline_has(w: *u8, n: u64) *u8 {
     val c: *u8 = boot.cmdline;
@@ -522,6 +558,7 @@ fun mount_root() {
     }
     if (b != nil) {
         val err: *u8 = mount.mount_root(b);
+        if (err == nil) { root_disk = b.disk; }
         kprint.puts("root: \0");
         if (err == nil) { kprint.puts("ext2 on \0"); }
         var dn: [32]u8;

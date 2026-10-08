@@ -8,7 +8,7 @@ types commands over the serial port, and checks that the output contains
 every expected string, in order. Tests marked `fsck` also run e2fsck on the
 root partition afterwards.
 """
-import argparse, os, re, subprocess, sys
+import argparse, os, re, subprocess, sys, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 P = r"[$#] "  # the shell prompt (# for root)
@@ -69,6 +69,57 @@ def broken_clean_on_host():
 
 USB = ["--qemu=-machine", "--qemu=i8042=off", "--qemu=-device", "--qemu=qemu-xhci,id=xhci",
        "--qemu=-device", "--qemu=usb-kbd,bus=xhci.0"]
+
+USB_STICK = os.path.join(ROOT, "out", "headless", "stick.img")
+
+
+def usb_stick(path=None):
+    """QEMU arguments for a USB stick (on xHCI) backed by `path`"""
+    return ["--qemu=-device", "--qemu=qemu-xhci,id=xhci", "--qemu=-drive",
+            f"--qemu=if=none,id=stick,format=raw,file={path or USB_STICK}",
+            "--qemu=-device", "--qemu=usb-storage,bus=xhci.0,drive=stick"]
+
+
+def fat_stick(kind):
+    """a 64 MiB stick image formatted FAT32 or exFAT (whole disk, no partition
+    table) holding hello.txt and docs/a long name.txt"""
+    sh(f"rm -f {USB_STICK}; dd if=/dev/zero of={USB_STICK} bs=1M count=64 status=none")
+    if kind == "fat":
+        sh(f"mkfs.fat -F 32 -n STICK {USB_STICK}")
+        sh(f"printf 'from the host\\n' > out/headless/h.txt; mcopy -i {USB_STICK} out/headless/h.txt ::/hello.txt")
+        sh(f"mmd -i {USB_STICK} ::/docs; mcopy -i {USB_STICK} out/headless/h.txt '::/docs/a long name.txt'")
+    else:
+        sh(f"mkfs.exfat -L STICK {USB_STICK}")
+        sh(f"mkdir -p out/headless/mnt; printf 'from the host\\n' > out/headless/h.txt")
+        # exFAT has no mtools: put the files on with the host's own driver via a loop mount is
+        # not possible here (no root), so the test writes them inside MachOS instead
+
+
+def fsck_stick(kind):
+    tool = "fsck.fat -n" if kind == "fat" else "fsck.exfat -n"
+    out = sh(f"{tool} {USB_STICK} 2>&1; echo status=$?")
+    return "" if "status=0" in out else "host fsck found problems: " + out.strip()[-300:]
+
+
+def update_stick():
+    """a FAT stick carrying an update package"""
+    pkg = sh("tools/mkupdate.sh out/headless/update.tgz").strip().splitlines()[-1]
+    sh(f"rm -f {USB_STICK}; dd if=/dev/zero of={USB_STICK} bs=1M count=64 status=none")
+    sh(f"mkfs.fat -F 32 {USB_STICK}")
+    sh(f"mcopy -i {USB_STICK} out/headless/update.tgz ::/update.tgz")
+
+
+DUAL = os.path.join(ROOT, "out", "headless", "dual.img")
+
+
+def fake_windows():
+    """a copy of the dev disk with machboot standing in for Windows' boot
+    manager on its EFI partition"""
+    sh("tools/mkimage.sh debug >/dev/null")
+    sh(f"cp {disk()} {DUAL}")
+    sh(f"mmd -i {DUAL}@@1M ::/EFI/Microsoft ::/EFI/Microsoft/Boot")
+    sh(f"mcopy -i {DUAL}@@1M machboot/out/uefi/release/BOOTX64.EFI ::/EFI/Microsoft/Boot/bootmgfw.efi")
+
 
 USB_BARE = ["--qemu=-machine", "--qemu=i8042=off", "--qemu=-device", "--qemu=qemu-xhci,id=xhci"]
 
@@ -175,6 +226,73 @@ TESTS = [
      ["--prep", lambda: sh("tools/iso.sh out/headless/live.iso"), "--boot", os.path.join(ROOT, "out/headless/live.iso"),
       "wait:" + P, "send:dmesg | grep -E 'live system|loaded by'; ls /bin | wc -l\\n", "wait:" + P],
      ["loaded by machboot", "live system: running from memory"]),
+
+    # FAT32 on a USB stick: read the host's files, write, rename, remove;
+    # the host's fsck.fat checks it after
+    ("fat-usb", False, False,
+     ["--prep", lambda: fat_stick("fat"), "--post", lambda: fsck_stick("fat")] + usb_stick() + [
+      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; mount; cat /mnt/hello.txt '/mnt/docs/a long name.txt'\\n",
+      "wait:" + P,
+      "send:echo written by MachOS > /mnt/Notes.TXT; mkdir '/mnt/New Dir'; seq 1 3000 > '/mnt/New Dir/numbers file.txt'; "
+      "mv /mnt/hello.txt /mnt/docs/moved.txt; rm '/mnt/docs/a long name.txt'; ls /mnt /mnt/docs; wc -l '/mnt/New Dir/numbers file.txt'; umount /mnt\\n",
+      "wait:" + P],
+     ["usb 1-", "mass storage", "/dev/sdb on /mnt type vfat", "from the host\nfrom the host",
+      "Notes.TXT", "moved.txt", "3000"]),
+
+    # exFAT on a USB stick, written and read back; the host's fsck.exfat checks it
+    ("exfat-usb", False, False,
+     ["--prep", lambda: fat_stick("exfat"), "--post", lambda: fsck_stick("exfat")] + usb_stick() + [
+      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; mount | grep sdb\\n", "wait:" + P,
+      "send:echo exfat works > '/mnt/a rather long file name.txt'; mkdir /mnt/folder; seq 1 5000 > /mnt/folder/n; "
+      "mv /mnt/folder/n /mnt/folder/numbers; cat '/mnt/a rather long file name.txt'; wc -l /mnt/folder/numbers; umount /mnt; "
+      "mount /dev/sdb /mnt; ls /mnt /mnt/folder; umount /mnt\\n",
+      "wait:" + P],
+     ["type exfat", "exfat works", "5000", "a rather long file name.txt", "numbers"]),
+
+    # the EFI partition is mounted next to the root; machboot can be updated there
+    ("esp-mounted", False, False,
+     ["wait:" + P, "send:mount; ls /boot/efi/EFI/BOOT; machboot update\\n", "wait:" + P],
+     ["/dev/sda1 on /boot/efi type vfat", "BOOTX64.EFI", "machboot on the EFI partition is now"]),
+
+    # machboot finds another system's loader and starts it (here: a copy of
+    # itself standing in for Windows' boot manager)
+    ("dualboot", False, False,
+     ["--prep", fake_windows, "--boot", DUAL, "--nologin", "sleep:2.5", "keys:<down><down><down>", "sleep:0.5",
+      "keys:<ret>", "wait:booting Windows", "wait:login: ", "send:root\\n", "wait:" + P],
+     ["Windows", "machboot: booting Windows", "machboot 0.8.1"]),
+
+    # machboot hide: no menu, straight into MachOS
+    ("hidden-menu", False, True,
+     ["wait:" + P, "send:machboot hide; machboot | head -3\\n", "wait:" + P],
+     ["the menu is hidden"]),
+    ("hidden-menu-boots", True, True,
+     ["wait:" + P, "send:machboot show\\n", "wait:" + P],
+     ["login"]),
+
+    # an update from a package on a USB stick, then a reboot into it
+    ("update", False, True,
+     ["--prep", update_stick] + usb_stick() + [
+      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; update /mnt/update.tgz; umount /mnt; machboot\\n",
+      "wait:" + P],
+     ["updating MachOS", "installing the programs", "MachOS is updated to 0.8.1", "MachOS (previous)"]),
+    ("update-reboot", True, True,
+     ["wait:" + P, "send:ls /boot; uname -a\\n", "wait:" + P],
+     ["kernel.old.elf", "MachOS 0.8.1"]),
+
+    # MachOS installed on a USB stick, then booted from the stick alone
+    ("usb-install", False, False,
+     ["--prep", lambda: sh(f"rm -f {USB_STICK}; dd if=/dev/zero of={USB_STICK} bs=1M count=512 status=none")]
+     + usb_stick() + ["wait:" + P, "send:install /dev/sdb\\n", "wait:continue: ", "send:yes\\n", "wait:New password: ", "send:machos\\n", "wait:Again: ", "send:machos\\n",
+      "wait:installed on", "wait:" + P],
+     ["mass storage", "installed on /dev/sdb"]),
+    ("usb-installed-boot", False, False,
+     ["--prep", lambda: sh("dd if=/dev/zero of=out/headless/empty.img bs=1M count=8 status=none"),
+      "--boot", os.path.join(ROOT, "out/headless/empty.img"),
+      "--qemu=-device", "--qemu=qemu-xhci,id=xhci", "--qemu=-drive",
+      f"--qemu=if=none,id=stick,format=raw,file={USB_STICK}",
+      "--qemu=-device", "--qemu=usb-storage,bus=xhci.0,drive=stick,bootindex=0",
+      "wait:Password: ", "send:machos\\n", "wait:" + P, "send:df\\n", "wait:" + P],
+     ["root: ext2 on /dev/sdb2", "/dev/sdb2"]),
 
     ("tools", False, False,
      ["wait:" + P,
@@ -290,7 +408,7 @@ TESTS = [
     ("install", False, False,
      ["--disk2", "blank:" + TARGET,
       "wait:" + P, "send:ls /dev; install /dev/sda\\n", "wait:continue: ", "send:no\\n", "wait:" + P,
-      "send:install /dev/sdb\\n", "wait:continue: ", "send:yes\\n", "wait:" + P,
+      "send:install /dev/sdb\\n", "wait:continue: ", "send:yes\\n", "wait:New password: ", "send:machos\\n", "wait:Again: ", "send:machos\\n", "wait:" + P,
       "send:ls /dev; mount /dev/sdb2 /mnt; ls /mnt; umount /dev/sdb2; ls /mnt; echo unmounted\\n", "wait:" + P],
      ["sdb", "/dev/sdb2 MachOS root 446 MiB", "mkfat: FAT32", "mkext2:", "copying the system",
       "is installed on /dev/sdb", "sdb1", "sdb2", "bin/", "unmounted"]),
@@ -302,16 +420,16 @@ TESTS = [
 
     ("nvme-install", False, False,
      ["--disk2", "blank:" + NVME_TARGET, "--disk2", "nvme:" + NVME_TARGET,
-      "wait:" + P, "send:install /dev/nvme0n1\\n", "wait:continue: ", "send:yes\\n", "wait:installed on",
+      "wait:" + P, "send:install /dev/nvme0n1\\n", "wait:continue: ", "send:yes\\n", "wait:New password: ", "send:machos\\n", "wait:Again: ", "send:machos\\n", "wait:installed on",
       "wait:" + P],
      ["/dev/nvme0n1p1 EFI system", "mkfat: FAT32", "copying the system", "installed on /dev/nvme0n1"]),
 
     ("nvme-installed-boot", False, True,
-     ["--boot", NVME_TARGET, "--nvme", "wait:" + P, "send:df\\n", "wait:" + P, "sleep:1"],
+     ["--boot", NVME_TARGET, "--nvme", "wait:Password: ", "send:machos\\n", "wait:" + P, "send:df\\n", "wait:" + P, "sleep:1"],
      ["root: ext2 on /dev/nvme0n1p2", "/dev/nvme0n1p2"]),
 
     ("installed-boot", False, True,
-     ["--boot", TARGET, "wait:" + P,
+     ["--boot", TARGET, "wait:Password: ", "send:machos\\n", "wait:" + P,
       "send:uname; ls /boot; echo on-installed > /home/x; cat /home/x; mkdir /mnt; mount /dev/sda2 /mnt\\n", "wait:" + P,
       "sleep:1"],
      ["root: ext2 on /dev/sda2", "MachOS", "kernel.elf", "on-installed", "busy"]),
@@ -329,6 +447,7 @@ def run(name, keep, fsck, steps, expect, profile):
     # it after (it returns "" or a problem)
     steps = list(steps)
     post = None
+    nologin = False
     while steps and isinstance(steps[0], str) and steps[0].startswith("--"):
         opt, val = steps[0], steps[1]
         if opt == "--prep":
@@ -338,6 +457,10 @@ def run(name, keep, fsck, steps, expect, profile):
         if opt == "--post":
             post = val
             steps = steps[2:]
+            continue
+        if opt == "--nologin":  # the test logs in itself (or never)
+            nologin = True
+            steps = steps[1:]
             continue
         if opt == "--nvme" or "=" in opt:  # takes no value (or has it inside)
             cmd.append(opt)
@@ -359,10 +482,30 @@ def run(name, keep, fsck, steps, expect, profile):
         cmd += [opt, val]
         steps = steps[2:]
     # every boot but rescue mode starts at a login prompt: log in as root
-    if "--rescue" not in cmd:
+    if "--rescue" not in cmd and not nologin:
         steps = ["wait:login: ", "send:root\\n"] + steps
-    r = subprocess.run(cmd + steps, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    out = r.stdout
+    # headless.py's progress (stderr) is shown live, so a stuck step is seen
+    # as it happens; its stdout (the serial log) is kept for the checks
+    proc = subprocess.Popen(cmd + steps, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    err_lines = []
+
+    def pump():
+        for line in proc.stderr:
+            err_lines.append(line)
+            if not line.startswith("building "):  # the compiler's per-program lines
+                print(f"     | {line.rstrip()}", flush=True)
+    t = threading.Thread(target=pump, daemon=True)
+    t.start()
+    out = proc.stdout.read()
+    proc.wait()
+    t.join()
+
+    class R:
+        pass
+    r = R()
+    r.returncode = proc.returncode
+    r.stderr = "".join(err_lines)
+    r.stdout = out
     problems = []
     if r.returncode == 1:
         problems.append("timed out")
@@ -396,16 +539,19 @@ def main():
     chosen = [t for t in TESTS if not a.names or t[0] in a.names]
     failed = 0
     for name, keep, fsck, steps, expect in chosen:
+        print(f"run  {name}", flush=True)
+        t0 = time.time()
         problems, out, err = run(name, keep, fsck, steps, expect, a.profile)
+        took = f"({time.time() - t0:.0f} s)"
         if problems:
             failed += 1
-            print(f"FAIL {name}: " + "; ".join(problems))
+            print(f"FAIL {name} {took}: " + "; ".join(problems))
             tail = "\n".join(out.splitlines()[-15:])
             print("     " + tail.replace("\n", "\n     "))
             if "e2fsck" in "".join(problems):
                 print("     " + "\n     ".join(err.splitlines()[-12:]))
         else:
-            print(f"ok   {name}")
+            print(f"ok   {name} {took}")
     print(f"{len(chosen) - failed}/{len(chosen)} passed ({a.profile})")
     sys.exit(1 if failed else 0)
 

@@ -2,11 +2,11 @@
 # install DISK: erase DISK and install MachOS on it, e.g. `install /dev/sdb`
 # or `install /dev/nvme0n1`
 #   1. gpt     a new partition table: EFI system + MachOS root
-#   2. mkfat   the EFI partition, with machboot (the boot loader) and copies
-#              of its config, the kernel and the initrd (machboot reads the
-#              real ones from the root partition's /boot)
+#   2. mkfat   the EFI partition, with machboot (the boot loader) only: it
+#              reads its settings, the kernel and the initrd from /boot
 #   3. mkext2  the root partition, an empty filesystem
 #   4. mount it and copy /bin, /etc and /boot over
+#   5. a root password for the new system (it must have one)
 test -n "$1" || echo "usage: install DISK (see ls -l /dev)"
 test -n "$1" || exit 2
 test -b "$1" || echo "install: $1 is not a disk"
@@ -16,7 +16,7 @@ confirm "Type yes to continue: " || exit 1
 ESP=$(partname $1 1)
 ROOT=$(partname $1 2)
 gpt $1 || exit 1
-mkfat $ESP /boot/BOOTX64.EFI:EFI/BOOT/BOOTX64.EFI /boot/machboot.conf:boot/machboot.conf /boot/kernel.elf:boot/kernel.elf ?/boot/initrd.tar:boot/initrd.tar || exit 1
+mkfat $ESP /boot/BOOTX64.EFI:EFI/BOOT/BOOTX64.EFI || exit 1
 mkext2 $ROOT || exit 1
 test -d /mnt || mkdir /mnt
 mount $ROOT /mnt || exit 1
@@ -25,6 +25,7 @@ cp -r /bin /etc /boot /mnt || exit 1
 mkdir /mnt/home
 mkdir /mnt/root
 chmod 700 /mnt/root
+passwd -R /mnt root || exit 1
 umount /mnt || exit 1
 sync
 echo "MachOS is installed on $1. Boot from that disk."

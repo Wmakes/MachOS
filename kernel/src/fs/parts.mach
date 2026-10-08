@@ -193,12 +193,57 @@ pub fun find_root(want: *u8) *Bdev {
     ret nil;
 }
 
+# USB disks plugged in (their partitions and /dev nodes appear) or pulled
+# out (their nodes go; anything still mounted from them fails until it is
+# unmounted)
+pub fun usb_hotplug() {
+    var first: u64 = 0;
+    val added: u64 = dsk.sync_usb(?first);
+    var d: u64 = first;
+    for (d < first + added) {
+        add(d, 0, 0, dsk.disk(d).sectors, nil, nil);
+        add_partitions(d);
+        d = d + 1;
+    }
+    var i: u64 = 0;
+    for (i < MAX) {
+        val b: *Bdev = ?devs[i];
+        if (b.used != 0 && dsk.disk(b.disk).gone != 0) {
+            if (b.node != nil) {
+                b.node.dev = vfs.DEV_NULL;
+                vfs.unlink(b.node);
+                b.node = nil;
+            }
+            b.used = 0;
+        }
+        i = i + 1;
+    }
+}
+
+# the EFI system partition on disk `disk`, or nil
+pub fun find_esp(disk: u64) *Bdev {
+    var i: u64 = 0;
+    for (i < MAX) {
+        val b: *Bdev = ?devs[i];
+        if (b.used != 0 && b.disk == disk && b.part != 0 && mem.equal(?b.kind[0], ?ESP_TYPE[0], 16) != 0) { ret b; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
 # the partition of disk `disk` starting at `start`, or nil
 pub fun find(disk: u64, start: u64) *Bdev {
     var i: u64 = 0;
     for (i < MAX) {
         val b: *Bdev = ?devs[i];
         if (b.used != 0 && b.disk == disk && b.start == start && b.part != 0) { ret b; }
+        i = i + 1;
+    }
+    # a filesystem on the whole disk (a stick formatted without partitions)
+    i = 0;
+    for (i < MAX) {
+        val b: *Bdev = ?devs[i];
+        if (b.used != 0 && b.disk == disk && b.part == 0 && start == 0) { ret b; }
         i = i + 1;
     }
     ret nil;

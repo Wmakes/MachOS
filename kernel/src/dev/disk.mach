@@ -1,15 +1,18 @@
-# every disk, whatever drives it: AHCI (SATA) disks are sda, sdb, ...;
-# NVMe disks nvme0n1, nvme1n1, ... (their namespace 1), as on Linux. all of
-# them are read and written in 512-byte sectors
+# every disk, whatever drives it: AHCI (SATA) and USB disks are sda, sdb,
+# ...; NVMe disks nvme0n1, nvme1n1, ... (their namespace 1), as on Linux.
+# all of them are read and written in 512-byte sectors. USB disks come and
+# go: sync_usb() picks up the changes (a disk pulled out stays, `gone`)
 
 use ahci: machos.dev.ahci;
 use nvme: machos.dev.nvme;
+use xhci: machos.dev.xhci;
 use mem:  machos.kern.mem;
 
 pub val SECTOR: u64 = 512;
 pub val MAX: u64 = 12;
 val AHCI: u64 = 1;
 val NVME: u64 = 2;
+val USB: u64 = 3;
 
 pub rec Disk {
     kind:     u64;
@@ -19,10 +22,13 @@ pub rec Disk {
     model:    [40]u8;
     name:     [16]u8;
     name_len: u64;
+    gone:     u8;      # a USB disk that was pulled out
+    usb:      u8;      # it is on USB (removable)
 }
 
 var disks: [12]Disk;
 var count: u64 = 0;
+var letters: u64 = 0;  # sd letters handed out
 
 fun add(kind: u64, idx: u64, sectors: u64, model: *u8) *Disk {
     if (count == MAX) { ret nil; }
@@ -43,14 +49,11 @@ pub fun init() u64 {
     for (i < na && i < 26) {
         val a: *ahci.Disk = ahci.disk(i);
         val d: *Disk = add(AHCI, i, a.sectors, ?a.model[0]);
-        if (d != nil) {
-            d.name[0] = 115; # "sd" + a letter
-            d.name[1] = 100;
-            d.name[2] = 97 + i::u8;
-            d.name_len = 3;
-        }
+        if (d != nil) { sd_name(d); }
         i = i + 1;
     }
+    var first_usb: u64 = 0;
+    sync_usb(?first_usb);
     val nn: u64 = nvme.init();
     i = 0;
     for (i < nn && i < 10) {
@@ -68,23 +71,65 @@ pub fun init() u64 {
     ret count;
 }
 
+fun sd_name(d: *Disk) {
+    d.name[0] = 115; # "sd" + a letter
+    d.name[1] = 100;
+    d.name[2] = 97 + letters::u8;
+    d.name_len = 3;
+    letters = letters + 1;
+}
+
+# USB disks plugged in or pulled out since last time: new ones are added
+# (the first new index goes to *first); pulled ones become `gone`. how
+# many were added
+pub fun sync_usb(first: *u64) u64 {
+    @first = count;
+    var added: u64 = 0;
+    var i: u64 = 0;
+    for (i < xhci.MAX_STOR) {
+        if (xhci.stor_ready(i) != 0 && xhci.stor_known(i) == 0 && letters < 26) {
+            val d: *Disk = add(USB, i, xhci.stor_sectors(i), xhci.stor_model(i));
+            if (d != nil) {
+                sd_name(d);
+                d.usb = 1;
+                xhci.stor_set_known(i);
+                added = added + 1;
+            }
+        }
+        if (xhci.stor_gone(i) != 0) {
+            var k: u64 = 0;
+            for (k < count) {
+                if (disks[k].kind == USB && disks[k].idx == i && disks[k].gone == 0) { disks[k].gone = 1; }
+                k = k + 1;
+            }
+            xhci.stor_forget(i);
+        }
+        i = i + 1;
+    }
+    ret added;
+}
+
 pub fun disk_count() u64 { ret count; }
 pub fun disk(i: u64) *Disk { ret ?disks[i]; }
 
 pub fun read(d: *Disk, lba: u64, n: u64, buf: u64) u8 {
-    if (lba + n > d.sectors) { ret 0; }
+    if (lba + n > d.sectors || d.gone != 0) { ret 0; }
     if (d.kind == AHCI) { ret ahci.read(ahci.disk(d.idx), lba, n, buf); }
+    if (d.kind == USB) { ret xhci.stor_read(d.idx, lba, n, buf); }
     ret nvme.read(d.idx, lba, n, buf);
 }
 
 pub fun write(d: *Disk, lba: u64, n: u64, buf: u64) u8 {
-    if (lba + n > d.sectors) { ret 0; }
+    if (lba + n > d.sectors || d.gone != 0) { ret 0; }
     if (d.kind == AHCI) { ret ahci.write(ahci.disk(d.idx), lba, n, buf); }
+    if (d.kind == USB) { ret xhci.stor_write(d.idx, lba, n, buf); }
     ret nvme.write(d.idx, lba, n, buf);
 }
 
 pub fun flush(d: *Disk) u8 {
+    if (d.gone != 0) { ret 0; }
     if (d.kind == AHCI) { ret ahci.flush(ahci.disk(d.idx)); }
+    if (d.kind == USB) { ret xhci.stor_flush(d.idx); }
     ret nvme.flush(d.idx);
 }
 

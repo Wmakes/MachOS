@@ -4,6 +4,7 @@
 # command table we use at +2048 (128-byte header, then up to 120 PRDs)
 
 use kprint: machos.kern.kprint;
+use cpu:    machos.arch.x86_64.cpu;
 use pci:    machos.dev.pci;
 use vmm:    machos.mm.vmm;
 use pmm:    machos.mm.pmm;
@@ -213,12 +214,8 @@ fun add_port(port: u64) {
     or (speed == 3) { kprint.puts("6\0"); }
     or { kprint.puts("?\0"); }
     kprint.puts(" Gbps, \0");
-    val sig: u32 = rd(port + P_SIG);
-    if (sig == 0xEB140101) { kprint.puts("ATAPI device (CD/DVD: not supported)\n\0"); ret; }
-    if (sig == 0xC33C0101) { kprint.puts("enclosure bridge (not supported)\n\0"); ret; }
-    if (sig == 0x96690101) { kprint.puts("port multiplier (not supported)\n\0"); ret; }
-    if (sig != 0x00000101) { kprint.puts("unknown device\n\0"); ret; }
-    kprint.puts("SATA disk\n\0");
+    # the port receives FISes first (the signature arrives in one), then
+    # the device gets time to finish its reset (BSY clear)
     val page: u64 = pmm.alloc();
     if (page == 0) { ret; }
     stop(port);
@@ -230,6 +227,29 @@ fun add_port(port: u64) {
     wr(port + P_IS, 0xFFFFFFFF);
     wr(port + P_IE, 0);
     start(port);
+    var spins: u64 = 0;
+    for ((rd(port + P_TFD) & 0x80) != 0 && spins < 2000) { # up to ~2 s
+        cpu.delay_us(1000);
+        spins = spins + 1;
+    }
+    val sig: u32 = rd(port + P_SIG);
+    var what: *u8 = nil;
+    if (sig == 0xEB140101) { what = "ATAPI device (CD/DVD: not supported)\n\0"; }
+    or (sig == 0xC33C0101) { what = "enclosure bridge (not supported)\n\0"; }
+    or (sig == 0x96690101) { what = "port multiplier (not supported)\n\0"; }
+    or (sig != 0x00000101) { what = "unknown device \0"; }
+    if (what != nil) {
+        kprint.puts(what);
+        if (sig != 0xEB140101 && sig != 0xC33C0101 && sig != 0x96690101) {
+            kprint.puts("(signature \0");
+            kprint.hex(sig::u64);
+            kprint.puts(")\n\0");
+        }
+        stop(port);
+        pmm.free(page);
+        ret;
+    }
+    kprint.puts("SATA disk\n\0");
 
     val d: *Disk = ?disks[ndisks];
     d.port = port;

@@ -295,6 +295,7 @@ pub rec MountInfo {
     dir:   [256]u8; # where it is mounted
     total: u64;     # bytes
     free:  u64;
+    fstype: [8]u8;  # "ext2", "vfat" or "exfat"
 }
 
 pub rec Info {

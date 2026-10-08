@@ -315,7 +315,10 @@ fun put_line(path: *u8, key_field: u64, name: *u8, n: u64, line: *u8, ln: u64, m
 }
 
 # store a new password for `name` (needs root: /etc/shadow is root's)
-pub fun set_password(name: *u8, n: u64, pw: *u8, pn: u64) u8 {
+pub fun set_password(name: *u8, n: u64, pw: *u8, pn: u64) u8 { ret set_password_in("/etc/shadow\0", name, n, pw, pn); }
+
+# the same in another system's shadow file (`install` sets up a new disk)
+pub fun set_password_in(shadow: *u8, name: *u8, n: u64, pw: *u8, pn: u64) u8 {
     var line: [256]u8;
     if (n > 31) { ret 0; }
     io.copy(?line[0], name, n);
@@ -324,7 +327,7 @@ pub fun set_password(name: *u8, n: u64, pw: *u8, pn: u64) u8 {
     if (pn > 0) { l = l + hash(pw, pn, ?line[l]); }
     line[l] = 58;
     l = l + 1;
-    ret put_line("/etc/shadow\0", 0, name, n, ?line[0], l, 0x180);
+    ret put_line(shadow, 0, name, n, ?line[0], l, 0x180);
 }
 
 # add a user (and its own group of the same name and number)

@@ -1,24 +1,33 @@
-# what is mounted where. every mount is an ext2 filesystem on a block
-# device (fs/parts) with its own Part and ext2.Fs. a device with something
-# mounted on it, or a whole disk with a mounted partition, cannot be written
-# raw
+# what is mounted where. every mount is a filesystem (ext2, FAT16/32 or
+# exFAT, recognised by what is on the disk) on a block device (fs/parts)
+# with its own Part. a device with something mounted on it, or a whole
+# disk with a mounted partition, cannot be written raw
 
 use abi:   sdk.abi;
 use dsk:  machos.dev.disk;
 use heap:  machos.mm.heap;
 use blk:   machos.fs.blk;
 use ext2:  machos.fs.ext2;
+use fat:   machos.fs.fat;
+use exfat: machos.fs.exfat;
 use vfs:   machos.fs.vfs;
 use parts: machos.fs.parts;
 
 pub val MAX: u64 = 8;
 
-rec Mount {
+pub val EXT2: u64 = 1;
+pub val FAT: u64 = 2;
+pub val EXFAT: u64 = 3;
+
+pub rec Mount {
     used:  u8;
+    kind:  u64;      # EXT2, FAT or EXFAT
     disk:  u64;      # index in dev/disk
     start: u64;      # first sector of the filesystem
     part:  *blk.Part;
     fs:    *ext2.Fs;
+    fatfs: *fat.Fs;
+    exfs:  *exfat.Fs;
     root:  *vfs.Node; # the mounted root (nil for the boot root)
 }
 
@@ -33,8 +42,9 @@ fun free_slot() *Mount {
     ret nil;
 }
 
-# open the ext2 filesystem on `b`; *why says what is wrong with it
-fun open_fs(b: *parts.Bdev, part: **blk.Part, fs: **ext2.Fs, why: **u8) u64 {
+# open the filesystem on `b` into m (part and the fs for its kind); *why
+# says what is wrong when nothing fits
+fun open_fs(b: *parts.Bdev, m: *Mount, ext2_only: u8, why: **u8) u64 {
     @why = nil;
     val d: *dsk.Disk = parts.disk_of(b);
     blk.forget_disk(d); # the disk may have just been written raw
@@ -43,46 +53,86 @@ fun open_fs(b: *parts.Bdev, part: **blk.Part, fs: **ext2.Fs, why: **u8) u64 {
     p.disk = d;
     p.start = b.start;
     p.sectors = b.count;
+    m.part = p;
+    m.fs = nil;
+    m.fatfs = nil;
+    m.exfs = nil;
     val f: *ext2.Fs = heap.zalloc($size_of(ext2.Fs)::u64)::*ext2.Fs;
     if (f == nil) {
         heap.free(p::u64);
         ret abi.err(abi.E_NOMEM);
     }
     val err: *u8 = ext2.mount(f, p);
-    if (err != nil) {
-        @why = err;
-        heap.free(f::u64);
-        heap.free(p::u64);
-        ret abi.err(abi.E_INVAL);
+    if (err == nil) {
+        m.kind = EXT2;
+        m.fs = f;
+        ret 0;
     }
-    @part = p;
-    @fs = f;
-    ret 0;
+    heap.free(f::u64);
+    @why = err;
+    if (ext2_only == 0) {
+        val ff: *fat.Fs = heap.zalloc($size_of(fat.Fs)::u64)::*fat.Fs;
+        if (ff != nil) {
+            if (fat.mount(ff, p) == nil) {
+                m.kind = FAT;
+                m.fatfs = ff;
+                @why = nil;
+                ret 0;
+            }
+            heap.free(ff::u64);
+        }
+        val xf: *exfat.Fs = heap.zalloc($size_of(exfat.Fs)::u64)::*exfat.Fs;
+        if (xf != nil) {
+            if (exfat.mount(xf, p) == nil) {
+                m.kind = EXFAT;
+                m.exfs = xf;
+                @why = nil;
+                ret 0;
+            }
+            heap.free(xf::u64);
+        }
+        @why = "no ext2, FAT or exFAT filesystem there\0";
+    }
+    heap.free(p::u64);
+    ret abi.err(abi.E_INVAL);
 }
 
-fun record(b: *parts.Bdev, p: *blk.Part, f: *ext2.Fs, root: *vfs.Node) {
+fun free_fs(m: *Mount) {
+    if (m.fs != nil) { heap.free(m.fs::u64); }
+    if (m.fatfs != nil) { heap.free(m.fatfs::u64); }
+    if (m.exfs != nil) { heap.free(m.exfs::u64); }
+    if (m.part != nil) { heap.free(m.part::u64); }
+    m.fs = nil;
+    m.fatfs = nil;
+    m.exfs = nil;
+    m.part = nil;
+}
+
+fun record(b: *parts.Bdev, t: *Mount, root: *vfs.Node) {
     val m: *Mount = free_slot();
     m.used = 1;
+    m.kind = t.kind;
     m.disk = b.disk;
     m.start = b.start;
-    m.part = p;
-    m.fs = f;
+    m.part = t.part;
+    m.fs = t.fs;
+    m.fatfs = t.fatfs;
+    m.exfs = t.exfs;
     m.root = root;
 }
 
 # boot: make `b` the root; nil, or the reason it cannot be
 pub fun mount_root(b: *parts.Bdev) *u8 {
-    var p: *blk.Part = nil;
-    var f: *ext2.Fs = nil;
+    var t: Mount;
     var why: *u8 = nil;
-    val r: u64 = open_fs(b, ?p, ?f, ?why);
+    val r: u64 = open_fs(b, ?t, 1, ?why);
     if (abi.is_err(r) != 0) {
         if (why != nil) { ret why; }
         ret "out of memory\0";
     }
-    if (vfs.init_ext2(f) == 0) { ret "out of memory\0"; }
-    record(b, p, f, nil);
-    ext2.set_clean(f, 0);
+    if (vfs.init_ext2(t.fs) == 0) { ret "out of memory\0"; }
+    record(b, ?t, nil);
+    ext2.set_clean(t.fs, 0);
     ret nil;
 }
 
@@ -90,19 +140,20 @@ pub fun mount_root(b: *parts.Bdev) *u8 {
 pub fun mount_at(b: *parts.Bdev, at: *vfs.Node) u64 {
     if (busy(b) != 0) { ret abi.err(abi.E_BUSY); }
     if (free_slot() == nil) { ret abi.err(abi.E_BUSY); }
-    var p: *blk.Part = nil;
-    var f: *ext2.Fs = nil;
+    var t: Mount;
     var why: *u8 = nil;
-    val r: u64 = open_fs(b, ?p, ?f, ?why);
+    val r: u64 = open_fs(b, ?t, 0, ?why);
     if (abi.is_err(r) != 0) { ret r; }
-    val vr: u64 = vfs.mount(at, f);
+    var vr: u64 = 0;
+    if (t.kind == EXT2) { vr = vfs.mount(at, t.fs); }
+    or (t.kind == FAT) { vr = vfs.mount_fat(at, t.fatfs); }
+    or { vr = vfs.mount_exfat(at, t.exfs); }
     if (abi.is_err(vr) != 0) {
-        heap.free(f::u64);
-        heap.free(p::u64);
+        free_fs(?t);
         ret vr;
     }
-    record(b, p, f, at.mounted);
-    ext2.set_clean(f, 0);
+    record(b, ?t, at.mounted);
+    if (t.kind == EXT2) { ext2.set_clean(t.fs, 0); }
     ret 0;
 }
 
@@ -110,10 +161,9 @@ fun release(m: *Mount) u64 {
     if (m.root == nil) { ret abi.err(abi.E_BUSY); } # the root stays
     val u: u64 = vfs.unmount(m.root);
     if (abi.is_err(u) != 0) { ret u; }
-    ext2.set_clean(m.fs, 1);
+    if (m.kind == EXT2) { ext2.set_clean(m.fs, 1); }
     blk.forget_disk(m.part.disk); # writes everything back first
-    heap.free(m.fs::u64);
-    heap.free(m.part::u64);
+    free_fs(m);
     m.used = 0;
     m.root = nil;
     ret 0;
@@ -123,7 +173,7 @@ fun release(m: *Mount) u64 {
 pub fun mark_all_clean() {
     var i: u64 = 0;
     for (i < MAX) {
-        if (mounts[i].used != 0) { ext2.set_clean(mounts[i].fs, 1); }
+        if (mounts[i].used != 0 && mounts[i].kind == EXT2) { ext2.set_clean(mounts[i].fs, 1); }
         i = i + 1;
     }
 }
@@ -132,7 +182,7 @@ pub fun mark_all_clean() {
 pub fun root_was_clean() u8 {
     var i: u64 = 0;
     for (i < MAX) {
-        if (mounts[i].used != 0 && mounts[i].root == nil) { ret mounts[i].fs.was_clean; }
+        if (mounts[i].used != 0 && mounts[i].root == nil && mounts[i].kind == EXT2) { ret mounts[i].fs.was_clean; }
         i = i + 1;
     }
     ret 1;
@@ -159,26 +209,39 @@ pub fun unmount_dev(b: *parts.Bdev) u64 {
     ret abi.err(abi.E_INVAL);
 }
 
-# the `idx`-th mount: device name, where it is (root = the mounted root, or
-# nil for /), and its filesystem. 0 past the end
-pub fun nth(idx: u64, disk: *u64, start: *u64, root: **vfs.Node, fs: **ext2.Fs) u8 {
+# the `idx`-th mount, or nil past the end
+pub fun nth(idx: u64) *Mount {
     var seen: u64 = 0;
     var i: u64 = 0;
     for (i < MAX) {
         val m: *Mount = ?mounts[i];
         if (m.used != 0) {
-            if (seen == idx) {
-                @disk = m.disk;
-                @start = m.start;
-                @root = m.root;
-                @fs = m.fs;
-                ret 1;
-            }
+            if (seen == idx) { ret m; }
             seen = seen + 1;
         }
         i = i + 1;
     }
-    ret 0;
+    ret nil;
+}
+
+# a mount's size and free space in bytes
+pub fun space(m: *Mount, total: *u64, free: *u64) {
+    if (m.kind == EXT2) {
+        @total = ext2.total_space(m.fs);
+        @free = ext2.free_space(m.fs);
+    } or (m.kind == FAT) {
+        @total = m.fatfs.clusters * m.fatfs.csize;
+        @free = fat.free_clusters(m.fatfs) * m.fatfs.csize;
+    } or {
+        @total = m.exfs.clusters * m.exfs.csize;
+        @free = exfat.free_space(m.exfs);
+    }
+}
+
+pub fun kind_name(m: *Mount) *u8 {
+    if (m.kind == FAT) { ret "vfat\0"; }
+    if (m.kind == EXFAT) { ret "exfat\0"; }
+    ret "ext2\0";
 }
 
 # whether `b` (or, for a whole disk, anything on it) is mounted

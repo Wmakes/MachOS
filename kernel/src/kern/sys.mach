@@ -963,22 +963,20 @@ fun sys_mount(dva: u64, dlen: u64, pva: u64, plen: u64) u64 {
 
 fun sys_mounts(idx: u64, out: u64) u64 {
     if (ok(out, $size_of(abi.MountInfo)::u64, 1) == 0) { ret e(abi.E_FAULT); }
-    var disk: u64 = 0;
-    var start: u64 = 0;
-    var r: *vfs.Node = nil;
-    var fs: *ext2.Fs = nil;
-    if (mount.nth(idx, ?disk, ?start, ?r, ?fs) == 0) { ret 0; }
+    val m: *mount.Mount = mount.nth(idx);
+    if (m == nil) { ret 0; }
     val mi: *abi.MountInfo = out::*abi.MountInfo;
     mem.fill(out, 0, $size_of(abi.MountInfo)::u64);
-    val b: *parts.Bdev = parts.find(disk, start);
+    val b: *parts.Bdev = parts.find(m.disk, m.start);
     if (b != nil) { parts.dev_name(b, ?mi.dev[0]); }
-    if (r == nil) {
+    if (m.root == nil) {
         mi.dir[0] = 47;
     } or {
-        vfs.path_of(r, ?mi.dir[0]);
+        vfs.path_of(m.root, ?mi.dir[0]);
     }
-    mi.total = ext2.total_space(fs);
-    mi.free = ext2.free_space(fs);
+    mount.space(m, ?mi.total, ?mi.free);
+    val kn: *u8 = mount.kind_name(m);
+    mem.copy((?mi.fstype[0])::u64, kn::u64, mem.cstrlen(kn));
     ret 1;
 }
 

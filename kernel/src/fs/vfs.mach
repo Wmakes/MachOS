@@ -10,10 +10,14 @@ use heap: machos.mm.heap;
 use mem:  machos.kern.mem;
 use path: machos.fs.path;
 use ext2: machos.fs.ext2;
+use fat:  machos.fs.fat;
+use exfat: machos.fs.exfat;
 use clock: machos.kern.clock;
 
 pub val FS_RAM:  u64 = 0;
 pub val FS_EXT2: u64 = 1;
+pub val FS_FAT:  u64 = 2;   # FAT16/32 (fs/fat.mach)
+pub val FS_EXFAT: u64 = 3;  # exFAT (fs/exfat.mach)
 
 pub val DEV_CONSOLE: u64 = 1;
 
@@ -52,6 +56,11 @@ pub rec Node {
     dead:     u8;    # FS_EXT2: no links left, release the inode at the last close
     name_len: u64;
     name:     [60]u8;
+    fatfs:    *fat.Fs;    # FS_FAT: the filesystem (ino = the first cluster)
+    exfs:     *exfat.Fs;  # FS_EXFAT: the filesystem (ino = the first cluster)
+    fidx:     u64;        # FAT/exFAT: its entry's index in the parent directory
+    fcount:   u64;        # FAT: long-name entries before it; exFAT: entries in its set
+    xnochain: u8;         # exFAT: the data is one contiguous run
 }
 
 var root: *Node = nil;
@@ -109,7 +118,8 @@ pub fun set_attr(nd: *Node, mode: u64, uid: u64, gid: u64) {
     nd.uid = uid;
     nd.gid = gid;
     if (nd.fs == FS_EXT2) { ext2.set_attr(nd.fsi, nd.ino, nd.mode, uid, gid); }
-    or { nd.mtime = clock.now(); }
+    or (nd.fs == FS_RAM) { nd.mtime = clock.now(); }
+    # FAT and exFAT have no owners or modes: kept in memory only
 }
 
 fun attr_from(nd: *Node, i: *ext2.Inode) {
@@ -211,9 +221,95 @@ fun ext2_root(fs: *ext2.Fs) *Node {
 
 pub fun get_root() *Node { ret root; }
 
+fun fat_root(fs: *fat.Fs) *Node {
+    val nd: *Node = new_node(abi.KIND_DIR, FS_FAT, "\0", 0);
+    if (nd == nil) { ret nil; }
+    nd.fatfs = fs;
+    nd.ino = fs.root;
+    nd.mode = 0x1ED;
+    ret nd;
+}
+
+fun exfat_root(fs: *exfat.Fs) *Node {
+    val nd: *Node = new_node(abi.KIND_DIR, FS_EXFAT, "\0", 0);
+    if (nd == nil) { ret nil; }
+    nd.exfs = fs;
+    nd.ino = fs.root;
+    nd.mode = 0x1ED;
+    ret nd;
+}
+
+# an exFAT directory node as exfat.Dir (where it is, and where its parent is)
+fun exdir(nd: *Node, d: *exfat.Dir) {
+    d.first = nd.ino;
+    d.nochain = nd.xnochain;
+    d.size = nd.size;
+    d.root = (nd.mount_of != nil || nd == root)::u8;
+    if (d.root != 0) { d.size = 0; }
+    d.idx = nd.fidx;
+    if (d.root == 0) {
+        val p: *Node = nd.parent;
+        d.up_first = p.ino;
+        d.up_nochain = p.xnochain;
+        d.up_size = p.size;
+        if (p.mount_of != nil || p == root) { d.up_size = 0; }
+    }
+}
+
+fun exback(nd: *Node, d: *exfat.Dir) {
+    if (d.root == 0) { nd.size = d.size; }
+    nd.xnochain = d.nochain;
+}
+
 # read an ext2 directory's entries into the tree, once
 fun load(dir: *Node) {
-    if (dir.fs != FS_EXT2 || dir.kind != abi.KIND_DIR || dir.loaded != 0) { ret; }
+    if (dir.kind != abi.KIND_DIR || dir.loaded != 0) { ret; }
+    if (dir.fs == FS_FAT) {
+        dir.loaded = 1;
+        var pos: u64 = 0;
+        var f: fat.Found;
+        for (fat.dir_next(dir.fatfs, dir.ino, ?pos, ?f) != 0) {
+            var kind: u64 = abi.KIND_FILE;
+            if (f.dir != 0) { kind = abi.KIND_DIR; }
+            val nd: *Node = new_node(kind, FS_FAT, ?f.name[0], f.nlen);
+            if (nd == nil) { brk; }
+            nd.fatfs = dir.fatfs;
+            nd.ino = f.first;
+            nd.size = f.size;
+            if (f.dir != 0) { nd.size = 0; }
+            nd.fidx = f.idx;
+            nd.fcount = f.lfn;
+            nd.mtime = f.mtime;
+            nd.mode = 0x1ED;
+            nd.loaded = 0;
+            attach(dir, nd);
+        }
+        ret;
+    }
+    if (dir.fs == FS_EXFAT) {
+        dir.loaded = 1;
+        var pos: u64 = 0;
+        var f: exfat.Found;
+        var dsize: u64 = dir.size;
+        if (dir.mount_of != nil || dir == root) { dsize = 0; }
+        for (exfat.dir_next(dir.exfs, dir.ino, dir.xnochain, dsize, ?pos, ?f) != 0) {
+            var kind: u64 = abi.KIND_FILE;
+            if (f.dir != 0) { kind = abi.KIND_DIR; }
+            val nd: *Node = new_node(kind, FS_EXFAT, ?f.name[0], f.nlen);
+            if (nd == nil) { brk; }
+            nd.exfs = dir.exfs;
+            nd.ino = f.first;
+            nd.size = f.size;
+            nd.xnochain = f.nochain;
+            nd.fidx = f.idx;
+            nd.fcount = f.count;
+            nd.mtime = f.mtime;
+            nd.mode = 0x1ED;
+            attach(dir, nd);
+        }
+        ret;
+    }
+    if (dir.fs != FS_EXT2) { ret; }
     dir.loaded = 1;
     var pos: u64 = 0;
     var name: [64]u8;
@@ -318,6 +414,7 @@ pub fun create(dir: *Node, name: *u8, n: u64, kind: u64, mode: u64, out: **Node)
         @out = nd;
         ret 0;
     }
+    if (dir.fs == FS_FAT || dir.fs == FS_EXFAT) { ret create_fat(dir, name, n, kind, out); }
     load(dir);
     val nd: *Node = new_node(kind, FS_EXT2, name, n);
     if (nd == nil) { ret e(abi.E_NOMEM); }
@@ -338,8 +435,46 @@ pub fun create(dir: *Node, name: *u8, n: u64, kind: u64, mode: u64, out: **Node)
     ret 0;
 }
 
+# a new file or directory on FAT or exFAT
+fun create_fat(dir: *Node, name: *u8, n: u64, kind: u64, out: **Node) u64 {
+    load(dir);
+    val nd: *Node = new_node(kind, dir.fs, name, n);
+    if (nd == nil) { ret e(abi.E_NOMEM); }
+    val is_dir: u8 = (kind == abi.KIND_DIR)::u8;
+    var idx: u64 = 0;
+    var cnt_: u64 = 0;
+    var first: u64 = 0;
+    var r: u64 = 0;
+    if (dir.fs == FS_FAT) {
+        r = fat.create(dir.fatfs, dir.ino, name, n, is_dir, 0, 0, ?idx, ?cnt_, ?first);
+        nd.fatfs = dir.fatfs;
+    } or {
+        var d: exfat.Dir;
+        exdir(dir, ?d);
+        var size: u64 = 0;
+        r = exfat.create(dir.exfs, ?d, name, n, is_dir, 0, 0, 0, 0, ?idx, ?cnt_, ?first, ?size);
+        exback(dir, ?d);
+        nd.exfs = dir.exfs;
+        nd.size = size;
+    }
+    if (abi.is_err(r) != 0) {
+        heap.free(nd::u64);
+        ret r;
+    }
+    nd.ino = first;
+    nd.fidx = idx;
+    nd.fcount = cnt_;
+    nd.mode = 0x1ED;
+    nd.loaded = 1; # brand new: nothing to read
+    attach(dir, nd);
+    @out = nd;
+    ret 0;
+}
+
 fun destroy(nd: *Node) {
     if (nd.fs == FS_EXT2 && nd.dead != 0) { ext2.release(nd.fsi, nd.ino); }
+    if (nd.fs == FS_FAT && nd.dead != 0) { fat.free_data(nd.fatfs, nd.ino); }
+    if (nd.fs == FS_EXFAT && nd.dead != 0) { exfat.free_data(nd.exfs, nd.ino, nd.xnochain, nd.size); }
     heap.free(nd.data);
     heap.free(nd::u64);
 }
@@ -354,6 +489,17 @@ pub fun unlink(nd: *Node) u64 {
         if (nd.kind == abi.KIND_DIR) { is_dir = 1; }
         val left: u64 = ext2.unlink(nd.fsi, nd.parent.ino, ?nd.name[0], nd.name_len, nd.ino, is_dir);
         if (left == 0) { nd.dead = 1; }
+    }
+    # FAT and exFAT: the entry goes now, the clusters with the last close
+    if (nd.fs == FS_FAT) {
+        fat.remove(nd.fatfs, nd.parent.ino, nd.fidx, nd.fcount, nd.ino, 1);
+        nd.dead = 1;
+    }
+    if (nd.fs == FS_EXFAT) {
+        var d: exfat.Dir;
+        exdir(nd.parent, ?d);
+        exfat.remove(nd.exfs, ?d, nd.fidx, nd.fcount, nd.ino, nd.xnochain, nd.size, 1);
+        nd.dead = 1;
     }
     detach(nd);
     nd.unlinked = 1;
@@ -379,11 +525,23 @@ pub fun within(a: *Node, b: *Node) u8 {
 }
 
 # mount `fs` on the directory `at`; fails if something is already there
-pub fun mount(at: *Node, fs: *ext2.Fs) u64 {
-    if (at.kind != abi.KIND_DIR) { ret e(abi.E_NOTDIR); }
-    if (at.mounted != nil || at == root) { ret e(abi.E_BUSY); }
-    val r: *Node = ext2_root(fs);
+pub fun mount(at: *Node, fs: *ext2.Fs) u64 { ret mount_node(at, ext2_root(fs)); }
+pub fun mount_fat(at: *Node, fs: *fat.Fs) u64 { ret mount_node(at, fat_root(fs)); }
+pub fun mount_exfat(at: *Node, fs: *exfat.Fs) u64 { ret mount_node(at, exfat_root(fs)); }
+
+fun mount_node(at: *Node, r: *Node) u64 {
     if (r == nil) { ret e(abi.E_NOMEM); }
+    if (at.kind != abi.KIND_DIR) {
+        heap.free(r::u64);
+        ret e(abi.E_NOTDIR);
+    }
+    if (at.mounted != nil || at == root) {
+        heap.free(r::u64);
+        ret e(abi.E_BUSY);
+    }
+    # listed under its mountpoint's name (an empty one would read as "/")
+    mem.copy((?r.name[0])::u64, (?at.name[0])::u64, at.name_len);
+    r.name_len = at.name_len;
     r.parent = at.parent;
     r.mount_of = at;
     at.mounted = r;
@@ -437,6 +595,39 @@ pub fun rename(nd: *Node, dir: *Node, name: *u8, n: u64) u64 {
         val r: u64 = ext2.rename(nd.fsi, nd.parent.ino, ?nd.name[0], nd.name_len, dir.ino, name, n, nd.ino, is_dir);
         if (abi.is_err(r) != 0) { ret r; }
     }
+    if (nd.fs == FS_FAT) {
+        load(dir);
+        if (nd.fatfs != dir.fatfs) { ret e(abi.E_XDEV); }
+        val is_dir: u8 = (nd.kind == abi.KIND_DIR)::u8;
+        var idx: u64 = 0;
+        var cnt_: u64 = 0;
+        var first: u64 = 0;
+        val r: u64 = fat.create(dir.fatfs, dir.ino, name, n, is_dir, nd.ino, nd.size, ?idx, ?cnt_, ?first);
+        if (abi.is_err(r) != 0) { ret r; }
+        fat.remove(nd.fatfs, nd.parent.ino, nd.fidx, nd.fcount, nd.ino, 1);
+        if (is_dir != 0 && dir != nd.parent) { fat.set_dotdot(nd.fatfs, nd.ino, dir.ino); }
+        nd.fidx = idx;
+        nd.fcount = cnt_;
+    }
+    if (nd.fs == FS_EXFAT) {
+        load(dir);
+        if (nd.exfs != dir.exfs) { ret e(abi.E_XDEV); }
+        val is_dir: u8 = (nd.kind == abi.KIND_DIR)::u8;
+        var to: exfat.Dir;
+        exdir(dir, ?to);
+        var idx: u64 = 0;
+        var cnt_: u64 = 0;
+        var first: u64 = 0;
+        var size: u64 = 0;
+        val r: u64 = exfat.create(dir.exfs, ?to, name, n, is_dir, 1, nd.ino, nd.xnochain, nd.size, ?idx, ?cnt_, ?first, ?size);
+        exback(dir, ?to);
+        if (abi.is_err(r) != 0) { ret r; }
+        var from: exfat.Dir;
+        exdir(nd.parent, ?from);
+        exfat.remove(nd.exfs, ?from, nd.fidx, nd.fcount, nd.ino, nd.xnochain, nd.size, 1);
+        nd.fidx = idx;
+        nd.fcount = cnt_;
+    }
     detach(nd);
     mem.copy((?nd.name[0])::u64, name::u64, n);
     nd.name_len = n;
@@ -446,6 +637,8 @@ pub fun rename(nd: *Node, dir: *Node, name: *u8, n: u64) u64 {
 
 pub fun read(nd: *Node, off: u64, buf: u64, n: u64) u64 {
     if (nd.fs == FS_EXT2) { ret ext2.read(nd.fsi, nd.ino, off, buf, n); }
+    if (nd.fs == FS_FAT) { ret fat.read(nd.fatfs, nd.ino, nd.size, off, buf, n); }
+    if (nd.fs == FS_EXFAT) { ret exfat.read(nd.exfs, nd.ino, nd.xnochain, nd.size, off, buf, n); }
     if (off >= nd.size) { ret 0; }
     var k: u64 = nd.size - off;
     if (k > n) { k = n; }
@@ -477,6 +670,18 @@ pub fun write(nd: *Node, off: u64, buf: u64, n: u64) u64 {
         if (abi.is_err(k) == 0 && off + k > nd.size) { nd.size = off + k; }
         ret k;
     }
+    if (nd.fs == FS_FAT) {
+        val k: u64 = fat.write(nd.fatfs, nd.parent.ino, nd.fidx, ?nd.ino, ?nd.size, off, buf, n);
+        nd.mtime = clock.now();
+        ret k;
+    }
+    if (nd.fs == FS_EXFAT) {
+        var d: exfat.Dir;
+        exdir(nd.parent, ?d);
+        val k: u64 = exfat.write(nd.exfs, ?d, nd.fidx, ?nd.ino, ?nd.xnochain, ?nd.size, off, buf, n);
+        nd.mtime = clock.now();
+        ret k;
+    }
     if (reserve(nd, off + n) == 0) { ret e(abi.E_NOMEM); }
     if (off > nd.size) { mem.fill(nd.data + nd.size, 0, off - nd.size); }
     mem.copy(nd.data + off, buf, n);
@@ -487,5 +692,11 @@ pub fun write(nd: *Node, off: u64, buf: u64, n: u64) u64 {
 
 pub fun truncate(nd: *Node) {
     if (nd.fs == FS_EXT2) { ext2.truncate(nd.fsi, nd.ino); }
+    if (nd.fs == FS_FAT) { fat.truncate(nd.fatfs, nd.parent.ino, nd.fidx, ?nd.ino, ?nd.size); }
+    if (nd.fs == FS_EXFAT) {
+        var d: exfat.Dir;
+        exdir(nd.parent, ?d);
+        exfat.truncate(nd.exfs, ?d, nd.fidx, ?nd.ino, ?nd.xnochain, ?nd.size);
+    }
     nd.size = 0;
 }

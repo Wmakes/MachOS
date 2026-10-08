@@ -69,8 +69,8 @@ pub rec BootServices {
     locate_handle:        u64;
     locate_device_path:   u64;
     install_config:       u64;
-    load_image:           u64;
-    start_image:          u64;
+    load_image:           fun(u64, u64, u64, u64, u64, *u64) u64;
+    start_image:          fun(u64, u64, u64) u64;
     exit:                 u64;
     unload_image:         u64;
     exit_boot_services:   fun(u64, u64) u64;

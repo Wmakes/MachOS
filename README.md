@@ -2,12 +2,17 @@
 
 A small Unix-like operating system for x86_64, written in [mach](https://github.com/briar-systems/mach).
 
-## Build and run
+## Building
 
-You need mach 6.10, lld, QEMU, OVMF, mtools, gptfdisk and e2fsprogs.
+You need the [mach](https://github.com/briar-systems/mach) compiler (6.10) and, on Arch:
+
+```
+sudo pacman -S lld gptfdisk e2fsprogs mtools xorriso qemu-system-x86 edk2-ovmf python
+```
 
 ```
 tools/run.sh        # build a disk image and boot it in QEMU
+tools/iso.sh        # build the live ISO (out/machos.iso)
 tools/test.py       # run the tests
 ```
 

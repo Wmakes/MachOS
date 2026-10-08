@@ -7,6 +7,7 @@ use kprint: machos.kern.kprint;
 use serial: machos.dev.serial;
 use kbd:    machos.dev.ps2kbd;
 use xhci:   machos.dev.xhci;
+use parts:  machos.fs.parts;
 use tty:    machos.kern.tty;
 use proc:   machos.kern.proc;
 use sys:    machos.kern.sys;
@@ -149,6 +150,7 @@ fun dispatch(f: *idt.Frame) {
         if (smp.me() == 0) { # the clock counts on one cpu; every cpu preempts
             proc.tick();
             xhci.poll(proc.uptime_ticks());
+            if (xhci.stor_changed() != 0) { parts.usb_hotplug(); }
         }
         preempt = from_user;
     } or (f.vector == apic.WAKE_VECTOR) {
