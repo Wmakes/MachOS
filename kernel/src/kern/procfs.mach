@@ -21,6 +21,15 @@
 #                                 sets the time (and the RTC) by writing seconds
 #   /proc/sys/kernel/rtc_offset   seconds the RTC is ahead of UTC (0, or the
 #                                 zone's offset when it keeps local time)
+#   /proc/net/config              the network: "eth0 MAC", "address IP/PREFIX",
+#                                 "gateway IP", "dns IP", "method dhcp|static|off"
+#                                 lines; root writes "dhcp", "off", or
+#                                 "IP/PREFIX GATEWAY DNS" to it
+#   /proc/net/dev                 per interface: received and sent packets and
+#                                 bytes, and the ones dropped
+#   /proc/net/arp                 "IP MAC" for every address it knows
+#   /proc/net/resolv.conf         "nameserver IP": the DNS server, the way
+#                                 resolv.conf says it (std's resolver reads it)
 #   /proc/PID/status, /proc/self/status
 #                                 Name, State, Pid, PPid, Pgid, Sid, Uid and
 #                                 Gid (real, then effective),
@@ -43,6 +52,8 @@ use smp:     machos.arch.x86_64.smp;
 use version: machos.abi.version;
 use fbcon:   machos.dev.fbcon;
 use clock:   machos.kern.clock;
+use net:     machos.net.net;
+use dhcp:    machos.net.dhcp;
 
 # what each /proc node is (its Node.ino)
 val VERSION:   u64 = 1;
@@ -58,6 +69,10 @@ val HOSTNAME:  u64 = 10;
 val SCREEN:    u64 = 11;
 val CLOCK:     u64 = 12;
 val RTCOFF:    u64 = 13;
+val NETCONF:   u64 = 30;
+val NETDEV:    u64 = 31;
+val NETARP:    u64 = 32;
+val RESOLV:    u64 = 33;
 val STATUS:    u64 = 20;
 val ROOT:      u64 = 100;
 val DIR:       u64 = 101; # sys, sys/kernel
@@ -162,6 +177,124 @@ fun status(o: *Out, p: *proc.Proc) {
     putc(o, 10);
     field(o, "Pages:\0", p.pages);
     field(o, "Ticks:\0", p.cpu_ticks);
+}
+
+fun ipv4(o: *Out, ip: u32) {
+    dec(o, (ip >> 24)::u64);
+    putc(o, 46);
+    dec(o, ((ip >> 16) & 0xFF)::u64);
+    putc(o, 46);
+    dec(o, ((ip >> 8) & 0xFF)::u64);
+    putc(o, 46);
+    dec(o, (ip & 0xFF)::u64);
+}
+
+fun mac(o: *Out, m: *u8) {
+    val digits: *u8 = "0123456789abcdef\0";
+    var i: u64 = 0;
+    for (i < 6) {
+        if (i > 0) { putc(o, 58); }
+        putc(o, digits[m[i] >> 4]);
+        putc(o, digits[m[i] & 15]);
+        i = i + 1;
+    }
+}
+
+fun net_config(o: *Out) {
+    val i: *net.Iface = net.iface();
+    if (i.present == 0) {
+        puts(o, "no network card\n\0");
+        ret;
+    }
+    puts(o, "eth0 \0");
+    mac(o, ?i.mac[0]);
+    puts(o, "\naddress \0");
+    ipv4(o, i.ip);
+    putc(o, 47);
+    dec(o, net.prefix_of(i.mask));
+    puts(o, "\ngateway \0");
+    ipv4(o, i.gateway);
+    puts(o, "\ndns \0");
+    ipv4(o, i.dns);
+    puts(o, "\nmethod \0");
+    if (dhcp.active() != 0) { puts(o, "dhcp\0"); }
+    or (i.up != 0) { puts(o, "static\0"); }
+    or { puts(o, "off\0"); }
+    putc(o, 10);
+}
+
+# a dotted IPv4 address at s[*i..]; ok gets 0 when it is not one
+fun parse_ip(s: *u8, n: u64, i: *u64, ok: *u8) u32 {
+    var v: u32 = 0;
+    var part: u64 = 0;
+    for (part < 4) {
+        var x: u64 = 0;
+        var digits: u64 = 0;
+        for (@i < n && s[@i] >= 48 && s[@i] <= 57 && digits < 3) {
+            x = x * 10 + (s[@i] - 48)::u64;
+            @i = @i + 1;
+            digits = digits + 1;
+        }
+        if (digits == 0 || x > 255) {
+            @ok = 0;
+            ret 0;
+        }
+        v = (v << 8) | x::u32;
+        part = part + 1;
+        if (part < 4) {
+            if (@i >= n || s[@i] != 46) {
+                @ok = 0;
+                ret 0;
+            }
+            @i = @i + 1;
+        }
+    }
+    @ok = 1;
+    ret v;
+}
+
+fun skip_blanks(s: *u8, n: u64, i: *u64) {
+    for (@i < n && (s[@i] == 32 || s[@i] == 9)) { @i = @i + 1; }
+}
+
+# "dhcp", "off", or "IP/PREFIX GATEWAY DNS"
+fun net_write(s: *u8, n: u64) u64 {
+    var k: u64 = n;
+    for (k > 0 && (s[k - 1] == 10 || s[k - 1] == 13 || s[k - 1] == 32)) { k = k - 1; }
+    if (k == 4 && mem.equal(s, "dhcp\0", 4) != 0) {
+        dhcp.start();
+        ret 0;
+    }
+    if (k == 3 && mem.equal(s, "off\0", 3) != 0) {
+        dhcp.stop();
+        net.configure(0, 0, 0, 0, 0, 0);
+        ret 0;
+    }
+    var i: u64 = 0;
+    var ok: u8 = 0;
+    val ip: u32 = parse_ip(s, k, ?i, ?ok);
+    if (ok == 0 || i >= k || s[i] != 47) { ret abi.err(abi.E_INVAL); }
+    i = i + 1;
+    var bits: u64 = 0;
+    for (i < k && s[i] >= 48 && s[i] <= 57) {
+        bits = bits * 10 + (s[i] - 48)::u64;
+        i = i + 1;
+    }
+    if (bits < 1 || bits > 32) { ret abi.err(abi.E_INVAL); }
+    var maskv: u32 = 0xFFFFFFFF;
+    if (bits < 32) { maskv = (0xFFFFFFFF::u32) << (32 - bits)::u32; }
+    skip_blanks(s, k, ?i);
+    val gw: u32 = parse_ip(s, k, ?i, ?ok);
+    if (ok == 0) { ret abi.err(abi.E_INVAL); }
+    skip_blanks(s, k, ?i);
+    var dns: u32 = 0;
+    if (i < k) {
+        dns = parse_ip(s, k, ?i, ?ok);
+        if (ok == 0) { ret abi.err(abi.E_INVAL); }
+    }
+    dhcp.stop();
+    net.configure(ip, maskv, gw, dns, 0, 0);
+    ret 0;
 }
 
 fun mounts(o: *Out) {
@@ -292,6 +425,44 @@ fun generate(nd: *vfs.Node, o: *Out) {
             dec(o, off::u64);
         }
         putc(o, 10);
+    } or (id == NETCONF) {
+        net_config(o);
+    } or (id == NETDEV) {
+        val i: *net.Iface = net.iface();
+        puts(o, "iface rx_packets rx_bytes rx_dropped tx_packets tx_bytes tx_dropped\n\0");
+        if (i.present != 0) {
+            puts(o, "eth0 \0");
+            dec(o, i.rx_packets);
+            putc(o, 32);
+            dec(o, i.rx_bytes);
+            putc(o, 32);
+            dec(o, i.rx_dropped);
+            putc(o, 32);
+            dec(o, i.tx_packets);
+            putc(o, 32);
+            dec(o, i.tx_bytes);
+            putc(o, 32);
+            dec(o, i.tx_dropped);
+            putc(o, 10);
+        }
+    } or (id == RESOLV) {
+        val ni: *net.Iface = net.iface();
+        if (ni.up != 0 && ni.dns != 0) {
+            puts(o, "nameserver \0");
+            ipv4(o, ni.dns);
+            putc(o, 10);
+        }
+    } or (id == NETARP) {
+        var k: u64 = 0;
+        for (k < net.arp_count()) {
+            if (net.arp_used(k) != 0) {
+                ipv4(o, net.arp_ip(k));
+                putc(o, 32);
+                mac(o, net.arp_mac(k));
+                putc(o, 10);
+            }
+            k = k + 1;
+        }
     } or (id == STATUS) {
         var p: *proc.Proc = proc.current();
         if (nd.pid != 0) { p = proc.find(nd.pid); }
@@ -364,6 +535,11 @@ fun write(nd: *vfs.Node, buf: u64, n: u64) u64 {
     }
     if (nd.ino == KMSG) {
         kprint.clear_log();
+        ret n;
+    }
+    if (nd.ino == NETCONF) {
+        val r: u64 = net_write(buf::*u8, n);
+        if (abi.is_err(r) != 0) { ret r; }
         ret n;
     }
     if (nd.ino == HOSTNAME) {
@@ -447,6 +623,13 @@ pub fun init(root: *vfs.Node) {
     vfs.make_proc(d, "kmsg\0", 4, abi.KIND_FILE, KMSG, 0, 0x1A4);
     val self: *vfs.Node = vfs.make_proc(d, "self\0", 4, abi.KIND_DIR, SELF, 0, 0x16D);
     if (self != nil) { vfs.make_proc(self, "status\0", 6, abi.KIND_FILE, STATUS, 0, 0x124); }
+    val nt: *vfs.Node = vfs.make_proc(d, "net\0", 3, abi.KIND_DIR, DIR, 0, 0x16D);
+    if (nt != nil) {
+        vfs.make_proc(nt, "config\0", 6, abi.KIND_FILE, NETCONF, 0, 0x1A4);
+        vfs.make_proc(nt, "dev\0", 3, abi.KIND_FILE, NETDEV, 0, 0x124);
+        vfs.make_proc(nt, "arp\0", 3, abi.KIND_FILE, NETARP, 0, 0x124);
+        vfs.make_proc(nt, "resolv.conf\0", 11, abi.KIND_FILE, RESOLV, 0, 0x124);
+    }
     val sys: *vfs.Node = vfs.make_proc(d, "sys\0", 3, abi.KIND_DIR, DIR, 0, 0x16D);
     if (sys == nil) { ret; }
     val k: *vfs.Node = vfs.make_proc(sys, "kernel\0", 6, abi.KIND_DIR, DIR, 0, 0x16D);

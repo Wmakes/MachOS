@@ -1,0 +1,35 @@
+# names to IPv4 addresses for the network programs: a dotted address as it
+# is, anything else through std's resolver (/etc/hosts, then DNS)
+
+use std.net.ip;
+use std.net.dns;
+use std.net.resolve.types;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.bool.bool;
+
+# the address of `name` into *out (host order); 1, or 0 when it has none
+pub fun lookup(name: *u8, out: *u32) u8 {
+    val parsed: res[ip.IPv4, ip.ParseError] = ip.ipv4_parse(name::str);
+    if (sel parsed.ok) {
+        @out = ip.ipv4_to_u32(parsed.ok);
+        ret 1;
+    }
+    var a: ip.IPv4;
+    val r: res[bool, types.Error] = dns.resolve(name::str, ?a);
+    if (sel r.ok) {
+        if (r.ok) {
+            @out = ip.ipv4_to_u32(a);
+            ret 1;
+        }
+    }
+    ret 0;
+}
+
+# "A.B.C.D" into buf (16 bytes, NUL-terminated); its length
+pub fun format(addr: u32, buf: *u8) u64 {
+    val n: usize = ip.ipv4_format(ip.ipv4_from_u32(addr), buf, 16);
+    buf[n] = 0;
+    ret n::u64;
+}

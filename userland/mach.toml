@@ -283,6 +283,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.host]
+kind = "bin"
+entry = "bin/host.mach"
+out = "bin/host"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.id]
 kind = "bin"
 entry = "bin/id.mach"
@@ -295,6 +303,14 @@ need = []
 kind = "bin"
 entry = "bin/init.mach"
 out = "bin/init"
+targets = ["machos"]
+link = []
+need = []
+
+[artifact.ip]
+kind = "bin"
+entry = "bin/ip.mach"
+out = "bin/ip"
 targets = ["machos"]
 link = []
 need = []
@@ -387,6 +403,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.nc]
+kind = "bin"
+entry = "bin/nc.mach"
+out = "bin/nc"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.neofetch]
 kind = "bin"
 entry = "bin/neofetch.mach"
@@ -407,6 +431,14 @@ need = []
 kind = "bin"
 entry = "bin/passwd.mach"
 out = "bin/passwd"
+targets = ["machos"]
+link = []
+need = []
+
+[artifact.ping]
+kind = "bin"
+entry = "bin/ping.mach"
+out = "bin/ping"
 targets = ["machos"]
 link = []
 need = []

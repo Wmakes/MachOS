@@ -1,0 +1,304 @@
+# Intel's gigabit Ethernet controllers of the e1000 family: the 82540EM
+# (QEMU's "e1000", VirtualBox), the 8254x server parts and the 82574L
+# (QEMU q35's "e1000e"). all of them take the "legacy" descriptors used
+# here: a ring of 32 receive and 32 transmit buffers of 2 KiB each, which
+# the card fills and empties by DMA. frames are collected by polling (from
+# the timer tick and whenever the network is used), so no interrupt is needed
+
+use pci:    machos.dev.pci;
+use vmm:    machos.mm.vmm;
+use pmm:    machos.mm.pmm;
+use mem:    machos.kern.mem;
+use kprint: machos.kern.kprint;
+use cpu:    machos.arch.x86_64.cpu;
+
+# registers
+val CTRL:   u64 = 0x0000;
+val STATUS: u64 = 0x0008;
+val EERD:   u64 = 0x0014;
+val ICR:    u64 = 0x00C0;
+val IMC:    u64 = 0x00D8;
+val RCTL:   u64 = 0x0100;
+val TCTL:   u64 = 0x0400;
+val TIPG:   u64 = 0x0410;
+val RDBAL:  u64 = 0x2800;
+val RDBAH:  u64 = 0x2804;
+val RDLEN:  u64 = 0x2808;
+val RDH:    u64 = 0x2810;
+val RDT:    u64 = 0x2818;
+val TDBAL:  u64 = 0x3800;
+val TDBAH:  u64 = 0x3804;
+val TDLEN:  u64 = 0x3808;
+val TDH:    u64 = 0x3810;
+val TDT:    u64 = 0x3818;
+val MTA:    u64 = 0x5200;
+val RAL:    u64 = 0x5400;
+val RAH:    u64 = 0x5404;
+
+val CTRL_ASDE: u32 = 0x20;       # find the link speed by itself
+val CTRL_SLU:  u32 = 0x40;       # set link up
+val CTRL_RST:  u32 = 0x04000000;
+val STATUS_LU: u32 = 0x02;       # the link is up
+
+val RCTL_EN:    u32 = 0x00000002;
+val RCTL_BAM:   u32 = 0x00008000; # broadcasts too
+val RCTL_SECRC: u32 = 0x04000000; # the card strips the CRC
+val TCTL_EN:    u32 = 0x00000002;
+val TCTL_PSP:   u32 = 0x00000008; # pad short packets
+
+val CMD_EOP:  u8 = 0x01; # end of packet
+val CMD_IFCS: u8 = 0x02; # the card adds the CRC
+val CMD_RS:   u8 = 0x08; # report status (DD) when sent
+val DD:       u8 = 0x01; # descriptor done
+val EOP:      u8 = 0x02;
+
+pub val RING: u64 = 32;
+pub val BUF:  u64 = 2048;
+
+rec Reg { v: u32; }
+
+# a receive descriptor
+rec Rx {
+    addr:    u64;
+    length:  u16;
+    csum:    u16;
+    status:  u8;
+    errors:  u8;
+    special: u16;
+}
+
+# a transmit descriptor
+rec Tx {
+    addr:    u64;
+    length:  u16;
+    cso:     u8;
+    cmd:     u8;
+    status:  u8;
+    css:     u8;
+    special: u16;
+}
+
+pub rec Nic {
+    regs:    u64;      # BAR0, mapped
+    rx:      u64;      # the rings (virtual)
+    tx:      u64;
+    rx_buf:  [32]u64;  # each buffer, virtual (physical in the descriptor)
+    tx_buf:  [32]u64;
+    rx_next: u64;
+    tx_next: u64;
+    mac:     [6]u8;
+    model:   *u8;
+}
+
+val MAX: u64 = 4;
+var nics: [4]Nic;
+var count: u64 = 0;
+
+fun rd(n: *Nic, off: u64) u32 { ret (@((n.regs + off)::*Reg)).v; }
+fun wr(n: *Nic, off: u64, v: u32) { (@((n.regs + off)::*Reg)).v = v; }
+
+pub fun nic_count() u64 { ret count; }
+pub fun get(i: u64) *Nic { ret ?nics[i]; }
+
+# the models this driver knows (all speak the same legacy descriptors)
+fun model_of(vendor: u16, device: u16) *u8 {
+    if (vendor != 0x8086) { ret nil; }
+    if (device == 0x100E) { ret "82540EM\0"; }
+    if (device == 0x100F || device == 0x1011 || device == 0x1026) { ret "82545EM\0"; }
+    if (device == 0x1004) { ret "82543GC\0"; }
+    if (device == 0x100C || device == 0x1015) { ret "82544\0"; }
+    if (device == 0x107C) { ret "82541PI\0"; }
+    if (device == 0x10D3) { ret "82574L\0"; }
+    ret nil;
+}
+
+# one word of the EEPROM (two ways of asking, by generation)
+fun eeprom(n: *Nic, word: u32) u16 {
+    # 82574 style: start bit 0, address from bit 2, done bit 1
+    wr(n, EERD, 1 | (word << 2));
+    var i: u64 = 0;
+    for (i < 100000) {
+        val v: u32 = rd(n, EERD);
+        if ((v & 2) != 0) { ret (v >> 16)::u16; }
+        i = i + 1;
+    }
+    # 8254x style: address from bit 8, done bit 4
+    wr(n, EERD, 1 | (word << 8));
+    i = 0;
+    for (i < 100000) {
+        val v: u32 = rd(n, EERD);
+        if ((v & 0x10) != 0) { ret (v >> 16)::u16; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun read_mac(n: *Nic) {
+    val lo: u32 = rd(n, RAL);
+    val hi: u32 = rd(n, RAH);
+    if (lo != 0 || (hi & 0xFFFF) != 0) {
+        n.mac[0] = (lo & 0xFF)::u8;
+        n.mac[1] = ((lo >> 8) & 0xFF)::u8;
+        n.mac[2] = ((lo >> 16) & 0xFF)::u8;
+        n.mac[3] = (lo >> 24)::u8;
+        n.mac[4] = (hi & 0xFF)::u8;
+        n.mac[5] = ((hi >> 8) & 0xFF)::u8;
+        ret;
+    }
+    var w: u32 = 0;
+    for (w < 3) {
+        val v: u16 = eeprom(n, w);
+        n.mac[w * 2] = (v & 0xFF)::u8;
+        n.mac[w * 2 + 1] = (v >> 8)::u8;
+        w = w + 1;
+    }
+    # the address filter: receive what is sent to it
+    wr(n, RAL, n.mac[0]::u32 | (n.mac[1]::u32 << 8) | (n.mac[2]::u32 << 16) | (n.mac[3]::u32 << 24));
+    wr(n, RAH, n.mac[4]::u32 | (n.mac[5]::u32 << 8) | 0x80000000);
+}
+
+# a page for DMA: its physical address, and the virtual one in *va
+fun dma_page(va: *u64) u64 {
+    val p: u64 = pmm.alloc();
+    if (p != 0) { @va = vmm.phys_to_virt(p); }
+    ret p;
+}
+
+fun setup(n: *Nic, d: *pci.Device) u8 {
+    pci.enable(d);
+    n.regs = vmm.map_phys(pci.bar(d, 0), 0x20000, 1);
+    wr(n, IMC, 0xFFFFFFFF);
+    wr(n, CTRL, rd(n, CTRL) | CTRL_RST);
+    cpu.delay_us(10000);
+    var spin: u64 = 0;
+    for ((rd(n, CTRL) & CTRL_RST) != 0 && spin < 1000) {
+        cpu.delay_us(100);
+        spin = spin + 1;
+    }
+    wr(n, IMC, 0xFFFFFFFF);
+    rd(n, ICR);
+    wr(n, CTRL, (rd(n, CTRL) | CTRL_SLU | CTRL_ASDE) & ~(0x80000000::u32)); # not PHY reset
+    read_mac(n);
+    var i: u64 = 0;
+    for (i < 128) {
+        wr(n, MTA + i * 4, 0);
+        i = i + 1;
+    }
+    # receive: the ring, and a buffer per descriptor (two to a page)
+    var rva: u64 = 0;
+    val rpa: u64 = dma_page(?rva);
+    var tva: u64 = 0;
+    val tpa: u64 = dma_page(?tva);
+    if (rpa == 0 || tpa == 0) { ret 0; }
+    n.rx = rva;
+    n.tx = tva;
+    i = 0;
+    for (i < RING) {
+        if (i % 2 == 0) {
+            var bva: u64 = 0;
+            val bpa: u64 = dma_page(?bva);
+            if (bpa == 0) { ret 0; }
+            n.rx_buf[i] = bva;
+            n.rx_buf[i + 1] = bva + BUF;
+            val r0: *Rx = (rva + i * 16)::*Rx;
+            r0.addr = bpa;
+            val r1: *Rx = (rva + (i + 1) * 16)::*Rx;
+            r1.addr = bpa + BUF;
+            var tbva: u64 = 0;
+            val tbpa: u64 = dma_page(?tbva);
+            if (tbpa == 0) { ret 0; }
+            n.tx_buf[i] = tbva;
+            n.tx_buf[i + 1] = tbva + BUF;
+            val t0: *Tx = (tva + i * 16)::*Tx;
+            t0.addr = tbpa;
+            t0.status = DD;
+            val t1: *Tx = (tva + (i + 1) * 16)::*Tx;
+            t1.addr = tbpa + BUF;
+            t1.status = DD;
+        }
+        i = i + 2;
+    }
+    wr(n, RDBAL, (rpa & 0xFFFFFFFF)::u32);
+    wr(n, RDBAH, (rpa >> 32)::u32);
+    wr(n, RDLEN, (RING * 16)::u32);
+    wr(n, RDH, 0);
+    wr(n, RDT, (RING - 1)::u32);
+    n.rx_next = 0;
+    wr(n, RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+    wr(n, TDBAL, (tpa & 0xFFFFFFFF)::u32);
+    wr(n, TDBAH, (tpa >> 32)::u32);
+    wr(n, TDLEN, (RING * 16)::u32);
+    wr(n, TDH, 0);
+    wr(n, TDT, 0);
+    n.tx_next = 0;
+    wr(n, TCTL, TCTL_EN | TCTL_PSP | (0x0F << 4) | (0x40 << 12));
+    wr(n, TIPG, 0x0060200A);
+    ret 1;
+}
+
+# find and start every card; how many
+pub fun init() u64 {
+    var i: u64 = 0;
+    for (i < pci.device_count() && count < MAX) {
+        val d: *pci.Device = pci.get(i);
+        val model: *u8 = model_of(d.vendor, d.device);
+        if (model != nil) {
+            val n: *Nic = ?nics[count];
+            n.model = model;
+            if (setup(n, d) != 0) {
+                count = count + 1;
+            } or {
+                kprint.level(kprint.WARN);
+                kprint.puts("e1000: \0");
+                kprint.puts(model);
+                kprint.puts(" could not be started (out of memory)\n\0");
+            }
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+pub fun link_up(n: *Nic) u8 { ret ((rd(n, STATUS) & STATUS_LU) != 0)::u8; }
+
+# the link speed in Mbit/s
+pub fun speed(n: *Nic) u64 {
+    val s: u32 = (rd(n, STATUS) >> 6) & 3;
+    if (s == 0) { ret 10; }
+    if (s == 1) { ret 100; }
+    ret 1000;
+}
+
+# send one frame (at most BUF bytes, the CRC not included); whether there
+# was room
+pub fun send(n: *Nic, frame: *u8, len: u64) u8 {
+    if (len > BUF) { ret 0; }
+    val t: *Tx = (n.tx + n.tx_next * 16)::*Tx;
+    if ((t.status & DD) == 0) { ret 0; } # the ring is full
+    mem.copy(n.tx_buf[n.tx_next], frame::u64, len);
+    t.length = len::u16;
+    t.cmd = CMD_EOP | CMD_IFCS | CMD_RS;
+    t.status = 0;
+    n.tx_next = (n.tx_next + 1) % RING;
+    wr(n, TDT, n.tx_next::u32);
+    ret 1;
+}
+
+# the next frame received, copied into out (BUF bytes); its length, 0 when
+# none is waiting
+pub fun receive(n: *Nic, out: *u8) u64 {
+    for {
+        val r: *Rx = (n.rx + n.rx_next * 16)::*Rx;
+        if ((r.status & DD) == 0) { ret 0; }
+        var len: u64 = r.length::u64;
+        val whole: u8 = r.status & EOP;
+        val bad: u8 = r.errors;
+        if (len > BUF) { len = BUF; }
+        if (whole != 0 && bad == 0) { mem.copy(out::u64, n.rx_buf[n.rx_next], len); }
+        r.status = 0;
+        wr(n, RDT, n.rx_next::u32);
+        n.rx_next = (n.rx_next + 1) % RING;
+        if (whole != 0 && bad == 0) { ret len; }
+    }
+    ret 0;
+}

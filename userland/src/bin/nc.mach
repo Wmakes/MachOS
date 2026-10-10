@@ -1,0 +1,111 @@
+# nc -u [-w SECONDS] HOST PORT: send what comes on standard input to
+# HOST:PORT in UDP datagrams (one per line) and show what comes back, until
+# nothing has come for SECONDS (default 2)
+
+use std.runtime;
+use os:     std.system.os;
+use machos: std.system.os.machos;
+use io:     userland.lib.cli;
+use addr:   userland.lib.netaddr;
+use std.types.size.usize;
+
+var line: [1500]u8;
+var reply: [1500]u8;
+
+fun usage() i64 {
+    io.err("usage: nc -u [-w SECONDS] HOST PORT\n");
+    ret 2;
+}
+
+# the next line of standard input (without its newline) into `line`; its
+# length, or -1 at the end
+fun next_line() i64 {
+    var n: u64 = 0;
+    for (n < 1499) {
+        var c: u8 = 0;
+        val r: i64 = io.read(io.STDIN, ?c, 1);
+        if (r <= 0) {
+            if (n == 0) { ret -1; }
+            brk;
+        }
+        if (c == 10) { brk; }
+        line[n] = c;
+        n = n + 1;
+    }
+    ret n::i64;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var i: i64 = 1;
+    var udp: u8 = 0;
+    var wait: u64 = 2;
+    for (i < argc && argv[i][0] == 45) {
+        if (io.streq(argv[i], "-u") != 0) { udp = 1; }
+        or (io.streq(argv[i], "-w") != 0 && i + 1 < argc) {
+            var ok: u8 = 0;
+            wait = io.parse_dec(argv[i + 1], io.len(argv[i + 1]), ?ok);
+            if (ok == 0) { ret usage(); }
+            i = i + 1;
+        } or { ret usage(); }
+        i = i + 1;
+    }
+    if (udp == 0) {
+        io.err("nc: only UDP (-u) for now\n");
+        ret 2;
+    }
+    if (argc - i != 2) { ret usage(); }
+    var ip: u32 = 0;
+    if (addr.lookup(argv[i], ?ip) == 0) {
+        io.err("nc: ");
+        io.err(argv[i]);
+        io.err(": not found\n");
+        ret 1;
+    }
+    var ok: u8 = 0;
+    val port: u64 = io.parse_dec(argv[i + 1], io.len(argv[i + 1]), ?ok);
+    if (ok == 0 || port == 0 || port > 65535) { ret usage(); }
+    var fd: usize = 0;
+    val made: i64 = machos.sock_create(machos.AF_INET, machos.SOCK_DGRAM, 0, ?fd);
+    if (made < 0) {
+        io.fail("nc", "socket", made);
+        ret 1;
+    }
+    var sa: [16]u8;
+    var k: u64 = 0;
+    for (k < 16) {
+        sa[k] = 0;
+        k = k + 1;
+    }
+    sa[0] = 2;
+    sa[2] = (port >> 8)::u8;
+    sa[3] = (port & 0xFF)::u8;
+    sa[4] = (ip >> 24)::u8;
+    sa[5] = ((ip >> 16) & 0xFF)::u8;
+    sa[6] = ((ip >> 8) & 0xFF)::u8;
+    sa[7] = (ip & 0xFF)::u8;
+    val c: i64 = machos.sock_connect(fd, ?sa[0], 16);
+    if (c < 0) {
+        io.fail("nc", "connect", c);
+        ret 1;
+    }
+    machos.sock_set_rcvtimeo(fd, wait * 1000);
+    for {
+        val n: i64 = next_line();
+        if (n < 0) { brk; }
+        val w: i64 = machos.sock_send(fd, ?line[0], n::usize);
+        if (w < 0) {
+            io.fail("nc", "send", w);
+            ret 1;
+        }
+    }
+    # what comes back, until it goes quiet
+    for {
+        val r: i64 = machos.sock_recv(fd, ?reply[0], 1500);
+        if (r < 0) { brk; }
+        io.outn(?reply[0], r::u64);
+        io.putc(10);
+    }
+    machos.sock_close(fd);
+    ret 0;
+}

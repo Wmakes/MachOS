@@ -1,0 +1,75 @@
+# ip: the network
+#   ip              the address, gateway and DNS server (/proc/net/config)
+#   ip stats        packets and bytes in and out (/proc/net/dev)
+#   ip neigh        the hardware addresses it knows (/proc/net/arp)
+#   ip dhcp         ask DHCP for an address (root)
+#   ip off          no address (root)
+#   ip set IP/PREFIX GATEWAY [DNS]   an address by hand (root)
+
+use std.runtime;
+use os:     std.system.os;
+use io:     userland.lib.cli;
+use system: userland.lib.system;
+
+fun show(path: *u8) u64 {
+    var b: [4096]u8;
+    val n: u64 = system.read_file(path, ?b[0], 4096);
+    if (n == 0) {
+        io.err("ip: ");
+        io.err(path);
+        io.err(" cannot be read\n");
+        ret 1;
+    }
+    io.outn(?b[0], n);
+    ret 0;
+}
+
+fun tell(text: *u8, n: u64) u64 {
+    val h: i64 = io.open_mode("/proc/net/config", os.O_WRONLY, 0);
+    if (h < 0) {
+        io.fail("ip", "/proc/net/config", h);
+        ret 1;
+    }
+    val r: i64 = io.write(h, text, n);
+    io.close(h);
+    if (r < 0) {
+        io.fail("ip", nil, r);
+        ret 1;
+    }
+    ret 0;
+}
+
+fun usage() u64 {
+    io.err("usage: ip [stats | neigh | dhcp | off | set IP/PREFIX GATEWAY [DNS]]\n");
+    ret 2;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
+
+fun run(argc: u64, argv: **u8) u64 {
+    if (argc == 1) { ret show("/proc/net/config"); }
+    val what: *u8 = argv[1];
+    if (argc == 2 && io.streq(what, "stats") != 0) { ret show("/proc/net/dev"); }
+    if (argc == 2 && io.streq(what, "neigh") != 0) { ret show("/proc/net/arp"); }
+    if (argc == 2 && io.streq(what, "dhcp") != 0) { ret tell("dhcp", 4); }
+    if (argc == 2 && io.streq(what, "off") != 0) { ret tell("off", 3); }
+    if ((argc == 4 || argc == 5) && io.streq(what, "set") != 0) {
+        var b: [128]u8;
+        var n: u64 = 0;
+        var k: u64 = 2;
+        for (k < argc) {
+            val l: u64 = io.len(argv[k]);
+            if (n + l + 1 >= 128) { ret usage(); }
+            if (k > 2) {
+                b[n] = 32;
+                n = n + 1;
+            }
+            io.copy(?b[n], argv[k], l);
+            n = n + l;
+            k = k + 1;
+        }
+        ret tell(?b[0], n);
+    }
+    ret usage();
+}

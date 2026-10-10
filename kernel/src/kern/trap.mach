@@ -1,5 +1,7 @@
 # where every interrupt and exception lands (isr_common calls isr_dispatch)
 
+use net:  machos.net.net;
+use dhcp: machos.net.dhcp;
 use idt:    machos.arch.x86_64.idt;
 use apic:   machos.arch.x86_64.apic;
 use cpu:    machos.arch.x86_64.cpu;
@@ -151,6 +153,8 @@ fun dispatch(f: *idt.Frame) {
             proc.tick();
             xhci.poll(proc.uptime_ticks());
             if (xhci.stor_changed() != 0) { parts.usb_hotplug(); }
+            net.poll();
+            dhcp.tick();
         }
         preempt = from_user;
     } or (f.vector == apic.WAKE_VECTOR) {

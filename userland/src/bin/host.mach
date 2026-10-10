@@ -1,0 +1,33 @@
+# host NAME...: the IPv4 address of each name (/etc/hosts, then DNS)
+
+use std.runtime;
+use io:   userland.lib.cli;
+use addr: userland.lib.netaddr;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    if (argc < 2) {
+        io.err("usage: host NAME...\n");
+        ret 2;
+    }
+    var status: i64 = 0;
+    var i: i64 = 1;
+    for (i < argc) {
+        var a: u32 = 0;
+        if (addr.lookup(argv[i], ?a) != 0) {
+            var b: [16]u8;
+            addr.format(a, ?b[0]);
+            io.out(argv[i]);
+            io.out(" has address ");
+            io.out(?b[0]);
+            io.putc(10);
+        } or {
+            io.err("host: ");
+            io.err(argv[i]);
+            io.err(": not found\n");
+            status = 1;
+        }
+        i = i + 1;
+    }
+    ret status;
+}

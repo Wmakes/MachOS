@@ -1,0 +1,141 @@
+# sockets: what a program sends and receives through the network. this
+# module only keeps them and their queues of received datagrams; net.mach
+# fills the queues and sends, the system calls (kern/sys.mach) tie the two
+# together. a socket is UDP (datagrams to and from a port) or ICMP (echo
+# requests and their replies, as `ping` uses them, matched by id)
+#
+# addresses travel as sockaddr_in, the BSD layout: family (2 = AF_INET, in
+# host order), the port and the IPv4 address (both in network order)
+
+use proc: machos.kern.proc;
+use mem:  machos.kern.mem;
+
+pub val UDP:  u64 = 17;
+pub val ICMP: u64 = 1;
+
+pub val MAX:   u64 = 32;
+pub val QUEUE: u64 = 8;
+pub val DATA:  u64 = 1500;
+
+pub rec Datagram {
+    len:  u64;
+    ip:   u32;   # where it came from (host order)
+    port: u16;
+    data: [1500]u8;
+}
+
+pub rec Sock {
+    used:      u8;
+    kind:      u64;  # UDP or ICMP
+    port:      u16;  # the local port (UDP), the echo id (ICMP); 0 = none yet
+    local_ip:  u32;  # 0 = any
+    peer_ip:   u32;  # set by connect: where send goes, what recv takes
+    peer_port: u16;
+    connected: u8;
+    broadcast: u8;   # may send to 255.255.255.255
+    timeout:   u64;  # receive timeout in ms, 0 = wait for ever
+    refs:      u64;  # handles open on it
+    head:      u64;
+    count:     u64;
+    dropped:   u64;  # datagrams that found the queue full
+    q:         [8]Datagram;
+}
+
+var socks: [32]Sock;
+var next_port: u16 = 49152;
+
+pub fun slot(i: u64) *Sock { ret ?socks[i]; }
+
+pub fun alloc(kind: u64) *Sock {
+    var i: u64 = 0;
+    for (i < MAX) {
+        val s: *Sock = ?socks[i];
+        if (s.used == 0) {
+            mem.fill(s::u64, 0, $size_of(Sock)::u64);
+            s.used = 1;
+            s.kind = kind;
+            s.refs = 1;
+            ret s;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+pub fun release(s: *Sock) {
+    if (s.refs > 0) { s.refs = s.refs - 1; }
+    if (s.refs == 0) {
+        s.used = 0;
+        proc.wakeup(s::u64);
+    }
+}
+
+# the socket of `kind` on local port (or echo id) `port`
+pub fun find(kind: u64, port: u16) *Sock {
+    var i: u64 = 0;
+    for (i < MAX) {
+        val s: *Sock = ?socks[i];
+        if (s.used != 0 && s.kind == kind && s.port == port) { ret s; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# a free local port (or echo id) for `kind`
+pub fun free_port(kind: u64) u16 {
+    var tries: u64 = 0;
+    for (tries < 16384) {
+        val p: u16 = next_port;
+        next_port = next_port + 1;
+        if (next_port < 49152) { next_port = 49152; }
+        if (find(kind, p) == nil) { ret p; }
+        tries = tries + 1;
+    }
+    ret 0;
+}
+
+# a datagram from ip:port arrived for s (dropped when the queue is full)
+pub fun deliver(s: *Sock, ip: u32, port: u16, data: *u8, len: u64) {
+    if (s.connected != 0 && (ip != s.peer_ip || (s.kind == UDP && port != s.peer_port))) { ret; }
+    if (s.count == QUEUE) {
+        s.dropped = s.dropped + 1;
+        ret;
+    }
+    val d: *Datagram = ?s.q[(s.head + s.count) % QUEUE];
+    var n: u64 = len;
+    if (n > DATA) { n = DATA; }
+    d.len = n;
+    d.ip = ip;
+    d.port = port;
+    mem.copy((?d.data[0])::u64, data::u64, n);
+    s.count = s.count + 1;
+    proc.wakeup(s::u64);
+}
+
+# the oldest datagram (s.count must be > 0), handed back with take_done
+pub fun peek(s: *Sock) *Datagram { ret ?s.q[s.head]; }
+
+pub fun take_done(s: *Sock) {
+    s.head = (s.head + 1) % QUEUE;
+    s.count = s.count - 1;
+}
+
+# sockaddr_in: family, port and address (network order) to and from host order
+pub fun put_addr(out: *u8, ip: u32, port: u16) {
+    mem.fill(out::u64, 0, 16);
+    out[0] = 2;
+    out[2] = (port >> 8)::u8;
+    out[3] = (port & 0xFF)::u8;
+    out[4] = (ip >> 24)::u8;
+    out[5] = ((ip >> 16) & 0xFF)::u8;
+    out[6] = ((ip >> 8) & 0xFF)::u8;
+    out[7] = (ip & 0xFF)::u8;
+}
+
+# whether `a` is an AF_INET address; its ip and port
+pub fun get_addr(a: *u8, ip: *u32, port: *u16) u8 {
+    if (a[0] != 2 || a[1] != 0) { ret 0; }
+    @port = (a[2]::u16 << 8) | a[3]::u16;
+    @ip = (a[4]::u32 << 24) | (a[5]::u32 << 16) | (a[6]::u32 << 8) | a[7]::u32;
+    ret 1;
+}

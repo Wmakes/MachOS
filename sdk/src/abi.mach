@@ -72,7 +72,25 @@ pub val GETRANDOM: u64 = 64; # (buf, len)                         -> bytes: rand
 pub val PREAD:   u64 = 65; # (fd, buf, len, offset)               -> bytes; the handle's offset stays
 pub val PWRITE:  u64 = 66; # (fd, buf, len, offset)               -> bytes; the handle's offset stays
 pub val FDPATH:  u64 = 67; # (fd, buf, len)                       -> length: the path a handle was opened at
-pub val COUNT:   u64 = 68;
+pub val SOCKET:  u64 = 68; # (AF_INET, SOCK_DGRAM, IPPROTO_UDP or _ICMP) -> fd
+pub val BIND:    u64 = 69; # (fd, *sockaddr_in, len)       the local port (0: any)
+pub val CONNECT: u64 = 70; # (fd, *sockaddr_in, len)       where send goes, what recv takes
+pub val SENDTO:  u64 = 71; # (fd, buf, len, *sockaddr_in or 0, addr_len) -> bytes
+pub val RECVFROM: u64 = 72; # (fd, buf, len, *sockaddr_in or 0, *u32 addr_len or 0) -> bytes
+pub val SETSOCKOPT: u64 = 73; # (fd, SO_*, value)
+pub val GETSOCKNAME: u64 = 74; # (fd, *sockaddr_in)
+pub val COUNT:   u64 = 75;
+
+# sockets: IPv4 only; a sockaddr_in is 16 bytes: family (AF_INET, host
+# order), the port and the address (network order), 8 zero bytes
+pub val AF_INET:    u64 = 2;
+pub val SOCK_STREAM: u64 = 1;
+pub val SOCK_DGRAM: u64 = 2;
+pub val IPPROTO_ICMP: u64 = 1;  # echo requests: what ping sends (the id is the kernel's)
+pub val IPPROTO_UDP: u64 = 17;
+pub val SO_RCVTIMEO: u64 = 1;   # milliseconds a receive waits (0: for ever); then E_AGAIN
+pub val SO_BROADCAST: u64 = 2;  # 1: may send to 255.255.255.255
+pub val KIND_SOCKET: u64 = 5;   # Stat.kind of a socket
 
 # CLOCK: the wall clock (since 1970-01-01 UTC) or the time since boot
 pub val CLOCK_REALTIME:  u64 = 0;

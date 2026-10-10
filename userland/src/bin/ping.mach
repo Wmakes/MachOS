@@ -1,0 +1,141 @@
+# ping [-c COUNT] HOST: send echo requests to HOST once a second and show
+# the replies with their round-trip time (COUNT of them, default 4)
+
+use std.runtime;
+use os:     std.system.os;
+use machos: std.system.os.machos;
+use io:     userland.lib.cli;
+use addr:   userland.lib.netaddr;
+use std.types.size.usize;
+
+# the reply's length, kept in memory: mach 6.10.1 at -O0 lost a value held in
+# rax across the us_now() call (it printed the time instead)
+var reply_len: u64 = 0;
+
+fun us_now() u64 {
+    var ts: os.Timespec;
+    os.monotonic(?ts);
+    ret ts.sec::u64 * 1000000 + ts.nsec::u64 / 1000;
+}
+
+fun put_addr(sa: *u8, ip: u32) {
+    var i: u64 = 0;
+    for (i < 16) {
+        sa[i] = 0;
+        i = i + 1;
+    }
+    sa[0] = 2;
+    sa[4] = (ip >> 24)::u8;
+    sa[5] = ((ip >> 16) & 0xFF)::u8;
+    sa[6] = ((ip >> 8) & 0xFF)::u8;
+    sa[7] = (ip & 0xFF)::u8;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var count: u64 = 4;
+    var i: i64 = 1;
+    if (argc == 4 && io.streq(argv[1], "-c") != 0) {
+        var ok: u8 = 0;
+        count = io.parse_dec(argv[2], io.len(argv[2]), ?ok);
+        if (ok == 0 || count == 0) {
+            io.err("usage: ping [-c COUNT] HOST\n");
+            ret 2;
+        }
+        i = 3;
+    } or (argc != 2) {
+        io.err("usage: ping [-c COUNT] HOST\n");
+        ret 2;
+    }
+    val host: *u8 = argv[i];
+    var ip: u32 = 0;
+    if (addr.lookup(host, ?ip) == 0) {
+        io.err("ping: ");
+        io.err(host);
+        io.err(": not found\n");
+        ret 2;
+    }
+    var shown: [16]u8;
+    addr.format(ip, ?shown[0]);
+    var fd: usize = 0;
+    val made: i64 = machos.sock_create(machos.AF_INET, machos.SOCK_DGRAM, 1, ?fd); # ICMP
+    if (made < 0) {
+        io.fail("ping", "socket", made);
+        ret 2;
+    }
+    machos.sock_set_rcvtimeo(fd, 1000);
+    io.out("PING ");
+    io.out(host);
+    io.out(" (");
+    io.out(?shown[0]);
+    io.out("): 56 data bytes\n");
+    var sa: [16]u8;
+    put_addr(?sa[0], ip);
+    var sent: u64 = 0;
+    var got: u64 = 0;
+    var seq: u64 = 0;
+    for (seq < count) {
+        # an echo request: type 8, code 0, checksum and id (the kernel's), sequence
+        var req: [64]u8;
+        var k: u64 = 0;
+        for (k < 64) {
+            req[k] = k::u8;
+            k = k + 1;
+        }
+        req[0] = 8;
+        req[1] = 0;
+        req[6] = (seq >> 8)::u8;
+        req[7] = (seq & 0xFF)::u8;
+        val t0: u64 = us_now();
+        val w: i64 = machos.sock_sendto(fd, ?req[0], 64, 0, ?sa[0], 16);
+        if (w < 0) {
+            io.fail("ping", "send", w);
+            ret 1;
+        }
+        sent = sent + 1;
+        # the reply with this sequence number, within a second
+        for {
+            var rep: [128]u8;
+            var from: [16]u8;
+            var flen: u32 = 16;
+            val r: i64 = machos.sock_recvfrom(fd, ?rep[0], 128, 0, ?from[0], ?flen);
+            if (r < 0) {
+                io.out("no reply for icmp_seq=");
+                io.dec(seq);
+                io.putc(10);
+                brk;
+            }
+            if (r >= 8 && rep[0] == 0 && ((rep[6]::u64 << 8) | rep[7]::u64) == seq) {
+                reply_len = r::u64;
+                val us: u64 = us_now() - t0;
+                got = got + 1;
+                io.dec(reply_len);
+                io.out(" bytes from ");
+                io.out(?shown[0]);
+                io.out(": icmp_seq=");
+                io.dec(seq);
+                io.out(" time=");
+                io.dec(us / 1000);
+                io.putc(46);
+                io.dec((us % 1000) / 100);
+                io.out(" ms\n");
+                # the rest of the second before the next one
+                if (seq + 1 < count && us < 1000000) { io.sleep_ms((1000000 - us) / 1000); }
+                brk;
+            }
+        }
+        seq = seq + 1;
+    }
+    machos.sock_close(fd);
+    io.out("--- ");
+    io.out(host);
+    io.out(" ping statistics ---\n");
+    io.dec(sent);
+    io.out(" packets transmitted, ");
+    io.dec(got);
+    io.out(" received, ");
+    io.dec((sent - got) * 100 / sent);
+    io.out("% packet loss\n");
+    if (got == 0) { ret 1; }
+    ret 0;
+}

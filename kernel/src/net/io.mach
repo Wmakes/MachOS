@@ -1,0 +1,70 @@
+# sending and receiving through a socket, for the system calls and for
+# read/write on a socket's handle. a receive waits (polling the card each
+# tick) until a datagram is there, the socket's timeout passes, or a signal
+# comes
+
+use abi:    sdk.abi;
+use net:    machos.net.net;
+use socket: machos.net.socket;
+use proc:   machos.kern.proc;
+use mem:    machos.kern.mem;
+use apic:   machos.arch.x86_64.apic;
+
+fun e(code: u64) u64 { ret abi.err(code); }
+
+# give s a local port (or echo id) if it has none yet; 0 or an error
+pub fun autobind(s: *socket.Sock) u64 {
+    if (s.port != 0) { ret 0; }
+    val p: u16 = socket.free_port(s.kind);
+    if (p == 0) { ret e(abi.E_AGAIN); }
+    s.port = p;
+    ret 0;
+}
+
+# send len bytes to ip:port (ip 0: the connected peer); bytes sent or an error
+pub fun send(s: *socket.Sock, buf: *u8, len: u64, ip: u32, port: u16) u64 {
+    val i: *net.Iface = net.iface();
+    if (i.present == 0) { ret e(abi.E_NETUNREACH); }
+    var dst: u32 = ip;
+    var dport: u16 = port;
+    if (dst == 0) {
+        if (s.connected == 0) { ret e(abi.E_NOTCONN); }
+        dst = s.peer_ip;
+        dport = s.peer_port;
+    }
+    if (dst == net.BROADCAST && s.broadcast == 0) { ret e(abi.E_ACCES); }
+    if (i.up == 0 && dst != net.BROADCAST) { ret e(abi.E_NETUNREACH); }
+    val b: u64 = autobind(s);
+    if (abi.is_err(b) != 0) { ret b; }
+    net.poll();
+    var ok: u8 = 0;
+    if (s.kind == socket.ICMP) {
+        ok = net.icmp_send(s, dst, buf, len);
+    } or {
+        if (len > 1472) { ret e(abi.E_2BIG); }
+        ok = net.udp_send(i.ip, s.port, dst, dport, buf, len);
+    }
+    if (ok == 0) { ret e(abi.E_NETUNREACH); }
+    ret len;
+}
+
+# the next datagram into buf (cut at len); its whole length or an error.
+# *ip and *port get where it came from
+pub fun recv(s: *socket.Sock, buf: *u8, len: u64, ip: *u32, port: *u16) u64 {
+    val start: u64 = proc.uptime_ticks();
+    for {
+        net.poll();
+        if (s.count > 0) { brk; }
+        if (s.timeout != 0 && (proc.uptime_ticks() - start) * 1000 >= s.timeout * apic.HZ) { ret e(abi.E_AGAIN); }
+        if (proc.interrupted(proc.current()) != 0) { ret e(abi.E_INTR); }
+        proc.sleep_ticks(1);
+    }
+    val d: *socket.Datagram = socket.peek(s);
+    var n: u64 = d.len;
+    if (n > len) { n = len; }
+    mem.copy(buf::u64, (?d.data[0])::u64, n);
+    @ip = d.ip;
+    @port = d.port;
+    socket.take_done(s);
+    ret n;
+}

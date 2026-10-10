@@ -1,0 +1,192 @@
+# DHCP (RFC 2131): asking the network for an address. DISCOVER is
+# broadcast, the first OFFER is taken with a REQUEST, and the ACK configures
+# the interface; halfway through the lease it is asked for again. it runs
+# from the timer tick on a kernel socket of its own (UDP port 68)
+
+use net:    machos.net.net;
+use socket: machos.net.socket;
+use proc:   machos.kern.proc;
+use apic:   machos.arch.x86_64.apic;
+use cpu:    machos.arch.x86_64.cpu;
+use mem:    machos.kern.mem;
+
+val OFF:      u64 = 0;
+val DISCOVER: u64 = 1; # waiting for an offer
+val REQUEST:  u64 = 2; # waiting for the ack
+val BOUND:    u64 = 3;
+
+var state: u64 = OFF;
+var sock: *socket.Sock = nil;
+var xid: u32 = 0;
+var next_at: u64 = 0;   # tick of the next (re)send
+var wait: u64 = 0;      # seconds before asking again
+var offered: u32 = 0;
+var server: u32 = 0;
+var bound_at: u64 = 0;
+var lease: u64 = 0;
+
+var msg: [548]u8;
+
+fun begin(kind: u8, ciaddr: u32) u64 {
+    mem.fill((?msg[0])::u64, 0, 548);
+    msg[0] = 1;   # a request
+    msg[1] = 1;   # Ethernet
+    msg[2] = 6;
+    net.put32(?msg[4], xid);
+    net.put16(?msg[10], 0x8000); # answer by broadcast: there is no address yet
+    net.put32(?msg[12], ciaddr);
+    val i: *net.Iface = net.iface();
+    mem.copy((?msg[28])::u64, (?i.mac[0])::u64, 6);
+    net.put32(?msg[236], 0x63825363);
+    msg[240] = 53;
+    msg[241] = 1;
+    msg[242] = kind;
+    # the options wanted: mask, router, dns, lease
+    msg[243] = 55;
+    msg[244] = 4;
+    msg[245] = 1;
+    msg[246] = 3;
+    msg[247] = 6;
+    msg[248] = 51;
+    ret 249;
+}
+
+fun send(n: u64, dst: u32) {
+    msg[n] = 255;
+    var len: u64 = n + 1;
+    if (len < 300) { len = 300; }
+    net.udp_send(0, 68, dst, 67, ?msg[0], len);
+}
+
+fun discover() {
+    xid = (cpu.rdtsc() & 0xFFFFFFFF)::u32;
+    state = DISCOVER;
+    send(begin(1, 0), net.BROADCAST);
+}
+
+fun request(renew: u8) {
+    var ciaddr: u32 = 0;
+    if (renew != 0) { ciaddr = net.iface().ip; }
+    var n: u64 = begin(3, ciaddr);
+    if (renew == 0) {
+        msg[n] = 50;
+        msg[n + 1] = 4;
+        net.put32(?msg[n + 2], offered);
+        msg[n + 6] = 54;
+        msg[n + 7] = 4;
+        net.put32(?msg[n + 8], server);
+        n = n + 12;
+    }
+    state = REQUEST;
+    send(n, net.BROADCAST);
+}
+
+rec Reply {
+    kind:   u8;
+    yiaddr: u32;
+    mask:   u32;
+    router: u32;
+    dns:    u32;
+    lease:  u64;
+    server: u32;
+}
+
+fun parse(p: *u8, n: u64, r: *Reply) u8 {
+    if (n < 240 || p[0] != 2 || net.get32(?p[4]) != xid || net.get32(?p[236]) != 0x63825363) { ret 0; }
+    r.kind = 0;
+    r.yiaddr = net.get32(?p[16]);
+    r.mask = 0xFFFFFF00;
+    r.router = 0;
+    r.dns = 0;
+    r.lease = 86400;
+    r.server = 0;
+    var i: u64 = 240;
+    for (i < n) {
+        val code: u8 = p[i];
+        if (code == 255) { brk; }
+        if (code == 0) {
+            i = i + 1;
+            cnt;
+        }
+        if (i + 1 >= n) { brk; }
+        val len: u64 = p[i + 1]::u64;
+        val v: *u8 = ?p[i + 2];
+        if (i + 2 + len > n) { brk; }
+        if (code == 53 && len >= 1) { r.kind = v[0]; }
+        or (code == 1 && len >= 4) { r.mask = net.get32(v); }
+        or (code == 3 && len >= 4) { r.router = net.get32(v); }
+        or (code == 6 && len >= 4) { r.dns = net.get32(v); }
+        or (code == 51 && len >= 4) { r.lease = net.get32(v)::u64; }
+        or (code == 54 && len >= 4) { r.server = net.get32(v); }
+        i = i + 2 + len;
+    }
+    ret (r.kind != 0)::u8;
+}
+
+fun later(seconds: u64) { next_at = proc.uptime_ticks() + seconds * apic.HZ; }
+
+# start asking (at boot, or when /proc/net/config says "dhcp")
+pub fun start() {
+    if (net.iface().present == 0) { ret; }
+    if (sock == nil) {
+        sock = socket.alloc(socket.UDP);
+        if (sock == nil) { ret; }
+        sock.port = 68;
+        sock.broadcast = 1;
+    }
+    wait = 1;
+    discover();
+    later(wait);
+}
+
+# stop asking (the address is set by hand, or the network is off)
+pub fun stop() { state = OFF; }
+
+pub fun active() u8 { ret (state != OFF)::u8; }
+
+# every timer tick: answers, and what is due
+pub fun tick() {
+    if (state == OFF || sock == nil) { ret; }
+    for (sock.count > 0) {
+        val d: *socket.Datagram = socket.peek(sock);
+        var r: Reply;
+        if (parse(?d.data[0], d.len, ?r) != 0) {
+            if (state == DISCOVER && r.kind == 2) { # an offer
+                offered = r.yiaddr;
+                server = r.server;
+                request(0);
+                wait = 1;
+                later(wait);
+            } or (state == REQUEST && r.kind == 5) { # ack
+                if (r.server != 0) { server = r.server; }
+                lease = r.lease;
+                bound_at = proc.uptime_ticks();
+                state = BOUND;
+                net.configure(r.yiaddr, r.mask, r.router, r.dns, 1, r.lease);
+                later(r.lease / 2);
+            } or (state == REQUEST && r.kind == 6) { # nak: from the start
+                net.configure(0, 0, 0, 0, 0, 0);
+                wait = 1;
+                discover();
+                later(wait);
+            }
+        }
+        socket.take_done(sock);
+    }
+    if (proc.uptime_ticks() < next_at) { ret; }
+    if (state == BOUND) { # halfway through: renew
+        request(1);
+        wait = 4;
+        later(wait);
+        ret;
+    }
+    if (state == REQUEST && net.iface().up != 0 && proc.uptime_ticks() - bound_at > lease * apic.HZ) {
+        net.configure(0, 0, 0, 0, 0, 0); # the lease ran out
+    }
+    # no answer: ask again, waiting longer each time (up to a minute)
+    if (wait < 64) { wait = wait * 2; }
+    if (state == REQUEST && net.iface().up == 0) { discover(); }
+    or (state == REQUEST) { request(1); }
+    or { discover(); }
+    later(wait);
+}

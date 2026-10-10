@@ -6,7 +6,8 @@
 # from /etc/machos.conf: hostname, ttys (how many terminals get a login
 # prompt), autologin (a user logged in on tty1 without a password), and
 # rtc (utc, or local when the hardware clock keeps local time, as Windows
-# does: the time zone's offset is handed to the kernel)
+# does: the time zone's offset is handed to the kernel) and network (dhcp,
+# off, or a fixed "IP/PREFIX GATEWAY DNS")
 
 use std.runtime;
 use os:   std.system.os;
@@ -95,6 +96,8 @@ fun configure() {
     ttys = clamp(conf.number("ttys", 6), 1, TTYS);
     conf.get("autologin", ?autologin[0], 32);
     if (conf.get("rtc", ?v[0], 64) > 0 && io.streq(?v[0], "local") != 0) { rtc_local(); }
+    # the network: dhcp (the kernel already asks), off, or "IP/PREFIX GATEWAY DNS"
+    if (conf.get("network", ?v[0], 64) > 0 && io.streq(?v[0], "dhcp") == 0) { tell("/proc/net/config", ?v[0]); }
 }
 
 # v as decimal text, with a minus when it is negative, into out (24 bytes)

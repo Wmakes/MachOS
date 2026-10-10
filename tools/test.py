@@ -57,6 +57,28 @@ def with_stdtest():
     sh(f"tools/put.sh examples/stdtest/out/machos/{p}/stdtest /bin/stdtest {disk()}")
 
 
+UDP_ECHO = []
+
+
+def udp_echo():
+    """a fresh dev disk, and a UDP echo server on the host's port 7777 (QEMU
+    passes 10.0.2.2 to the host): it answers "echo: " and what it got"""
+    import socket as pysocket
+    sh(f"tools/mkimage.sh {PROFILE[0]} --fresh")
+    if UDP_ECHO:
+        return
+    srv = pysocket.socket(pysocket.AF_INET, pysocket.SOCK_DGRAM)
+    srv.setsockopt(pysocket.SOL_SOCKET, pysocket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 7777))
+    UDP_ECHO.append(srv)
+
+    def serve():
+        while True:
+            data, peer = srv.recvfrom(2048)
+            srv.sendto(b"echo: " + data, peer)
+    threading.Thread(target=serve, daemon=True).start()
+
+
 def make_broken():
     """a copy of a fresh dev disk with three faults put in by debugfs"""
     sh("tools/mkimage.sh --fresh")
@@ -391,6 +413,25 @@ TESTS = [
      ["--nologin", "wait:" + P, "send:uname -n; date; cat /proc/sys/kernel/rtc_offset; ps | grep -c login\\n",
       "wait:" + P],
      ["testbox", "CE", "00", "1"]),
+
+    ("network", False, False,
+     ["--prep", udp_echo, "--boot", disk,
+      "wait:" + P, "send:ip; cat /proc/net/resolv.conf; ping -c 2 10.0.2.2\\n", "wait:packet loss", "wait:" + P,
+      "send:host localhost; echo hello | nc -u -w 1 10.0.2.2 7777; ip stats; ip neigh\\n", "wait:" + P],
+     ["address 10.0.2.15/24", "gateway 10.0.2.2", "dns 10.0.2.3", "method dhcp", "nameserver 10.0.2.3",
+      "64 bytes from 10.0.2.2: icmp_seq=0", "64 bytes from 10.0.2.2: icmp_seq=1", "0% packet loss",
+      "localhost has address 127.0.0.1", "echo: hello", "eth0", "10.0.2.2 52:55:0a:00:02:02"]),
+
+    ("net-config", False, False,
+     ["wait:" + P, "send:ip set 10.0.2.50/24 10.0.2.2 10.0.2.3; ip; ping -c 1 10.0.2.2\\n", "wait:packet loss",
+      "wait:" + P, "send:ip off; ip; ip dhcp; sleep 2; ip\\n", "wait:" + P],
+     ["address 10.0.2.50/24", "method static", "64 bytes from 10.0.2.2", "0% packet loss",
+      "address 0.0.0.0/0", "method off", "address 10.0.2.15/24", "method dhcp"]),
+
+    # needs the internet (QEMU's DNS asks the host's resolver)
+    ("dns", False, False,
+     ["wait:" + P, "send:host example.com\\n", "wait:" + P],
+     ["example.com has address"]),
 
     ("environment", False, False,
      ["wait:" + P,
