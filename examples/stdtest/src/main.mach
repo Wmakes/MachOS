@@ -17,8 +17,26 @@ use io_error: std.io.error;
 use env:      std.process.env;
 use time:     std.chrono.time;
 use rand:     std.crypto.rand;
+use thread:   std.sync.thread;
+use mutex:    std.sync.mutex;
+use cond:     std.sync.condition;
+use dur:      std.chrono.duration;
 
 var failures: u64 = 0;
+
+# threads: each adds to the counter under the lock
+var counter: u64 = 0;
+var lock: mutex.Mutex = 0;
+
+fun worker(arg: *u8) {
+    var i: u64 = 0;
+    for (i < 10000) {
+        mutex.lock(?lock);
+        counter = counter + 1;
+        mutex.unlock(?lock);
+        i = i + 1;
+    }
+}
 
 fun check(name: str, good: bool) {
     if (good) { print.printlnf("ok {}", name); }
@@ -106,6 +124,42 @@ fun main(argc: i64, argv: **u8) i64 {
     val f1: err[io_error.Error] = rand.fill(?r1[0], 16);
     val f2: err[io_error.Error] = rand.fill(?r2[0], 16);
     check("random", sel f1.ok && sel f2.ok && !same(?r1[0], ?r2[0], 16));
+
+    var ts: [4]thread.Thread;
+    var started: bool = true;
+    var k: u64 = 0;
+    for (k < 4) {
+        val op: thread.Operation = thread.spawn_with(worker, nil, ?ts[k]);
+        if (sel op.err) { started = false; }
+        k = k + 1;
+    }
+    check("thread_spawn", started);
+    var joined: bool = true;
+    k = 0;
+    for (k < 4) {
+        val op: thread.Operation = thread.join(?ts[k]);
+        if (sel op.err) { joined = false; }
+        k = k + 1;
+    }
+    check("thread_join", joined);
+    check("mutex", counter == 40000);
+
+    # a condition nobody signals: the wait ends at its deadline
+    var c: cond.Condition = cond.make();
+    var m: mutex.Mutex = mutex.make();
+    val t0: time.InstantClock = time.instant();
+    var timed: bool = false;
+    if (sel t0.ok) {
+        mutex.lock(?m);
+        val st: cond.WaitStatus = cond.wait_until(?c, ?m, time.instant_add(t0.ok, 200 * dur.MILLISECOND));
+        mutex.unlock(?m);
+        val t1: time.InstantClock = time.instant();
+        if (sel t1.ok) {
+            val waited: i64 = (t1.ok.sec - t0.ok.sec) * 1000 + (t1.ok.nsec - t0.ok.nsec) / 1000000;
+            timed = waited >= 150 && waited < 2000;
+        }
+    }
+    check("timed_wait", timed);
 
     print.printlnf("stdtest: {} failures", failures);
     ret failures::i64;

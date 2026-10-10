@@ -1,6 +1,15 @@
-# processes and the scheduler. one cpu, and the kernel runs with interrupts
-# off, so nothing here needs a lock: a process gives up the cpu only by
-# blocking, exiting, or being preempted on its way back to user mode.
+# processes, their threads, and the scheduler. the kernel runs with
+# interrupts off under the big lock, so nothing here needs a lock of its own:
+# a thread gives up the cpu only by blocking, exiting, or being preempted on
+# its way back to user mode.
+#
+# a process is a slot whose `leader` is nil; its threads are slots whose
+# leader is it. the process's slot holds what its threads share (address
+# space, mappings, handles, working directory, ids, signal handlers and
+# pending signals); every thread, the leader too, has its own kernel stack,
+# registers, state and FS base (where std keeps its per-thread block). the
+# threads of a process run on one cpu at a time, so a change to its page
+# tables never has to be flushed from other cpus.
 #
 # each process has its own kernel stack. switching processes means saving
 # callee-saved registers and rsp on one kernel stack and restoring them from
@@ -35,6 +44,7 @@ pub val CWD_MAX: u64 = 256;
 pub val CHAN_TTY:   u64 = 1;
 pub val CHAN_TIMER: u64 = 2;
 pub val CHAN_EVENTS: u64 = 3; # readers of /dev/events
+pub val CHAN_FUTEX:  u64 = 4; # threads in FUTEX_WAIT (Proc.futex: the word)
 
 pub rec Proc {
     pid:       u64;
@@ -74,6 +84,12 @@ pub rec Proc {
     cwd_len:   u64;
     name:      [32]u8;
     name_len:  u64;
+    leader:    *Proc;  # a thread: its process; nil: it is a process (its first thread)
+    fsbase:    u64;    # the FS base it runs with
+    clear_tid: u64;    # a thread: the word set to 0 (and woken) when it ends
+    futex:     u64;    # CHAN_FUTEX: the address it waits on
+    timed_out: u8;     # a timed wait ran out
+    on_cpu:    u64;    # a process: how many of its threads run now (0 or 1)
 }
 
 pub rec Region {
@@ -94,7 +110,19 @@ var ticks: u64 = 0;
 var sched_ksp: [16]u64;
 var running: [16]*Proc;
 
-pub fun current() *Proc { ret cur; }
+# the process of the running thread (what system calls act on)
+pub fun current() *Proc {
+    if (cur != nil && cur.leader != nil) { ret cur.leader; }
+    ret cur;
+}
+
+# the running thread itself
+pub fun current_thread() *Proc { ret cur; }
+
+pub fun process_of(t: *Proc) *Proc {
+    if (t.leader != nil) { ret t.leader; }
+    ret t;
+}
 
 # what cpu 0 does when it has nothing to run (main sets it: write dirty
 # disk blocks back). a hook, so the scheduler need not know the disks
@@ -114,7 +142,7 @@ pub fun account(c: u64) {
     all[c] = all[c] + 1;
     val p: *Proc = running[c];
     if (p != nil) {
-        p.cpu_ticks = p.cpu_ticks + 1;
+        process_of(p).cpu_ticks = process_of(p).cpu_ticks + 1;
         busy[c] = busy[c] + 1;
     }
 }
@@ -158,10 +186,11 @@ fun watch_memory() {
 }
 pub fun slot(i: u64) *Proc { ret ?table[i]; }
 
+# the process with this pid (threads are not processes)
 pub fun find(pid: u64) *Proc {
     var i: u64 = 0;
     for (i < MAX) {
-        if (table[i].state != FREE && table[i].pid == pid) { ret ?table[i]; }
+        if (table[i].state != FREE && table[i].leader == nil && table[i].pid == pid) { ret ?table[i]; }
         i = i + 1;
     }
     ret nil;
@@ -171,7 +200,19 @@ pub fun count() u64 {
     var n: u64 = 0;
     var i: u64 = 0;
     for (i < MAX) {
-        if (table[i].state != FREE) { n = n + 1; }
+        if (table[i].state != FREE && table[i].leader == nil) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# how many threads process p has (its first one included)
+pub fun thread_count(p: *Proc) u64 {
+    var n: u64 = 0;
+    var i: u64 = 0;
+    for (i < MAX) {
+        val t: *Proc = ?table[i];
+        if (t.state != FREE && t.state != ZOMBIE && (t == p || t.leader == p)) { n = n + 1; }
         i = i + 1;
     }
     ret n;
@@ -231,6 +272,91 @@ pub fun alloc() *Proc {
 }
 
 fun kstack_top(p: *Proc) u64 { ret p.kstack + KSTACK; }
+
+# a new thread of process p, not runnable until start(); nil when there is
+# no room. it gets a pid of its own (its thread id)
+pub fun alloc_thread(p: *Proc) *Proc {
+    var i: u64 = 0;
+    for (i < MAX) {
+        if (table[i].state == FREE) {
+            val t: *Proc = ?table[i];
+            mem.fill(t::u64, 0, $size_of(Proc)::u64);
+            t.kstack = heap.alloc(KSTACK);
+            if (t.kstack == 0) { ret nil; }
+            t.pml4 = p.pml4;
+            t.leader = p;
+            t.pid = next_pid;
+            next_pid = next_pid + 1;
+            t.name_len = p.name_len;
+            mem.copy((?t.name[0])::u64, (?p.name[0])::u64, p.name_len);
+            t.state = BLOCKED;
+            t.chan = 0xFFFFFFFFFFFFFFFF;
+            ret t;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# wait on the futex word at addr (the caller checked its value) for up to
+# `ticks_left` ticks (0: for ever); 0, 1 when it timed out
+pub fun futex_wait(addr: u64, ticks_left: u64) u8 {
+    cur.futex = addr;
+    cur.timed_out = 0;
+    cur.wake_at = 0;
+    if (ticks_left != 0) { cur.wake_at = ticks + ticks_left; }
+    sleep_on(CHAN_FUTEX);
+    cur.futex = 0;
+    ret cur.timed_out;
+}
+
+# wake up to n threads of process p waiting on addr; how many
+pub fun futex_wake(p: *Proc, addr: u64, n: u64) u64 {
+    var woke: u64 = 0;
+    var i: u64 = 0;
+    for (i < MAX && woke < n) {
+        val t: *Proc = ?table[i];
+        if (t.state == BLOCKED && t.chan == CHAN_FUTEX && t.futex == addr && process_of(t) == p) {
+            t.state = RUNNABLE;
+            woke = woke + 1;
+        }
+        i = i + 1;
+    }
+    if (woke != 0) { smp.kick(); }
+    ret woke;
+}
+
+# every other thread of the running thread's process ends now (exit, exec)
+pub fun end_other_threads() {
+    val p: *Proc = current();
+    var i: u64 = 0;
+    for (i < MAX) {
+        val t: *Proc = ?table[i];
+        if (t != cur && t.state != FREE && process_of(t) == p && t != p) {
+            # never running: its process runs on this cpu only
+            heap.free(t.kstack);
+            t.state = FREE;
+            t.pid = 0;
+        }
+        i = i + 1;
+    }
+}
+
+# the running thread ends (THREAD_EXIT). its clear_tid word is set to 0 and
+# whoever waits on it is woken; the process goes on. never returns
+pub fun thread_exit() {
+    val t: *Proc = cur;
+    val p: *Proc = current();
+    if (t == p) {
+        # the first thread cannot go before its process: it just stops
+        t.state = BLOCKED;
+        t.chan = 0xFFFFFFFFFFFFFFFF;
+        sched();
+    }
+    t.state = ZOMBIE; # reaped by the scheduler once it is off its stack
+    t.ppid = 0;
+    sched();
+}
 
 # make `p` runnable so that it enters user mode at `rip` with stack `rsp`
 # and rdi, rsi, rdx set. builds the frame isr_return expects, plus a
@@ -320,6 +446,9 @@ pub fun wakeup(chan: u64) {
     if (woke != 0) { smp.kick(); }
 }
 
+# a futex word the scheduler should clear and wake once thread t is gone
+pub fun cleared_on_exit(t: *Proc) u64 { ret t.clear_tid; }
+
 pub fun sleep_ticks(n: u64) {
     cur.wake_at = ticks + n;
     sleep_on(CHAN_TIMER);
@@ -333,6 +462,11 @@ pub fun tick() {
     for (i < MAX) {
         val p: *Proc = ?table[i];
         if (p.state == BLOCKED && p.chan == CHAN_TIMER && p.wake_at <= ticks) {
+            p.state = RUNNABLE;
+            smp.kick();
+        }
+        if (p.state == BLOCKED && p.chan == CHAN_FUTEX && p.wake_at != 0 && p.wake_at <= ticks) {
+            p.timed_out = 1;
             p.state = RUNNABLE;
             smp.kick();
         }
@@ -371,7 +505,15 @@ pub fun send(p: *Proc, sig: u64) {
         if (h == abi.SIG_DFL && default_ignored(sig) != 0) { ret; }
     }
     p.sig_pending = p.sig_pending | abi.sigbit(sig);
-    if (p.state == BLOCKED && interrupted(p) != 0) { p.state = RUNNABLE; }
+    # a blocked call of any of its threads gives up (E_INTR)
+    if (interrupted(p) != 0) {
+        var i: u64 = 0;
+        for (i < MAX) {
+            val t: *Proc = ?table[i];
+            if (t.state == BLOCKED && (t == p || t.leader == p) && t.chan != 0xFFFFFFFFFFFFFFFF) { t.state = RUNNABLE; }
+            i = i + 1;
+        }
+    }
 }
 
 # whether a signal waits that `p` will act on (so a blocking call should give up)
@@ -386,7 +528,7 @@ pub fun send_group(group: u64, sig: u64) u64 {
     var n: u64 = 0;
     var i: u64 = 0;
     for (i < MAX) {
-        if (table[i].group == group && table[i].state != FREE && table[i].state != ZOMBIE) {
+        if (table[i].leader == nil && table[i].group == group && table[i].state != FREE && table[i].state != ZOMBIE) {
             send(?table[i], sig);
             n = n + 1;
         }
@@ -419,7 +561,17 @@ pub fun reap(p: *Proc) {
 # called by the exiting process after it released its handles. drops the
 # address space, orphans its children, wakes its parent, never returns
 pub fun exit(code: u64) {
-    val p: *Proc = cur;
+    end_other_threads();
+    val p: *Proc = current();
+    val t: *Proc = cur;
+    p.on_cpu = 0;
+    if (t != p) {
+        # a thread ends the process: the process's slot becomes the zombie
+        # its parent waits for; this thread's goes once it is off its stack
+        t.state = ZOMBIE;
+        t.ppid = 0;
+        t.leader = nil;
+    }
     cpu.set_cr3(vmm.kernel_space());
     vmm.free_space(p.pml4);
     p.pml4 = 0;
@@ -454,7 +606,8 @@ pub fun scheduler(me: u64) {
         var n: u64 = 0;
         for (n < MAX && picked == nil) {
             last = (last + 1) % MAX;
-            if (table[last].state == RUNNABLE) { picked = ?table[last]; }
+            # one thread of a process at a time: its siblings wait their turn
+            if (table[last].state == RUNNABLE && process_of(?table[last]).on_cpu == 0) { picked = ?table[last]; }
             n = n + 1;
         }
         if (picked == nil) {
@@ -471,6 +624,9 @@ pub fun scheduler(me: u64) {
         cur = picked;
         running[me] = picked;
         picked.state = RUNNING;
+        val owner: *Proc = process_of(picked);
+        owner.on_cpu = 1;
+        cpu.wrmsr(0xC0000100, picked.fsbase); # FS base: the thread's own block
         gdt.set_rsp0(me, kstack_top(picked));
         syscall.set_kstack(me, kstack_top(picked));
         cpu.set_cr3(picked.pml4);
@@ -480,6 +636,7 @@ pub fun scheduler(me: u64) {
         cpu.set_cr3(vmm.kernel_space());
         running[me] = nil;
         cur = nil;
+        owner.on_cpu = 0;
         if (picked.state == ZOMBIE && picked.ppid == 0) { reap(picked); }
     }
 }

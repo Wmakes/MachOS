@@ -83,7 +83,15 @@ pub val LISTEN:  u64 = 75; # (fd, backlog)                     a stream socket w
 pub val ACCEPT:  u64 = 76; # (fd, *sockaddr_in or 0)           -> the next connection's fd
 pub val SHUTDOWN: u64 = 77; # (fd, SHUT_*)                     SHUT_WR / SHUT_RDWR: no more to send
 pub val GETPEERNAME: u64 = 78; # (fd, *sockaddr_in)            the other end of a connection
-pub val COUNT:   u64 = 79;
+pub val THREAD_SPAWN: u64 = 79; # (rip, rsp, arg, fsbase, *u64 tid_word) -> tid; it starts at rip
+                                # with rdi = arg on stack rsp; at its end *tid_word = 0 and is woken
+pub val THREAD_EXIT: u64 = 80;  # ()  this thread ends (EXIT ends every thread)
+pub val FUTEX_WAIT: u64 = 81;   # (*u64 word, expected, timeout ms or 0) sleep while *word == expected
+                                # -> 0, E_AGAIN (it was not), E_TIMEDOUT, E_INTR
+pub val FUTEX_WAKE: u64 = 82;   # (*u64 word, how many) -> how many were woken
+pub val SET_FSBASE: u64 = 83;   # (address)  this thread's FS base (thread-local storage)
+pub val GETTID:  u64 = 84;      # ()  -> this thread's id (the process's pid for its first thread)
+pub val COUNT:   u64 = 85;
 
 # sockets: IPv4 only; a sockaddr_in is 16 bytes: family (AF_INET, host
 # order), the port and the address (network order), 8 zero bytes

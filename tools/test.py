@@ -403,7 +403,8 @@ TESTS = [
       "wait:" + P, "send:stdtest one two\\n", "wait:failures", "wait:" + P],
      ["hello from mach std on MachOS", "ok args", "ok env", "ok write_bytes", "ok metadata", "ok read",
       "ok remove_file", "ok exists", "ok not_found", "ok create_dir", "ok is_dir", "ok remove_dir",
-      "ok clock", "ok monotonic", "ok random", "stdtest: 0 failures"]),
+      "ok clock", "ok monotonic", "ok random", "ok thread_spawn", "ok thread_join", "ok mutex", "ok timed_wait",
+      "stdtest: 0 failures"]),
 
     ("proc", False, False,
      ["wait:" + P, "send:cat /proc/version; head -2 /proc/meminfo; cat /proc/self/status; ls /proc/sys/kernel; cat /proc/stat\\n",

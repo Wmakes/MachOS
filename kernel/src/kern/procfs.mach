@@ -34,8 +34,9 @@
 #   /proc/PID/status, /proc/self/status
 #                                 Name, State, Pid, PPid, Pgid, Sid, Uid and
 #                                 Gid (real, then effective),
-#                                 Pages (4 KiB pages mapped), Ticks (timer
-#                                 ticks it ran)
+#                                 Threads, a Thread line (id and state) for
+#                                 each, Pages (4 KiB pages mapped), Ticks
+#                                 (timer ticks it ran)
 
 use events: machos.kern.events;
 use abi:     sdk.abi;
@@ -178,6 +179,23 @@ fun status(o: *Out, p: *proc.Proc) {
     putc(o, 9);
     dec(o, p.egid);
     putc(o, 10);
+    field(o, "Threads:\0", proc.thread_count(p));
+    var ti: u64 = 0;
+    for (ti < proc.MAX) {
+        val t: *proc.Proc = proc.slot(ti);
+        if (t.state != proc.FREE && (t == p || t.leader == p)) {
+            puts(o, "Thread:\t\0");
+            dec(o, t.pid);
+            putc(o, 32);
+            puts(o, state_name(t.state));
+            if (t.state == proc.BLOCKED) {
+                puts(o, " chan \0");
+                dec(o, t.chan);
+            }
+            putc(o, 10);
+        }
+        ti = ti + 1;
+    }
     field(o, "Pages:\0", p.pages);
     field(o, "Ticks:\0", p.cpu_ticks);
 }
@@ -609,7 +627,7 @@ fun refresh(d: *vfs.Node) {
     var i: u64 = 0;
     for (i < proc.MAX) {
         val p: *proc.Proc = proc.slot(i);
-        if (p.state != proc.FREE) {
+        if (p.state != proc.FREE && p.leader == nil) {
             var have: u8 = 0;
             c = d.child;
             for (c != nil && have == 0) {

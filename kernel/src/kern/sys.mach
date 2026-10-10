@@ -373,6 +373,7 @@ fun sys_fork() u64 {
         c.fdflags[i] = p.fdflags[i];
         i = i + 1;
     }
+    c.fsbase = proc.current_thread().fsbase;
     proc.start_copy(c, frame);
     ret c.pid;
 }
@@ -407,6 +408,8 @@ fun setid(p: *proc.Proc, nd: *vfs.Node) {
 }
 
 fun sys_execve(pva: u64, plen: u64, ava: u64, alen: u64, eva: u64) u64 {
+    # only the first thread may: the program replaced is the process's
+    if (proc.current_thread() != cur()) { ret e(abi.E_BUSY); }
     var full: [256]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
@@ -466,6 +469,10 @@ fun sys_execve(pva: u64, plen: u64, ava: u64, alen: u64, eva: u64) u64 {
         vmm.free_space(fresh);
         ret r;
     }
+    # the other threads ran in the old program: they end with it
+    proc.end_other_threads();
+    proc.current_thread().fsbase = 0;
+    cpu.wrmsr(0xC0000100, 0);
     cpu.set_cr3(fresh);
     vmm.free_space(old);
     set_name(p, ?full[0], n);
@@ -808,7 +815,7 @@ fun sys_procs(idx: u64, out: u64) u64 {
     var i: u64 = 0;
     for (i < proc.MAX) {
         val p: *proc.Proc = proc.slot(i);
-        if (p.state != proc.FREE) {
+        if (p.state != proc.FREE && p.leader == nil) {
             if (seen == idx) {
                 val pi: *abi.ProcInfo = out::*abi.ProcInfo;
                 pi.pid = p.pid;
@@ -855,7 +862,7 @@ fun sys_kill(pid: u64, sig: u64) u64 {
     var i: u64 = 0;
     for (i < proc.MAX) {
         val p: *proc.Proc = proc.slot(i);
-        if (p.state != proc.FREE && p.state != proc.ZOMBIE && p.pid != 1) {
+        if (p.state != proc.FREE && p.state != proc.ZOMBIE && p.pid != 1 && p.leader == nil) {
             if (((group == 1 && p != me) || (group != 1 && p.group == group)) && may_signal(me, p) != 0) {
                 found = found + 1;
                 if (sig != 0) { proc.send(p, sig); }
@@ -1354,6 +1361,43 @@ fun sys_getsockname(h: u64, va: u64) u64 {
     ret 0;
 }
 
+# --- threads ------------------------------------------------------------------
+
+fun sys_thread_spawn(rip: u64, rsp: u64, arg: u64, fsbase: u64, tid_word: u64) u64 {
+    if (rip >= 0x800000000000 || rsp >= 0x800000000000 || fsbase >= 0x800000000000) { ret e(abi.E_INVAL); }
+    if (tid_word != 0 && ok(tid_word, 8, 1) == 0) { ret e(abi.E_FAULT); }
+    val p: *proc.Proc = cur();
+    val t: *proc.Proc = proc.alloc_thread(p);
+    if (t == nil) { ret e(abi.E_AGAIN); }
+    t.fsbase = fsbase;
+    t.clear_tid = tid_word;
+    proc.start(t, rip, rsp, arg, 0, 0);
+    ret t.pid;
+}
+
+fun sys_thread_exit() u64 {
+    val t: *proc.Proc = proc.current_thread();
+    if (t.clear_tid != 0 && ok(t.clear_tid, 8, 1) != 0) {
+        @(t.clear_tid::*u64) = 0;
+        proc.futex_wake(cur(), t.clear_tid, 0xFFFFFFFF);
+    }
+    proc.thread_exit();
+    ret 0;
+}
+
+fun sys_futex_wait(addr: u64, expected: u64, ms: u64) u64 {
+    if ((addr & 7) != 0 || ok(addr, 8, 0) == 0) { ret e(abi.E_FAULT); }
+    if (@(addr::*u64) != expected) { ret e(abi.E_AGAIN); }
+    var t: u64 = 0;
+    if (ms != 0) {
+        t = (ms * apic.HZ + 999) / 1000;
+        if (t == 0) { t = 1; }
+    }
+    if (proc.futex_wait(addr, t) != 0) { ret e(abi.E_TIMEDOUT); }
+    if (proc.interrupted(cur()) != 0) { ret e(abi.E_INTR); }
+    ret 0;
+}
+
 fun sys_dup2(h: u64, to: u64) u64 {
     val f: *file.Handle = handle(h);
     if (f == nil || to >= abi.MAX_HANDLES) { ret e(abi.E_BADF); }
@@ -1549,6 +1593,20 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.ACCEPT)  { ret sys_accept(a, b); }
     if (n == abi.SHUTDOWN) { ret sys_shutdown(a, b); }
     if (n == abi.GETPEERNAME) { ret sys_getpeername(a, b); }
+    if (n == abi.THREAD_SPAWN) { ret sys_thread_spawn(a, b, c, d, f5); }
+    if (n == abi.THREAD_EXIT) { ret sys_thread_exit(); }
+    if (n == abi.FUTEX_WAIT) { ret sys_futex_wait(a, b, c); }
+    if (n == abi.FUTEX_WAKE) {
+        if ((a & 7) != 0) { ret e(abi.E_FAULT); }
+        ret proc.futex_wake(cur(), a, b);
+    }
+    if (n == abi.SET_FSBASE) {
+        if (a >= 0x800000000000) { ret e(abi.E_INVAL); }
+        proc.current_thread().fsbase = a;
+        cpu.wrmsr(0xC0000100, a);
+        ret 0;
+    }
+    if (n == abi.GETTID)  { ret proc.current_thread().pid; }
     if (n == abi.MOUNT)   { ret sys_mount(a, b, c, d); }
     if (n == abi.UMOUNT)  { ret sys_umount(a, b); }
     if (n == abi.UNAME)   { ret sys_uname(a); }
