@@ -1,0 +1,169 @@
+# readiness queues (QUEUE_CREATE, QUEUE_CTL, QUEUE_WAIT, QUEUE_WAKE): a
+# program registers handles with what it wants to do on them (read, write)
+# and a context of its own, and a wait returns the contexts of those that are
+# ready, as epoll does with EPOLLONESHOT: a registration that fired waits for
+# QUEUE_MOD before it fires again. errors and hangups are always reported.
+# QUEUE_WAKE makes a wait return an EV_WAKE event (context 0) at once.
+#
+# a registration keeps the fd and the handle it named; when the fd no longer
+# names that handle (it was closed, or reused) the registration is dropped
+
+use abi:    sdk.abi;
+use file:   machos.fs.file;
+use vfs:    machos.fs.vfs;
+use pipe:   machos.kern.pipe;
+use tty:    machos.kern.tty;
+use events: machos.kern.events;
+use proc:   machos.kern.proc;
+use heap:   machos.mm.heap;
+use mem:    machos.kern.mem;
+use netio:  machos.net.io;
+use net:    machos.net.net;
+use apic:   machos.arch.x86_64.apic;
+
+val ENTRIES: u64 = 128;
+
+rec Entry {
+    used:    u8;
+    armed:   u8;
+    fd:      u64;
+    h:       u64;   # the handle fd named when it was registered
+    context: u64;
+    want:    u64;   # EV_READ | EV_WRITE
+}
+
+pub rec Queue {
+    wake:    u8;
+    entries: [128]Entry;
+}
+
+fun e(code: u64) u64 { ret abi.err(code); }
+
+pub fun create() *Queue {
+    ret heap.zalloc($size_of(Queue)::u64)::*Queue;
+}
+
+# what handle h is ready for now (abi.EV_*)
+fun readiness(h: *file.Handle) u64 {
+    if (h.kind == file.SOCK) { ret netio.readiness(h.sock); }
+    if (h.kind == file.PIPE_R) {
+        var ev: u64 = 0;
+        if (h.pipe.count > 0) { ev = ev | abi.EV_READ; }
+        if (h.pipe.writers == 0) { ev = ev | abi.EV_READ | abi.EV_HANGUP; }
+        ret ev;
+    }
+    if (h.kind == file.PIPE_W) {
+        if (h.pipe.readers == 0) { ret abi.EV_WRITE | abi.EV_ERROR | abi.EV_HANGUP; }
+        if (h.pipe.count < pipe.capacity()) { ret abi.EV_WRITE; }
+        ret 0;
+    }
+    if (h.kind == file.NODE && h.node.kind == abi.KIND_DEV) {
+        val t: u64 = vfs.tty_of(h.node.dev);
+        if (t != 0xFF) {
+            if (tty.readable(t) != 0) { ret abi.EV_READ | abi.EV_WRITE; }
+            ret abi.EV_WRITE;
+        }
+        if (h.node.dev == vfs.DEV_EVENTS) {
+            if (events.pending(h.offset) != 0) { ret abi.EV_READ; }
+            ret 0;
+        }
+    }
+    ret abi.EV_READ | abi.EV_WRITE; # files are always ready
+}
+
+fun find(q: *Queue, fd: u64) *Entry {
+    var i: u64 = 0;
+    for (i < ENTRIES) {
+        if (q.entries[i].used != 0 && q.entries[i].fd == fd) { ret ?q.entries[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# QUEUE_CTL: h is what fd names now
+pub fun control(q: *Queue, op: u64, fd: u64, h: *file.Handle, want: u64, context: u64) u64 {
+    var x: *Entry = find(q, fd);
+    if (x != nil && x.h != h::u64) { # a stale registration of an earlier handle
+        x.used = 0;
+        x = nil;
+    }
+    if (op == abi.QUEUE_DEL) {
+        if (x != nil) { x.used = 0; }
+        ret 0;
+    }
+    if ((want & (abi.EV_READ | abi.EV_WRITE)) == 0 || context == 0) { ret e(abi.E_INVAL); }
+    if (op == abi.QUEUE_ADD) {
+        if (x != nil) { ret e(abi.E_EXIST); }
+        var i: u64 = 0;
+        for (i < ENTRIES) {
+            if (q.entries[i].used == 0) {
+                x = ?q.entries[i];
+                brk;
+            }
+            i = i + 1;
+        }
+        if (x == nil) { ret e(abi.E_NOSPC); }
+        x.used = 1;
+        x.fd = fd;
+        x.h = h::u64;
+    } or (op == abi.QUEUE_MOD) {
+        if (x == nil) { ret e(abi.E_NOENT); }
+    } or {
+        ret e(abi.E_INVAL);
+    }
+    x.want = want;
+    x.context = context;
+    x.armed = 1;
+    ret 0;
+}
+
+# collect what is ready into out (max records); how many
+fun collect(q: *Queue, out: *abi.QueueEvent, max: u64, handles: *[64]u64) u64 {
+    var n: u64 = 0;
+    if (q.wake != 0 && n < max) {
+        q.wake = 0;
+        out[n].context = 0;
+        out[n].events = abi.EV_WAKE::u32;
+        out[n].pad = 0;
+        n = n + 1;
+    }
+    var i: u64 = 0;
+    for (i < ENTRIES && n < max) {
+        val x: *Entry = ?q.entries[i];
+        if (x.used != 0 && x.armed != 0) {
+            if (x.fd >= 64 || (@handles)[x.fd] != x.h) {
+                x.used = 0; # its fd was closed or reused
+            } or {
+                val ready: u64 = readiness(x.h::*file.Handle);
+                val got: u64 = ready & (x.want | abi.EV_ERROR | abi.EV_HANGUP);
+                if (got != 0) {
+                    out[n].context = x.context;
+                    out[n].events = got::u32;
+                    out[n].pad = 0;
+                    n = n + 1;
+                    x.armed = 0; # one shot
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# QUEUE_WAIT: up to max events into out, waiting at most `ms` milliseconds
+# (0xFFFFFFFF: for ever, 0: not at all); how many, or an error
+pub fun wait(q: *Queue, out: *abi.QueueEvent, max: u64, ms: u64, handles: *[64]u64) u64 {
+    val start: u64 = proc.uptime_ticks();
+    for {
+        net.poll();
+        val n: u64 = collect(q, out, max, handles);
+        if (n > 0) { ret n; }
+        if (ms == 0) { ret 0; }
+        if (ms != 0xFFFFFFFF && (proc.uptime_ticks() - start) * 1000 >= ms * apic.HZ) { ret 0; }
+        if (proc.interrupted(proc.current()) != 0) { ret e(abi.E_INTR); }
+        proc.sleep_ticks(1);
+    }
+    ret 0;
+}
+
+pub fun wake(q: *Queue) { q.wake = 1; }

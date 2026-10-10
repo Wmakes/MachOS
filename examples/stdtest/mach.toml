@@ -45,3 +45,13 @@ need = []
 [dep.std]
 git = "git@github.com:Wmakes/machos-std.git"
 ref = "branch/machos"
+
+# runs a mach test dispatcher (mach test -o) once per test index, each in its
+# own process with a time limit: std's own tests on MachOS
+[artifact.runtests]
+kind = "bin"
+entry = "runtests.mach"
+out = "runtests"
+targets = ["machos"]
+link = []
+need = []

@@ -21,12 +21,14 @@ pub val NODE:   u64 = 1;
 pub val PIPE_R: u64 = 2;
 pub val PIPE_W: u64 = 3;
 pub val SOCK:   u64 = 4;
+pub val QUEUE:  u64 = 5;  # a readiness queue (kern/queue.mach; queue: its record)
 
 pub rec Handle {
     kind:   u64;
     node:   *vfs.Node;
     pipe:   *pipe.Pipe;
     sock:   *socket.Sock;
+    queue:  u64;
     offset: u64;
     flags:  u64; # abi.O_*
     refs:   u64;
@@ -49,6 +51,15 @@ pub fun open_node(nd: *vfs.Node, flags: u64) *Handle {
     # /dev/events: what happens from now on (the offset is the next event)
     if (nd.kind == abi.KIND_DEV && nd.dev == vfs.DEV_EVENTS) { h.offset = events.latest(); }
     nd.opens = nd.opens + 1;
+    ret h;
+}
+
+# a handle on readiness queue q (a heap record)
+pub fun open_queue(q: u64) *Handle {
+    val h: *Handle = new(QUEUE);
+    if (h == nil) { ret nil; }
+    h.queue = q;
+    h.flags = abi.O_READ;
     ret h;
 }
 
@@ -96,6 +107,7 @@ pub fun close(h: *Handle) {
         vfs.release(h.node);
     }
     or (h.kind == PIPE_R) { pipe.close_reader(h.pipe); }
+    or (h.kind == QUEUE) { heap.free(h.queue); }
     or (h.kind == SOCK) {
         if (h.sock.refs <= 1) { netio.close(h.sock); }
         socket.release(h.sock);
@@ -163,7 +175,7 @@ fun console_read(t: u64, buf: u64, n: u64) u64 {
 # `buf` must already be checked to be writable user memory
 pub fun read(h: *Handle, buf: u64, n: u64) u64 {
     if ((h.flags & abi.O_READ) == 0) { ret abi.err(abi.E_BADF); }
-    if (h.kind == PIPE_R) { ret pipe.read(h.pipe, buf, n); }
+    if (h.kind == PIPE_R) { ret pipe.read(h.pipe, buf, n, ((h.flags & abi.O_NONBLOCK) != 0)::u8); }
     if (h.kind == SOCK) {
         var ip: u32 = 0;
         var port: u16 = 0;
@@ -173,7 +185,10 @@ pub fun read(h: *Handle, buf: u64, n: u64) u64 {
     val nd: *vfs.Node = h.node;
     if (nd.kind == abi.KIND_DIR) { ret abi.err(abi.E_ISDIR); }
     if (nd.kind == abi.KIND_DEV) {
-        if (vfs.tty_of(nd.dev) != 0xFF) { ret console_read(vfs.tty_of(nd.dev), buf, n); }
+        if (vfs.tty_of(nd.dev) != 0xFF) {
+            if ((h.flags & abi.O_NONBLOCK) != 0 && tty.readable(vfs.tty_of(nd.dev)) == 0) { ret abi.err(abi.E_AGAIN); }
+            ret console_read(vfs.tty_of(nd.dev), buf, n);
+        }
         if (nd.dev >= vfs.DEV_DISK) { ret disk_io(h, buf, n, 0); }
         if (nd.dev == vfs.DEV_EVENTS) {
             for (events.pending(h.offset) == 0) {
@@ -195,7 +210,7 @@ pub fun read(h: *Handle, buf: u64, n: u64) u64 {
 
 pub fun write(h: *Handle, buf: u64, n: u64) u64 {
     if ((h.flags & abi.O_WRITE) == 0) { ret abi.err(abi.E_BADF); }
-    if (h.kind == PIPE_W) { ret pipe.write(h.pipe, buf, n); }
+    if (h.kind == PIPE_W) { ret pipe.write(h.pipe, buf, n, ((h.flags & abi.O_NONBLOCK) != 0)::u8); }
     if (h.kind == SOCK) { ret netio.send(h.sock, buf::*u8, n, 0, 0); }
     if (h.kind != NODE) { ret abi.err(abi.E_BADF); }
     val nd: *vfs.Node = h.node;

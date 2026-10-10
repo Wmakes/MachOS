@@ -4,6 +4,7 @@
 # a file mapping is a private copy of the file read in at once. new
 # mappings go downward from below the stack; sbrk's heap grows up to them
 
+use heap: machos.mm.heap;
 use abi:  sdk.abi;
 use proc: machos.kern.proc;
 use vmm:  machos.mm.vmm;
@@ -13,7 +14,8 @@ use vfs:  machos.fs.vfs;
 use file: machos.fs.file;
 
 val PAGE: u64 = 4096;
-pub val MAX: u64 = 64;              # regions per process
+pub val MAX: u64 = 0xFFFFFFFFFFFFFFFF; # "no such region"
+val COVER: u64 = 64;                # region pieces a caller's buffer takes
 pub val GAP: u64 = 0x1000000;       # 16 MiB kept free above the heap and below the stack
 
 fun page_flags(prot: u64) u64 {
@@ -33,14 +35,42 @@ fun find(p: *proc.Proc, va: u64) u64 {
     ret MAX;
 }
 
+# room for `need` regions (the array doubles); whether there is
+fun ensure(p: *proc.Proc, need: u64) u8 {
+    if (need <= p.maps_cap) { ret 1; }
+    var cap: u64 = p.maps_cap * 2;
+    if (cap < 16) { cap = 16; }
+    if (cap < need) { cap = need; }
+    val fresh: u64 = heap.alloc(cap * $size_of(proc.Region)::u64);
+    if (fresh == 0) { ret 0; }
+    if (p.nmaps > 0) { mem.copy(fresh, p.maps::u64, p.nmaps * $size_of(proc.Region)::u64); }
+    heap.free(p.maps::u64);
+    p.maps = fresh::*proc.Region;
+    p.maps_cap = cap;
+    ret 1;
+}
+
+# child c gets parent p's regions (fork); whether there was memory
+pub fun copy_regions(c: *proc.Proc, p: *proc.Proc) u8 {
+    c.nmaps = 0;
+    if (ensure(c, p.nmaps) == 0) { ret 0; }
+    if (p.nmaps > 0) { mem.copy(c.maps::u64, p.maps::u64, p.nmaps * $size_of(proc.Region)::u64); }
+    c.nmaps = p.nmaps;
+    ret 1;
+}
+
 fun add(p: *proc.Proc, start: u64, end: u64, prot: u64) u8 {
-    if (p.nmaps == MAX) { ret 0; }
+    if (ensure(p, p.nmaps + 1) == 0) { ret 0; }
     p.maps[p.nmaps].start = start;
     p.maps[p.nmaps].end = end;
     p.maps[p.nmaps].prot = prot;
     p.nmaps = p.nmaps + 1;
     ret 1;
 }
+
+# reserve [start, end) for the process with prot, its pages given memory
+# when touched (exec: the stack); whether there was room
+pub fun reserve(p: *proc.Proc, start: u64, end: u64, prot: u64) u8 { ret add(p, start, end, prot); }
 
 fun remove_at(p: *proc.Proc, i: u64) {
     var k: u64 = i;
@@ -64,7 +94,7 @@ fun cut(p: *proc.Proc, a: u64, b: u64, covered: *u64, ncov: *u64) u8 {
             i = i + 1;
             cnt;
         }
-        if (covered != nil && @ncov < MAX) {
+        if (covered != nil && @ncov < COVER) {
             var cs: u64 = s;
             var ce: u64 = t;
             if (cs < a) { cs = a; }
@@ -75,7 +105,7 @@ fun cut(p: *proc.Proc, a: u64, b: u64, covered: *u64, ncov: *u64) u8 {
             @ncov = @ncov + 1;
         }
         if (s < a && t > b) { # split in two
-            if (p.nmaps == MAX) { ret 0; }
+            if (ensure(p, p.nmaps + 1) == 0) { ret 0; }
             p.maps[i].end = a;
             add(p, b, t, pr);
             i = i + 1;

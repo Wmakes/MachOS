@@ -149,6 +149,18 @@ fun find_listener(lport: u16) *Conn {
     ret nil;
 }
 
+# whether a new socket may not bind `port`: a listener has it, or (without
+# SO_REUSEADDR) any connection still does
+pub fun port_busy(port: u16, reuse: u8) u8 {
+    var i: u64 = 0;
+    for (i < MAXCONN) {
+        val c: *Conn = ?conns[i];
+        if (c.used != 0 && c.lport == port && (reuse == 0 || c.state == LISTEN)) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
 # whether a local port is taken by a connection or a listener
 pub fun port_used(port: u16) u8 {
     var i: u64 = 0;
@@ -538,7 +550,7 @@ pub fun tick() {
 pub fun connect(lport: u16, rip: u32, rport: u16) *Conn {
     val c: *Conn = alloc();
     if (c == nil) { ret nil; }
-    c.lip = net.iface().ip;
+    c.lip = net.source_for(rip);
     c.lport = lport;
     c.rip = rip;
     c.rport = rport;

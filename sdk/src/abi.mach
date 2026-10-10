@@ -91,13 +91,37 @@ pub val FUTEX_WAIT: u64 = 81;   # (*u64 word, expected, timeout ms or 0) sleep w
 pub val FUTEX_WAKE: u64 = 82;   # (*u64 word, how many) -> how many were woken
 pub val SET_FSBASE: u64 = 83;   # (address)  this thread's FS base (thread-local storage)
 pub val GETTID:  u64 = 84;      # ()  -> this thread's id (the process's pid for its first thread)
-pub val COUNT:   u64 = 85;
+pub val QUEUE_CREATE: u64 = 85; # ()  -> a readiness queue's fd
+pub val QUEUE_CTL:  u64 = 86;   # (queue, QUEUE_ADD/MOD/DEL, fd, EV_* wanted, context)
+                                # a registration fires once, then waits for QUEUE_MOD to arm it again
+pub val QUEUE_WAIT: u64 = 87;   # (queue, *QueueEvent, max, timeout ms or 0xFFFFFFFF for ever) -> how many
+pub val QUEUE_WAKE: u64 = 88;   # (queue)  the next QUEUE_WAIT returns an EV_WAKE event (context 0)
+pub val GETSOCKOPT: u64 = 90;   # (fd, SO_*) -> its value
+pub val SOCK_STATUS: u64 = 89;  # (fd, 0)  a connect's outcome: 0, E_INPROGRESS, or why it failed
+                                # (fd, 1)  without reading: 1 data waits, 0 the end, E_AGAIN not yet
+pub val COUNT:   u64 = 91;
+
+pub val QUEUE_ADD: u64 = 1;
+pub val QUEUE_DEL: u64 = 2;
+pub val QUEUE_MOD: u64 = 3;
+pub val EV_READ:   u64 = 0x01;
+pub val EV_WRITE:  u64 = 0x02;
+pub val EV_ERROR:  u64 = 0x04;  # always reported
+pub val EV_HANGUP: u64 = 0x08;  # always reported: the other end is gone
+pub val EV_WAKE:   u64 = 0x10;
+
+pub rec QueueEvent {
+    context: u64;
+    events:  u32;
+    pad:     u32;
+}
 
 # sockets: IPv4 only; a sockaddr_in is 16 bytes: family (AF_INET, host
 # order), the port and the address (network order), 8 zero bytes
 pub val AF_INET:    u64 = 2;
 pub val SOCK_STREAM: u64 = 1;
 pub val SOCK_DGRAM: u64 = 2;
+pub val SOCK_NONBLOCK: u64 = 0x800; # or'd into the type: a non-blocking socket
 pub val IPPROTO_ICMP: u64 = 1;  # echo requests: what ping sends (the id is the kernel's)
 pub val IPPROTO_UDP: u64 = 17;
 pub val IPPROTO_TCP: u64 = 6;   # with SOCK_STREAM
@@ -106,6 +130,12 @@ pub val SHUT_WR:   u64 = 1;
 pub val SHUT_RDWR: u64 = 2;
 pub val SO_RCVTIMEO: u64 = 1;   # milliseconds a receive waits (0: for ever); then E_AGAIN
 pub val SO_BROADCAST: u64 = 2;  # 1: may send to 255.255.255.255
+pub val SO_REUSEADDR: u64 = 3;  # 1: bind a port whose old connections still linger
+pub val SO_KEEPALIVE: u64 = 4;  # kept (MachOS sends no keepalives yet)
+pub val TCP_NODELAY:  u64 = 5;  # kept (MachOS sends at once anyway)
+pub val SO_SNDBUF:    u64 = 6;  # the buffer sizes (64 KiB, whatever is asked)
+pub val SO_RCVBUF:    u64 = 7;
+pub val SO_LINGER:    u64 = 8;  # on << 32 | seconds
 pub val KIND_SOCKET: u64 = 5;   # Stat.kind of a socket
 
 # CLOCK: the wall clock (since 1970-01-01 UTC) or the time since boot
@@ -209,6 +239,7 @@ pub val O_CLOEXEC: u64 = 32; # closed in the new program after exec
 pub val O_EXCL:   u64 = 64;  # with O_CREATE: fail with E_EXIST if it is there
 pub val O_DIRECTORY: u64 = 128; # fail with E_NOTDIR unless it is a directory
 pub val O_NOFOLLOW: u64 = 256; # accepted; MachOS has no symbolic links
+pub val O_NONBLOCK: u64 = 512; # pipes, terminals, sockets: E_AGAIN instead of waiting
 
 # errors, returned negated
 pub val E_NOENT:    u64 = 1;  # no such file or directory
@@ -255,6 +286,7 @@ pub val E_NOTCONN:  u64 = 41;
 pub val E_CONNREFUSED: u64 = 42;
 pub val E_HOSTUNREACH: u64 = 43;
 pub val E_CANCELED: u64 = 44; # cancelled
+pub val E_INPROGRESS: u64 = 45; # a non-blocking connect is under way
 
 pub val ERR_MIN: u64 = 0xFFFFFFFFFFFFF000;
 
@@ -313,6 +345,7 @@ pub fun err_name(v: u64) *u8 {
     if (e == E_CONNREFUSED) { ret "connection refused\0"; }
     if (e == E_HOSTUNREACH) { ret "host unreachable\0"; }
     if (e == E_CANCELED) { ret "cancelled\0"; }
+    if (e == E_INPROGRESS) { ret "in progress\0"; }
     ret "unknown error\0";
 }
 

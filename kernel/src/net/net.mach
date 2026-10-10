@@ -20,6 +20,34 @@ pub val ETH_ARP: u16 = 0x0806;
 pub val PROTO_ICMP: u8 = 1;
 pub val PROTO_UDP:  u8 = 17;
 pub val BROADCAST: u32 = 0xFFFFFFFF;
+pub val LOOPBACK:  u32 = 0x7F000001; # 127.0.0.1
+
+# whether dst never leaves this machine: 127.0.0.0/8, or our own address
+pub fun is_local(dst: u32) u8 {
+    if ((dst >> 24) == 127) { ret 1; }
+    if (ifc.up != 0 && dst == ifc.ip) { ret 1; }
+    ret 0;
+}
+
+# the address to send to dst from
+pub fun source_for(dst: u32) u32 {
+    if ((dst >> 24) == 127) { ret LOOPBACK; }
+    ret ifc.ip;
+}
+
+# packets to ourselves wait here for the next poll (delivering them at once
+# could recurse: a reply to a reply to ...)
+val LOOPS: u64 = 64;
+
+rec Looped {
+    len:  u64;
+    data: [1500]u8;
+}
+
+var loops: [64]Looped;
+var loop_head: u64 = 0;
+var loop_count: u64 = 0;
+pub var loop_packets: u64 = 0;
 
 # the interface
 pub rec Iface {
@@ -233,7 +261,8 @@ fun next_hop(dst: u32) u32 {
 # (from src: our address, or 0 before DHCP has given one); whether it went
 # or waits for its next hop's address
 pub fun ip_send(src: u32, dst: u32, proto: u8, payload: *u8, len: u64) u8 {
-    if (ifc.present == 0 || len + 20 > 1500) { ret 0; }
+    if (len + 20 > 1500) { ret 0; }
+    if (ifc.present == 0 && is_local(dst) == 0) { ret 0; }
     val p: *u8 = ?packet[0];
     p[0] = 0x45;
     p[1] = 0;
@@ -249,6 +278,15 @@ pub fun ip_send(src: u32, dst: u32, proto: u8, payload: *u8, len: u64) u8 {
     put16(?p[10], csum_end(csum_add(0, p, 20)));
     mem.copy((?p[20])::u64, payload::u64, len);
     val total: u64 = 20 + len;
+    if (is_local(dst) != 0) {
+        if (loop_count == LOOPS) { ret 0; }
+        val l: *Looped = ?loops[(loop_head + loop_count) % LOOPS];
+        l.len = total;
+        mem.copy((?l.data[0])::u64, p::u64, total);
+        loop_count = loop_count + 1;
+        loop_packets = loop_packets + 1;
+        ret 1;
+    }
     if (dst == BROADCAST) { ret eth_send(?ALL[0], ETH_IP, p, total); }
     val hop: u32 = next_hop(dst);
     if (hop == 0) { ret 0; }
@@ -287,7 +325,7 @@ fun icmp_input(src: u32, p: *u8, n: u64) {
         reply[0] = 0;
         put16(?reply[2], 0);
         put16(?reply[2], csum_end(csum_add(0, ?reply[0], n)));
-        ip_send(ifc.ip, src, PROTO_ICMP, ?reply[0], n);
+        ip_send(source_for(src), src, PROTO_ICMP, ?reply[0], n);
         ret;
     }
     if (kind == 0) { # echo reply: to the socket with that id
@@ -304,7 +342,7 @@ pub fun icmp_send(s: *socket.Sock, dst: u32, p: *u8, n: u64) u8 {
     put16(?reply[4], s.port);
     put16(?reply[2], 0);
     put16(?reply[2], csum_end(csum_add(0, ?reply[0], n)));
-    ret ip_send(ifc.ip, dst, PROTO_ICMP, ?reply[0], n);
+    ret ip_send(source_for(dst), dst, PROTO_ICMP, ?reply[0], n);
 }
 
 # --- UDP -----------------------------------------------------------------------------
@@ -354,15 +392,27 @@ fun ip_input(p: *u8, n: u64) {
     val src: u32 = get32(?p[12]);
     val dst: u32 = get32(?p[16]);
     # ours, a broadcast, or anything while DHCP is still asking
-    if (ifc.up != 0 && dst != ifc.ip && dst != BROADCAST && (dst | ifc.mask) != BROADCAST) { ret; }
+    if (ifc.up != 0 && dst != ifc.ip && dst != BROADCAST && (dst | ifc.mask) != BROADCAST && (dst >> 24) != 127) { ret; }
     val proto: u8 = p[9];
     if (proto == PROTO_ICMP) { icmp_input(src, ?p[hl], total - hl); }
     or (proto == PROTO_UDP) { udp_input(src, dst, ?p[hl], total - hl); }
     or (proto == 6 && have_tcp != 0) { tcp_in(src, dst, ?p[hl], total - hl); }
 }
 
-# take in whatever the card received
+var loopbuf: [1500]u8;
+
+# take in whatever the card received, and what was sent to ourselves
 pub fun poll() {
+    var turns: u64 = 0;
+    for (loop_count > 0 && turns < 256) {
+        val l: *Looped = ?loops[loop_head];
+        val n: u64 = l.len;
+        mem.copy((?loopbuf[0])::u64, (?l.data[0])::u64, n);
+        loop_head = (loop_head + 1) % LOOPS;
+        loop_count = loop_count - 1;
+        ip_input(?loopbuf[0], n);
+        turns = turns + 1;
+    }
     if (ifc.present == 0) { ret; }
     var budget: u64 = 64;
     for (budget > 0) {

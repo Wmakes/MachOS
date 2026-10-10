@@ -15,6 +15,8 @@ pub rec Pipe {
     writers: u64;
 }
 
+pub fun capacity() u64 { ret CAP; }
+
 pub fun new() *Pipe {
     val p: *Pipe = heap.zalloc($size_of(Pipe)::u64)::*Pipe;
     if (p == nil) { ret nil; }
@@ -47,10 +49,12 @@ pub fun close_writer(p: *Pipe) {
     maybe_free(p);
 }
 
-# 0 = every writer is gone and the pipe is drained
-pub fun read(p: *Pipe, buf: u64, n: u64) u64 {
+# 0 = every writer is gone and the pipe is drained. nb: E_AGAIN instead of
+# waiting
+pub fun read(p: *Pipe, buf: u64, n: u64, nb: u8) u64 {
     for (p.count == 0) {
         if (p.writers == 0) { ret 0; }
+        if (nb != 0) { ret abi.err(abi.E_AGAIN); }
         if (proc.interrupted(proc.current()) != 0) { ret abi.err(abi.E_INTR); }
         proc.sleep_on(p::u64);
     }
@@ -67,7 +71,7 @@ pub fun read(p: *Pipe, buf: u64, n: u64) u64 {
     ret i;
 }
 
-pub fun write(p: *Pipe, buf: u64, n: u64) u64 {
+pub fun write(p: *Pipe, buf: u64, n: u64, nb: u8) u64 {
     var i: u64 = 0;
     val b: *u8 = buf::*u8;
     val dst: *u8 = p.buf::*u8;
@@ -79,6 +83,10 @@ pub fun write(p: *Pipe, buf: u64, n: u64) u64 {
         if (proc.interrupted(proc.current()) != 0) { ret abi.err(abi.E_INTR); }
         if (p.count == CAP) {
             proc.wakeup(p::u64);
+            if (nb != 0) {
+                if (i > 0) { ret i; }
+                ret abi.err(abi.E_AGAIN);
+            }
             proc.sleep_on(p::u64);
             cnt;
         }

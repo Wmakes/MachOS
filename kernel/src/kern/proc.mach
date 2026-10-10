@@ -73,7 +73,8 @@ pub rec Proc {
     wake_at:   u64;  # tick a CHAN_TIMER sleeper wakes at
     brk:       u64;  # end of the user heap
     brk_base:  u64;
-    maps:      [64]Region; # mmap's regions (kern/mmap.mach)
+    maps:      *Region; # mmap's regions (kern/mmap.mach), a heap array of maps_cap
+    maps_cap:  u64;
     nmaps:     u64;
     mmap_next: u64;  # the next mapping goes below this
     pages:     u64;  # user pages mapped
@@ -554,6 +555,9 @@ pub fun stop_self(sig: u64) {
 # free everything a zombie still holds and its slot
 pub fun reap(p: *Proc) {
     heap.free(p.kstack);
+    if (p.leader == nil) { heap.free(p.maps::u64); }
+    p.maps = nil;
+    p.maps_cap = 0;
     p.state = FREE;
     p.pid = 0;
 }

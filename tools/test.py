@@ -92,6 +92,9 @@ def http_server():
     os.makedirs(www, exist_ok=True)
     with open(os.path.join(www, "hello.txt"), "w") as f:
         f.write("hello over tcp\n")
+    os.makedirs(os.path.join(www, "sub"), exist_ok=True)
+    with open(os.path.join(www, "sub", "index.html"), "w") as f:
+        f.write("behind a redirect\n")
     with open(os.path.join(www, "big.txt"), "w") as f:
         f.write("".join(f"{i}\n" for i in range(1, 150001)))
     if HTTP_SERVER:
@@ -454,6 +457,17 @@ TESTS = [
       "wait:" + P, "send:nc 10.0.2.2 1 < /dev/null; cat /proc/net/tcp\\n", "wait:" + P],
      ["HTTP/1.0 200 OK", "hello over tcp", "150000",
       "771c3995129ed087c7336651f32a510b009e3c9d2190f13bda69d91dd91a257e", "connection refused"]),
+
+    ("wget", False, False,
+     ["--prep", http_server, "--boot", disk,
+      "wait:" + P, "send:cd /tmp; wget http://10.0.2.2:8080/hello.txt; cat hello.txt\\n", "wait:" + P,
+      "send:wget -q -O big http://10.0.2.2:8080/big.txt; wc -l big; sha256sum big\\n", "wait:" + P,
+      "send:wget -O - http://10.0.2.2:8080/sub; wget http://10.0.2.2:8080/nope; echo status $?\\n", "wait:" + P,
+      "send:wget https://example.com/; wget http://10.0.2.2:1/\\n", "wait:" + P],
+     ["hello.txt saved, 15 bytes", "hello over tcp", "150000",
+      "771c3995129ed087c7336651f32a510b009e3c9d2190f13bda69d91dd91a257e",
+      "redirected to http://10.0.2.2:8080/sub/", "behind a redirect", "404", "status 1",
+      "https:// is not supported yet", "connection refused"]),
 
     ("net-config", False, False,
      ["wait:" + P, "send:ip set 10.0.2.50/24 10.0.2.2 10.0.2.3; ip; ping -c 1 10.0.2.2\\n", "wait:packet loss",

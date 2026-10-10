@@ -1,0 +1,105 @@
+# runtests DISPATCHER FIRST LAST [SECONDS]: run tests FIRST..LAST of a mach
+# test dispatcher (built with `mach test ... -o`), each in its own process,
+# and say "ok N", "FAIL N STATUS" or "HANG N" (killed after SECONDS, default
+# 60); then "runtests: P passed, F failed, H hung"
+
+use std.runtime;
+use std.print;
+use std.types.string.str;
+use std.types.size.usize;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use os: std.system.os;
+
+fun num(s: *u8) u64 {
+    var v: u64 = 0;
+    var i: u64 = 0;
+    for (s[i] >= 48 && s[i] <= 57) {
+        v = v * 10 + (s[i] - 48)::u64;
+        i = i + 1;
+    }
+    ret v;
+}
+
+fun ms_now() u64 {
+    var ts: os.Timespec;
+    os.monotonic(?ts);
+    ret ts.sec::u64 * 1000 + ts.nsec::u64 / 1000000;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    if (argc < 4) {
+        print.eprintln("usage: runtests DISPATCHER FIRST LAST [SECONDS]");
+        ret 2;
+    }
+    val first: u64 = num(argv[2]);
+    val last: u64 = num(argv[3]);
+    var limit: u64 = 60;
+    if (argc > 4) { limit = num(argv[4]); }
+    var passed: u64 = 0;
+    var failed: u64 = 0;
+    var hung: u64 = 0;
+    var i: u64 = first;
+    for (i <= last) {
+        var index: [24]u8;
+        var n: u64 = 0;
+        var x: u64 = i;
+        var t: [24]u8;
+        for {
+            t[n] = 48 + (x % 10)::u8;
+            n = n + 1;
+            x = x / 10;
+            if (x == 0) { brk; }
+        }
+        var k: u64 = 0;
+        for (k < n) {
+            index[k] = t[n - 1 - k];
+            k = k + 1;
+        }
+        index[n] = 0;
+        var args: [3]*u8;
+        args[0] = argv[1];
+        args[1] = ?index[0];
+        args[2] = nil;
+        val pid: i64 = os.spawn(argv[1], ?args[0], os.environ());
+        if (pid < 0) {
+            print.printlnf("FAIL {} spawn {}", i, pid);
+            failed = failed + 1;
+            i = i + 1;
+            cnt;
+        }
+        val start: u64 = ms_now();
+        var st: os.ProcessStatus;
+        var done: bool = false;
+        var killed: bool = false;
+        for (!done) {
+            val w: os.WaitResult = os.wait_pid(pid, ?st, os.WNOHANG);
+            if (w.pid > 0) { done = true; }
+            or (w.pid < 0 || w.error.code < 0) { done = true; }
+            or (ms_now() - start > limit * 1000 && !killed) {
+                os.terminate_child(pid);
+                killed = true;
+            } or {
+                os.sleep(20000000);
+            }
+        }
+        if (killed) {
+            print.printlnf("HANG {}", i);
+            hung = hung + 1;
+        } or (st.kind == os.PROCESS_EXITED && st.code == 0) {
+            print.printlnf("ok {}", i);
+            passed = passed + 1;
+        } or (st.kind == os.PROCESS_EXITED) {
+            print.printlnf("FAIL {} exit {}", i, st.code);
+            failed = failed + 1;
+        } or {
+            print.printlnf("FAIL {} signal {}", i, st.signal);
+            failed = failed + 1;
+        }
+        i = i + 1;
+    }
+    print.printlnf("runtests: {} passed, {} failed, {} hung", passed, failed, hung);
+    ret 0;
+}

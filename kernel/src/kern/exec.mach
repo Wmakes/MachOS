@@ -1,6 +1,7 @@
 # load an ELF executable from the file tree into a fresh process: map its
 # segments, a stack with the arguments on it, and say where to start
 
+use mmap: machos.kern.mmap;
 use abi:   sdk.abi;
 use elf:   machos.kern.elf;
 use mem:   machos.kern.mem;
@@ -11,7 +12,8 @@ use vmm:   machos.mm.vmm;
 use pmm:   machos.mm.pmm;
 
 pub val STACK_TOP:   u64 = 0x00007FFFFFFFF000;
-pub val STACK_PAGES: u64 = 32; # 128 KiB
+pub val STACK_PAGES: u64 = 32; # 128 KiB given memory at once (the arguments go there)
+pub val STACK_RESERVE: u64 = 0x800000; # 8 MiB: the rest when touched
 pub val LOAD_MIN:    u64 = 0x1000;
 val PAGE: u64 = 4096;
 
@@ -62,7 +64,7 @@ fun load_segment(p: *proc.Proc, img: u64, len: u64, ph: *elf.Phdr) u64 {
     if (ph.memsz == 0) { ret 0; }
     if (ph.filesz > ph.memsz) { ret abi.err(abi.E_NOEXEC); }
     if (ph.offset > len || ph.filesz > len - ph.offset) { ret abi.err(abi.E_NOEXEC); }
-    val stack_bottom: u64 = STACK_TOP - STACK_PAGES * PAGE;
+    val stack_bottom: u64 = STACK_TOP - STACK_RESERVE;
     if (ph.vaddr < LOAD_MIN || ph.vaddr >= stack_bottom || ph.memsz > stack_bottom - ph.vaddr) {
         ret abi.err(abi.E_NOEXEC);
     }
@@ -217,7 +219,8 @@ fun load_image(p: *proc.Proc, img: u64, len: u64, args: u64, args_len: u64,
     p.brk_base = (top + PAGE - 1) & ~(PAGE - 1);
     p.brk = p.brk_base;
     p.nmaps = 0;
-    p.mmap_next = STACK_TOP - STACK_PAGES * PAGE - 0x1000000; # 16 MiB below the stack
+    p.mmap_next = STACK_TOP - STACK_RESERVE - 0x1000000; # 16 MiB below the stack
+    if (mmap.reserve(p, STACK_TOP - STACK_RESERVE, STACK_TOP, abi.PROT_READ | abi.PROT_WRITE) == 0) { ret abi.err(abi.E_NOMEM); }
 
     var va: u64 = STACK_TOP - STACK_PAGES * PAGE;
     for (va < STACK_TOP) {

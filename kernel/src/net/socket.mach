@@ -36,6 +36,11 @@ pub rec Sock {
     broadcast: u8;   # may send to 255.255.255.255
     timeout:   u64;  # receive timeout in ms, 0 = wait for ever
     conn:      u64;  # TCP: its tcp.Conn (connecting, connected, or listening)
+    nonblock:  u8;   # E_AGAIN (E_INPROGRESS for a connect) instead of waiting
+    reuse:     u8;   # SO_REUSEADDR
+    keepalive: u8;
+    nodelay:   u8;
+    linger:    u64;  # SO_LINGER: on << 32 | seconds
     refs:      u64;  # handles open on it
     head:      u64;
     count:     u64;

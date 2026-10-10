@@ -667,6 +667,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.wget]
+kind = "bin"
+entry = "bin/wget.mach"
+out = "bin/wget"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.which]
 kind = "bin"
 entry = "bin/which.mach"

@@ -1,6 +1,7 @@
 # system calls (numbers and records in abi/sys.mach). every user pointer is
 # checked against the caller's page tables before the kernel touches it
 
+use queue:  machos.kern.queue;
 use tcp:    machos.net.tcp;
 use socket: machos.net.socket;
 use netio:  machos.net.io;
@@ -355,12 +356,11 @@ fun sys_fork() u64 {
     }
     c.brk = p.brk;
     c.brk_base = p.brk_base;
-    c.nmaps = p.nmaps;
     c.mmap_next = p.mmap_next;
-    var mi: u64 = 0;
-    for (mi < p.nmaps) {
-        c.maps[mi] = p.maps[mi];
-        mi = mi + 1;
+    if (mmap.copy_regions(c, p) == 0) {
+        vmm.free_space(c.pml4);
+        proc.reap(c);
+        ret e(abi.E_NOMEM);
     }
     c.pages = p.pages;
     mem.copy((?c.cwd[0])::u64, (?p.cwd[0])::u64, p.cwd_len);
@@ -1197,8 +1197,9 @@ fun sock_of(h: u64) *socket.Sock {
     ret f.sock;
 }
 
-fun sys_socket(domain: u64, kind: u64, proto: u64) u64 {
+fun sys_socket(domain: u64, kind_flags: u64, proto: u64) u64 {
     if (domain != abi.AF_INET) { ret e(abi.E_NOTSUP); }
+    val kind: u64 = kind_flags & 0xF;
     var k: u64 = socket.UDP;
     if (kind == abi.SOCK_STREAM) {
         if (proto != 0 && proto != abi.IPPROTO_TCP) { ret e(abi.E_NOTSUP); }
@@ -1211,7 +1212,9 @@ fun sys_socket(domain: u64, kind: u64, proto: u64) u64 {
     }
     val s: *socket.Sock = socket.alloc(k);
     if (s == nil) { ret e(abi.E_NFILE); }
+    s.nonblock = ((kind_flags & abi.SOCK_NONBLOCK) != 0)::u8;
     val h: *file.Handle = file.open_socket(s);
+    if (h != nil && s.nonblock != 0) { h.flags = h.flags | abi.O_NONBLOCK; }
     if (h == nil) {
         socket.release(s);
         ret e(abi.E_NOMEM);
@@ -1246,7 +1249,7 @@ fun sys_bind(h: u64, va: u64, len: u64) u64 {
     if (s.kind != socket.ICMP && port < 1024 && is_root() == 0) { ret e(abi.E_ACCES); }
     val other: *socket.Sock = socket.find(s.kind, port);
     if (other != nil && other != s) { ret e(abi.E_ADDRINUSE); }
-    if (s.kind == socket.TCP && tcp.port_used(port) != 0) { ret e(abi.E_ADDRINUSE); }
+    if (s.kind == socket.TCP && tcp.port_busy(port, s.reuse) != 0) { ret e(abi.E_ADDRINUSE); }
     s.port = port;
     s.local_ip = ip;
     ret 0;
@@ -1301,8 +1304,26 @@ fun sys_setsockopt(h: u64, opt: u64, v: u64) u64 {
     if (s == nil) { ret e(abi.E_BADF); }
     if (opt == abi.SO_RCVTIMEO) { s.timeout = v; }
     or (opt == abi.SO_BROADCAST) { s.broadcast = (v != 0)::u8; }
+    or (opt == abi.SO_REUSEADDR) { s.reuse = (v != 0)::u8; }
+    or (opt == abi.SO_KEEPALIVE) { s.keepalive = (v != 0)::u8; }
+    or (opt == abi.TCP_NODELAY) { s.nodelay = (v != 0)::u8; }
+    or (opt == abi.SO_SNDBUF || opt == abi.SO_RCVBUF) { } # fixed at 64 KiB
+    or (opt == abi.SO_LINGER) { s.linger = v; }
     or { ret e(abi.E_INVAL); }
     ret 0;
+}
+
+fun sys_getsockopt(h: u64, opt: u64) u64 {
+    val s: *socket.Sock = sock_of(h);
+    if (s == nil) { ret e(abi.E_BADF); }
+    if (opt == abi.SO_RCVTIMEO) { ret s.timeout; }
+    if (opt == abi.SO_BROADCAST) { ret s.broadcast::u64; }
+    if (opt == abi.SO_REUSEADDR) { ret s.reuse::u64; }
+    if (opt == abi.SO_KEEPALIVE) { ret s.keepalive::u64; }
+    if (opt == abi.TCP_NODELAY) { ret s.nodelay::u64; }
+    if (opt == abi.SO_SNDBUF || opt == abi.SO_RCVBUF) { ret 65536; }
+    if (opt == abi.SO_LINGER) { ret s.linger; }
+    ret e(abi.E_INVAL);
 }
 
 fun sys_listen(h: u64, backlog: u64) u64 {
@@ -1359,6 +1380,43 @@ fun sys_getsockname(h: u64, va: u64) u64 {
     if (ip == 0) { ip = net.iface().ip; }
     socket.put_addr(va::*u8, ip, s.port);
     ret 0;
+}
+
+# --- readiness queues ------------------------------------------------------------
+
+fun queue_of(h: u64) *queue.Queue {
+    val f: *file.Handle = handle(h);
+    if (f == nil || f.kind != file.QUEUE) { ret nil; }
+    ret f.queue::*queue.Queue;
+}
+
+fun sys_queue_create() u64 {
+    val q: *queue.Queue = queue.create();
+    if (q == nil) { ret e(abi.E_NOMEM); }
+    val h: *file.Handle = file.open_queue(q::u64);
+    if (h == nil) {
+        heap.free(q::u64);
+        ret e(abi.E_NOMEM);
+    }
+    val idx: u64 = install(h);
+    if (abi.is_err(idx) != 0) { file.close(h); }
+    ret idx;
+}
+
+fun sys_queue_ctl(qh: u64, op: u64, fd: u64, want: u64, context: u64) u64 {
+    val q: *queue.Queue = queue_of(qh);
+    if (q == nil) { ret e(abi.E_BADF); }
+    val f: *file.Handle = handle(fd);
+    if (f == nil && op != abi.QUEUE_DEL) { ret e(abi.E_BADF); }
+    ret queue.control(q, op, fd, f, want, context);
+}
+
+fun sys_queue_wait(qh: u64, out: u64, max: u64, ms: u64) u64 {
+    val q: *queue.Queue = queue_of(qh);
+    if (q == nil) { ret e(abi.E_BADF); }
+    if (max == 0 || max > 1024) { ret e(abi.E_INVAL); }
+    if (ok(out, max * $size_of(abi.QueueEvent)::u64, 1) == 0) { ret e(abi.E_FAULT); }
+    ret queue.wait(q, out::*abi.QueueEvent, max, ms, ?cur().handles);
 }
 
 # --- threads ------------------------------------------------------------------
@@ -1426,7 +1484,8 @@ fun sys_fcntl(h: u64, cmd: u64, arg: u64) u64 {
     }
     if (cmd == abi.F_GETFL) { ret f.flags; }
     if (cmd == abi.F_SETFL) {
-        f.flags = (f.flags & ~abi.O_APPEND) | (arg & abi.O_APPEND);
+        f.flags = (f.flags & ~(abi.O_APPEND | abi.O_NONBLOCK)) | (arg & (abi.O_APPEND | abi.O_NONBLOCK));
+        if (f.kind == file.SOCK) { f.sock.nonblock = ((arg & abi.O_NONBLOCK) != 0)::u8; }
         ret 0;
     }
     ret e(abi.E_INVAL);
@@ -1607,6 +1666,22 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
         ret 0;
     }
     if (n == abi.GETTID)  { ret proc.current_thread().pid; }
+    if (n == abi.QUEUE_CREATE) { ret sys_queue_create(); }
+    if (n == abi.QUEUE_CTL) { ret sys_queue_ctl(a, b, c, d, f5); }
+    if (n == abi.QUEUE_WAIT) { ret sys_queue_wait(a, b, c, d); }
+    if (n == abi.QUEUE_WAKE) {
+        val q: *queue.Queue = queue_of(a);
+        if (q == nil) { ret e(abi.E_BADF); }
+        queue.wake(q);
+        ret 0;
+    }
+    if (n == abi.GETSOCKOPT) { ret sys_getsockopt(a, b); }
+    if (n == abi.SOCK_STATUS) {
+        val s: *socket.Sock = sock_of(a);
+        if (s == nil) { ret e(abi.E_BADF); }
+        if (b == 1) { ret netio.peek(s); }
+        ret netio.status(s);
+    }
     if (n == abi.MOUNT)   { ret sys_mount(a, b, c, d); }
     if (n == abi.UMOUNT)  { ret sys_umount(a, b); }
     if (n == abi.UNAME)   { ret sys_uname(a); }
