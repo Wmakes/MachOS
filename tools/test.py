@@ -318,7 +318,7 @@ TESTS = [
     ("dualboot", False, False,
      ["--prep", fake_windows, "--boot", DUAL, "--nologin", "sleep:2.5", "keys:<down><down><down>", "sleep:0.5",
       "keys:<ret>", "wait:booting Windows", "wait:login: ", "send:root\\n", "wait:" + P],
-     ["Windows", "machboot: booting Windows", "machboot 0.8.5"]),
+     ["Windows", "machboot: booting Windows", "machboot 0.8.6"]),
 
     # machboot hide: no menu, straight into MachOS
     ("hidden-menu", False, True,
@@ -333,10 +333,10 @@ TESTS = [
      ["--prep", update_stick] + usb_stick() + [
       "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; update /mnt/update.tgz; umount /mnt; machboot\\n",
       "wait:" + P],
-     ["updating MachOS", "installing the programs", "MachOS is updated to 0.8.5", "MachOS (previous)"]),
+     ["updating MachOS", "installing the programs", "MachOS is updated to 0.8.6", "MachOS (previous)"]),
     ("update-reboot", True, True,
      ["wait:" + P, "send:ls /boot; uname -a\\n", "wait:" + P],
-     ["kernel.old.elf", "MachOS 0.8.5"]),
+     ["kernel.old.elf", "MachOS 0.8.6"]),
 
     # MachOS installed on a USB stick, then booted from the stick alone
     ("usb-install", False, False,
@@ -413,8 +413,8 @@ TESTS = [
      ["wait:" + P, "send:cat /proc/version; head -2 /proc/meminfo; cat /proc/self/status; ls /proc/sys/kernel; cat /proc/stat\\n",
       "wait:" + P,
       "send:uname -a; free; uptime; ps; df; id; whoami; tty; neofetch | grep -c Memory\\n", "wait:" + P],
-     ["MachOS version 0.8.5", "MemTotal:", "Name:", "cat", "Uid:", "hostname", "cpu0",
-      "MachOS 0.8.5 x86_64 on machos", "total", "processes", "PID", "init", "Filesystem", "/dev/sda2",
+     ["MachOS version 0.8.6", "MemTotal:", "Name:", "cat", "Uid:", "hostname", "cpu0",
+      "MachOS 0.8.6 x86_64 on machos", "total", "processes", "PID", "init", "Filesystem", "/dev/sda2",
       "uid=0(root)", "root", "/dev/tty1", "1"]),
 
     ("events", False, False,
