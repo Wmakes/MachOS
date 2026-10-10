@@ -79,7 +79,11 @@ pub val SENDTO:  u64 = 71; # (fd, buf, len, *sockaddr_in or 0, addr_len) -> byte
 pub val RECVFROM: u64 = 72; # (fd, buf, len, *sockaddr_in or 0, *u32 addr_len or 0) -> bytes
 pub val SETSOCKOPT: u64 = 73; # (fd, SO_*, value)
 pub val GETSOCKNAME: u64 = 74; # (fd, *sockaddr_in)
-pub val COUNT:   u64 = 75;
+pub val LISTEN:  u64 = 75; # (fd, backlog)                     a stream socket waits for connections
+pub val ACCEPT:  u64 = 76; # (fd, *sockaddr_in or 0)           -> the next connection's fd
+pub val SHUTDOWN: u64 = 77; # (fd, SHUT_*)                     SHUT_WR / SHUT_RDWR: no more to send
+pub val GETPEERNAME: u64 = 78; # (fd, *sockaddr_in)            the other end of a connection
+pub val COUNT:   u64 = 79;
 
 # sockets: IPv4 only; a sockaddr_in is 16 bytes: family (AF_INET, host
 # order), the port and the address (network order), 8 zero bytes
@@ -88,6 +92,10 @@ pub val SOCK_STREAM: u64 = 1;
 pub val SOCK_DGRAM: u64 = 2;
 pub val IPPROTO_ICMP: u64 = 1;  # echo requests: what ping sends (the id is the kernel's)
 pub val IPPROTO_UDP: u64 = 17;
+pub val IPPROTO_TCP: u64 = 6;   # with SOCK_STREAM
+pub val SHUT_RD:   u64 = 0;
+pub val SHUT_WR:   u64 = 1;
+pub val SHUT_RDWR: u64 = 2;
 pub val SO_RCVTIMEO: u64 = 1;   # milliseconds a receive waits (0: for ever); then E_AGAIN
 pub val SO_BROADCAST: u64 = 2;  # 1: may send to 255.255.255.255
 pub val KIND_SOCKET: u64 = 5;   # Stat.kind of a socket

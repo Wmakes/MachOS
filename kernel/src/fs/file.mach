@@ -96,7 +96,10 @@ pub fun close(h: *Handle) {
         vfs.release(h.node);
     }
     or (h.kind == PIPE_R) { pipe.close_reader(h.pipe); }
-    or (h.kind == SOCK) { socket.release(h.sock); }
+    or (h.kind == SOCK) {
+        if (h.sock.refs <= 1) { netio.close(h.sock); }
+        socket.release(h.sock);
+    }
     or (h.kind == PIPE_W) { pipe.close_writer(h.pipe); }
     heap.free(h::u64);
 }

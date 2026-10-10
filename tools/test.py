@@ -79,6 +79,30 @@ def udp_echo():
     threading.Thread(target=serve, daemon=True).start()
 
 
+HTTP_SERVER = []
+
+
+def http_server():
+    """a fresh dev disk, and a web server on the host's port 8080 (10.0.2.2
+    for MachOS) serving out/headless/www: hello.txt and big.txt (the
+    numbers 1 to 150000, a line each)"""
+    import http.server, functools
+    sh(f"tools/mkimage.sh {PROFILE[0]} --fresh")
+    www = os.path.join(ROOT, "out", "headless", "www")
+    os.makedirs(www, exist_ok=True)
+    with open(os.path.join(www, "hello.txt"), "w") as f:
+        f.write("hello over tcp\n")
+    with open(os.path.join(www, "big.txt"), "w") as f:
+        f.write("".join(f"{i}\n" for i in range(1, 150001)))
+    if HTTP_SERVER:
+        return
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=www)
+    handler.log_message = lambda *a: None
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 8080), handler)
+    HTTP_SERVER.append(srv)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
 def make_broken():
     """a copy of a fresh dev disk with three faults put in by debugfs"""
     sh("tools/mkimage.sh --fresh")
@@ -421,6 +445,14 @@ TESTS = [
      ["address 10.0.2.15/24", "gateway 10.0.2.2", "dns 10.0.2.3", "method dhcp", "nameserver 10.0.2.3",
       "64 bytes from 10.0.2.2: icmp_seq=0", "64 bytes from 10.0.2.2: icmp_seq=1", "0% packet loss",
       "localhost has address 127.0.0.1", "echo: hello", "eth0", "10.0.2.2 52:55:0a:00:02:02"]),
+
+    ("tcp", False, False,
+     ["--prep", http_server, "--boot", disk,
+      "wait:" + P, "send:printf 'GET /hello.txt HTTP/1.0\\\\n\\\\n' | nc 10.0.2.2 8080\\n", "wait:" + P,
+      "send:printf 'GET /big.txt HTTP/1.0\\\\n\\\\n' | nc 10.0.2.2 8080 > /tmp/big; tail -150000 /tmp/big > /tmp/body; wc -l /tmp/body; sha256sum /tmp/body\\n",
+      "wait:" + P, "send:nc 10.0.2.2 1 < /dev/null; cat /proc/net/tcp\\n", "wait:" + P],
+     ["HTTP/1.0 200 OK", "hello over tcp", "150000",
+      "771c3995129ed087c7336651f32a510b009e3c9d2190f13bda69d91dd91a257e", "connection refused"]),
 
     ("net-config", False, False,
      ["wait:" + P, "send:ip set 10.0.2.50/24 10.0.2.2 10.0.2.3; ip; ping -c 1 10.0.2.2\\n", "wait:packet loss",

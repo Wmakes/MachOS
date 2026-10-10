@@ -1,0 +1,661 @@
+# TCP (RFC 793 and 1122, the parts that matter): reliable byte streams.
+# a connection keeps 64 KiB to send and 64 KiB received; what is sent but not
+# yet acknowledged is sent again after a timeout that doubles each time
+# (from 1 s, giving up after 8 tries). the window is at most 64 KiB (no
+# scaling), segments at most 1460 bytes. out-of-order segments are dropped
+# and the last in-order byte acknowledged again, so the sender repeats them
+#
+# a socket of kind TCP points at its connection. listening sockets have a
+# queue of connections that finished their handshake, for accept
+#
+# sequence numbers wrap, so they are compared through their difference
+
+use net:    machos.net.net;
+use socket: machos.net.socket;
+use heap:   machos.mm.heap;
+use mem:    machos.kern.mem;
+use proc:   machos.kern.proc;
+use apic:   machos.arch.x86_64.apic;
+use cpu:    machos.arch.x86_64.cpu;
+
+pub val CLOSED:      u64 = 0;
+pub val LISTEN:      u64 = 1;
+pub val SYN_SENT:    u64 = 2;
+pub val SYN_RCVD:    u64 = 3;
+pub val ESTABLISHED: u64 = 4;
+pub val FIN_WAIT1:   u64 = 5;
+pub val FIN_WAIT2:   u64 = 6;
+pub val CLOSE_WAIT:  u64 = 7;
+pub val CLOSING:     u64 = 8;
+pub val LAST_ACK:    u64 = 9;
+pub val TIME_WAIT:   u64 = 10;
+
+val FIN: u8 = 0x01;
+val SYN: u8 = 0x02;
+val RST: u8 = 0x04;
+val PSH: u8 = 0x08;
+val ACK: u8 = 0x10;
+
+pub val BUFSZ: u64 = 65536;
+val MSS: u64 = 1460;
+val MAXCONN: u64 = 64;
+val BACKLOG: u64 = 16;
+
+# why a connection ended badly (the socket calls turn these into errors)
+pub val ERR_NONE:    u64 = 0;
+pub val ERR_REFUSED: u64 = 1;
+pub val ERR_RESET:   u64 = 2;
+pub val ERR_TIMEOUT: u64 = 3;
+
+pub rec Conn {
+    used:      u8;
+    state:     u64;
+    owned:     u8;     # a socket (a handle) still has it
+    lip:       u32;
+    lport:     u16;
+    rip:       u32;
+    rport:     u16;
+    iss:       u32;
+    snd_una:   u32;    # the oldest byte not yet acknowledged
+    snd_nxt:   u32;    # the next byte to send
+    snd_wnd:   u64;    # what the peer can take
+    rcv_nxt:   u32;    # the next byte expected
+    mss:       u64;
+    tx:        u64;    # BUFSZ: bytes from snd_una on, tx_len of them
+    tx_start:  u64;    # where snd_una's byte is in tx
+    tx_len:    u64;
+    rx:        u64;    # BUFSZ: received bytes not yet read
+    rx_start:  u64;
+    rx_len:    u64;
+    fin_want:  u8;     # send a FIN once the data is out
+    fin_sent:  u8;
+    peer_fin:  u8;     # the peer has nothing more to send
+    err:       u64;
+    rto:       u64;    # ticks before resending
+    rtx_at:    u64;    # the tick to resend at (0: nothing outstanding)
+    tries:     u64;
+    dead_at:   u64;    # TIME_WAIT: the tick it goes
+    parent:    *Conn;  # SYN_RCVD: the listening connection it came to
+    queue:     [16]*Conn; # LISTEN: connections ready for accept
+    qlen:      u64;
+    backlog:   u64;
+}
+
+var conns: [64]Conn;
+
+pub fun slot(i: u64) *Conn { ret ?conns[i]; }
+pub fun max() u64 { ret MAXCONN; }
+
+fun lt(a: u32, b: u32) u8 { ret (((a - b)::i32) < 0)::u8; }
+fun le(a: u32, b: u32) u8 { ret (((a - b)::i32) <= 0)::u8; }
+
+fun now() u64 { ret proc.uptime_ticks(); }
+
+fun alloc() *Conn {
+    var i: u64 = 0;
+    for (i < MAXCONN) {
+        val c: *Conn = ?conns[i];
+        if (c.used == 0) {
+            val tx: u64 = heap.alloc(BUFSZ);
+            val rx: u64 = heap.alloc(BUFSZ);
+            if (tx == 0 || rx == 0) {
+                if (tx != 0) { heap.free(tx); }
+                if (rx != 0) { heap.free(rx); }
+                ret nil;
+            }
+            mem.fill(c::u64, 0, $size_of(Conn)::u64);
+            c.used = 1;
+            c.owned = 1;
+            c.tx = tx;
+            c.rx = rx;
+            c.mss = 536;
+            c.rto = apic.HZ;
+            ret c;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun free(c: *Conn) {
+    if (c.used == 0) { ret; }
+    heap.free(c.tx);
+    heap.free(c.rx);
+    c.used = 0;
+    c.state = CLOSED;
+}
+
+# wake whoever waits on c (a reader, a writer, an accept, a connect)
+fun wake(c: *Conn) { proc.wakeup(c::u64); }
+
+pub fun find(lip: u32, lport: u16, rip: u32, rport: u16) *Conn {
+    var i: u64 = 0;
+    for (i < MAXCONN) {
+        val c: *Conn = ?conns[i];
+        if (c.used != 0 && c.state != LISTEN && c.lport == lport && c.rport == rport && c.rip == rip
+            && (c.lip == lip || c.lip == 0)) { ret c; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun find_listener(lport: u16) *Conn {
+    var i: u64 = 0;
+    for (i < MAXCONN) {
+        val c: *Conn = ?conns[i];
+        if (c.used != 0 && c.state == LISTEN && c.lport == lport) { ret c; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# whether a local port is taken by a connection or a listener
+pub fun port_used(port: u16) u8 {
+    var i: u64 = 0;
+    for (i < MAXCONN) {
+        if (conns[i].used != 0 && conns[i].lport == port) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# --- sending segments ------------------------------------------------------------
+
+var seg: [1500]u8;
+
+fun send_segment(c: *Conn, seq: u32, flags: u8, data: u64, len: u64) {
+    val h: *u8 = ?seg[0];
+    var hl: u64 = 20;
+    if ((flags & SYN) != 0) { hl = 24; }
+    net.put16(?h[0], c.lport);
+    net.put16(?h[2], c.rport);
+    net.put32(?h[4], seq);
+    var ackno: u32 = 0;
+    var f: u8 = flags;
+    if (c.state != SYN_SENT || (flags & SYN) == 0) {
+        f = f | ACK;
+        ackno = c.rcv_nxt;
+    }
+    net.put32(?h[8], ackno);
+    h[12] = ((hl / 4) << 4)::u8;
+    h[13] = f;
+    var win: u64 = BUFSZ - c.rx_len;
+    if (win > 65535) { win = 65535; }
+    net.put16(?h[14], win::u16);
+    net.put16(?h[16], 0);
+    net.put16(?h[18], 0);
+    if ((flags & SYN) != 0) { # our MSS
+        h[20] = 2;
+        h[21] = 4;
+        net.put16(?h[22], MSS::u16);
+    }
+    # the data: from the send ring, which may wrap
+    var k: u64 = 0;
+    for (k < len) {
+        h[hl + k] = @((c.tx + (data + k) % BUFSZ)::*u8);
+        k = k + 1;
+    }
+    var ph: [12]u8;
+    var src: u32 = c.lip;
+    if (src == 0) { src = net.iface().ip; }
+    net.put32(?ph[0], src);
+    net.put32(?ph[4], c.rip);
+    ph[8] = 0;
+    ph[9] = 6;
+    net.put16(?ph[10], (hl + len)::u16);
+    net.put16(?h[16], net.csum_end(net.csum_add(net.csum_add(0, ?ph[0], 12), h, hl + len)));
+    net.ip_send(src, c.rip, 6, h, hl + len);
+}
+
+# an acknowledgement (and our window), nothing else
+fun send_ack(c: *Conn) { send_segment(c, c.snd_nxt, 0, 0, 0); }
+
+# a reset answering a segment nobody wants
+var rst_conn: Conn;
+
+fun send_rst(src: u32, dst: u32, sport: u16, dport: u16, seq: u32, ackno: u32, ack: u8) {
+    rst_conn.lip = dst;
+    rst_conn.lport = dport;
+    rst_conn.rip = src;
+    rst_conn.rport = sport;
+    rst_conn.rcv_nxt = ackno;
+    rst_conn.rx_len = BUFSZ;
+    rst_conn.state = CLOSED;
+    if (ack != 0) { send_segment(?rst_conn, seq, RST, 0, 0); }
+    or {
+        rst_conn.state = SYN_SENT; # no ACK flag
+        send_segment(?rst_conn, seq, RST, 0, 0);
+    }
+}
+
+fun arm(c: *Conn) {
+    if (c.rtx_at == 0) { c.rtx_at = now() + c.rto; }
+}
+
+# send what the window and the queue allow, then the FIN when it is due
+fun output(c: *Conn) {
+    if (c.state != ESTABLISHED && c.state != CLOSE_WAIT && c.state != FIN_WAIT1
+        && c.state != CLOSING && c.state != LAST_ACK) { ret; }
+    for {
+        val inflight: u64 = (c.snd_nxt - c.snd_una)::u64;
+        # the FIN takes a sequence number but no byte of tx
+        var sent_data: u64 = inflight;
+        if (c.fin_sent != 0 && sent_data > 0) { sent_data = sent_data - 1; }
+        if (sent_data >= c.tx_len) { brk; }
+        var wnd: u64 = c.snd_wnd;
+        if (wnd == 0 && inflight == 0) { wnd = 1; } # probe a closed window
+        if (inflight >= wnd) { brk; }
+        var n: u64 = c.tx_len - sent_data;
+        if (n > wnd - inflight) { n = wnd - inflight; }
+        if (n > c.mss) { n = c.mss; }
+        send_segment(c, c.snd_nxt, PSH, c.tx_start + sent_data, n);
+        c.snd_nxt = c.snd_nxt + n::u32;
+        arm(c);
+    }
+    # everything sent: the FIN
+    if (c.fin_want != 0 && c.fin_sent == 0 && (c.snd_nxt - c.snd_una)::u64 == c.tx_len) {
+        send_segment(c, c.snd_nxt, FIN, 0, 0);
+        c.snd_nxt = c.snd_nxt + 1;
+        c.fin_sent = 1;
+        arm(c);
+        if (c.state == ESTABLISHED) { c.state = FIN_WAIT1; }
+        or (c.state == CLOSE_WAIT) { c.state = LAST_ACK; }
+    }
+}
+
+fun fail(c: *Conn, why: u64) {
+    c.err = why;
+    c.state = CLOSED;
+    c.rtx_at = 0;
+    wake(c);
+    if (c.parent != nil || c.owned == 0) { free(c); }
+}
+
+# --- receiving segments ------------------------------------------------------------
+
+fun accept_data(c: *Conn, p: *u8, len: u64) {
+    var room: u64 = BUFSZ - c.rx_len;
+    var n: u64 = len;
+    if (n > room) { n = room; }
+    var k: u64 = 0;
+    for (k < n) {
+        @((c.rx + (c.rx_start + c.rx_len + k) % BUFSZ)::*u8) = p[k];
+        k = k + 1;
+    }
+    c.rx_len = c.rx_len + n;
+    c.rcv_nxt = c.rcv_nxt + n::u32;
+    if (n > 0) { wake(c); }
+}
+
+# an acknowledgement up to `ackno`: what it covers leaves the send ring
+fun acked(c: *Conn, ackno: u32, wnd: u64) {
+    if (lt(c.snd_una, ackno) != 0 && le(ackno, c.snd_nxt) != 0) {
+        var n: u64 = (ackno - c.snd_una)::u64;
+        # the FIN's sequence number is not a byte in the ring
+        if (c.fin_sent != 0 && ackno == c.snd_nxt && n > c.tx_len) { n = c.tx_len; }
+        if (n > c.tx_len) { n = c.tx_len; }
+        c.tx_start = (c.tx_start + n) % BUFSZ;
+        c.tx_len = c.tx_len - n;
+        c.snd_una = ackno;
+        c.tries = 0;
+        c.rto = apic.HZ;
+        c.rtx_at = 0;
+        if (c.snd_una != c.snd_nxt) { arm(c); }
+        wake(c);
+    }
+    c.snd_wnd = wnd;
+}
+
+fun fin_acked(c: *Conn) u8 { ret (c.fin_sent != 0 && c.snd_una == c.snd_nxt)::u8; }
+
+fun listen_input(l: *Conn, src: u32, dst: u32, sport: u16, seq: u32, flags: u8, mss: u64) {
+    if ((flags & SYN) == 0 || (flags & (ACK | RST)) != 0) { ret; }
+    if (l.qlen >= l.backlog) { ret; } # full: the peer tries again
+    val c: *Conn = alloc();
+    if (c == nil) { ret; }
+    c.owned = 0;
+    c.parent = l;
+    c.lip = dst;
+    c.lport = l.lport;
+    c.rip = src;
+    c.rport = sport;
+    c.rcv_nxt = seq + 1;
+    c.mss = mss;
+    c.iss = (cpu.rdtsc() & 0xFFFFFFFF)::u32;
+    c.snd_una = c.iss;
+    c.snd_nxt = c.iss;
+    c.state = SYN_RCVD;
+    send_segment(c, c.snd_nxt, SYN, 0, 0);
+    c.snd_nxt = c.snd_nxt + 1;
+    arm(c);
+}
+
+# a TCP segment for us (net.mach hands them over)
+pub fun input(src: u32, dst: u32, p: *u8, n: u64) {
+    if (n < 20) { ret; }
+    val off: u64 = ((p[12] >> 4)::u64) * 4;
+    if (off < 20 || off > n) { ret; }
+    var ph: [12]u8;
+    net.put32(?ph[0], src);
+    net.put32(?ph[4], dst);
+    ph[8] = 0;
+    ph[9] = 6;
+    net.put16(?ph[10], n::u16);
+    if (net.csum_end(net.csum_add(net.csum_add(0, ?ph[0], 12), p, n)) != 0) { ret; }
+    val sport: u16 = net.get16(?p[0]);
+    val dport: u16 = net.get16(?p[2]);
+    val seq: u32 = net.get32(?p[4]);
+    val ackno: u32 = net.get32(?p[8]);
+    val flags: u8 = p[13];
+    val wnd: u64 = net.get16(?p[14])::u64;
+    val data: *u8 = ?p[off];
+    val len: u64 = n - off;
+    # the peer's segment size, from a SYN's options
+    var mss: u64 = 536;
+    var o: u64 = 20;
+    for (o + 1 < off) {
+        val kind: u8 = p[o];
+        if (kind == 0) { brk; }
+        if (kind == 1) {
+            o = o + 1;
+            cnt;
+        }
+        val ol: u64 = p[o + 1]::u64;
+        if (ol < 2) { brk; }
+        if (kind == 2 && ol == 4) { mss = net.get16(?p[o + 2])::u64; }
+        o = o + ol;
+    }
+    if (mss > MSS) { mss = MSS; }
+
+    var c: *Conn = find(dst, dport, src, sport);
+    if (c == nil) {
+        val l: *Conn = find_listener(dport);
+        if (l != nil) {
+            listen_input(l, src, dst, sport, seq, flags, mss);
+            ret;
+        }
+        if ((flags & RST) == 0) {
+            if ((flags & ACK) != 0) { send_rst(src, dst, sport, dport, ackno, 0, 1); }
+            or {
+                var plus: u32 = len::u32;
+                if ((flags & SYN) != 0) { plus = plus + 1; }
+                if ((flags & FIN) != 0) { plus = plus + 1; }
+                send_rst(src, dst, sport, dport, 0, seq + plus, 1);
+            }
+        }
+        ret;
+    }
+
+    if (c.state == SYN_SENT) {
+        if ((flags & ACK) != 0 && (ackno != c.snd_nxt)) {
+            if ((flags & RST) == 0) { send_rst(src, dst, sport, dport, ackno, 0, 1); }
+            ret;
+        }
+        if ((flags & RST) != 0) {
+            if ((flags & ACK) != 0) { fail(c, ERR_REFUSED); }
+            ret;
+        }
+        if ((flags & SYN) != 0 && (flags & ACK) != 0) {
+            c.rcv_nxt = seq + 1;
+            c.mss = mss;
+            c.snd_una = ackno;
+            c.snd_wnd = wnd;
+            c.state = ESTABLISHED;
+            c.rtx_at = 0;
+            c.tries = 0;
+            c.rto = apic.HZ;
+            send_ack(c);
+            wake(c);
+            output(c);
+        }
+        ret;
+    }
+
+    # is it in the window? (an empty segment at rcv_nxt always is)
+    if ((flags & RST) != 0) {
+        if (seq == c.rcv_nxt || (lt(c.rcv_nxt, seq) != 0 && lt(seq, c.rcv_nxt + 65535) != 0)) {
+            if (c.state == SYN_RCVD) {
+                free(c);
+                ret;
+            }
+            fail(c, ERR_RESET);
+        }
+        ret;
+    }
+    if (seq != c.rcv_nxt) {
+        # out of order or a repeat: say again what we have
+        if (len > 0 || (flags & (SYN | FIN)) != 0) { send_ack(c); }
+        if ((flags & ACK) != 0) { acked(c, ackno, wnd); }
+        ret;
+    }
+    if ((flags & SYN) != 0) { # a SYN inside a connection
+        fail(c, ERR_RESET);
+        ret;
+    }
+    if ((flags & ACK) == 0) { ret; }
+
+    if (c.state == SYN_RCVD) {
+        if (ackno != c.snd_nxt) {
+            send_rst(src, dst, sport, dport, ackno, 0, 1);
+            ret;
+        }
+        c.snd_una = ackno;
+        c.snd_wnd = wnd;
+        c.state = ESTABLISHED;
+        c.rtx_at = 0;
+        c.tries = 0;
+        val l: *Conn = c.parent;
+        if (l != nil && l.used != 0 && l.state == LISTEN && l.qlen < BACKLOG) {
+            l.queue[l.qlen] = c;
+            l.qlen = l.qlen + 1;
+            wake(l);
+        }
+    } or {
+        acked(c, ackno, wnd);
+    }
+
+    if (len > 0 && c.peer_fin == 0) {
+        accept_data(c, data, len);
+        send_ack(c);
+    }
+    if ((flags & FIN) != 0 && c.peer_fin == 0 && seq + len::u32 == c.rcv_nxt) {
+        c.rcv_nxt = c.rcv_nxt + 1;
+        c.peer_fin = 1;
+        send_ack(c);
+        wake(c);
+        if (c.state == ESTABLISHED) { c.state = CLOSE_WAIT; }
+        or (c.state == FIN_WAIT1) {
+            if (fin_acked(c) != 0) {
+                c.state = TIME_WAIT;
+                c.dead_at = now() + 2 * apic.HZ;
+            } or {
+                c.state = CLOSING;
+            }
+        } or (c.state == FIN_WAIT2) {
+            c.state = TIME_WAIT;
+            c.dead_at = now() + 2 * apic.HZ;
+        }
+    }
+    # our FIN acknowledged
+    if (fin_acked(c) != 0) {
+        if (c.state == FIN_WAIT1) { c.state = FIN_WAIT2; }
+        or (c.state == CLOSING) {
+            c.state = TIME_WAIT;
+            c.dead_at = now() + 2 * apic.HZ;
+        } or (c.state == LAST_ACK) {
+            c.state = CLOSED;
+            wake(c);
+            if (c.owned == 0) { free(c); }
+            ret;
+        }
+    }
+    output(c);
+}
+
+# --- the timer ---------------------------------------------------------------------
+
+pub fun tick() {
+    val t: u64 = now();
+    var i: u64 = 0;
+    for (i < MAXCONN) {
+        val c: *Conn = ?conns[i];
+        if (c.used != 0) {
+            if (c.state == TIME_WAIT && t >= c.dead_at) {
+                c.state = CLOSED;
+                if (c.owned == 0) { free(c); }
+            } or (c.state == CLOSED && c.owned == 0) {
+                free(c);
+            } or (c.rtx_at != 0 && t >= c.rtx_at) {
+                c.tries = c.tries + 1;
+                if (c.tries > 8) {
+                    fail(c, ERR_TIMEOUT);
+                } or {
+                    c.rto = c.rto * 2;
+                    if (c.rto > 60 * apic.HZ) { c.rto = 60 * apic.HZ; }
+                    c.rtx_at = 0;
+                    if (c.state == SYN_SENT || c.state == SYN_RCVD) {
+                        send_segment(c, c.iss, SYN, 0, 0);
+                        arm(c);
+                    } or {
+                        # go back to the oldest unacknowledged byte: the
+                        # data and the FIN go again
+                        c.snd_nxt = c.snd_una;
+                        c.fin_sent = 0;
+                        output(c);
+                    }
+                }
+            } or (c.state == ESTABLISHED || c.state == CLOSE_WAIT) {
+                output(c); # a window that opened
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# --- what the socket calls use ---------------------------------------------------------
+
+# start connecting from lport to rip:rport; the connection, or nil (none free)
+pub fun connect(lport: u16, rip: u32, rport: u16) *Conn {
+    val c: *Conn = alloc();
+    if (c == nil) { ret nil; }
+    c.lip = net.iface().ip;
+    c.lport = lport;
+    c.rip = rip;
+    c.rport = rport;
+    c.iss = (cpu.rdtsc() & 0xFFFFFFFF)::u32;
+    c.snd_una = c.iss;
+    c.snd_nxt = c.iss + 1;
+    c.state = SYN_SENT;
+    send_segment(c, c.iss, SYN, 0, 0);
+    arm(c);
+    ret c;
+}
+
+pub fun listen(lport: u16, backlog: u64) *Conn {
+    val c: *Conn = alloc();
+    if (c == nil) { ret nil; }
+    c.lport = lport;
+    c.state = LISTEN;
+    var b: u64 = backlog;
+    if (b == 0 || b > BACKLOG) { b = BACKLOG; }
+    c.backlog = b;
+    ret c;
+}
+
+# a connection ready on listener l, or nil
+pub fun take(l: *Conn) *Conn {
+    if (l.qlen == 0) { ret nil; }
+    val c: *Conn = l.queue[0];
+    var i: u64 = 1;
+    for (i < l.qlen) {
+        l.queue[i - 1] = l.queue[i];
+        i = i + 1;
+    }
+    l.qlen = l.qlen - 1;
+    c.parent = nil;
+    c.owned = 1;
+    ret c;
+}
+
+# up to n received bytes into buf; how many (0: none waiting)
+pub fun read(c: *Conn, buf: *u8, n: u64) u64 {
+    var k: u64 = n;
+    if (k > c.rx_len) { k = c.rx_len; }
+    val was_full: u8 = (c.rx_len == BUFSZ)::u8;
+    var i: u64 = 0;
+    for (i < k) {
+        buf[i] = @((c.rx + (c.rx_start + i) % BUFSZ)::*u8);
+        i = i + 1;
+    }
+    c.rx_start = (c.rx_start + k) % BUFSZ;
+    c.rx_len = c.rx_len - k;
+    # the window opened again: tell the peer
+    if (k > 0 && (was_full != 0 || BUFSZ - c.rx_len >= BUFSZ / 2) && c.state != CLOSED) { send_ack(c); }
+    ret k;
+}
+
+# queue up to n bytes for sending; how many fitted
+pub fun write(c: *Conn, buf: *u8, n: u64) u64 {
+    var k: u64 = BUFSZ - c.tx_len;
+    if (k > n) { k = n; }
+    var i: u64 = 0;
+    for (i < k) {
+        @((c.tx + (c.tx_start + c.tx_len + i) % BUFSZ)::*u8) = buf[i];
+        i = i + 1;
+    }
+    c.tx_len = c.tx_len + k;
+    output(c);
+    ret k;
+}
+
+# no more to send (shutdown, close)
+pub fun finish(c: *Conn) {
+    if (c.state == SYN_SENT || c.state == LISTEN) {
+        c.state = CLOSED;
+        c.rtx_at = 0;
+        ret;
+    }
+    c.fin_want = 1;
+    output(c);
+}
+
+# the socket lets go: what is queued still goes, then the connection ends
+# by itself (listeners and unfinished connects end at once)
+pub fun release(c: *Conn) {
+    c.owned = 0;
+    if (c.state == LISTEN) {
+        var i: u64 = 0;
+        for (i < c.qlen) {
+            val q: *Conn = c.queue[i];
+            send_segment(q, q.snd_nxt, RST, 0, 0);
+            free(q);
+            i = i + 1;
+        }
+        free(c);
+        ret;
+    }
+    if (c.state == CLOSED || c.state == SYN_SENT) {
+        free(c);
+        ret;
+    }
+    if (c.rx_len > 0) { # unread data: a reset, as the RFC asks
+        send_segment(c, c.snd_nxt, RST, 0, 0);
+        free(c);
+        ret;
+    }
+    finish(c);
+}
+
+pub fun state_name(s: u64) *u8 {
+    if (s == LISTEN) { ret "LISTEN\0"; }
+    if (s == SYN_SENT) { ret "SYN_SENT\0"; }
+    if (s == SYN_RCVD) { ret "SYN_RCVD\0"; }
+    if (s == ESTABLISHED) { ret "ESTABLISHED\0"; }
+    if (s == FIN_WAIT1) { ret "FIN_WAIT1\0"; }
+    if (s == FIN_WAIT2) { ret "FIN_WAIT2\0"; }
+    if (s == CLOSE_WAIT) { ret "CLOSE_WAIT\0"; }
+    if (s == CLOSING) { ret "CLOSING\0"; }
+    if (s == LAST_ACK) { ret "LAST_ACK\0"; }
+    if (s == TIME_WAIT) { ret "TIME_WAIT\0"; }
+    ret "CLOSED\0";
+}

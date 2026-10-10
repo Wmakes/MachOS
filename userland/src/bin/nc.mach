@@ -1,6 +1,11 @@
-# nc -u [-w SECONDS] HOST PORT: send what comes on standard input to
-# HOST:PORT in UDP datagrams (one per line) and show what comes back, until
-# nothing has come for SECONDS (default 2)
+# nc [-u] [-w SECONDS] HOST PORT: send standard input to HOST:PORT and show
+# what comes back
+#   (TCP)  connect, send everything, then show what the other side sends
+#          until it closes (or nothing comes for SECONDS, when -w is given)
+#   -u     UDP: a datagram per line, and the answers until nothing has come
+#          for SECONDS (default 2)
+# nc -l [-w SECONDS] PORT: wait for one TCP connection on PORT, show what it
+#   sends until it closes, and answer with standard input
 
 use std.runtime;
 use os:     std.system.os;
@@ -8,13 +13,86 @@ use machos: std.system.os.machos;
 use io:     userland.lib.cli;
 use addr:   userland.lib.netaddr;
 use std.types.size.usize;
+use std.types.result.res;
+use std.types.error.err;
+use std.net.ip;
+use std.net.tcp;
+use io_error: std.io.error;
 
 var line: [1500]u8;
 var reply: [1500]u8;
 
 fun usage() i64 {
-    io.err("usage: nc -u [-w SECONDS] HOST PORT\n");
+    io.err("usage: nc [-u] [-w SECONDS] HOST PORT, or nc -l [-w SECONDS] PORT\n");
     ret 2;
+}
+
+var chunk: [4096]u8;
+
+# everything on standard input into stream s
+fun send_input(s: *tcp.Stream) u8 {
+    for {
+        val r: i64 = io.read(io.STDIN, ?chunk[0], 4096);
+        if (r <= 0) { ret 1; }
+        var at: u64 = 0;
+        for (at < r::u64) {
+            val w: res[usize, io_error.Error] = tcp.stream_write(s, ?chunk[at], (r::u64 - at)::usize);
+            if (sel w.err) {
+                io.err("nc: sending failed\n");
+                ret 0;
+            }
+            at = at + w.ok::u64;
+        }
+    }
+    ret 1;
+}
+
+# what comes from s, to standard output, until it closes or goes quiet
+fun show_output(s: *tcp.Stream) {
+    for {
+        val r: res[usize, io_error.Error] = tcp.stream_read(s, ?chunk[0], 4096);
+        if (sel r.err) { brk; }
+        if (r.ok == 0) { brk; }
+        io.outn(?chunk[0], r.ok::u64);
+    }
+}
+
+fun tcp_client(ip4: u32, port: u64, wait: u64) i64 {
+    val ep: ip.Endpoint = ip.endpoint_v4(ip.ipv4_from_u32(ip4), port::u16);
+    val c: res[tcp.Stream, io_error.Error] = tcp.connect(ep);
+    if (sel c.err) {
+        io.fail("nc", "connect", c.err.code);
+        ret 1;
+    }
+    var s: tcp.Stream = c.ok;
+    if (wait != 0) { tcp.stream_set_read_timeout(?s, wait * 1000); }
+    if (send_input(?s) == 0) { ret 1; }
+    tcp.stream_shutdown(?s, 1);
+    show_output(?s);
+    tcp.stream_close(?s);
+    ret 0;
+}
+
+fun tcp_server(port: u64, wait: u64) i64 {
+    val ep: ip.Endpoint = ip.endpoint_v4(ip.ipv4_any(), port::u16);
+    val l: res[tcp.Listener, io_error.Error] = tcp.listen(ep, 1);
+    if (sel l.err) {
+        io.fail("nc", "listen", l.err.code);
+        ret 1;
+    }
+    var ln: tcp.Listener = l.ok;
+    val a: res[tcp.Stream, io_error.Error] = tcp.accept(?ln);
+    if (sel a.err) {
+        io.fail("nc", "accept", a.err.code);
+        ret 1;
+    }
+    var s: tcp.Stream = a.ok;
+    if (wait != 0) { tcp.stream_set_read_timeout(?s, wait * 1000); }
+    show_output(?s);
+    send_input(?s);
+    tcp.stream_close(?s);
+    tcp.listener_close(?ln);
+    ret 0;
 }
 
 # the next line of standard input (without its newline) into `line`; its
@@ -39,9 +117,11 @@ fun next_line() i64 {
 fun main(argc: i64, argv: **u8) i64 {
     var i: i64 = 1;
     var udp: u8 = 0;
-    var wait: u64 = 2;
+    var listening: u8 = 0;
+    var wait: u64 = 0;
     for (i < argc && argv[i][0] == 45) {
         if (io.streq(argv[i], "-u") != 0) { udp = 1; }
+        or (io.streq(argv[i], "-l") != 0) { listening = 1; }
         or (io.streq(argv[i], "-w") != 0 && i + 1 < argc) {
             var ok: u8 = 0;
             wait = io.parse_dec(argv[i + 1], io.len(argv[i + 1]), ?ok);
@@ -50,9 +130,12 @@ fun main(argc: i64, argv: **u8) i64 {
         } or { ret usage(); }
         i = i + 1;
     }
-    if (udp == 0) {
-        io.err("nc: only UDP (-u) for now\n");
-        ret 2;
+    if (listening != 0) {
+        if (argc - i != 1 || udp != 0) { ret usage(); }
+        var lok: u8 = 0;
+        val lport: u64 = io.parse_dec(argv[i], io.len(argv[i]), ?lok);
+        if (lok == 0 || lport == 0 || lport > 65535) { ret usage(); }
+        ret tcp_server(lport, wait);
     }
     if (argc - i != 2) { ret usage(); }
     var ip: u32 = 0;
@@ -65,6 +148,8 @@ fun main(argc: i64, argv: **u8) i64 {
     var ok: u8 = 0;
     val port: u64 = io.parse_dec(argv[i + 1], io.len(argv[i + 1]), ?ok);
     if (ok == 0 || port == 0 || port > 65535) { ret usage(); }
+    if (udp == 0) { ret tcp_client(ip, port, wait); }
+    if (wait == 0) { wait = 2; }
     var fd: usize = 0;
     val made: i64 = machos.sock_create(machos.AF_INET, machos.SOCK_DGRAM, 0, ?fd);
     if (made < 0) {

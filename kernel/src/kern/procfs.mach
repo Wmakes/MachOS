@@ -28,6 +28,7 @@
 #   /proc/net/dev                 per interface: received and sent packets and
 #                                 bytes, and the ones dropped
 #   /proc/net/arp                 "IP MAC" for every address it knows
+#   /proc/net/tcp                 "LOCAL REMOTE STATE" per TCP connection
 #   /proc/net/resolv.conf         "nameserver IP": the DNS server, the way
 #                                 resolv.conf says it (std's resolver reads it)
 #   /proc/PID/status, /proc/self/status
@@ -54,6 +55,7 @@ use fbcon:   machos.dev.fbcon;
 use clock:   machos.kern.clock;
 use net:     machos.net.net;
 use dhcp:    machos.net.dhcp;
+use tcp:     machos.net.tcp;
 
 # what each /proc node is (its Node.ino)
 val VERSION:   u64 = 1;
@@ -73,6 +75,7 @@ val NETCONF:   u64 = 30;
 val NETDEV:    u64 = 31;
 val NETARP:    u64 = 32;
 val RESOLV:    u64 = 33;
+val NETTCP:    u64 = 34;
 val STATUS:    u64 = 20;
 val ROOT:      u64 = 100;
 val DIR:       u64 = 101; # sys, sys/kernel
@@ -445,6 +448,24 @@ fun generate(nd: *vfs.Node, o: *Out) {
             dec(o, i.tx_dropped);
             putc(o, 10);
         }
+    } or (id == NETTCP) {
+        var k: u64 = 0;
+        for (k < tcp.max()) {
+            val c: *tcp.Conn = tcp.slot(k);
+            if (c.used != 0) {
+                ipv4(o, c.lip);
+                putc(o, 58);
+                dec(o, c.lport::u64);
+                putc(o, 32);
+                ipv4(o, c.rip);
+                putc(o, 58);
+                dec(o, c.rport::u64);
+                putc(o, 32);
+                puts(o, tcp.state_name(c.state));
+                putc(o, 10);
+            }
+            k = k + 1;
+        }
     } or (id == RESOLV) {
         val ni: *net.Iface = net.iface();
         if (ni.up != 0 && ni.dns != 0) {
@@ -629,6 +650,7 @@ pub fun init(root: *vfs.Node) {
         vfs.make_proc(nt, "dev\0", 3, abi.KIND_FILE, NETDEV, 0, 0x124);
         vfs.make_proc(nt, "arp\0", 3, abi.KIND_FILE, NETARP, 0, 0x124);
         vfs.make_proc(nt, "resolv.conf\0", 11, abi.KIND_FILE, RESOLV, 0, 0x124);
+        vfs.make_proc(nt, "tcp\0", 3, abi.KIND_FILE, NETTCP, 0, 0x124);
     }
     val sys: *vfs.Node = vfs.make_proc(d, "sys\0", 3, abi.KIND_DIR, DIR, 0, 0x16D);
     if (sys == nil) { ret; }

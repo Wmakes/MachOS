@@ -9,6 +9,7 @@ use socket: machos.net.socket;
 use proc:   machos.kern.proc;
 use mem:    machos.kern.mem;
 use apic:   machos.arch.x86_64.apic;
+use tcp:    machos.net.tcp;
 
 fun e(code: u64) u64 { ret abi.err(code); }
 
@@ -23,6 +24,7 @@ pub fun autobind(s: *socket.Sock) u64 {
 
 # send len bytes to ip:port (ip 0: the connected peer); bytes sent or an error
 pub fun send(s: *socket.Sock, buf: *u8, len: u64, ip: u32, port: u16) u64 {
+    if (s.kind == socket.TCP) { ret tcp_send(s, buf, len); }
     val i: *net.Iface = net.iface();
     if (i.present == 0) { ret e(abi.E_NETUNREACH); }
     var dst: u32 = ip;
@@ -51,6 +53,11 @@ pub fun send(s: *socket.Sock, buf: *u8, len: u64, ip: u32, port: u16) u64 {
 # the next datagram into buf (cut at len); its whole length or an error.
 # *ip and *port get where it came from
 pub fun recv(s: *socket.Sock, buf: *u8, len: u64, ip: *u32, port: *u16) u64 {
+    if (s.kind == socket.TCP) {
+        @ip = s.peer_ip;
+        @port = s.peer_port;
+        ret tcp_recv(s, buf, len);
+    }
     val start: u64 = proc.uptime_ticks();
     for {
         net.poll();
@@ -67,4 +74,161 @@ pub fun recv(s: *socket.Sock, buf: *u8, len: u64, ip: *u32, port: *u16) u64 {
     @port = d.port;
     socket.take_done(s);
     ret n;
+}
+
+# --- TCP --------------------------------------------------------------------------
+
+fun conn(s: *socket.Sock) *tcp.Conn { ret s.conn::*tcp.Conn; }
+
+fun tcp_error(c: *tcp.Conn) u64 {
+    if (c.err == tcp.ERR_REFUSED) { ret e(abi.E_CONNREFUSED); }
+    if (c.err == tcp.ERR_RESET) { ret e(abi.E_CONNRESET); }
+    if (c.err == tcp.ERR_TIMEOUT) { ret e(abi.E_TIMEDOUT); }
+    ret e(abi.E_NOTCONN);
+}
+
+# a free local port for a TCP socket
+pub fun tcp_port() u16 {
+    var tries: u64 = 0;
+    for (tries < 16384) {
+        val p: u16 = socket.free_port(socket.TCP);
+        if (p != 0 && tcp.port_used(p) == 0) { ret p; }
+        tries = tries + 1;
+    }
+    ret 0;
+}
+
+# wait (polling the card) until `ready` says so, the timeout passes or a
+# signal comes; 0, or the error
+fun wait_until(s: *socket.Sock, start: u64) u64 {
+    if (s.timeout != 0 && (proc.uptime_ticks() - start) * 1000 >= s.timeout * apic.HZ) { ret e(abi.E_AGAIN); }
+    if (proc.interrupted(proc.current()) != 0) { ret e(abi.E_INTR); }
+    proc.sleep_ticks(1);
+    net.poll();
+    ret 0;
+}
+
+pub fun tcp_connect(s: *socket.Sock, ip: u32, port: u16) u64 {
+    if (s.conn != 0) { ret e(abi.E_INVAL); }
+    val i: *net.Iface = net.iface();
+    if (i.up == 0) { ret e(abi.E_NETUNREACH); }
+    if (s.port == 0) {
+        s.port = tcp_port();
+        if (s.port == 0) { ret e(abi.E_AGAIN); }
+    }
+    val c: *tcp.Conn = tcp.connect(s.port, ip, port);
+    if (c == nil) { ret e(abi.E_NFILE); }
+    s.conn = c::u64;
+    s.peer_ip = ip;
+    s.peer_port = port;
+    # a connect waits for the handshake (the socket's timeout aside)
+    for (c.state == tcp.SYN_SENT) {
+        if (proc.interrupted(proc.current()) != 0) { ret e(abi.E_INTR); }
+        proc.sleep_ticks(1);
+        net.poll();
+    }
+    if (c.state != tcp.ESTABLISHED && c.state != tcp.CLOSE_WAIT) { ret tcp_error(c); }
+    s.connected = 1;
+    ret 0;
+}
+
+pub fun tcp_listen(s: *socket.Sock, backlog: u64) u64 {
+    if (s.conn != 0) {
+        if (conn(s).state == tcp.LISTEN) { ret 0; }
+        ret e(abi.E_INVAL);
+    }
+    if (s.port == 0) {
+        s.port = tcp_port();
+        if (s.port == 0) { ret e(abi.E_AGAIN); }
+    }
+    val c: *tcp.Conn = tcp.listen(s.port, backlog);
+    if (c == nil) { ret e(abi.E_NFILE); }
+    s.conn = c::u64;
+    ret 0;
+}
+
+# the next connection on listening socket s: a new socket for it, or nil
+# with *err set
+pub fun tcp_accept(s: *socket.Sock, err: *u64) *socket.Sock {
+    @err = 0;
+    if (s.conn == 0 || conn(s).state != tcp.LISTEN) {
+        @err = e(abi.E_INVAL);
+        ret nil;
+    }
+    val l: *tcp.Conn = conn(s);
+    val start: u64 = proc.uptime_ticks();
+    for (l.qlen == 0) {
+        val w: u64 = wait_until(s, start);
+        if (abi.is_err(w) != 0) {
+            @err = w;
+            ret nil;
+        }
+    }
+    val ns: *socket.Sock = socket.alloc(socket.TCP);
+    if (ns == nil) {
+        @err = e(abi.E_NFILE);
+        ret nil;
+    }
+    val c: *tcp.Conn = tcp.take(l);
+    ns.conn = c::u64;
+    ns.port = c.lport;
+    ns.peer_ip = c.rip;
+    ns.peer_port = c.rport;
+    ns.connected = 1;
+    ret ns;
+}
+
+pub fun tcp_send(s: *socket.Sock, buf: *u8, len: u64) u64 {
+    if (s.conn == 0) { ret e(abi.E_NOTCONN); }
+    val c: *tcp.Conn = conn(s);
+    var done: u64 = 0;
+    for (done < len) {
+        if (c.err != tcp.ERR_NONE) { ret tcp_error(c); }
+        if (c.state != tcp.ESTABLISHED && c.state != tcp.CLOSE_WAIT) {
+            if (done > 0) { ret done; }
+            ret e(abi.E_PIPE);
+        }
+        if (c.fin_want != 0) { ret e(abi.E_PIPE); }
+        val k: u64 = tcp.write(c, ?buf[done], len - done);
+        done = done + k;
+        if (done < len) { # the send ring is full: wait for acknowledgements
+            if (proc.interrupted(proc.current()) != 0) {
+                if (done > 0) { ret done; }
+                ret e(abi.E_INTR);
+            }
+            proc.sleep_ticks(1);
+            net.poll();
+        }
+    }
+    ret done;
+}
+
+pub fun tcp_recv(s: *socket.Sock, buf: *u8, len: u64) u64 {
+    if (s.conn == 0) { ret e(abi.E_NOTCONN); }
+    val c: *tcp.Conn = conn(s);
+    val start: u64 = proc.uptime_ticks();
+    for {
+        net.poll();
+        if (c.rx_len > 0) { ret tcp.read(c, buf, len); }
+        if (c.peer_fin != 0) { ret 0; }
+        if (c.err != tcp.ERR_NONE) { ret tcp_error(c); }
+        if (c.state == tcp.CLOSED) { ret 0; }
+        val w: u64 = wait_until(s, start);
+        if (abi.is_err(w) != 0) { ret w; }
+    }
+    ret 0;
+}
+
+pub fun tcp_shutdown(s: *socket.Sock, how: u64) u64 {
+    if (s.conn == 0) { ret e(abi.E_NOTCONN); }
+    if (how == abi.SHUT_WR || how == abi.SHUT_RDWR) { tcp.finish(conn(s)); }
+    ret 0;
+}
+
+# the socket's last handle went: let the connection finish by itself
+pub fun close(s: *socket.Sock) {
+    if (s.kind == socket.TCP && s.conn != 0) {
+        tcp.release(conn(s));
+        s.conn = 0;
+    }
 }

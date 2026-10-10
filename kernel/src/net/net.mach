@@ -43,6 +43,15 @@ pub rec Iface {
 
 var ifc: Iface;
 
+# TCP sits above this module (net/tcp.mach): it hands over its input here
+var have_tcp: u8 = 0;
+var tcp_in: fun(u32, u32, *u8, u64);
+
+pub fun set_tcp(f: fun(u32, u32, *u8, u64)) {
+    tcp_in = f;
+    have_tcp = 1;
+}
+
 pub fun iface() *Iface { ret ?ifc; }
 
 # --- byte order -----------------------------------------------------------------
@@ -349,6 +358,7 @@ fun ip_input(p: *u8, n: u64) {
     val proto: u8 = p[9];
     if (proto == PROTO_ICMP) { icmp_input(src, ?p[hl], total - hl); }
     or (proto == PROTO_UDP) { udp_input(src, dst, ?p[hl], total - hl); }
+    or (proto == 6 && have_tcp != 0) { tcp_in(src, dst, ?p[hl], total - hl); }
 }
 
 # take in whatever the card received

@@ -1,5 +1,6 @@
 # kernel entry
 
+use tcp:  machos.net.tcp;
 use net:  machos.net.net;
 use dhcp: machos.net.dhcp;
 use info:   machos.boot.info;
@@ -183,6 +184,7 @@ fun kmain(handoff: u64) {
         kprint.dec(nkbd);
         kprint.puts(" keyboard(s)\n\0");
     }
+    net.set_tcp(tcp.input);
     if (net.init() != 0 && cmdline_has("nonet\0", 5) == nil) { dhcp.start(); }
     val ndisk: u64 = dsk.init();
     var di: u64 = 0;
