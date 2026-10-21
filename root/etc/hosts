@@ -1,0 +1,2 @@
+# Local names; DHCP DNS servers are exposed at /proc/net/resolv.conf.
+127.0.0.1 localhost

@@ -46,7 +46,9 @@ pub fun send(s: *socket.Sock, buf: *u8, len: u64, ip: u32, port: u16) u64 {
         ok = net.icmp_send(s, dst, buf, len);
     } or {
         if (len > 1472) { ret e(abi.E_2BIG); }
-        ok = net.udp_send(net.source_for(dst), s.port, dst, dport, buf, len);
+        var source: u32 = s.local_ip;
+        if (source == 0) { source = net.source_for(dst); }
+        ok = net.udp_send(source, s.port, dst, dport, buf, len);
     }
     if (ok == 0) { ret e(abi.E_NETUNREACH); }
     ret len;
@@ -55,6 +57,11 @@ pub fun send(s: *socket.Sock, buf: *u8, len: u64, ip: u32, port: u16) u64 {
 # the next datagram into buf (cut at len); its whole length or an error.
 # *ip and *port get where it came from
 pub fun recv(s: *socket.Sock, buf: *u8, len: u64, ip: *u32, port: *u16) u64 {
+    ret recv_message(s, buf, len, ip, port, nil);
+}
+
+# the same receive, optionally returning truncation and destination metadata.
+pub fun recv_message(s: *socket.Sock, buf: *u8, len: u64, ip: *u32, port: *u16, meta: *abi.RecvMeta) u64 {
     if (s.kind == socket.TCP) {
         @ip = s.peer_ip;
         @port = s.peer_port;
@@ -75,6 +82,13 @@ pub fun recv(s: *socket.Sock, buf: *u8, len: u64, ip: *u32, port: *u16) u64 {
     mem.copy(buf::u64, (?d.data[0])::u64, n);
     @ip = d.ip;
     @port = d.port;
+    if (meta != nil) {
+        socket.put_addr(?meta.peer[0], d.ip, d.port);
+        meta.destination = d.destination;
+        meta.interface_index = 1; # the current stack has one receiving interface
+        meta.flags = 0;
+        if (d.len > len) { meta.flags = 0x20; }
+    }
     socket.take_done(s);
     ret n;
 }
@@ -254,7 +268,8 @@ pub fun tcp_shutdown(s: *socket.Sock, how: u64) u64 {
 # the socket's last handle went: let the connection finish by itself
 pub fun close(s: *socket.Sock) {
     if (s.kind == socket.TCP && s.conn != 0) {
-        tcp.release(conn(s));
+        if ((s.linger >> 32) != 0 && (s.linger & 0xFFFFFFFF) == 0) { tcp.abort(conn(s)); }
+        or { tcp.release(conn(s)); }
         s.conn = 0;
     }
 }

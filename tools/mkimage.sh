@@ -58,7 +58,9 @@ fi
 mkdir -p "$ROOTFS/root" "$ROOTFS/home"
 chmod 0755 "$ROOTFS" "$ROOTFS/bin" "$ROOTFS/boot" "$ROOTFS/etc" "$ROOTFS/home"
 chmod 0700 "$ROOTFS/root"
-chmod 0644 "$ROOTFS/etc/"* "$ROOTFS/boot/"*.*
+find "$ROOTFS/etc" -type d -exec chmod 0755 {} +
+find "$ROOTFS/etc" -type f -exec chmod 0644 {} +
+chmod 0644 "$ROOTFS/boot/"*.*
 chmod 0755 "$ROOTFS/boot/efi"
 chmod 0600 "$ROOTFS/etc/shadow"
 chmod 0755 "$ROOTFS/bin/"*
@@ -113,7 +115,18 @@ else
     if ! debugfs -R "stat /boot/machboot.conf" "$ROOTIMG" 2>&1 | grep -q "File not found"; then
         KEEP_CONF=1
     fi
-    for d in bin boot; do
+    # Add resolver defaults to older dev images without replacing local policy.
+    for n in hosts services; do
+        if debugfs -R "stat /etc/$n" "$ROOTIMG" 2>&1 | grep -q "File not found"; then
+            echo "write $ROOTFS/etc/$n /etc/$n" >> "$CMDS"
+        fi
+    done
+    for d in /etc/ssl /etc/ssl/certs; do
+        if debugfs -R "stat $d" "$ROOTIMG" 2>&1 | grep -q "File not found"; then
+            echo "mkdir $d" >> "$CMDS"
+        fi
+    done
+    for d in bin boot etc/ssl/certs; do
         for f in "$ROOTFS/$d"/*; do
             [ -f "$f" ] || continue
             n=$(basename "$f")
@@ -124,7 +137,7 @@ else
         done
     done
     debugfs -w -f "$CMDS" "$ROOTIMG" >/dev/null 2>&1
-    owned_by_root "$ROOTIMG" "$(cd "$ROOTFS" && find bin boot -mindepth 1 | sed 's|^|/|')"
+    owned_by_root "$ROOTIMG" "$(cd "$ROOTFS" && find bin boot etc/ssl -mindepth 1 | sed 's|^|/|')"
     # a rescue build's config is undone by the next normal one
     if [ "$RESCUE" = 1 ]; then touch "$OUT/rescue-conf"; else rm -f "$OUT/rescue-conf"; fi
     dd if="$ROOTIMG" of="$IMG" bs=512 seek="$ROOT_START" conv=notrunc 2>/dev/null

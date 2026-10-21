@@ -1,0 +1,63 @@
+--- a/src/cert/bundle.mach
++++ b/src/cert/bundle.mach
+@@ -449,7 +449,7 @@
+ #[testing]
+ val ROOT: str = "-----BEGIN CERTIFICATE-----\nMIIBoDCCAVKgAwIBAgIUcUBdqlz8lEoxcPtVyGLrQN0qDrwwBQYDK2VwMDwxCzAJ\nBgNVBAYTAlVTMRMwEQYDVQQKDApCcmlhciBUZXN0MRgwFgYDVQQDDA9CcmlhciBU\nZXN0IFJvb3QwHhcNMjYwODI4MTEzMjQ1WhcNMzYwODI1MTEzMjQ1WjA8MQswCQYD\nVQQGEwJVUzETMBEGA1UECgwKQnJpYXIgVGVzdDEYMBYGA1UEAwwPQnJpYXIgVGVz\ndCBSb290MCowBQYDK2VwAyEA1zQsVUhtzx5sroC8d3ohC0MJZbzDcOsY4SoyGpTY\ncU2jZjBkMB8GA1UdIwQYMBaAFELfNo+RqDCA56syuG7lnW5tmzn+MBIGA1UdEwEB\n/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBRC3zaPkagwgOer\nMrhu5Z1ubZs5/jAFBgMrZXADQQB+WLFqB51+X7MOjRk2ZhOLGMvH4WNx8S8TO5rD\nVHQtXkYNVwGK3eDz3CZdB9uJH2HCTrIISG55wgGR3yg6cHoJ\n-----END CERTIFICATE-----\n";
+ 
+-# a P-521 key, which this build cannot represent
++# A P-521 root key, accepted as a configured trust anchor by mach-pki 0.4.
+ #[testing]
+ val P521_ROOT: str = "-----BEGIN CERTIFICATE-----\nMIICBTCCAWagAwIBAgIUdCIyy1M1plepJx9Rx4jW/1gRlhgwCgYIKoZIzj0EAwIw\nFDESMBAGA1UEAwwJUDUyMSBSb290MB4XDTI2MDkyNzA2NTUxNFoXDTM2MDkyNDA2\nNTUxNFowFDESMBAGA1UEAwwJUDUyMSBSb290MIGbMBAGByqGSM49AgEGBSuBBAAj\nA4GGAAQB6r27q74kR2bnzCe518X4u9oi36t0+sSTCD3sYi97eyHrrk87sf2tkw7q\n/E9q3TRlKRkj11TaOzMANQ8TBcXPRg0AUVFesV7196pa2nwg50bUGVd943pk5vzA\nO8faUOllkoRLvCNOFgVwFv653rKFFpjHhNEDlcf/nlGQyGUA2pgGPumjUzBRMB0G\nA1UdDgQWBBT1EPlmAcVldcCX8QoVJmrZfDKUCzAfBgNVHSMEGDAWgBT1EPlmAcVl\ndcCX8QoVJmrZfDKUCzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA4GMADCB\niAJCAJtYloGQ4V4O4ij4yZycBQ8EFAn1AQcIVNqwMJoeq1VfOhKiZBfYCIWOd9cO\n4eOLhlC7uX3GoJq7yKjdv9Bbnc0UAkIBuKSg6hnLBeyuR3k9txlWixHxVpk+pX8f\nrrztkcR5IEJYiF3uVNvk5wBRNzvp3oQ3zS3FJvi7LPfqtN4l9hGp0HU=\n-----END CERTIFICATE-----\n";
+ 
+@@ -513,7 +513,7 @@
+     if (parse(input, Storage{der: contracts.Buffer{data: ?der[0], capacity: 4096},
+         anchors:       ?anchors[0], anchor_capacity: 8, skips: ?skips[0],
+         skip_capacity: 8}, ?bundle) != OK) { ret 2; }
+-    if (bundle.blocks != 8 || bundle.store.len != 1 || bundle.skipped != 7 ||
++    if (bundle.blocks != 8 || bundle.store.len != 2 || bundle.skipped != 6 ||
+         bundle.store.anchors[0].der_len != 420 || !consistent(?bundle)) { ret 3; }
+     if (!skip_is(?bundle, 0, 1, MALFORMED_PEM) || skips[0].offset != 642 ||
+         skips[0].length != second - 642 ||
+@@ -521,9 +521,8 @@
+         !skip_is(?bundle, 2, 3, NOT_A_CERTIFICATE) ||
+         !skip_is(?bundle, 3, 4, MALFORMED_PEM) ||
+         !skip_is(?bundle, 4, 5, MALFORMED_CERTIFICATE) ||
+-        !skip_is(?bundle, 5, 6, UNSUPPORTED) ||
+-        !skip_is(?bundle, 6, 7, MALFORMED_PEM) || skips[6].offset != tail ||
+-        skips[6].length != at - tail) { ret 4; }
++        !skip_is(?bundle, 5, 7, MALFORMED_PEM) || skips[5].offset != tail ||
++        skips[5].length != at - tail) { ret 4; }
+ 
+     # storage smaller than measure asked for refuses before anything is written
+     if (parse(input, Storage{der: contracts.Buffer{data: ?der[0],
+@@ -534,13 +533,12 @@
+         anchors:       ?anchors[0], anchor_capacity: 8, skips: ?skips[0],
+         skip_capacity: 7}, ?bundle) != STORAGE) { ret 6; }
+     # without one usable anchor the bundle is refused, and still says why
+-    val unusable: contracts.Bytes = contracts.Bytes{data: ?text[tail - 761],
+-        len: at - (tail - 761)};
++    val unusable: contracts.Bytes = contracts.Bytes{data: ?text[tail],
++        len: at - tail};
+     if (parse(unusable, Storage{der: contracts.Buffer{data: ?der[0], capacity: 4096},
+         anchors:       ?anchors[0], anchor_capacity: 8, skips: ?skips[0],
+         skip_capacity: 8}, ?bundle) != NO_ANCHORS || bundle.store.len != 0 ||
+-        bundle.blocks != 2 || !skip_is(?bundle, 0, 0, UNSUPPORTED) ||
+-        !skip_is(?bundle, 1, 1, MALFORMED_PEM)) { ret 7; }
++        bundle.blocks != 1 || !skip_is(?bundle, 0, 0, MALFORMED_PEM)) { ret 7; }
+     if (parse(contracts.Bytes{data: ?text[0], len: 17}, Storage{
+         der:             contracts.Buffer{data: nil, capacity: 0}, anchors: nil,
+         anchor_capacity: 0, skips: nil, skip_capacity: 0
+@@ -594,10 +592,10 @@
+ }
+ 
+ test cert_bundle__loads_the_debian_and_alpine_system_bundles {
+-    # every debian root loads. alpine's one skip is e-szigno tls root ca 2023,
+-    # whose p-521 key this build has no verifier for
++    # Configured P-521 anchors load with mach-pki 0.4, including Alpine's
++    # e-szigno root; trust-anchor loading does not require its self-signature.
+     if (!loads("test/fixtures/bundles/debian.pem", 150, 150, 0)) { ret 1; }
+-    if (!loads("test/fixtures/bundles/alpine.pem", 121, 120, 1)) { ret 2; }
++    if (!loads("test/fixtures/bundles/alpine.pem", 121, 121, 0)) { ret 2; }
+     ret 0;
+ }
+ 

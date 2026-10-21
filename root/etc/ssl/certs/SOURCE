@@ -1,0 +1,6 @@
+# Mozilla-derived CA bundle distributed by Debian ca-certificates.
+# Snapshot: 2026-09-27, debian:stable-slim with ca-certificates installed.
+# Imported: 2026-10-21 from mach-tls's documented Debian bundle fixture.
+# Source: https://github.com/briar-systems/mach-tls/blob/10c2463fa72a212c53db934190f46046692236e8/test/fixtures/bundles/debian.pem
+# Provenance: https://github.com/briar-systems/mach-tls/blob/10c2463fa72a212c53db934190f46046692236e8/test/fixtures/bundles/README.md
+# Refresh source: https://curl.se/ca/cacert.pem

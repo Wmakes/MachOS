@@ -14,13 +14,14 @@ pub val UDP:  u64 = 17;
 pub val ICMP: u64 = 1;
 pub val TCP:  u64 = 6;   # its connection is net/tcp.mach's (conn)
 
-pub val MAX:   u64 = 32;
+pub val MAX:   u64 = 256;
 pub val QUEUE: u64 = 8;
 pub val DATA:  u64 = 1500;
 
 pub rec Datagram {
     len:  u64;
     ip:   u32;   # where it came from (host order)
+    destination: u32;
     port: u16;
     data: [1500]u8;
 }
@@ -33,6 +34,7 @@ pub rec Sock {
     peer_ip:   u32;  # set by connect: where send goes, what recv takes
     peer_port: u16;
     connected: u8;
+    error_reported: u8; # SO_ERROR consumes the pending error once
     broadcast: u8;   # may send to 255.255.255.255
     timeout:   u64;  # receive timeout in ms, 0 = wait for ever
     conn:      u64;  # TCP: its tcp.Conn (connecting, connected, or listening)
@@ -48,7 +50,7 @@ pub rec Sock {
     q:         [8]Datagram;
 }
 
-var socks: [32]Sock;
+var socks: [256]Sock;
 var next_port: u16 = 49152;
 
 pub fun slot(i: u64) *Sock { ret ?socks[i]; }
@@ -103,6 +105,11 @@ pub fun free_port(kind: u64) u16 {
 
 # a datagram from ip:port arrived for s (dropped when the queue is full)
 pub fun deliver(s: *Sock, ip: u32, port: u16, data: *u8, len: u64) {
+    deliver_to(s, ip, port, s.local_ip, data, len);
+}
+
+# retain the IP destination for wildcard-bound sockets too.
+pub fun deliver_to(s: *Sock, ip: u32, port: u16, destination: u32, data: *u8, len: u64) {
     if (s.connected != 0 && (ip != s.peer_ip || (s.kind == UDP && port != s.peer_port))) { ret; }
     if (s.count == QUEUE) {
         s.dropped = s.dropped + 1;
@@ -114,6 +121,7 @@ pub fun deliver(s: *Sock, ip: u32, port: u16, data: *u8, len: u64) {
     d.len = n;
     d.ip = ip;
     d.port = port;
+    d.destination = destination;
     mem.copy((?d.data[0])::u64, data::u64, n);
     s.count = s.count + 1;
     proc.wakeup(s::u64);

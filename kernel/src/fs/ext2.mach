@@ -713,6 +713,56 @@ pub fun unlink(fs: *Fs, dir: u64, name: *u8, nl: u64, ino: u64, is_dir: u8) u64 
     ret i.links::u64;
 }
 
+# Replace an existing regular directory entry without removing its name first.
+fun dir_replace(fs: *Fs, dir: u64, name: *u8, nl: u64, ino: u64) u64 {
+    var i: Inode;
+    if (read_inode(fs, dir, ?i) == 0) { ret e(abi.E_IO); }
+    drop_index(fs, dir, ?i);
+    val buf: u64 = heap.alloc(BS);
+    if (buf == 0) { ret e(abi.E_NOMEM); }
+    var lbn: u64 = 0;
+    for (lbn < size_of(?i) / BS) {
+        val pb: u64 = bmap(fs, dir, ?i, lbn, 0);
+        if (pb != 0 && blk.read(fs.part, pb, buf) != 0) {
+            var off: u64 = 0;
+            for (off + 8 <= BS) {
+                val at: u64 = buf + off;
+                val rec: u64 = (@((at + 4)::*u16))::u64;
+                if (rec < 8 || off + rec > BS) { brk; }
+                if (@(at::*u32) != 0 && (@((at + 6)::*u8))::u64 == nl &&
+                    mem.equal((at + 8)::*u8, name, nl) != 0) {
+                    @(at::*u32) = ino::u32;
+                    @((at + 7)::*u8) = FT_REG;
+                    val written: u8 = blk.write(fs.part, pb, buf);
+                    heap.free(buf);
+                    if (written == 0) { ret e(abi.E_IO); }
+                    ret 0;
+                }
+                off = off + rec;
+            }
+        }
+        lbn = lbn + 1;
+    }
+    heap.free(buf);
+    ret e(abi.E_NOENT);
+}
+
+# Namespace replacement is serialized by the kernel lock. Keep the displaced
+# inode until its last open handle closes, just as unlink does.
+pub fun replace(fs: *Fs, odir: u64, oname: *u8, onl: u64,
+    ndir: u64, nname: *u8, nnl: u64, ino: u64, old: u64) u64 {
+    val changed: u64 = dir_replace(fs, ndir, nname, nnl, ino);
+    if (abi.is_err(changed) != 0) { ret changed; }
+    if (dir_remove(fs, odir, oname, onl) == 0) {
+        dir_replace(fs, ndir, nname, nnl, old);
+        ret e(abi.E_IO);
+    }
+    add_links(fs, old, 0);
+    var displaced: Inode;
+    if (read_inode(fs, old, ?displaced) == 0) { ret e(abi.E_IO); }
+    ret displaced.links::u64;
+}
+
 # give back the blocks and inode of something with no links left
 pub fun release(fs: *Fs, ino: u64) {
     var i: Inode;

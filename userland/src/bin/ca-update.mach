@@ -1,0 +1,125 @@
+# Download and validate a CA bundle before replacing the system trust store.
+use std.runtime;
+use os: std.system.os;
+use std.process.exec;
+use std.process.env;
+use std.allocator;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.string.str;
+use tls.cert.bundle;
+use io: userland.lib.cli;
+
+val DEFAULT_URL: *u8 = "https://curl.se/ca/cacert.pem";
+val DESTINATION: *u8 = "/etc/ssl/certs/ca-certificates.crt";
+var temporary: [256]u8;
+
+fun usage() i64 {
+    io.err("usage: ca-update [--provider mozilla | --url HTTPS_URL]\n");
+    ret 2;
+}
+
+fun https(url: *u8) bool {
+    var i: u64 = 0;
+    for (i < 8) {
+        if (url[i] == 0 || url[i] != "https://"[i]) { ret false; }
+        i = i + 1;
+    }
+    ret url[8] != 0;
+}
+
+# Record the source only after the verified bundle was installed.
+fun provenance(url: *u8) bool {
+    val file: i64 = io.open_mode(?temporary[0], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644);
+    if (file < 0) { ret false; }
+    val prefix: *u8 = "# Updated by ca-update\n# Source: ";
+    val stamp: *u8 = "\n# Retrieved at Unix UTC seconds: ";
+    var now: os.Timespec;
+    var number: [24]u8;
+    var good: bool = io.write_all(file, prefix, io.len(prefix)) != 0 &&
+        io.write_all(file, url, io.len(url)) != 0 &&
+        io.write_all(file, stamp, io.len(stamp)) != 0 &&
+        os.realtime(?now) == 0;
+    if (good) {
+        good = io.write_all(file, ?number[0], io.fmt_dec(now.sec::u64, ?number[0])) != 0 &&
+            io.write_all(file, "\n", 1) != 0;
+    }
+    io.close(file);
+    if (good && io.rename(?temporary[0], "/etc/ssl/certs/SOURCE") == 0) { ret good; }
+    io.remove(?temporary[0]);
+    ret false;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var url: *u8 = DEFAULT_URL;
+    if (argc == 3 && io.streq(argv[1], "--provider") != 0) {
+        if (io.streq(argv[2], "mozilla") == 0) { ret usage(); }
+    }
+    or (argc == 3 && io.streq(argv[1], "--url") != 0) { url = argv[2]; }
+    or (argc != 1) { ret usage(); }
+    if (!https(url)) {
+        io.err("ca-update: a verified HTTPS URL is required\n");
+        ret 1;
+    }
+    # Keep staging on the same filesystem. O_EXCL prevents concurrent runs from
+    # sharing a file or following a pre-existing staging symlink.
+    val prefix: *u8 = "/etc/ssl/certs/.ca-update-";
+    var n: u64 = io.len(prefix);
+    io.copy(?temporary[0], prefix, n);
+    n = n + io.fmt_dec(os.getpid()::u64, ?temporary[n]);
+    temporary[n] = 0;
+    val opened: i64 = io.open_mode(?temporary[0], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600);
+    if (opened < 0) {
+        io.err("ca-update: cannot create a staging file\n");
+        ret 1;
+    }
+    io.close(opened);
+    var args: [7]*u8 = [7]*u8{"wget", "--https-only", "-q", "-O", ?temporary[0], url, nil};
+    val child: res[exec.Child, exec.Error] = exec.spawn("/bin/wget", ?args[0], env.environ());
+    var downloaded: bool = false;
+    if (sel child.ok) {
+        val waited: res[exec.ExitStatus, exec.Error] = exec.wait(child.ok);
+        if (sel waited.ok) {
+            downloaded = exec.exited(waited.ok) && exec.code(waited.ok) == 0;
+        }
+    }
+    if (!downloaded) {
+        io.remove(?temporary[0]);
+        io.err("ca-update: download failed; existing CA bundle kept\n");
+        ret 1;
+    }
+    var pages: allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?pages);
+    var parsed: bundle.Loaded;
+    var valid: bool = false;
+    if (sel made.ok) {
+        if (bundle.load(?pages, (?temporary[0])::str, ?parsed) == bundle.OK) {
+            # A provider update must be entirely well formed. Unsupported roots
+            # remain usable as anchors, but malformed or duplicate PEM is refused.
+            valid = parsed.bundle.skipped == 0;
+            bundle.release(?pages, ?parsed);
+        }
+    }
+    if (!valid) {
+        io.remove(?temporary[0]);
+        io.err("ca-update: invalid CA bundle; existing CA bundle kept\n");
+        ret 1;
+    }
+    if (io.chmod(?temporary[0], 0o644) < 0) {
+        io.remove(?temporary[0]);
+        io.err("ca-update: cannot set CA bundle permissions; existing CA bundle kept\n");
+        ret 1;
+    }
+    if (io.rename(?temporary[0], DESTINATION) < 0) {
+        io.remove(?temporary[0]);
+        io.err("ca-update: cannot replace CA bundle; existing CA bundle kept\n");
+        ret 1;
+    }
+    if (!provenance(url)) { io.err("ca-update: warning: cannot record CA bundle source\n"); }
+    io.out("ca-update: CA bundle updated\n");
+    ret 0;
+}

@@ -356,7 +356,7 @@ fun udp_input(src: u32, dst: u32, p: *u8, n: u64) {
     val s: *socket.Sock = socket.find(socket.UDP, get16(?p[2]));
     if (s == nil) { ret; }
     if (s.local_ip != 0 && dst != s.local_ip && dst != BROADCAST) { ret; }
-    socket.deliver(s, src, get16(?p[0]), ?p[8], len - 8);
+    socket.deliver_to(s, src, get16(?p[0]), dst, ?p[8], len - 8);
 }
 
 # send `len` bytes from src:sport to dst:dport

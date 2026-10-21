@@ -628,6 +628,33 @@ fun drop_children(nd: *Node) {
     nd.child = nil;
 }
 
+# Atomically replace a regular file in the mounted root or a RAM filesystem.
+# Other filesystems retain their existing refusal until they implement this.
+pub fun replace(nd: *Node, old: *Node) u64 {
+    if (nd == old) { ret 0; }
+    if (nd.kind != abi.KIND_FILE || old.kind != abi.KIND_FILE) { ret e(abi.E_NOTSUP); }
+    if (nd.fs != old.fs || nd.fsi != old.fsi) { ret e(abi.E_XDEV); }
+    if (nd.fs != FS_RAM && nd.fs != FS_EXT2) { ret e(abi.E_NOTSUP); }
+    if (nd.mount_of != nil || old.mount_of != nil || nd.mounted != nil || old.mounted != nil) {
+        ret e(abi.E_BUSY);
+    }
+    if (nd.fs == FS_EXT2) {
+        val left: u64 = ext2.replace(nd.fsi, nd.parent.ino, ?nd.name[0], nd.name_len,
+            old.parent.ino, ?old.name[0], old.name_len, nd.ino, old.ino);
+        if (abi.is_err(left) != 0) { ret left; }
+        if (left == 0) { old.dead = 1; }
+    }
+    val dir: *Node = old.parent;
+    detach(nd);
+    mem.copy((?nd.name[0])::u64, (?old.name[0])::u64, old.name_len);
+    nd.name_len = old.name_len;
+    detach(old);
+    old.unlinked = 1;
+    attach(dir, nd);
+    if (old.opens == 0) { destroy(old); }
+    ret 0;
+}
+
 # move `nd` into `dir` as `name` (which must not exist there yet)
 pub fun rename(nd: *Node, dir: *Node, name: *u8, n: u64) u64 {
     if (n > abi.NAME_MAX) { ret e(abi.E_NAMETOOLONG); }

@@ -163,6 +163,19 @@ fun main(argc: u64, argv: **u8) u64 {
         if (exists("/boot/efi/EFI/BOOT\0") != 0) { install("boot/BOOTX64.EFI\0", "/boot/efi/EFI/BOOT/BOOTX64.EFI\0"); }
     }
     if (exists("/tmp/update/etc/motd\0") != 0) { install("etc/motd\0", "/etc/motd\0"); }
+    if (exists("/tmp/update/etc/ssl/certs/ca-certificates.crt\0") != 0) {
+        sys.mkdir("/etc/ssl\0", 8);
+        sys.mkdir("/etc/ssl/certs\0", 14);
+        install("etc/ssl/certs/ca-certificates.crt\0", "/etc/ssl/certs/ca-certificates.crt\0");
+        install("etc/ssl/certs/SOURCE\0", "/etc/ssl/certs/SOURCE\0");
+        install("etc/ssl/certs/LICENSE.mach-tls\0", "/etc/ssl/certs/LICENSE.mach-tls\0");
+    }
+    if (exists("/tmp/update/etc/hosts\0") != 0 && exists("/etc/hosts\0") == 0) {
+        install("etc/hosts\0", "/etc/hosts\0");
+    }
+    if (exists("/tmp/update/etc/services\0") != 0 && exists("/etc/services\0") == 0) {
+        install("etc/services\0", "/etc/services\0");
+    }
     # the settings file only when there is none yet: the one there is yours
     if (exists("/tmp/update/etc/machos.conf\0") != 0 && exists("/etc/machos.conf\0") == 0) {
         install("etc/machos.conf\0", "/etc/machos.conf\0");

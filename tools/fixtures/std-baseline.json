@@ -1,0 +1,36 @@
+{
+  "description": "Pre-existing failures outside the networking/TLS prerequisites. Every test still runs and every failure is reported. New failures, signals and all hangs fail the regression scenario.",
+  "compiler": "6.10.1",
+  "profile": "release",
+  "std_commit": "981c0beec08f363faef1d6a23b5a9ed8812aa1ea",
+  "before": {
+    "passed": 636,
+    "failed": 35,
+    "hung": 12
+  },
+  "failures": {
+    "std.system.os#file_identity__metadata_retention_grants_no_content_access": "exit 6",
+    "std.system.os#mode__held_and_rooted_changes_do_not_follow_links": "exit 9",
+    "std.system.os#file_identity__read_authorized_retention_survives_replacement_and_unlink": "exit 14",
+    "std.system.os#directory__entries_span_native_batches_and_restart": "exit 3",
+    "std.sync.thread#thread__refused_config_destroys_owned_context_once": "exit 5",
+    "std.sync.thread#thread__custom_reserve_and_portable_name": "exit 1",
+    "std.sync.thread#thread__allowed_cpus_match_the_affinity_mask_and_each_can_be_pinned": "exit 1",
+    "std.sync.thread#thread__a_short_affinity_buffer_reports_range_with_the_size_it_needs": "exit 1",
+    "std.sync.thread#thread__pinning_to_a_cpu_the_process_cannot_use_is_invalid": "exit 1",
+    "std.filesystem#is_file__an_unanswerable_query_is_the_native_refusal": "exit 1",
+    "std.filesystem#rename__source_symlinks_move_without_moving_their_targets": "exit 2",
+    "std.filesystem#rename__directory_symlink_source_to_absent_and_file_destinations": "exit 98",
+    "std.filesystem#remove_all__removes_nested_entries_and_preserves_external_link_targets": "exit 7",
+    "std.filesystem.removal#private_removal__recovers_without_exposing_content_or_linked_trees": "exit 9",
+    "std.runtime.stack.tests#stack__remaining_falls_by_each_frame_on_the_main_thread": "exit 1",
+    "std.process.exec#spawn_grouped__child_leads_its_group": "exit 1",
+    "std.process.exec#terminate_group__kills_a_grandchild": "exit 1",
+    "std.process.exec#terminate_child__refusal_keeps_the_child": "exit 5",
+    "std.process.exec#wait_within__child_finishing_first_is_not_terminated": "exit 2",
+    "std.process.exec#wait_within__expired_deadline_terminates_and_reaps": "exit 2",
+    "std.process.exec#wait_within__expired_deadline_reaches_a_grandchild": "exit 2",
+    "std.process.exec#spawn_with_options__applies_the_directory_the_redirection_and_the_group": "exit 2",
+    "std.log.record#log_record__typed_fields_encode": "exit 2"
+  }
+}

@@ -1,32 +1,67 @@
-# wget [-q] [-O FILE] http://HOST[:PORT]/PATH: fetch a file over HTTP
-#   the file is saved under the last part of the path (index.html when it
-#   has none), in the current directory; -O names it, -O - writes it to
-#   standard output; -q keeps quiet about the progress
-#   redirects (301, 302, 303, 307, 308) are followed, up to 5 of them. only
-#   http:// works for now (https:// needs TLS), and a reply sent in chunks
-#   (Transfer-Encoding: chunked) is refused: the request says HTTP/1.0, so
-#   servers have no reason to use it
+# wget fetches HTTP and verified HTTPS URLs, following at most five redirects.
 
 use std.runtime;
+use secure: userland.lib.tls_socket;
+use roots: userland.lib.tls_roots;
 use os:     std.system.os;
 use io:     userland.lib.cli;
 use addr:   userland.lib.netaddr;
 use std.types.size.usize;
+use pki.cert;
+use parser: http.h1.parser;
+use http.core.field;
+use http.core.method;
+use std.types.bool.true;
 use std.types.result.res;
 use std.net.ip;
 use std.net.tcp;
 use io_error: std.io.error;
+
+var response: parser.Parser;
+var response_line: [8192]u8;
+var response_storage: [32768]u8;
+var response_fields: [128]field.Field;
+var response_trailers: [32]field.Field;
+var body_bytes: u64;
+var body_write_failed: u8;
+
+# Feed borrowed wire bytes to mach-http and write only decoded body spans.
+fun body_feed(fd: i64, data: *u8, length: usize) u8 {
+    var at: usize = 0;
+    for (at < length) {
+        val result: parser.Feed = parser.feed(?response, ?data[at], length - at);
+        if (result.status == parser.PARSE_ERROR) { ret 0; }
+        if (result.body_length != 0) {
+            if (io.write_all(fd, result.body, result.body_length::u64) == 0) {
+                body_write_failed = 1;
+                ret 0;
+            }
+            body_bytes = body_bytes + result.body_length::u64;
+        }
+        at = at + result.consumed;
+        if (result.status == parser.PARSE_MESSAGE && at != length) { ret 0; }
+        if (result.consumed == 0) { ret 0; }
+    }
+    ret 1;
+}
 
 var head:    [8192]u8;   # the reply's header, and what came after it
 var chunk:   [4096]u8;
 var host:    [256]u8;    # of the URL being fetched
 var path:    [1024]u8;   # its path (with the query), always starting with /
 var port:    u64 = 80;
+var encrypted: u8;
+var https_only: u8;
 var target:  [1024]u8;   # the URL itself
 var outname: [256]u8;
 
+fun default_port() u64 {
+    if (encrypted != 0) { ret 443; }
+    ret 80;
+}
+
 fun usage() i64 {
-    io.err("usage: wget [-q] [-O FILE|-] http://HOST[:PORT]/PATH\n");
+    io.err("usage: wget [-q] [--https-only] [-O FILE|-] http[s]://HOST[:PORT]/PATH\n");
     ret 2;
 }
 
@@ -82,12 +117,12 @@ fun crlf(buf: *u8, at: u64) u64 {
     ret at + 2;
 }
 
-# splits the URL in `target` into host, port and path (the globals above).
-# 1 when it worked, 2 for an https:// URL, 0 when it is no usable URL
+# Split the URL into its host, port, and request path.
 fun parse_url() u8 {
-    if (starts(?target[0], "https://") != 0) { ret 2; }
-    if (starts(?target[0], "http://") == 0) { ret 0; }
+    encrypted = starts(?target[0], "https://");
+    if (encrypted == 0 && starts(?target[0], "http://") == 0) { ret 0; }
     var at: u64 = 7;
+    if (encrypted != 0) { at = 8; }
     var h: u64 = 0;
     for (target[at] != 0 && target[at] != 47 && target[at] != 58 && target[at] != 63 && target[at] != 35) {
         if (h >= 255) { ret 0; }
@@ -98,6 +133,7 @@ fun parse_url() u8 {
     host[h] = 0;
     if (h == 0) { ret 0; }
     port = 80;
+    if (encrypted != 0) { port = 443; }
     if (target[at] == 58) {
         at = at + 1;
         var p: u64 = 0;
@@ -183,17 +219,41 @@ fun line_end(v: u64, n: u64) u64 {
     ret e;
 }
 
+# The HTTP parser consumes the same plaintext stream for both schemes.
+fun receive(socket: *tcp.Stream, data: *u8, length: usize) res[usize, io_error.Error] {
+    if (encrypted == 0) { ret tcp.stream_read(socket, data, length); }
+    val count: i64 = secure.read(data, length);
+    if (count < 0) {
+        ret res[usize, io_error.Error].err{io_error.make(io_error.IO, io_error.OP_READ)};
+    }
+    ret res[usize, io_error.Error].ok{count::usize};
+}
+
+fun send(socket: *tcp.Stream, data: *u8, length: usize) res[usize, io_error.Error] {
+    if (encrypted == 0) { ret tcp.stream_write(socket, data, length); }
+    val count: i64 = secure.write(data, length);
+    if (count < 0) {
+        ret res[usize, io_error.Error].err{io_error.make(io_error.IO, io_error.OP_WRITE)};
+    }
+    ret res[usize, io_error.Error].ok{count::usize};
+}
+
+fun disconnect(socket: *tcp.Stream) {
+    if (encrypted != 0) { secure.destroy(); }
+    tcp.stream_close(socket);
+}
+
 # fetches the URL in host/port/path from the server at ip4. 0: it was saved;
 # 1: it failed (and said why); 2: a redirect, with the new URL in `target`
 fun get(ip4: u32, quiet: u8, output: *u8) i64 {
     var req: [2048]u8;
     var n: u64 = put(?req[0], 0, "GET ");
     n = put(?req[0], n, ?path[0]);
-    n = put(?req[0], n, " HTTP/1.0");
+    n = put(?req[0], n, " HTTP/1.1");
     n = crlf(?req[0], n);
     n = put(?req[0], n, "Host: ");
     n = put(?req[0], n, ?host[0]);
-    if (port != 80) {
+    if (port != default_port()) {
         n = put(?req[0], n, ":");
         n = put_num(?req[0], n, port);
     }
@@ -214,13 +274,28 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
     }
     var s: tcp.Stream = c.ok;
     tcp.stream_set_read_timeout(?s, 30000);
+    if (encrypted != 0) {
+        val trust: *cert.TrustStore = roots.load(quiet == 0);
+        if (trust == nil) {
+            io.err("wget: cannot load trusted CA certificates\n");
+            tcp.stream_close(?s);
+            ret 1;
+        }
+        if (!secure.open(?s, ?host[0], trust)) {
+            io.err("wget: TLS handshake or certificate verification failed: ");
+            io.err(secure.reason());
+            io.err("\n");
+            disconnect(?s);
+            ret 1;
+        }
+    }
 
     var sent: u64 = 0;
     for (sent < n) {
-        val w: res[usize, io_error.Error] = tcp.stream_write(?s, ?req[sent], (n - sent)::usize);
+        val w: res[usize, io_error.Error] = send(?s, ?req[sent], (n - sent)::usize);
         if (sel w.err) {
             io.err("wget: sending the request failed\n");
-            tcp.stream_close(?s);
+            disconnect(?s);
             ret 1;
         }
         sent = sent + w.ok::u64;
@@ -232,18 +307,18 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
     for (hlen == 0) {
         if (have >= 8192) {
             io.err("wget: the reply's header is too long\n");
-            tcp.stream_close(?s);
+            disconnect(?s);
             ret 1;
         }
-        val r: res[usize, io_error.Error] = tcp.stream_read(?s, ?head[have], (8192 - have)::usize);
+        val r: res[usize, io_error.Error] = receive(?s, ?head[have], (8192 - have)::usize);
         if (sel r.err) {
             io.err("wget: no reply\n");
-            tcp.stream_close(?s);
+            disconnect(?s);
             ret 1;
         }
         if (r.ok == 0) {
             io.err("wget: the server closed the connection without a reply\n");
-            tcp.stream_close(?s);
+            disconnect(?s);
             ret 1;
         }
         val before: u64 = have;
@@ -271,7 +346,7 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
     }
     if (bad != 0) {
         io.err("wget: that is no HTTP reply\n");
-        tcp.stream_close(?s);
+        disconnect(?s);
         ret 1;
     }
     val code: u64 = (head[9] - 48)::u64 * 100 + (head[10] - 48)::u64 * 10 + (head[11] - 48)::u64;
@@ -284,22 +359,23 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
         val l: u64 = find_header(hlen, "location");
         if (l == 0) {
             io.err("wget: a redirect without a Location\n");
-            tcp.stream_close(?s);
+            disconnect(?s);
             ret 1;
         }
         val e: u64 = line_end(l, hlen);
         val len: u64 = e - l;
         if (len == 0 || len > 900) {
             io.err("wget: the Location is unusable\n");
-            tcp.stream_close(?s);
+            disconnect(?s);
             ret 1;
         }
         var t: u64 = 0;
         if (head[l] == 47) {
             # an absolute path: same server
-            t = put(?target[0], 0, "http://");
+            if (encrypted != 0) { t = put(?target[0], 0, "https://"); }
+            or { t = put(?target[0], 0, "http://"); }
             t = put(?target[0], t, ?host[0]);
-            if (port != 80) {
+            if (port != default_port()) {
                 t = put(?target[0], t, ":");
                 t = put_num(?target[0], t, port);
             }
@@ -308,40 +384,34 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
             t = put_n(?target[0], 0, ?head[l], len);
         } or {
             io.err("wget: only absolute redirects work\n");
-            tcp.stream_close(?s);
+            disconnect(?s);
             ret 1;
         }
         if (t >= 1023) {
             io.err("wget: the Location is too long\n");
-            tcp.stream_close(?s);
+            disconnect(?s);
             ret 1;
         }
         target[t] = 0;
-        tcp.stream_close(?s);
+        disconnect(?s);
         ret 2;
     }
     if (code != 200) {
-        tcp.stream_close(?s);
+        disconnect(?s);
         ret 1;
     }
 
-    val te: u64 = find_header(hlen, "transfer-encoding");
-    if (te != 0 && lower(head[te]) == 99) {
-        io.err("wget: a chunked reply is not supported\n");
-        tcp.stream_close(?s);
+    var limits: parser.Limits = parser.limits_default();
+    # Downloads stream to disk and retain no body in memory.
+    limits.max_body_bytes = 0xFFFFFFFFFFFFFFFF;
+    if (!parser.init_response(?response, method.GET, ?response_line[0], 8192,
+        ?response_storage[0], 32768, ?response_fields[0], 128,
+        ?response_trailers[0], 32, limits)) { disconnect(?s); ret 1; }
+    val headers: parser.Feed = parser.feed(?response, ?head[0], hlen::usize);
+    if (headers.status != parser.PARSE_HEADERS || headers.consumed != hlen::usize) {
+        io.err("wget: invalid HTTP response framing\n");
+        disconnect(?s);
         ret 1;
-    }
-    var expect: u64 = 0;
-    var known: u8 = 0;
-    val cl: u64 = find_header(hlen, "content-length");
-    if (cl != 0) {
-        val ce: u64 = line_end(cl, hlen);
-        var ok: u8 = 0;
-        val v: u64 = io.parse_dec(?head[cl], ce - cl, ?ok);
-        if (ok != 0) {
-            expect = v;
-            known = 1;
-        }
     }
 
     # where it goes
@@ -355,44 +425,34 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
         fd = io.open_mode(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644);
         if (fd < 0) {
             io.fail("wget", name, fd);
-            tcp.stream_close(?s);
+            disconnect(?s);
             ret 1;
         }
     }
 
-    # the body: what came with the header, then the rest until the server
-    # closes (or the announced length is in)
-    var got: u64 = have - hlen;
-    var failed: u8 = 0;
-    if (got > 0) {
-        if (io.write_all(fd, ?head[hlen], got) == 0) { failed = 1; }
-    }
+    body_bytes = 0;
+    body_write_failed = 0;
     var lost: u8 = 0;
-    for (failed == 0 && (known == 0 || got < expect)) {
-        val r: res[usize, io_error.Error] = tcp.stream_read(?s, ?chunk[0], 4096);
-        if (sel r.err) {
-            lost = 1;
+    if (body_feed(fd, ?head[hlen], (have - hlen)::usize) == 0) { lost = 1; }
+    for (lost == 0 && (encrypted != 0 || response.phase != parser.MESSAGE_COMPLETE)) {
+        val received: res[usize, io_error.Error] = receive(?s, ?chunk[0], 4096);
+        if (sel received.err) { lost = 1; brk; }
+        if (received.ok == 0) {
+            val end: parser.Feed = parser.finish_eof(?response, true);
+            if (end.status != parser.PARSE_MESSAGE) { lost = 1; }
             brk;
         }
-        if (r.ok == 0) { brk; }
-        if (io.write_all(fd, ?chunk[0], r.ok::u64) == 0) {
-            failed = 1;
-            brk;
-        }
-        got = got + r.ok::u64;
+        if (body_feed(fd, ?chunk[0], received.ok) == 0) { lost = 1; }
     }
-    tcp.stream_close(?s);
+    val got: u64 = body_bytes;
+    disconnect(?s);
     if (fd != 1) { io.close(fd); }
-    if (failed != 0) {
+    if (body_write_failed != 0) {
         io.err("wget: writing the file failed\n");
         ret 1;
     }
-    if (known != 0 && got < expect) { lost = 1; }
     if (lost != 0) {
-        io.err("wget: the connection broke after ");
-        var nb: [24]u8;
-        io.errn(?nb[0], io.fmt_dec(got, ?nb[0]));
-        io.err(" bytes\n");
+        io.err("wget: truncated, invalid, or unauthenticated response body\n");
         ret 1;
     }
     if (quiet == 0) {
@@ -412,7 +472,8 @@ fun main(argc: i64, argv: **u8) i64 {
     var output: *u8 = nil;
     var i: i64 = 1;
     for (i < argc && argv[i][0] == 45 && argv[i][1] != 0) {
-        if (io.streq(argv[i], "-q") != 0) { quiet = 1; }
+        if (io.streq(argv[i], "--https-only") != 0) { https_only = 1; }
+        or (io.streq(argv[i], "-q") != 0) { quiet = 1; }
         or (io.streq(argv[i], "-O") != 0 && i + 1 < argc) {
             i = i + 1;
             output = argv[i];
@@ -431,14 +492,14 @@ fun main(argc: i64, argv: **u8) i64 {
     var hops: u64 = 0;
     for {
         val parsed: u8 = parse_url();
-        if (parsed == 2) {
-            io.err("wget: https:// is not supported yet\n");
-            ret 1;
-        }
         if (parsed == 0) {
-            io.err("wget: not an http:// URL: ");
+            io.err("wget: not an http:// or https:// URL: ");
             io.err(?target[0]);
             io.err("\n");
+            ret 1;
+        }
+        if (https_only != 0 && encrypted == 0) {
+            io.err("wget: HTTPS is required for this download\n");
             ret 1;
         }
         var ip4: u32 = 0;

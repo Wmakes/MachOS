@@ -1,0 +1,12 @@
+Upstream: https://github.com/briar-systems/mach-tls
+Base: 10c2463fa72a212c53db934190f46046692236e8 (0.17.0)
+Dependency: mach-pki 16145a4f2eae83efb60f93375fc1f1c849316788 (0.4.0)
+
+Two upstream bundle tests expect P-521 trust anchors to be unsupported.
+The pinned PKI 0.4 parser now accepts those anchors. The original tests fail
+on Linux as well as MachOS. This patch updates their anchor/skip counts and
+keeps malformed-input coverage. No test is removed or given a longer limit.
+
+tools/test.py applies this test-only patch to an isolated generated source
+copy. Shipped TLS code remains the pinned upstream revision. Submit this
+compatibility correction upstream; it is not a MachOS runtime workaround.

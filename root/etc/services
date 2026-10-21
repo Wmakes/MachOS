@@ -1,0 +1,6 @@
+# Common services used by the native resolver.
+ssh       22/tcp
+domain    53/udp
+domain    53/tcp
+http      80/tcp    www www-http
+https     443/tcp

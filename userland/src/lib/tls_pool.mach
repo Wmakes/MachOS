@@ -1,0 +1,88 @@
+# TLS buffer pool, adapted from mach-tls test/interop/src/pool.mach.
+
+use A: std.allocator;
+use std.allocator.page;
+use std.memory.buffers;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+use tls.buffer;
+use tls.record;
+
+pub val CLASS_COUNT: usize = 7;
+
+pub rec Harness {
+    backing: A.Allocator;
+    classes: [CLASS_COUNT]buffers.ClassConfig;
+    pool:    buffers.Pool;
+    plain:   buffers.Source;
+    secret:  buffers.SecretSource;
+    account: buffers.Account;
+    made:    bool;
+}
+
+# the class shape the documentation recommends: 512 B, 4 KiB and one record,
+# each plain and secret, and a secret class that holds one cipher context
+pub fun make(harness: *Harness, global: usize, budget: usize) bool {
+    var made: err[A.Error] = page.make(?harness.backing);
+    if (sel made.err) { ret false; }
+    val sizes: [3]usize = [3]usize{512, 4096, 17408};
+    var i:     usize    = 0;
+    for (i < 6) {
+        harness.classes[i] = buffers.ClassConfig{size: sizes[i % 3], align: 0,
+            secret: i >= 3, high_water: 4};
+        i = i + 1;
+    }
+    harness.classes[6] = buffers.ClassConfig{size: record.CONTEXT_SIZE,
+        align: record.CONTEXT_ALIGN, secret: true, high_water: 4};
+    var config: buffers.Config;
+    config.classes       = ?harness.classes[0];
+    config.class_count   = CLASS_COUNT;
+    config.lanes         = 2;
+    config.global_budget = global;
+    config.initial_slots = 8;
+    if (!buffers.make(?harness.pool, config, ?harness.backing)) { ret false; }
+    harness.plain  = buffers.source(?harness.pool);
+    harness.secret = buffers.secret_source(?harness.pool);
+    var budgets: buffers.Budgets;
+    budgets.lanes    = 2;
+    budgets.bytes[0] = budget;
+    budgets.bytes[1] = budget;
+    var opened: buffers.Reason = buffers.open_account(?harness.pool, ?harness.account,
+        1, budgets, 0);
+    if (!(sel opened.none)) {
+        buffers.destroy(?harness.pool);
+        ret false;
+    }
+    harness.made = true;
+    ret true;
+}
+
+pub fun lease(harness: *Harness) buffer.Lease {
+    ret buffer.Lease{source: ?harness.plain, account: ?harness.account, lane: 0};
+}
+
+pub fun secret_lease(harness: *Harness) buffer.SecretLease {
+    ret buffer.SecretLease{source: ?harness.secret, account: ?harness.account, lane: 0};
+}
+
+# bytes the account holds now
+pub fun held(harness: *Harness) usize {
+    ret harness.account.held;
+}
+
+pub fun ready(harness: *Harness) bool {
+    var handle: u64 = 0;
+    ret buffers.ready(?harness.pool, ?handle, 1) == 1 && handle == 1;
+}
+
+# false when the account still holds a chunk
+pub fun destroy(harness: *Harness) bool {
+    if (!harness.made) { ret true; }
+    var closed: buffers.Reason = buffers.close_account(?harness.pool, ?harness.account);
+    if (!(sel closed.none)) { ret false; }
+    harness.made = false;
+    ret buffers.destroy(?harness.pool);
+}

@@ -11,7 +11,7 @@ root partition afterwards.
 import argparse, os, re, subprocess, sys, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-P = r"[$#] "  # the shell prompt (# for root)
+P = r"[^\r\n ]+@[^\r\n :]+:[^\r\n]*[$#] "  # shell prompt, not a printed comment
 TARGET = os.path.join(ROOT, "out", "headless", "target.img")
 BROKEN = os.path.join(ROOT, "out", "headless", "broken.img")
 NVME_TARGET = os.path.join(ROOT, "out", "headless", "nvme-target.img")
@@ -57,6 +57,197 @@ def with_stdtest():
     sh(f"tools/put.sh examples/stdtest/out/machos/{p}/stdtest /bin/stdtest {disk()}")
 
 
+STD_SUITE = []
+
+
+def with_stdsuite():
+    """Build std's supported module tests and keep their index/name mapping."""
+    p = PROFILE[0]
+    subprocess.run(["tools/mkimage.sh", p, "--fresh"], cwd=ROOT, check=True,
+                   stdout=subprocess.PIPE)
+    project = os.path.join(ROOT, "examples", "stdtest")
+    subprocess.run(["mach", "dep", "pull", "."], cwd=project, check=True)
+    subprocess.run(["mach", "build", ".", "-a", "runtests", "-t", "machos", "-p", p],
+                   cwd=project, check=True)
+    base = ["mach", "test", ".", "-a", "stdsuite", "-t", "machos", "-p", p, "--include-deps"]
+    listing = subprocess.run(base + ["--list"], cwd=project, check=True,
+                             stdout=subprocess.PIPE, text=True).stdout
+    STD_SUITE[:] = [line.split()[0] for line in listing.splitlines() if "#" in line]
+    if not STD_SUITE:
+        raise RuntimeError("std test dispatcher contains no tests")
+    output = os.path.join(project, "out", "machos", p, "stdsuite-dispatcher")
+    if os.path.isfile(output):
+        os.remove(output)
+    built = subprocess.run(base + ["-o", os.path.join("out", "machos", p, "stdsuite-dispatcher")], cwd=project, text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # a cross-built dispatcher is usable even though mach test cannot run it on the host.
+    if built.returncode not in (0, 1) or not os.path.isfile(output):
+        raise RuntimeError(built.stdout)
+    for src, dest in ((output, "/bin/stdsuite"),
+                      (os.path.join(project, "out", "machos", p, "runtests"), "/bin/runtests")):
+        subprocess.run(["tools/put.sh", src, dest, disk()], cwd=ROOT, check=True)
+    os.makedirs(os.path.join(ROOT, "out", "headless"), exist_ok=True)
+    import shutil
+    fixtures = os.path.join(ROOT, "out", "headless", "std-fixtures")
+    shutil.rmtree(fixtures, ignore_errors=True)
+    for platform in ("darwin", "windows"):
+        shutil.copytree(os.path.join(project, "dep", "std", "src", "system", "os", platform),
+                        os.path.join(fixtures, "src", "system", "os", platform))
+    put_test_tree(fixtures, "/root")
+    with open(os.path.join(ROOT, "out", "headless", "stdtest-tests.txt"), "w") as f:
+        f.write("".join(f"{i} {name}\n" for i, name in enumerate(STD_SUITE)))
+
+
+TLS_SUITE = []
+
+def with_tlssuite():
+    """Build upstream crypto, PKI, TLS and HTTP tests and keep their index/name mapping."""
+    p = PROFILE[0]
+    subprocess.run(["tools/mkimage.sh", p, "--fresh"], cwd=ROOT, check=True,
+                   stdout=subprocess.PIPE)
+    project = os.path.join(ROOT, "examples", "tlstest")
+    subprocess.run(["mach", "dep", "pull", "."], cwd=project, check=True)
+    # Apply the documented upstream test correction in an isolated source copy.
+    # The dependency manifests above keep the exact shipped upstream revisions.
+    import shutil
+    original = project
+    project = os.path.join(ROOT, "out", "headless", "tlstest-project")
+    os.makedirs(project, exist_ok=True)
+    tls_source = os.path.join(project, "sources", "tls")
+    shutil.rmtree(tls_source, ignore_errors=True)
+    shutil.copytree(os.path.join(original, "dep", "tls"), tls_source,
+                    ignore=shutil.ignore_patterns(".git", "dep", "out"))
+    subprocess.run(["git", "apply", "--directory", os.path.relpath(tls_source, ROOT),
+                    "tools/patches/mach-tls-pki-0.4-tests.patch"], cwd=ROOT, check=True)
+    with open(os.path.join(original, "mach.toml")) as source:
+        manifest = source.read()
+    manifest, changed = re.subn(r'\[dep\.std\]\n(?:(?!\[)[^\n]*\n)*',
+                               '[dep.std]\npath = "' + os.path.join(original, "dep", "std") + '"\n\n',
+                               manifest, count=1)
+    if changed != 1:
+        raise RuntimeError("TLS test project has no std dependency")
+    for name in ("crypto", "pki", "tls", "http"):
+        path = tls_source if name == "tls" else os.path.join(original, "dep", name)
+        manifest = re.sub(r'git = "https://github.com/briar-systems/mach-' + name +
+                          r'\.git"\nref = "[^"]+"', 'path = "' + path + '"', manifest)
+    with open(os.path.join(project, "mach.toml"), "w") as output:
+        output.write(manifest)
+    shutil.copytree(os.path.join(original, "src"), os.path.join(project, "src"), dirs_exist_ok=True)
+    subprocess.run(["mach", "dep", "pull", "."], cwd=project, check=True)
+    subprocess.run(["mach", "build", "examples/stdtest", "-a", "runtests", "-t", "machos", "-p", p],
+                   cwd=ROOT, check=True)
+    base = ["mach", "test", ".", "-a", "tlstest", "-t", "machos", "-p", p, "--include-deps"]
+    listing = subprocess.run(base + ["--list"], cwd=project, check=True,
+                             stdout=subprocess.PIPE, text=True).stdout
+    TLS_SUITE[:] = [line.split()[0] for line in listing.splitlines() if "#" in line]
+    if not TLS_SUITE:
+        raise RuntimeError("std test dispatcher contains no tests")
+    output = os.path.join(project, "out", "machos", p, "tlstest-dispatcher")
+    if os.path.isfile(output):
+        os.remove(output)
+    built = subprocess.run(base + ["-o", os.path.join("out", "machos", p, "tlstest-dispatcher")], cwd=project, text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # a cross-built dispatcher is usable even though mach test cannot run it on the host.
+    if built.returncode not in (0, 1) or not os.path.isfile(output):
+        raise RuntimeError(built.stdout)
+    for src, dest in ((output, "/bin/tlstest"),
+                      (os.path.join(ROOT, "examples", "stdtest", "out", "machos", p, "runtests"), "/bin/runtests")):
+        subprocess.run(["tools/put.sh", src, dest, disk()], cwd=ROOT, check=True)
+    os.makedirs(os.path.join(ROOT, "out", "headless"), exist_ok=True)
+    put_test_tree(os.path.join(project, "dep", "tls", "test", "fixtures", "bundles"),
+                  "/root/test/fixtures/bundles")
+    with open(os.path.join(ROOT, "out", "headless", "tlstest-tests.txt"), "w") as f:
+        f.write("".join(f"{i} {name}\n" for i, name in enumerate(TLS_SUITE)))
+
+
+def put_test_tree(source, destination):
+    """Copy a fixture tree into the offline guest root filesystem."""
+    import tempfile
+    info = subprocess.check_output(["sgdisk", "-i", "2", disk()], text=True)
+    first = int(re.search(r"First sector: (\d+)", info)[1])
+    last = int(re.search(r"Last sector: (\d+)", info)[1])
+    with tempfile.TemporaryDirectory(dir=os.path.join(ROOT, "out")) as temp:
+        part = os.path.join(temp, "root.img")
+        subprocess.run(["dd", "if=" + disk(), "of=" + part, "bs=512",
+                        f"skip={first}", f"count={last - first + 1}", "status=none"], check=True)
+        commands = []
+        planned = set()
+
+        def ensure_dir(path):
+            if path in planned:
+                return
+            stat = subprocess.run(["debugfs", "-R", "stat " + path, part],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True).stdout
+            if "Inode:" not in stat:
+                commands.append('mkdir "' + path + '"')
+            planned.add(path)
+
+        components = destination.strip("/").split("/")
+        for i in range(len(components)):
+            ensure_dir('/' + '/'.join(components[:i + 1]))
+        for directory, dirs, files in os.walk(source):
+            relative = os.path.relpath(directory, source)
+            target = destination if relative == "." else destination + "/" + relative
+            for child in dirs:
+                ensure_dir(target + "/" + child)
+            for child in files:
+                commands.append(f'write "{directory}/{child}" "{target}/{child}"')
+        script = os.path.join(temp, "fixtures.cmds")
+        with open(script, "w") as output:
+            output.write("\n".join(commands) + "\n")
+        subprocess.run(["debugfs", "-w", "-f", script, part], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["dd", "if=" + part, "of=" + disk(), "bs=512",
+                        f"seek={first}", "conv=notrunc", "status=none"], check=True)
+
+
+def tlssuite_steps():
+    steps = ["wait:" + P]
+    selected = [i for i, name in enumerate(TLS_SUITE)
+                if name.startswith(("crypto.", "pki.", "tls.", "http."))]
+    groups = []
+    for i in selected:
+        if groups and i == groups[-1][-1] + 1:
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+    for group in groups:
+        steps.append(f"send:runtests /bin/tlstest {group[0]} {group[-1]}\\n")
+        for i in group:
+            steps.append(rf"wait:(?:ok {i}|HANG {i}|FAIL {i} [^\n]*)\r?\n")
+        steps += ["wait:runtests:", "wait:" + P]
+    return steps
+
+
+def stdsuite_steps():
+    steps = ["wait:" + P, f"send:runtests /bin/stdsuite 0 {len(STD_SUITE) - 1}\\n"]
+    for i in range(len(STD_SUITE)):
+        steps.append(rf"wait:(?:ok {i}|HANG {i}|FAIL {i} [^\n]*)\r?\n")
+    return steps + ["wait:runtests:", "wait:" + P]
+
+
+
+def with_kernel_sockets():
+    """Run the kernel's socket syscall regressions using the standard dispatcher runner."""
+    p = PROFILE[0]
+    subprocess.run(["tools/mkimage.sh", p, "--fresh"], cwd=ROOT, check=True,
+                   stdout=subprocess.PIPE)
+    subprocess.run(["mach", "dep", "pull", "kernel"], cwd=ROOT, check=True)
+    output = os.path.join(ROOT, "kernel", "out", "machos", p, "socket-tests-dispatcher")
+    if os.path.isfile(output):
+        os.remove(output)
+    subprocess.run(["mach", "test", "kernel", "-a", "socket-tests", "-t", "machos", "-p", p,
+                    "-o", os.path.join("out", "machos", p, "socket-tests-dispatcher")], cwd=ROOT)
+    if not os.path.isfile(output):
+        raise RuntimeError("socket test dispatcher was not built")
+    project = os.path.join(ROOT, "examples", "stdtest")
+    subprocess.run(["mach", "dep", "pull", "."], cwd=project, check=True)
+    subprocess.run(["mach", "build", ".", "-a", "runtests", "-t", "machos", "-p", p], cwd=project, check=True)
+    for src, dest in ((output, "/bin/socket-tests"),
+                      (os.path.join(project, "out", "machos", p, "runtests"), "/bin/runtests")):
+        subprocess.run(["tools/put.sh", src, dest, disk()], cwd=ROOT, check=True)
+
+
 UDP_ECHO = []
 
 
@@ -97,7 +288,7 @@ def http_server():
         f.write("behind a redirect\n")
     with open(os.path.join(www, "big.txt"), "w") as f:
         f.write("".join(f"{i}\n" for i in range(1, 150001)))
-    if HTTP_SERVER:
+    if any(server.server_address[1] == 8080 for server in HTTP_SERVER):
         return
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=www)
     handler.log_message = lambda *a: None
@@ -106,10 +297,209 @@ def http_server():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 
+DNS_COUNTS = {}
+
+
+def dns_fixture():
+    """Drop the first A query, then answer through two CNAMEs deterministically."""
+    import socket, struct
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 5533))
+    DNS_COUNTS.clear()
+
+    def name(text):
+        return b"".join(bytes([len(part)]) + part.encode("ascii") for part in text.split(".")) + b"\x00"
+
+    def serve():
+        while True:
+            packet, peer = server.recvfrom(4096)
+            if len(packet) < 12:
+                continue
+            at, labels = 12, []
+            while at < len(packet) and packet[at]:
+                size = packet[at]
+                labels.append(packet[at + 1:at + 1 + size].decode("ascii"))
+                at += size + 1
+            at += 1
+            if at + 4 > len(packet):
+                continue
+            query = ".".join(labels).lower()
+            kind = struct.unpack("!H", packet[at:at + 2])[0]
+            key = (query, kind)
+            DNS_COUNTS[key] = DNS_COUNTS.get(key, 0) + 1
+            if kind == 1 and DNS_COUNTS[key] == 1:
+                continue
+            answers = b""
+            count = 0
+            if query == "alias.test" and kind == 1:
+                for owner, target in (("alias.test", "middle.test"), ("middle.test", "tls.test")):
+                    data = name(target)
+                    answers += name(owner) + struct.pack("!HHIH", 5, 1, 60, len(data)) + data
+                answers += name("tls.test") + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([10, 0, 2, 2])
+                count = 3
+            response = packet[:2] + struct.pack("!HHHHH", 0x8180, 1, count, 0, 0)
+            server.sendto(response + packet[12:at + 4] + answers, peer)
+
+    threading.Thread(target=serve, daemon=True).start()
+
+
+def check_dns_retry():
+    if DNS_COUNTS.get(("alias.test", 1), 0) < 2:
+        return "wget did not retry the dropped DNS query"
+    return ""
+
+
+def https_server():
+    """A fresh private CA and TLS server; no trust bypass is used in the guest."""
+    import datetime, ssl, http.server
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, rsa
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+    subprocess.run(["tools/mkimage.sh", PROFILE[0], "--fresh"], cwd=ROOT, check=True,
+                   stdout=subprocess.PIPE)
+    directory = os.path.join(ROOT, "out", "headless", "https")
+    os.makedirs(directory, exist_ok=True)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "MachOS test CA")])
+    ca = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+          .public_key(key.public_key()).serial_number(x509.random_serial_number())
+          .not_valid_before(now - datetime.timedelta(days=1))
+          .not_valid_after(now + datetime.timedelta(days=30))
+          .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+          .add_extension(x509.KeyUsage(False, False, False, False, False, True, True, False, False), critical=True)
+          .sign(key, hashes.SHA256()))
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf_builder = (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "tls.test")]))
+            .issuer_name(name).public_key(leaf_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("tls.test"), x509.DNSName("alias.test"),
+                                                       x509.IPAddress(__import__("ipaddress").ip_address("10.0.2.2"))]), critical=False)
+            .add_extension(x509.KeyUsage(True, False, False, False, False, False, False, False, False), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            )
+    leaf = (leaf_builder.not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=7)).sign(key, hashes.SHA256()))
+    expired = (leaf_builder.not_valid_before(now - datetime.timedelta(days=10))
+               .not_valid_after(now - datetime.timedelta(days=1)).sign(key, hashes.SHA256()))
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_leaf = (x509.CertificateBuilder().subject_name(leaf.subject).issuer_name(name)
+                .public_key(rsa_key.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(days=1))
+                .not_valid_after(now + datetime.timedelta(days=7))
+                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                .add_extension(x509.SubjectAlternativeName([x509.DNSName("tls.test")]), critical=False)
+                .add_extension(x509.KeyUsage(True, False, False, False, False, False, False, False, False), critical=True)
+                .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+                .sign(key, hashes.SHA256()))
+    for filename, data in (("ca.pem", ca.public_bytes(serialization.Encoding.PEM)),
+                           ("leaf.pem", leaf.public_bytes(serialization.Encoding.PEM)),
+                           ("expired.pem", expired.public_bytes(serialization.Encoding.PEM)),
+                           ("rsa.pem", rsa_leaf.public_bytes(serialization.Encoding.PEM)),
+                           ("rsa-key.pem", rsa_key.private_bytes(serialization.Encoding.PEM,
+                             serialization.PrivateFormat.PKCS8, serialization.NoEncryption())),
+                           ("key.pem", leaf_key.private_bytes(serialization.Encoding.PEM,
+                             serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))):
+        with open(os.path.join(directory, filename), "wb") as output:
+            output.write(data)
+    subprocess.run(["tools/put.sh", os.path.join(directory, "ca.pem"), "/root/test-ca.pem", disk()],
+                   cwd=ROOT, check=True)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            body = b"hello over verified TLS\n"
+            if self.path == "/bundle":
+                body = ca.public_bytes(serialization.Encoding.PEM)
+            if self.path == "/big":
+                body = b"0123456789abcdef" * 65536
+            if self.path in ("/truncated", "/no-notify"):
+                self.send_response(200)
+                self.send_header("Content-Length", "1048576" if self.path == "/truncated" else str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b"cut short" if self.path == "/truncated" else body)
+                self.wfile.flush()
+                os.close(self.connection.detach())
+                self.close_connection = True
+                return
+            if self.path == "/chunked":
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b"6;part=one\r\nhello \r\n8\r\nchunked!\r\n0\r\nX-Test: yes\r\n\r\n")
+            else:
+                if self.path in ("/redirect-http", "/redirect-tls"):
+                    self.send_response(302)
+                    self.send_header("Location", "http://tls.test:9080/plain" if self.path == "/redirect-http" else "/")
+                    body = b""
+                else:
+                    self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+            self.wfile.flush()
+            self.close_connection = True
+            try:
+                self.connection.settimeout(5)
+                self.connection.unwrap()
+            except (OSError, ssl.SSLError):
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    def start(port, certificate, handler, private_key="key.pem"):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        context.set_alpn_protocols(["http/1.1"])
+        context.load_cert_chain(os.path.join(directory, certificate), os.path.join(directory, private_key))
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        HTTP_SERVER.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    subprocess.run(["mach", "build", "examples/tlstest", "-a", "dns-proxy", "-t", "machos",
+                    "-p", PROFILE[0]], cwd=ROOT, check=True)
+    proxy = os.path.join(ROOT, "examples", "tlstest", "out", "machos", PROFILE[0], "dns-proxy")
+    subprocess.run(["tools/put.sh", proxy, "/bin/dns-proxy", disk()], cwd=ROOT, check=True)
+    dns_fixture()
+    start(9443, "leaf.pem", Handler)
+    start(9444, "expired.pem", Handler)
+    start(9445, "rsa.pem", Handler, "rsa-key.pem")
+
+    class Redirect(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/plain":
+                body = b"plain HTTP after TLS redirect\n"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(302)
+            self.send_header("Location", "https://tls.test:9443/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    redirect = http.server.ThreadingHTTPServer(("127.0.0.1", 9080), Redirect)
+    HTTP_SERVER.append(redirect)
+    threading.Thread(target=redirect.serve_forever, daemon=True).start()
+
+
 def make_broken():
     """a copy of a fresh dev disk with three faults put in by debugfs"""
-    sh("tools/mkimage.sh --fresh")
-    sh(f"cp out/debug/disk.img {BROKEN}")
+    sh(f"tools/mkimage.sh {PROFILE[0]} --fresh")
+    sh(f"cp {disk()} {BROKEN}")
     sh(f"dd if={BROKEN} of=out/headless/p.img bs=512 skip=133120 count=389120 status=none")
     blk = sh("debugfs -R 'blocks /bin/ls' out/headless/p.img 2>/dev/null").split()[0]
     with open(os.path.join(ROOT, "out/headless/cmds"), "w") as f:
@@ -174,7 +564,7 @@ DUAL = os.path.join(ROOT, "out", "headless", "dual.img")
 def fake_windows():
     """a copy of the dev disk with machboot standing in for Windows' boot
     manager on its EFI partition"""
-    sh("tools/mkimage.sh debug >/dev/null")
+    sh(f"tools/mkimage.sh {PROFILE[0]} >/dev/null")
     sh(f"cp {disk()} {DUAL}")
     sh(f"mmd -i {DUAL}@@1M ::/EFI/Microsoft ::/EFI/Microsoft/Boot")
     sh(f"mcopy -i {DUAL}@@1M machboot/out/uefi/release/BOOTX64.EFI ::/EFI/Microsoft/Boot/bootmgfw.efi")
@@ -331,7 +721,7 @@ TESTS = [
     # an update from a package on a USB stick, then a reboot into it
     ("update", False, True,
      ["--prep", update_stick] + usb_stick() + [
-      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; update /mnt/update.tgz; umount /mnt; machboot\\n",
+      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update; update /mnt/update.tgz; umount /mnt; machboot\\n",
       "wait:" + P],
      ["updating MachOS", "installing the programs", "MachOS is updated to 0.8.6", "MachOS (previous)"]),
     ("update-reboot", True, True,
@@ -361,7 +751,7 @@ TESTS = [
       "wait:diff=", "wait:" + P,
       "send:find / -name '*.conf'; ls /etc | xargs echo got; seq 1 50 | tail -2 | tee /tmp/t | wc -l; basename /a/b.txt .txt; df\\n",
       "wait:" + P],
-     ["APPLE", "FIG", "PEAR", "20", "19", "-3", "+X", "diff=1", "/boot/machboot.conf", "got group machos.conf motd passwd shadow",
+     ["APPLE", "FIG", "PEAR", "20", "19", "-3", "+X", "diff=1", "/boot/machboot.conf", "got group hosts machos.conf motd passwd services shadow ssl/",
       "      2", "b", "/dev/sda2", "%"]),
 
     ("jobs-and-ctrl-c", False, False,
@@ -408,6 +798,26 @@ TESTS = [
       "ok remove_file", "ok exists", "ok not_found", "ok create_dir", "ok is_dir", "ok remove_dir",
       "ok clock", "ok monotonic", "ok random", "ok thread_spawn", "ok thread_join", "ok mutex", "ok timed_wait",
       "stdtest: 0 failures"]),
+
+    ("socket-kernel", False, True,
+     ["--prep", with_kernel_sockets, "--boot", disk,
+      "wait:" + P, "send:runtests /bin/socket-tests 0 14\\n", "wait:runtests:", "wait:" + P],
+     ["runtests: 15 passed, 0 failed, 0 hung"]),
+
+    ("socket-kernel-no-entropy", False, True,
+     ["--prep", with_kernel_sockets, "--boot", disk, "--qemu=-cpu", "--qemu=max,-rdrand,-rdseed",
+      "wait:" + P, "send:runtests /bin/socket-tests 0 14\\n", "wait:runtests:", "wait:" + P],
+     ["runtests: 15 passed, 0 failed, 0 hung"]),
+
+    ("tlstest", False, False,
+     ["--prep", with_tlssuite, "--boot", disk, tlssuite_steps],
+     []),
+
+    # The 100,000-result resolver stress test retains at least 400 MiB of
+    # page-allocator storage. Match tools/run.sh's normal 1 GiB VM.
+    ("stdtest", False, False,
+     ["--prep", with_stdsuite, "--boot", disk, "--qemu=-m", "--qemu=1G", stdsuite_steps],
+     []),
 
     ("proc", False, False,
      ["wait:" + P, "send:cat /proc/version; head -2 /proc/meminfo; cat /proc/self/status; ls /proc/sys/kernel; cat /proc/stat\\n",
@@ -481,16 +891,39 @@ TESTS = [
      ["HTTP/1.0 200 OK", "hello over tcp", "150000",
       "771c3995129ed087c7336651f32a510b009e3c9d2190f13bda69d91dd91a257e", "connection refused"]),
 
+    ("https", False, True,
+     ["--prep", https_server, "--post", check_dns_retry, "--boot", disk,
+      "wait:" + P, "send:echo '10.0.2.2 tls.test wrong.test' >> /etc/hosts; export SSL_CERT_FILE=/root/test-ca.pem; time wget -O - https://tls.test:9443/; echo https-status $?\\n", "wait:" + P,
+      "send:wget -q -O /tmp/tls-big https://tls.test:9443/big; echo big-status $?; sha256sum /tmp/tls-big\\n", "wait:" + P,
+      "send:wget -q -O - https://tls.test:9443/chunked; echo chunk-status $?; wget -q -O - http://tls.test:9080/; echo redirect-status $?\\n", "wait:" + P,
+      "send:wget -q -O /tmp/bad https://wrong.test:9443/; echo wrong-host-status $?; wget -q -O /tmp/bad https://tls.test:9444/; echo expired-status $?\\n", "wait:" + P,
+      "send:wget -q -O /tmp/bad https://tls.test:9443/truncated; echo truncated-status $?; unset SSL_CERT_FILE; wget -q -O /tmp/bad https://tls.test:9443/; echo untrusted-status $?\\n", "wait:" + P,
+      "send:export SSL_CERT_FILE=/root/test-ca.pem; wget -q -O /tmp/bad https://tls.test:9443/no-notify; echo no-notify-status $?; wget -q -O - https://tls.test:9443/redirect-http; echo downgrade-status $?; time wget -q -O /tmp/rsa https://tls.test:9445/; echo rsa-status $?; wget -q -O - https://tls.test:9443/redirect-tls; echo tls-redirect-status $?\\n", "wait:" + P,
+      "send:dns-proxy &\\n", "wait:" + P,
+      "send:sleep 1; export SSL_CERT_FILE=/root/test-ca.pem; ip set 10.0.2.15/24 10.0.2.2 127.0.0.1; cat /proc/net/resolv.conf; wget -q -O - https://alias.test:9443/; echo dns-chain-retry-status $?\\n", "wait:" + P,
+      "send:export SSL_CERT_FILE=/root/test-ca.pem; wget -q -O /tmp/ip-san https://10.0.2.2:9443/; echo ip-san-status $?; ca-update --url https://tls.test:9443/bundle; echo ca-update-status $?; cat /etc/ssl/certs/SOURCE; cp /etc/ssl/certs/ca-certificates.crt /tmp/before-ca; ca-update --url https://tls.test:9443/; echo invalid-bundle-status $?; diff /tmp/before-ca /etc/ssl/certs/ca-certificates.crt; echo bundle-kept-status $?; ca-update --url http://tls.test:9080/; echo insecure-url-status $?; ca-update --url https://tls.test:9443/redirect-http; echo insecure-redirect-status $?; diff /tmp/before-ca /etc/ssl/certs/ca-certificates.crt; echo redirect-kept-status $?\\n", "wait:" + P],
+     ["hello over verified TLS", "https-status 0", "big-status 0",
+      __import__("hashlib").sha256(b"0123456789abcdef" * 65536).hexdigest(),
+      "hello chunked!", "chunk-status 0", "hello over verified TLS", "redirect-status 0",
+      "certificate verification failed", "wrong-host-status 1",
+      "certificate verification failed", "expired-status 1",
+      "truncated, invalid, or unauthenticated", "truncated-status 1",
+      "certificate verification failed", "untrusted-status 1", "truncated, invalid, or unauthenticated", "no-notify-status 1",
+      "plain HTTP after TLS redirect", "downgrade-status 0", "rsa-status 0", "tls-redirect-status 0", "dns-proxy ready", "nameserver 127.0.0.1", "hello over verified TLS", "dns-chain-retry-status 0", "ip-san-status 0", "ca-update: CA bundle updated", "ca-update-status 0", "# Source: https://tls.test:9443/bundle",
+      "invalid CA bundle; existing CA bundle kept", "invalid-bundle-status 1", "bundle-kept-status 0",
+      "HTTPS URL is required", "insecure-url-status 1", "ca-update: download failed; existing CA bundle kept",
+      "insecure-redirect-status 1", "redirect-kept-status 0"]),
+
     ("wget", False, False,
      ["--prep", http_server, "--boot", disk,
       "wait:" + P, "send:cd /tmp; wget http://10.0.2.2:8080/hello.txt; cat hello.txt\\n", "wait:" + P,
       "send:wget -q -O big http://10.0.2.2:8080/big.txt; wc -l big; sha256sum big\\n", "wait:" + P,
       "send:wget -O - http://10.0.2.2:8080/sub; wget http://10.0.2.2:8080/nope; echo status $?\\n", "wait:" + P,
-      "send:wget https://example.com/; wget http://10.0.2.2:1/\\n", "wait:" + P],
+      "send:wget http://10.0.2.2:1/\\n", "wait:" + P],
      ["hello.txt saved, 15 bytes", "hello over tcp", "150000",
       "771c3995129ed087c7336651f32a510b009e3c9d2190f13bda69d91dd91a257e",
       "redirected to http://10.0.2.2:8080/sub/", "behind a redirect", "404", "status 1",
-      "https:// is not supported yet", "connection refused"]),
+      "connection refused"]),
 
     ("net-config", False, False,
      ["wait:" + P, "send:ip set 10.0.2.50/24 10.0.2.2 10.0.2.3; ip; ping -c 1 10.0.2.2\\n", "wait:packet loss",
@@ -561,7 +994,7 @@ TESTS = [
       "wait:" + P, "send:ls /; fsck -y /dev/sda2; echo rc=$?.\\n", "wait:rc=[0-9]+\\."],
      ["rescue mode", "root: initrd in memory", "bin/", "/dev/sda2:", "rc="]),
     ("shutdown-clean", True, False,
-     ["--post", lambda: "" if "clean" in root_state("out/debug/disk.img") and "not clean" not in root_state("out/debug/disk.img") else "root not clean after poweroff",
+     ["--post", lambda: "" if "clean" in root_state(disk()) and "not clean" not in root_state(disk()) else "root not clean after poweroff",
       "wait:" + P, "send:echo hi > /tmp/z; poweroff\\n", "wait:power: off", "sleep:1"],
      ["power: off"]),
 
@@ -595,6 +1028,18 @@ TESTS = [
       "sleep:1"],
      ["root: ext2 on /dev/sda2", "MachOS", "kernel.elf", "on-installed", "busy"]),
 ]
+
+
+# Verify the shipped trust store and updater on every system-copy path.
+import hashlib
+with open(os.path.join(ROOT, "root", "etc", "ssl", "certs", "ca-certificates.crt"), "rb") as source:
+    CA_BUNDLE_SHA256 = hashlib.sha256(source.read()).hexdigest()
+for index, (name, keep, fsck, steps, expect) in enumerate(TESTS):
+    if name in ("live-iso", "update", "update-reboot", "usb-installed-boot",
+                "nvme-installed-boot", "installed-boot"):
+        TESTS[index] = (name, keep, fsck,
+                        steps + ["send:sha256sum /etc/ssl/certs/ca-certificates.crt; ca-update --provider unsupported; test \"$?\" = 2; echo ca-tool-status $?\\n", "wait:" + P],
+                        expect + [CA_BUNDLE_SHA256, "usage: ca-update", "ca-tool-status 0"])
 
 
 def run(name, keep, fsck, steps, expect, profile):
@@ -642,6 +1087,8 @@ def run(name, keep, fsck, steps, expect, profile):
             del cmd[i:i + 2]
         cmd += [opt, val]
         steps = steps[2:]
+    # preparations can discover a dispatcher's test count before its steps are expanded.
+    steps = [part for step in steps for part in (step() if callable(step) else [step])]
     # every boot but rescue mode starts at a login prompt: log in as root
     if "--rescue" not in cmd and not nologin:
         steps = ["wait:login: ", "send:root\\n"] + steps
@@ -680,6 +1127,58 @@ def run(name, keep, fsck, steps, expect, profile):
         why = post()
         if why:
             problems.append(why)
+    os.makedirs(os.path.join(ROOT, "out", "headless"), exist_ok=True)
+    with open(os.path.join(ROOT, "out", "headless", name + ".log"), "w") as f:
+        f.write(out)
+    if name == "https":
+        timings = [float(value) for value in re.findall(r"\breal\s+(\d+\.\d+)s", out)]
+        if len(timings) < 2:
+            problems.append("TLS handshake timing results are missing")
+        else:
+            print(f"     | TLS small-file times: ECDSA {timings[0]:.3f}s, RSA {timings[1]:.3f}s", flush=True)
+            if profile == "release" and max(timings[:2]) > 5:
+                problems.append("a release TLS handshake exceeded five seconds under QEMU")
+    if name == "tlstest":
+        selected = [i for i, label in enumerate(TLS_SUITE)
+                    if label.startswith(("crypto.", "pki.", "tls.", "http."))]
+        results = list(re.finditer(r"^(ok|FAIL|HANG) (\d+)(.*)$", out, re.MULTILINE))
+        failures = [match for match in results if match[1] != "ok"]
+        for match in failures:
+            print(f"     | {match[1]} {match[2]} {TLS_SUITE[int(match[2])]}{match[3]}", flush=True)
+        summary = f"upstream libraries: {len(results) - len(failures)} passed, " + \
+                  f"{sum(match[1] == 'FAIL' for match in failures)} failed, " + \
+                  f"{sum(match[1] == 'HANG' for match in failures)} hung"
+        print("     | " + summary, flush=True)
+        if failures or len(results) != len(selected):
+            problems.append(summary + f" ({len(results)}/{len(selected)} completed)")
+    if name == "stdtest":
+        with open(os.path.join(ROOT, "out", "headless", "stdtest.log"), "w") as f:
+            f.write(out)
+        import json
+        with open(os.path.join(ROOT, "tools", "fixtures", "std-baseline.json")) as source:
+            baseline = json.load(source)["failures"]
+        known = 0
+        regressions = 0
+        for match in re.finditer(r"^(FAIL|HANG) (\d+)(.*)$", out, re.MULTILINE):
+            index = int(match[2])
+            label = STD_SUITE[index] if index < len(STD_SUITE) else "unknown test"
+            expected = match[1] == "FAIL" and baseline.get(label) == match[3].strip()
+            if expected:
+                known += 1
+            else:
+                regressions += 1
+            suffix = " (pre-existing, outside networking)" if expected else ""
+            print(f"     | {match[1]} {index} {label}{match[3]}{suffix}", flush=True)
+        summary = re.search(r"runtests: (\d+) passed, (\d+) failed, (\d+) hung", out)
+        if summary:
+            print("     | " + summary[0], flush=True)
+            completed = sum(int(summary[i]) for i in (1, 2, 3))
+            if completed != len(STD_SUITE) or regressions:
+                problems.append(summary[0] + f"; {regressions} new or prerequisite failures")
+            if known:
+                print(f"     | {known} pre-existing failures outside networking remain; no tests skipped", flush=True)
+        else:
+            problems.append("std test dispatcher did not finish")
     at = 0
     for want in expect:
         i = out.find(want, at)
@@ -691,6 +1190,7 @@ def run(name, keep, fsck, steps, expect, profile):
 
 
 def main():
+    import json
     ap = argparse.ArgumentParser()
     ap.add_argument("-p", "--profile", default="debug")
     ap.add_argument("names", nargs="*")
@@ -699,10 +1199,19 @@ def main():
     PROFILE[0] = a.profile
     chosen = [t for t in TESTS if not a.names or t[0] in a.names]
     failed = 0
+    results = []
     for name, keep, fsck, steps, expect in chosen:
         print(f"run  {name}", flush=True)
         t0 = time.time()
-        problems, out, err = run(name, keep, fsck, steps, expect, a.profile)
+        try:
+            problems, out, err = run(name, keep, fsck, steps, expect, a.profile)
+        except Exception as error:
+            problems, out, err = ["preparation failed: " + str(error)], "", ""
+        results.append({"name": name, "passed": not problems, "problems": problems,
+                        "seconds": round(time.time() - t0, 2)})
+        os.makedirs(os.path.join(ROOT, "out", "headless"), exist_ok=True)
+        with open(os.path.join(ROOT, "out", "headless", f"results-{a.profile}.json"), "w") as output:
+            json.dump(results, output, indent=2)
         took = f"({time.time() - t0:.0f} s)"
         if problems:
             failed += 1
@@ -713,6 +1222,10 @@ def main():
                 print("     " + "\n     ".join(err.splitlines()[-12:]))
         else:
             print(f"ok   {name} {took}")
+    import json
+    os.makedirs(os.path.join(ROOT, "out", "headless"), exist_ok=True)
+    with open(os.path.join(ROOT, "out", "headless", f"results-{a.profile}.json"), "w") as output:
+        json.dump(results, output, indent=2)
     print(f"{len(chosen) - failed}/{len(chosen)} passed ({a.profile})")
     sys.exit(1 if failed else 0)
 

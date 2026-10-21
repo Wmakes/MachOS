@@ -1,0 +1,11 @@
+# Upstream cryptography, PKI, TLS and HTTP tests, cross-built for MachOS.
+use std.runtime;
+use crypto_tests: crypto.lib.tests;
+use pki.lib.pki;
+use tls_tests: tls.lib.tests;
+use http.lib.http;
+
+#[symbol("main")]
+fun main() u8 {
+    ret 0;
+}

@@ -60,6 +60,14 @@ pub fun copy_regions(c: *proc.Proc, p: *proc.Proc) u8 {
 }
 
 fun add(p: *proc.Proc, start: u64, end: u64, prot: u64) u8 {
+    # Consecutive page-allocator requests share permissions and addresses.
+    # Keep them in one region so allocation faults do not scan one entry per
+    # small allocation. munmap and mprotect still split at page boundaries.
+    if (p.nmaps > 0) {
+        val last: *proc.Region = ?p.maps[p.nmaps - 1];
+        if (last.prot == prot && last.start == end) { last.start = start; ret 1; }
+        if (last.prot == prot && last.end == start) { last.end = end; ret 1; }
+    }
     if (ensure(p, p.nmaps + 1) == 0) { ret 0; }
     p.maps[p.nmaps].start = start;
     p.maps[p.nmaps].end = end;
@@ -73,12 +81,9 @@ fun add(p: *proc.Proc, start: u64, end: u64, prot: u64) u8 {
 pub fun reserve(p: *proc.Proc, start: u64, end: u64, prot: u64) u8 { ret add(p, start, end, prot); }
 
 fun remove_at(p: *proc.Proc, i: u64) {
-    var k: u64 = i;
-    for (k + 1 < p.nmaps) {
-        p.maps[k] = p.maps[k + 1];
-        k = k + 1;
-    }
+    # Region order is not observable; avoid shifting the remaining mappings.
     p.nmaps = p.nmaps - 1;
+    if (i != p.nmaps) { p.maps[i] = p.maps[p.nmaps]; }
 }
 
 # take [a, b) out of every region; the parts that were inside a region go

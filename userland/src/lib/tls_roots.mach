@@ -1,0 +1,43 @@
+# Lazily load the configured CA bundle once per process. Storage remains alive
+# while TLS connections borrow the trust anchors.
+use A: std.allocator;
+use std.allocator.page;
+use std.process.env;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use pki.cert;
+use tls.cert.bundle;
+use io: userland.lib.cli;
+
+var attempted: bool;
+var available: bool;
+var pages: A.Allocator;
+var roots: bundle.Loaded;
+var override_path: [4096]u8;
+
+pub fun load(verbose: bool) *cert.TrustStore {
+    if (!attempted) {
+        attempted = true;
+        val made: err[A.Error] = page.make(?pages);
+        if (sel made.err) { ret nil; }
+        var path: str = "/etc/ssl/certs/ca-certificates.crt";
+        val value: res[opt[usize], env.EnvError] = env.get("SSL_CERT_FILE",
+            ?override_path[0], 4096);
+        if (sel value.err) { ret nil; }
+        if (sel value.ok.some) {
+            if (value.ok.some >= 4096) { ret nil; }
+            path = (?override_path[0])::str;
+        }
+        available = bundle.load(?pages, path, ?roots) == bundle.OK;
+        if (verbose && roots.bundle.skipped != 0) {
+            io.err("wget: warning: unusable certificates skipped in CA bundle\n");
+        }
+    }
+    if (!available) { ret nil; }
+    ret ?roots.bundle.store;
+}

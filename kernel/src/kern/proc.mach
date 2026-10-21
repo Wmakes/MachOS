@@ -79,8 +79,8 @@ pub rec Proc {
     mmap_next: u64;  # the next mapping goes below this
     pages:     u64;  # user pages mapped
     cpu_ticks: u64;  # timer ticks spent running
-    handles:   [64]u64;
-    fdflags:   [64]u8; # FD_CLOEXEC per fd
+    handles:   [256]u64;
+    fdflags:   [256]u8; # FD_CLOEXEC per fd
     cwd:       [256]u8;
     cwd_len:   u64;
     name:      [32]u8;
@@ -450,9 +450,15 @@ pub fun wakeup(chan: u64) {
 # a futex word the scheduler should clear and wake once thread t is gone
 pub fun cleared_on_exit(t: *Proc) u64 { ret t.clear_tid; }
 
-pub fun sleep_ticks(n: u64) {
+# Wait on a resource, with a timer fallback for device polling and deadlines.
+pub fun sleep_on_for(chan: u64, n: u64) {
     cur.wake_at = ticks + n;
-    sleep_on(CHAN_TIMER);
+    sleep_on(chan);
+    cur.wake_at = 0;
+}
+
+pub fun sleep_ticks(n: u64) {
+    sleep_on_for(CHAN_TIMER, n);
 }
 
 # timer interrupt: wake sleepers whose time has come
@@ -462,7 +468,7 @@ pub fun tick() {
     var i: u64 = 0;
     for (i < MAX) {
         val p: *Proc = ?table[i];
-        if (p.state == BLOCKED && p.chan == CHAN_TIMER && p.wake_at <= ticks) {
+        if (p.state == BLOCKED && p.chan != CHAN_FUTEX && p.wake_at != 0 && p.wake_at <= ticks) {
             p.state = RUNNABLE;
             smp.kick();
         }

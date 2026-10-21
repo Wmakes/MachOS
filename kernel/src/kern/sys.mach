@@ -131,7 +131,7 @@ pub fun killed_by(sig: u64) { exit.killed_by(sig); }
 # create a process running `nd`. hs[i] (a Handle, or 0 for closed) becomes
 # its fd i. returns the pid or an error
 fun spawn(parent: *proc.Proc, nd: *vfs.Node, full: *u8, full_len: u64,
-          args: u64, args_len: u64, env: u64, env_len: u64, hs: *[64]u64, group: u64) u64 {
+          args: u64, args_len: u64, env: u64, env_len: u64, hs: *[256]u64, group: u64) u64 {
     if (nd.kind != abi.KIND_FILE || vfs.allowed(nd, abi.X_OK) == 0) { ret e(abi.E_ACCES); }
     val c: *proc.Proc = proc.alloc();
     if (c == nil) { ret e(abi.E_AGAIN); }
@@ -201,8 +201,8 @@ pub fun spawn_init(p: *u8, rescue: u8) u64 {
     if (con == nil) { ret e(abi.E_NOENT); }
     val h: *file.Handle = file.open_node(con, abi.O_READ | abi.O_WRITE);
     if (h == nil) { ret e(abi.E_NOMEM); }
-    var hs: [64]u64;
-    mem.fill((?hs[0])::u64, 0, 512);
+    var hs: [256]u64;
+    mem.fill((?hs[0])::u64, 0, $size_of([256]u64)::u64);
     hs[0] = h::u64;
     hs[1] = h::u64;
     hs[2] = h::u64;
@@ -238,7 +238,7 @@ fun sys_spawn(pva: u64, plen: u64, ava: u64, alen: u64, sva: u64) u64 {
     val env_len: u64 = sp.env_len;
     if (env_len > ENV_MAX) { ret e(abi.E_INVAL); }
     if (env_len > 0 && ok(sp.env::u64, env_len, 0) == 0) { ret e(abi.E_FAULT); }
-    var hs: [64]u64;
+    var hs: [256]u64;
     val group: u64 = sp.group;
     var i: u64 = 0;
     for (i < abi.MAX_HANDLES) {
@@ -721,7 +721,7 @@ fun sys_rename(fva: u64, flen: u64, tva: u64, tlen: u64) u64 {
     var src: *vfs.Node = nil;
     val fr: u64 = find_node(?from[0], fnl, ?src);
     if (abi.is_err(fr) != 0) { ret fr; }
-    if (vfs.lookup(?to[0], tnl) != nil) { ret e(abi.E_EXIST); }
+    val displaced: *vfs.Node = vfs.lookup(?to[0], tnl);
     val dir: *vfs.Node = vfs.parent_dir(?to[0], tnl);
     if (dir == nil) { ret e(abi.E_NOENT); }
     if (src.parent != nil) {
@@ -730,6 +730,11 @@ fun sys_rename(fva: u64, flen: u64, tva: u64, tlen: u64) u64 {
     }
     val c2: u64 = may_change(dir, nil);
     if (abi.is_err(c2) != 0) { ret c2; }
+    if (displaced != nil) {
+        val allowed: u64 = may_change(dir, displaced);
+        if (abi.is_err(allowed) != 0) { ret allowed; }
+        ret vfs.replace(src, displaced);
+    }
     val b: u64 = path.base_index(?to[0], tnl);
     ret vfs.rename(src, dir, ?to[b], tnl - b);
 }
@@ -1156,28 +1161,23 @@ fun sys_clock(id: u64, out: u64) u64 {
     ret 0;
 }
 
-# GETRANDOM: the cpu's random numbers (RDRAND) when it has them, stirred
-# with the time-stamp counter's jitter through splitmix64
-var rng: u64 = 0x9E3779B97F4A7C15;
-
-fun random64() u64 {
-    var good: u8 = 0;
-    val hw: u64 = cpu.rdrand(?good);
-    rng = rng + 0x9E3779B97F4A7C15 + (hw ^ cpu.rdtsc());
-    var z: u64 = rng;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
-    z = z ^ (z >> 31);
-    if (good != 0) { ret z ^ hw; }
-    ret z;
-}
-
+# GETRANDOM uses the CPU entropy source directly. timer/RTC/TSC values do
+# not have a measured entropy budget, so machines without RDSEED/RDRAND
+# fail explicitly instead of silently serving a predictable PRNG to TLS.
 fun sys_getrandom(buf: u64, n: u64) u64 {
     if (n > 0x100000) { ret e(abi.E_INVAL); }
     if (ok(buf, n, 1) == 0) { ret e(abi.E_FAULT); }
+    if (n == 0) { ret 0; }
+    if (cpu.has_random_source() == 0) { ret e(abi.E_NOTSUP); }
     var i: u64 = 0;
     for (i < n) {
-        var v: u64 = random64();
+        var good: u8 = 0;
+        var v: u64 = cpu.rdseed(?good);
+        if (good == 0) { v = cpu.rdrand(?good); }
+        if (good == 0) {
+            if (i > 0) { ret i; }
+            ret e(abi.E_AGAIN);
+        }
         var k: u64 = 0;
         for (k < 8 && i < n) {
             @((buf + i)::*u8) = (v & 0xFF)::u8;
@@ -1221,6 +1221,7 @@ fun sys_socket(domain: u64, kind_flags: u64, proto: u64) u64 {
     }
     val idx: u64 = install(h);
     if (abi.is_err(idx) != 0) { file.close(h); }
+    if (abi.is_err(idx) == 0 && (kind_flags & abi.SOCK_CLOEXEC) != 0) { cur().fdflags[idx] = abi.FD_CLOEXEC::u8; }
     ret idx;
 }
 
@@ -1242,9 +1243,12 @@ fun sys_bind(h: u64, va: u64, len: u64) u64 {
         if (s.kind == socket.TCP) {
             s.port = netio.tcp_port();
             if (s.port == 0) { ret e(abi.E_AGAIN); }
+            s.local_ip = ip;
             ret 0;
         }
-        ret netio.autobind(s);
+        val bound: u64 = netio.autobind(s);
+        if (abi.is_err(bound) == 0) { s.local_ip = ip; }
+        ret bound;
     }
     if (s.kind != socket.ICMP && port < 1024 && is_root() == 0) { ret e(abi.E_ACCES); }
     val other: *socket.Sock = socket.find(s.kind, port);
@@ -1299,6 +1303,17 @@ fun sys_recvfrom(h: u64, buf: u64, len: u64, va: u64, alen: u64) u64 {
     ret n;
 }
 
+# datagram receive metadata stays separate from the original RECVFROM ABI.
+fun sys_recvmsg(h: u64, buf: u64, len: u64, metadata: u64) u64 {
+    val s: *socket.Sock = sock_of(h);
+    if (s == nil) { ret e(abi.E_BADF); }
+    if (s.kind != socket.UDP) { ret e(abi.E_NOTSUP); }
+    if (ok(buf, len, 1) == 0 || ok(metadata, $size_of(abi.RecvMeta)::u64, 1) == 0) { ret e(abi.E_FAULT); }
+    var ip: u32;
+    var port: u16;
+    ret netio.recv_message(s, buf::*u8, len, ?ip, ?port, metadata::*abi.RecvMeta);
+}
+
 fun sys_setsockopt(h: u64, opt: u64, v: u64) u64 {
     val s: *socket.Sock = sock_of(h);
     if (s == nil) { ret e(abi.E_BADF); }
@@ -1323,6 +1338,16 @@ fun sys_getsockopt(h: u64, opt: u64) u64 {
     if (opt == abi.TCP_NODELAY) { ret s.nodelay::u64; }
     if (opt == abi.SO_SNDBUF || opt == abi.SO_RCVBUF) { ret 65536; }
     if (opt == abi.SO_LINGER) { ret s.linger; }
+    if (opt == abi.SO_ERROR) {
+        if (s.kind != socket.TCP || s.conn == 0 || s.error_reported != 0) { ret 0; }
+        val status: u64 = netio.status(s);
+        if (status == e(abi.E_INPROGRESS)) { ret 0; }
+        if (abi.is_err(status) != 0) {
+            s.error_reported = 1;
+            ret abi.err_code(status);
+        }
+        ret 0;
+    }
     ret e(abi.E_INVAL);
 }
 
@@ -1333,7 +1358,8 @@ fun sys_listen(h: u64, backlog: u64) u64 {
     ret netio.tcp_listen(s, backlog);
 }
 
-fun sys_accept(h: u64, va: u64) u64 {
+fun sys_accept(h: u64, va: u64, flags: u64) u64 {
+    if ((flags & ~(abi.SOCK_NONBLOCK | abi.SOCK_CLOEXEC)) != 0) { ret e(abi.E_INVAL); }
     val s: *socket.Sock = sock_of(h);
     if (s == nil) { ret e(abi.E_BADF); }
     if (s.kind != socket.TCP) { ret e(abi.E_NOTSUP); }
@@ -1341,17 +1367,20 @@ fun sys_accept(h: u64, va: u64) u64 {
     var err: u64 = 0;
     val ns: *socket.Sock = netio.tcp_accept(s, ?err);
     if (ns == nil) { ret err; }
+    ns.nonblock = ((flags & abi.SOCK_NONBLOCK) != 0)::u8;
     val nh: *file.Handle = file.open_socket(ns);
     if (nh == nil) {
         netio.close(ns);
         socket.release(ns);
         ret e(abi.E_NOMEM);
     }
+    if (ns.nonblock != 0) { nh.flags = nh.flags | abi.O_NONBLOCK; }
     val idx: u64 = install(nh);
     if (abi.is_err(idx) != 0) {
         file.close(nh);
         ret idx;
     }
+    if ((flags & abi.SOCK_CLOEXEC) != 0) { cur().fdflags[idx] = abi.FD_CLOEXEC::u8; }
     if (va != 0) { socket.put_addr(va::*u8, ns.peer_ip, ns.peer_port); }
     ret idx;
 }
@@ -1377,7 +1406,10 @@ fun sys_getsockname(h: u64, va: u64) u64 {
     if (s == nil) { ret e(abi.E_BADF); }
     if (ok(va, 16, 1) == 0) { ret e(abi.E_FAULT); }
     var ip: u32 = s.local_ip;
-    if (ip == 0) { ip = net.iface().ip; }
+    if (s.kind == socket.TCP && s.conn != 0) {
+        val c: *tcp.Conn = s.conn::*tcp.Conn;
+        if (c.state != tcp.LISTEN) { ip = c.lip; }
+    } or (ip == 0 && s.connected != 0) { ip = net.source_for(s.peer_ip); }
     socket.put_addr(va::*u8, ip, s.port);
     ret 0;
 }
@@ -1448,8 +1480,8 @@ fun sys_futex_wait(addr: u64, expected: u64, ms: u64) u64 {
     if (@(addr::*u64) != expected) { ret e(abi.E_AGAIN); }
     var t: u64 = 0;
     if (ms != 0) {
-        t = (ms * apic.HZ + 999) / 1000;
-        if (t == 0) { t = 1; }
+        # the next tick may be imminent; only whole subsequent ticks count.
+        t = (ms * apic.HZ + 999) / 1000 + 1;
     }
     if (proc.futex_wait(addr, t) != 0) { ret e(abi.E_TIMEDOUT); }
     if (proc.interrupted(cur()) != 0) { ret e(abi.E_INTR); }
@@ -1649,7 +1681,9 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.SETSOCKOPT) { ret sys_setsockopt(a, b, c); }
     if (n == abi.GETSOCKNAME) { ret sys_getsockname(a, b); }
     if (n == abi.LISTEN)  { ret sys_listen(a, b); }
-    if (n == abi.ACCEPT)  { ret sys_accept(a, b); }
+    if (n == abi.ACCEPT)  { ret sys_accept(a, b, 0); }
+    if (n == abi.RECVMSG) { ret sys_recvmsg(a, b, c, d); }
+    if (n == abi.ACCEPT4) { ret sys_accept(a, b, c); }
     if (n == abi.SHUTDOWN) { ret sys_shutdown(a, b); }
     if (n == abi.GETPEERNAME) { ret sys_getpeername(a, b); }
     if (n == abi.THREAD_SPAWN) { ret sys_thread_spawn(a, b, c, d, f5); }

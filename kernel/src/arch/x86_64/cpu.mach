@@ -346,6 +346,40 @@ pub fun rdrand(ok: *u8) u64 {
     ret v;
 }
 
+# hardware entropy is required until the kernel has a seeded entropy pool.
+pub fun has_random_source() u8 {
+    var r: [4]u32;
+    cpuid(1, ?r[0]);
+    if ((r[2] & (1 << 30)) != 0) { ret 1; }
+    cpuid(0, ?r[0]);
+    if (r[0] < 7) { ret 0; }
+    cpuid(7, ?r[0]);
+    ret ((r[1] & (1 << 18)) != 0)::u8;
+}
+
+# RDSEED supplies entropy directly, with RDRAND available as a fallback.
+pub fun rdseed(ok: *u8) u64 {
+    @ok = 0;
+    var r: [4]u32;
+    cpuid(0, ?r[0]);
+    if (r[0] < 7) { ret 0; }
+    cpuid(7, ?r[0]);
+    if ((r[1] & (1 << 18)) == 0) { ret 0; }
+    var v: u64 = 0;
+    var good: u64 = 0;
+    var tries: u64 = 0;
+    for (tries < 10 && good == 0) {
+        asm x86_64 {
+            .byte 0x48, 0x0f, 0xc7, 0xf8, 0x0f, 0x92, 0xc1, 0x48, 0x0f, 0xb6, 0xc9 :: writes()
+            mov {v}, rax
+            mov {good}, rcx
+        }
+        tries = tries + 1;
+    }
+    @ok = good::u8;
+    ret v;
+}
+
 # wait about `us` microseconds (on the time-stamp counter; a rough spin
 # before it is measured)
 pub fun delay_us(us: u64) {

@@ -44,7 +44,7 @@ need = []
 # std with its MachOS layer, until mach-std has a way to add one from outside
 [dep.std]
 git = "git@github.com:Wmakes/machos-std.git"
-ref = "branch/machos"
+ref = "commit/97475a1514ea1cf7a8773563d94435bf24b6700e"
 
 # runs a mach test dispatcher (mach test -o) once per test index, each in its
 # own process with a time limit: std's own tests on MachOS
@@ -52,6 +52,15 @@ ref = "branch/machos"
 kind = "bin"
 entry = "runtests.mach"
 out = "runtests"
+targets = ["machos"]
+link = []
+need = []
+
+# std's own tests, run inside MachOS by the per-process dispatcher runner.
+[artifact.stdsuite]
+kind = "bin"
+entry = "suite.mach"
+out = "stdsuite"
 targets = ["machos"]
 link = []
 need = []

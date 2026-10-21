@@ -38,7 +38,7 @@ val ACK: u8 = 0x10;
 
 pub val BUFSZ: u64 = 65536;
 val MSS: u64 = 1460;
-val MAXCONN: u64 = 64;
+val MAXCONN: u64 = 256;
 val BACKLOG: u64 = 16;
 
 # why a connection ended badly (the socket calls turn these into errors)
@@ -71,6 +71,7 @@ pub rec Conn {
     fin_sent:  u8;
     peer_fin:  u8;     # the peer has nothing more to send
     err:       u64;
+    probe_at:  u64;    # next zero-window probe, without advancing snd_nxt
     rto:       u64;    # ticks before resending
     rtx_at:    u64;    # the tick to resend at (0: nothing outstanding)
     tries:     u64;
@@ -81,7 +82,7 @@ pub rec Conn {
     backlog:   u64;
 }
 
-var conns: [64]Conn;
+var conns: [256]Conn;
 
 pub fun slot(i: u64) *Conn { ret ?conns[i]; }
 pub fun max() u64 { ret MAXCONN; }
@@ -254,8 +255,17 @@ fun output(c: *Conn) {
         var sent_data: u64 = inflight;
         if (c.fin_sent != 0 && sent_data > 0) { sent_data = sent_data - 1; }
         if (sent_data >= c.tx_len) { brk; }
-        var wnd: u64 = c.snd_wnd;
-        if (wnd == 0 && inflight == 0) { wnd = 1; } # probe a closed window
+        val wnd: u64 = c.snd_wnd;
+        if (wnd == 0 && inflight == 0) {
+            # Probe with an already acknowledged sequence number. Advancing
+            # snd_nxt here leaves a gap when the receiver opens its window:
+            # the rejected probe byte otherwise waits for a retransmit timer.
+            if (c.probe_at == 0 || now() >= c.probe_at) {
+                send_segment(c, c.snd_una - 1, PSH, c.tx_start, 1);
+                c.probe_at = now() + apic.HZ;
+            }
+            brk;
+        }
         if (inflight >= wnd) { brk; }
         var n: u64 = c.tx_len - sent_data;
         if (n > wnd - inflight) { n = wnd - inflight; }
@@ -316,6 +326,7 @@ fun acked(c: *Conn, ackno: u32, wnd: u64) {
         wake(c);
     }
     c.snd_wnd = wnd;
+    if (wnd != 0) { c.probe_at = 0; }
 }
 
 fun fin_acked(c: *Conn) u8 { ret (c.fin_sent != 0 && c.snd_una == c.snd_nxt)::u8; }
@@ -629,6 +640,13 @@ pub fun finish(c: *Conn) {
     }
     c.fin_want = 1;
     output(c);
+}
+
+# SO_LINGER with a zero deadline aborts instead of sending an orderly FIN.
+pub fun abort(c: *Conn) {
+    if (c.state == LISTEN) { release(c); ret; }
+    if (c.state != CLOSED && c.state != SYN_SENT) { send_segment(c, c.snd_nxt, RST | ACK, 0, 0); }
+    free(c);
 }
 
 # the socket lets go: what is queued still goes, then the connection ends

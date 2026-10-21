@@ -1,0 +1,402 @@
+# syscall regressions for accepted socket flags, readiness and half-close.
+
+use machos.arch.x86_64.cpu;
+use sdk.abi;
+use sdk.io;
+use sdk.sys;
+
+fun call(n: u64, a: u64, b: u64, c: u64) u64 {
+    ret sys.raw(n, a, b, c, 0, 0);
+}
+
+# connect a loopback pair without publishing the accepted socket yet.
+fun pair(listener: *u64, client: *u64, server: *u64, flags: u64) u8 {
+    @listener = call(abi.SOCKET, abi.AF_INET, abi.SOCK_STREAM, 0);
+    if (abi.is_err(@listener) != 0) { ret 0; }
+    var addr: [16]u8;
+    addr[0] = 2;
+    addr[4] = 127;
+    addr[7] = 1;
+    if (abi.is_err(call(abi.BIND, @listener, (?addr[0])::u64, 16)) != 0)       { ret 0; }
+    if (abi.is_err(call(abi.LISTEN, @listener, 4, 0)) != 0)                    { ret 0; }
+    if (abi.is_err(call(abi.GETSOCKNAME, @listener, (?addr[0])::u64, 0)) != 0) { ret 0; }
+    @client = call(abi.SOCKET, abi.AF_INET, abi.SOCK_STREAM, 0);
+    if (abi.is_err(@client) != 0)                                         { ret 0; }
+    if (abi.is_err(call(abi.CONNECT, @client, (?addr[0])::u64, 16)) != 0) { ret 0; }
+    @server = call(abi.ACCEPT4, @listener, 0, flags);
+    ret (abi.is_err(@server) == 0)::u8;
+}
+
+test regression__accept_flags_are_applied_before_the_handle_is_returned {
+    var listener: u64;
+    var client:   u64;
+    var server:   u64;
+    if (pair(?listener, ?client, ?server, abi.SOCK_NONBLOCK | abi.SOCK_CLOEXEC) == 0) { ret 1; }
+    if ((sys.fcntl(server, abi.F_GETFL, 0) & abi.O_NONBLOCK) == 0)                    { ret 2; }
+    if (sys.fcntl(server, abi.F_GETFD, 0) != abi.FD_CLOEXEC)                          { ret 3; }
+    var byte: u8;
+    if (sys.read(server, ?byte, 1) != abi.err(abi.E_AGAIN)) { ret 4; }
+    byte = 73;
+    if (sys.write(client, ?byte, 1) != 1)              { ret 5; }
+    if (sys.read(server, ?byte, 1) != 1 || byte != 73) { ret 6; }
+    ret 0;
+}
+
+test regression__socket_creation_sets_only_requested_descriptor_flags {
+    val first:  u64 = call(abi.SOCKET, abi.AF_INET, abi.SOCK_DGRAM | abi.SOCK_NONBLOCK | abi.SOCK_CLOEXEC, 0);
+    val second: u64 = call(abi.SOCKET, abi.AF_INET, abi.SOCK_DGRAM, 0);
+    if (abi.is_err(first) != 0 || abi.is_err(second) != 0)         { ret 1; }
+    if (sys.fcntl(first, abi.F_GETFD, 0) != abi.FD_CLOEXEC)        { ret 2; }
+    if ((sys.fcntl(first, abi.F_GETFL, 0) & abi.O_NONBLOCK) == 0)  { ret 3; }
+    if (sys.fcntl(second, abi.F_GETFD, 0) != 0)                    { ret 4; }
+    if ((sys.fcntl(second, abi.F_GETFL, 0) & abi.O_NONBLOCK) != 0) { ret 5; }
+    if (call(abi.ACCEPT4, 0, 0, 0x100000) != abi.err(abi.E_INVAL)) { ret 6; }
+    ret 0;
+}
+
+test regression__queues_rearm_unread_data_and_report_half_close_without_losing_writes {
+    var listener: u64;
+    var client:   u64;
+    var server:   u64;
+    if (pair(?listener, ?client, ?server, abi.SOCK_NONBLOCK) == 0) { ret 1; }
+    val q: u64 = call(abi.QUEUE_CREATE, 0, 0, 0);
+    if (abi.is_err(q) != 0)                                                     { ret 2; }
+    if (sys.raw(abi.QUEUE_CTL, q, abi.QUEUE_ADD, server, abi.EV_READ, 73) != 0) { ret 3; }
+    var ev: abi.QueueEvent;
+    if (sys.raw(abi.QUEUE_WAIT, q, (?ev)::u64, 1, 0, 0) != 0) { ret 4; }
+    var byte: u8 = 73;
+    if (sys.write(client, ?byte, 1) != 1)                                                  { ret 5; }
+    if (sys.raw(abi.QUEUE_WAIT, q, (?ev)::u64, 1, 1000, 0) != 1 || ev.context != 73)       { ret 6; }
+    if (sys.raw(abi.QUEUE_WAIT, q, (?ev)::u64, 1, 0, 0) != 0)                              { ret 7; }
+    if (sys.raw(abi.QUEUE_CTL, q, abi.QUEUE_MOD, server, abi.EV_READ, 74) != 0)            { ret 8; }
+    if (sys.raw(abi.QUEUE_WAIT, q, (?ev)::u64, 1, 0, 0) != 1 || ev.context != 74)          { ret 9; }
+    if (sys.read(server, ?byte, 1) != 1 || byte != 73)                                     { ret 10; }
+    if (call(abi.SHUTDOWN, client, abi.SHUT_WR, 0) != 0)                                   { ret 11; }
+    if (sys.raw(abi.QUEUE_CTL, q, abi.QUEUE_MOD, server, abi.EV_READ, 75) != 0)            { ret 12; }
+    if (sys.raw(abi.QUEUE_WAIT, q, (?ev)::u64, 1, 1000, 0) != 1)                           { ret 13; }
+    if ((ev.events::u64 & (abi.EV_READ | abi.EV_HANGUP)) != (abi.EV_READ | abi.EV_HANGUP)) { ret 14; }
+    if (sys.read(server, ?byte, 1) != 0)                                                   { ret 15; }
+    if (sys.write(server, ?byte, 1) != 1 || sys.read(client, ?byte, 1) != 1)               { ret 16; }
+    ret 0;
+}
+
+test regression__nonblocking_connect_completes_through_a_readiness_queue {
+    val listener: u64 = call(abi.SOCKET, abi.AF_INET, abi.SOCK_STREAM, 0);
+    if (abi.is_err(listener) != 0) { ret 1; }
+    var addr: [16]u8;
+    addr[0] = 2;
+    addr[4] = 127;
+    addr[7] = 1;
+    if (call(abi.BIND, listener, (?addr[0])::u64, 16) != 0)       { ret 2; }
+    if (call(abi.LISTEN, listener, 4, 0) != 0)                    { ret 3; }
+    if (call(abi.GETSOCKNAME, listener, (?addr[0])::u64, 0) != 0) { ret 4; }
+    val client: u64 = call(abi.SOCKET, abi.AF_INET, abi.SOCK_STREAM | abi.SOCK_NONBLOCK, 0);
+    if (call(abi.CONNECT, client, (?addr[0])::u64, 16) != abi.err(abi.E_INPROGRESS)) { ret 5; }
+    val q: u64 = call(abi.QUEUE_CREATE, 0, 0, 0);
+    if (sys.raw(abi.QUEUE_CTL, q, abi.QUEUE_ADD, client, abi.EV_WRITE, 73) != 0) { ret 6; }
+    var ev: abi.QueueEvent;
+    if (sys.raw(abi.QUEUE_WAIT, q, (?ev)::u64, 1, 1000, 0) != 1) { ret 7; }
+    if ((ev.events::u64 & abi.EV_WRITE) == 0)                    { ret 8; }
+    if (call(abi.GETSOCKOPT, client, abi.SO_ERROR, 0) != 0)      { ret 9; }
+    if (call(abi.SOCK_STATUS, client, 0, 0) != 0)                { ret 10; }
+    ret 0;
+}
+
+# mach test supplies main; MachOS enters with argc and argv in rdi and rsi.
+#[naked]
+#[symbol("_start")]
+fun start() {
+    asm x86_64 {
+        and rsp, -16
+        call main
+        mov rsi, rax
+        mov rdi, 0
+        call sys_call
+    }
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    ret 0;
+}
+
+test regression__datagram_metadata_preserves_destination_and_truncation {
+    val receiver: u64 = call(abi.SOCKET, abi.AF_INET, abi.SOCK_DGRAM | abi.SOCK_NONBLOCK, 0);
+    val sender:   u64 = call(abi.SOCKET, abi.AF_INET, abi.SOCK_DGRAM | abi.SOCK_NONBLOCK, 0);
+    if (abi.is_err(receiver) != 0 || abi.is_err(sender) != 0) { ret 1; }
+    var addr: [16]u8;
+    addr[0] = 2;
+    addr[4] = 127;
+    addr[7] = 1;
+    if (call(abi.BIND, receiver, (?addr[0])::u64, 16) != 0)       { ret 2; }
+    if (call(abi.GETSOCKNAME, receiver, (?addr[0])::u64, 0) != 0) { ret 3; }
+    var packet: [8]u8;
+    packet[0] = 73;
+    packet[3] = 74;
+    if (sys.raw(abi.SENDTO, sender, (?packet[0])::u64, 8, (?addr[0])::u64, 16) != 8) { ret 4; }
+    var out: [5]u8;
+    out[4] = 99;
+    var meta: abi.RecvMeta;
+    if (sys.raw(abi.RECVMSG, receiver, (?out[0])::u64, 4, (?meta)::u64, 0) != 4) { ret 5; }
+    if (out[0] != 73 || out[3] != 74 || out[4] != 99)                            { ret 6; }
+    if (meta.flags != 0x20 || meta.destination != 0x7F000001 || meta.interface_index == 0) {
+        io.out("metadata: \0");
+        io.dec(meta.flags);
+        io.putc(32);
+        io.dec(meta.destination::u64);
+        io.putc(32);
+        io.dec(meta.interface_index::u64);
+        io.putc(10);
+        ret 7;
+    }
+    if (meta.peer[4] != 127 || meta.peer[7] != 1)                                      { ret 8; }
+    if (sys.raw(abi.SENDTO, sender, 0, 0, (?addr[0])::u64, 16) != 0)                   { ret 9; }
+    if (sys.raw(abi.RECVMSG, receiver, 0, 0, (?meta)::u64, 0) != 0 || meta.flags != 0) { ret 10; }
+    ret 0;
+}
+
+test regression__abortive_close_reports_reset_to_the_peer {
+    var listener: u64;
+    var client:   u64;
+    var server:   u64;
+    if (pair(?listener, ?client, ?server, abi.SOCK_NONBLOCK) == 0) { ret 1; }
+    if (call(abi.SETSOCKOPT, server, abi.SO_LINGER, 1 << 32) != 0) { ret 2; }
+    if (sys.close(server) != 0)                                    { ret 3; }
+    var byte: u8;
+    if (sys.read(client, ?byte, 1) != abi.err(abi.E_CONNRESET)) { ret 4; }
+    ret 0;
+}
+
+test regression__refused_connect_reports_error_after_readiness {
+    val listener: u64 = call(abi.SOCKET, abi.AF_INET, abi.SOCK_STREAM, 0);
+    if (abi.is_err(listener) != 0) { ret 1; }
+    var addr: [16]u8;
+    addr[0] = 2;
+    addr[4] = 127;
+    addr[7] = 1;
+    if (call(abi.BIND, listener, (?addr[0])::u64, 16) != 0)       { ret 2; }
+    if (call(abi.GETSOCKNAME, listener, (?addr[0])::u64, 0) != 0) { ret 3; }
+    sys.close(listener);
+    val client: u64 = call(abi.SOCKET, abi.AF_INET, abi.SOCK_STREAM | abi.SOCK_NONBLOCK, 0);
+    if (call(abi.CONNECT, client, (?addr[0])::u64, 16) != abi.err(abi.E_INPROGRESS)) { ret 4; }
+    val q: u64 = call(abi.QUEUE_CREATE, 0, 0, 0);
+    if (sys.raw(abi.QUEUE_CTL, q, abi.QUEUE_ADD, client, abi.EV_WRITE, 73) != 0) { ret 5; }
+    var ev: abi.QueueEvent;
+    if (sys.raw(abi.QUEUE_WAIT, q, (?ev)::u64, 1, 1000, 0) != 1)            { ret 6; }
+    if ((ev.events::u64 & abi.EV_ERROR) == 0)                               { ret 7; }
+    if (call(abi.GETSOCKOPT, client, abi.SO_ERROR, 0) != abi.E_CONNREFUSED) { ret 8; }
+    if (call(abi.GETSOCKOPT, client, abi.SO_ERROR, 0) != 0) { ret 9; }
+    ret 0;
+}
+
+test regression__readiness_tracks_handles_above_the_previous_limit {
+    var sockets: [130]u64;
+    var i:       u64 = 0;
+    for (i < 130) {
+        sockets[i] = call(abi.SOCKET, abi.AF_INET, abi.SOCK_DGRAM | abi.SOCK_NONBLOCK, 0);
+        if (abi.is_err(sockets[i]) != 0) { ret 1; }
+        i = i + 1;
+    }
+    val receiver: u64 = sockets[129];
+    if (receiver < 128) { ret 2; }
+    var addr: [16]u8;
+    addr[0] = 2;
+    addr[4] = 127;
+    addr[7] = 1;
+    if (call(abi.BIND, receiver, (?addr[0])::u64, 16) != 0)       { ret 3; }
+    if (call(abi.GETSOCKNAME, receiver, (?addr[0])::u64, 0) != 0) { ret 4; }
+    val q: u64 = call(abi.QUEUE_CREATE, 0, 0, 0);
+    if (sys.raw(abi.QUEUE_CTL, q, abi.QUEUE_ADD, receiver, abi.EV_READ, 73) != 0) { ret 5; }
+    var byte: u8 = 73;
+    if (sys.raw(abi.SENDTO, sockets[0], (?byte)::u64, 1, (?addr[0])::u64, 16) != 1) { ret 6; }
+    var event: abi.QueueEvent;
+    if (sys.raw(abi.QUEUE_WAIT, q, (?event)::u64, 1, 1000, 0) != 1 || event.context != 73) { ret 7; }
+    ret 0;
+}
+
+test regression__futex_timeout_does_not_expire_before_its_milliseconds {
+    var start:  abi.Timespec;
+    var finish: abi.Timespec;
+    if (call(abi.CLOCK, abi.CLOCK_MONOTONIC, (?start)::u64, 0) != 0) { ret 1; }
+    var word: u64 = 0;
+    if (call(abi.FUTEX_WAIT, (?word)::u64, 0, 20) != abi.err(abi.E_TIMEDOUT)) { ret 2; }
+    if (call(abi.CLOCK, abi.CLOCK_MONOTONIC, (?finish)::u64, 0) != 0)         { ret 3; }
+    val elapsed: u64 = (finish.sec - start.sec) * 1000000000 + finish.nsec - start.nsec;
+    if (elapsed < 20000000) { ret 4; }
+    ret 0;
+}
+
+test regression__entropy_is_hardware_backed_or_explicitly_unavailable {
+    if (call(abi.GETRANDOM, 0, 0, 0) != 0) { ret 1; }
+    var first:  [32]u8;
+    var second: [32]u8;
+    val got:    u64 = call(abi.GETRANDOM, (?first[0])::u64, 32, 0);
+    if (cpu.has_random_source() == 0) {
+        if (got != abi.err(abi.E_NOTSUP)) { ret 2; }
+        ret 0;
+    }
+    if (got != 32)                                           { ret 3; }
+    if (call(abi.GETRANDOM, (?second[0])::u64, 32, 0) != 32) { ret 4; }
+    var different: u8  = 0;
+    var i:         u64 = 0;
+    for (i < 32) {
+        different = different | (first[i] ^ second[i]);
+        i         = i + 1;
+    }
+    if (different == 0) { ret 5; }
+    ret 0;
+}
+
+# A queue wake must release a blocked waiter without waiting for its poll tick.
+test regression__queue_wakes_make_progress_without_timer_quantization {
+    val requests: u64 = sys.raw(abi.QUEUE_CREATE, 0, 0, 0, 0, 0);
+    val replies: u64 = sys.raw(abi.QUEUE_CREATE, 0, 0, 0, 0, 0);
+    if (abi.is_err(requests) != 0 || abi.is_err(replies) != 0) { ret 1; }
+    val child: u64 = sys.fork();
+    if (abi.is_err(child) != 0) { ret 2; }
+    var event: abi.QueueEvent;
+    var i: u64 = 0;
+    if (child == 0) {
+        for (i < 32) {
+            if (sys.raw(abi.QUEUE_WAIT, requests, (?event)::u64, 1, 1000, 0) != 1) { sys.exit(3); }
+            sys.raw(abi.QUEUE_WAKE, replies, 0, 0, 0, 0);
+            i = i + 1;
+        }
+        sys.exit(0);
+    }
+    var start: abi.Timespec;
+    var finish: abi.Timespec;
+    call(abi.CLOCK, abi.CLOCK_MONOTONIC, (?start)::u64, 0);
+    for (i < 32) {
+        sys.raw(abi.QUEUE_WAKE, requests, 0, 0, 0, 0);
+        if (sys.raw(abi.QUEUE_WAIT, replies, (?event)::u64, 1, 1000, 0) != 1) { ret 4; }
+        i = i + 1;
+    }
+    call(abi.CLOCK, abi.CLOCK_MONOTONIC, (?finish)::u64, 0);
+    val elapsed: u64 = (finish.sec - start.sec) * 1000000000 + finish.nsec - start.nsec;
+    if (sys.wait(child) != 0) { ret 5; }
+    sys.close(requests);
+    sys.close(replies);
+    if (elapsed >= 300000000) { ret 6; }
+    ret 0;
+}
+
+# CA updates need rename-over-file on disk; held readers retain the old inode.
+test regression__replacement_preserves_held_readers_on_ram_and_ext2 {
+    val sources: [2]*u8 = [2]*u8{"/tmp/rename-new", "/root/rename-new"};
+    val targets: [2]*u8 = [2]*u8{"/tmp/rename-old", "/root/rename-old"};
+    var i: u64 = 0;
+    for (i < 2) {
+        val from: *u8 = sources[i];
+        val to: *u8 = targets[i];
+        sys.remove(from, io.len(from));
+        sys.remove(to, io.len(to));
+        val old: u64 = sys.open(to, io.len(to), abi.O_CREATE | abi.O_READ | abi.O_WRITE);
+        val new: u64 = sys.open(from, io.len(from), abi.O_CREATE | abi.O_READ | abi.O_WRITE);
+        if (abi.is_err(old) != 0 || abi.is_err(new) != 0) { ret 1; }
+        var before: u8 = 41;
+        var after: u8 = 73;
+        if (sys.write(old, ?before, 1) != 1 || sys.write(new, ?after, 1) != 1) { ret 2; }
+        sys.close(old);
+        sys.close(new);
+        val held: u64 = sys.open(to, io.len(to), abi.O_READ);
+        if (sys.rename(from, io.len(from), to, io.len(to)) != 0) { ret 3; }
+        val replaced: u64 = sys.open(to, io.len(to), abi.O_READ);
+        var byte: u8;
+        if (sys.read(held, ?byte, 1) != 1 || byte != 41) { ret 4; }
+        if (sys.read(replaced, ?byte, 1) != 1 || byte != 73) { ret 5; }
+        sys.close(held);
+        sys.close(replaced);
+        if (sys.remove(to, io.len(to)) != 0) { ret 6; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# Queue timeouts use elapsed milliseconds, not the phase of the next APIC tick.
+test regression__queue_timeout_cannot_expire_before_its_duration {
+    val queue: u64 = call(abi.QUEUE_CREATE, 0, 0, 0);
+    if (abi.is_err(queue) != 0) { ret 1; }
+    var start: abi.Timespec;
+    var finish: abi.Timespec;
+    var event: abi.QueueEvent;
+    call(abi.CLOCK, abi.CLOCK_MONOTONIC, (?start)::u64, 0);
+    if (sys.raw(abi.QUEUE_WAIT, queue, (?event)::u64, 1, 20, 0) != 0) { ret 2; }
+    call(abi.CLOCK, abi.CLOCK_MONOTONIC, (?finish)::u64, 0);
+    sys.close(queue);
+    val elapsed: u64 = (finish.sec - start.sec) * 1000000000 + finish.nsec - start.nsec;
+    if (elapsed < 20000000) { ret 3; }
+    ret 0;
+}
+
+# Fill a receiver before reading. Opening its window must send the first queued
+# byte immediately, including after a zero-window probe was rejected.
+test regression__opening_a_zero_window_preserves_the_next_sequence_byte {
+    var listener: u64;
+    var client: u64;
+    var server: u64;
+    if (pair(?listener, ?client, ?server, 0) == 0) { ret 1; }
+    val child: u64 = sys.fork();
+    if (abi.is_err(child) != 0) { ret 2; }
+    var buffer: [4096]u8;
+    var i: u64 = 0;
+    if (child == 0) {
+        sys.close(listener);
+        sys.close(client);
+        for (i < 4096) { buffer[i] = (i % 251)::u8; i = i + 1; }
+        i = 0;
+        for (i < 32) {
+            if (sys.write(server, ?buffer[0], 4096) != 4096) { sys.exit(3); }
+            i = i + 1;
+        }
+        sys.close(server);
+        sys.exit(0);
+    }
+    sys.close(listener);
+    sys.close(server);
+    sys.sleep(100);
+    var start: abi.Timespec;
+    var finish: abi.Timespec;
+    call(abi.CLOCK, abi.CLOCK_MONOTONIC, (?start)::u64, 0);
+    var total: u64 = 0;
+    for (total < 131072) {
+        val got: u64 = sys.read(client, ?buffer[0], 4096);
+        if (abi.is_err(got) != 0 || got == 0) { ret 4; }
+        i = 0;
+        for (i < got) {
+            if (buffer[i] != (((total + i) % 4096) % 251)::u8) { ret 5; }
+            i = i + 1;
+        }
+        total = total + got;
+    }
+    call(abi.CLOCK, abi.CLOCK_MONOTONIC, (?finish)::u64, 0);
+    val elapsed: u64 = (finish.sec - start.sec) * 1000000000 + finish.nsec - start.nsec;
+    sys.close(client);
+    if (sys.wait(child) != 0) { ret 6; }
+    if (elapsed >= 500000000) { ret 7; }
+    ret 0;
+}
+
+# Coalescing adjacent allocator pages must preserve independent protection,
+# unmapping and zero-filled reuse of the middle page.
+test regression__adjacent_mappings_preserve_page_boundaries {
+    val flags: u64 = abi.MAP_PRIVATE | abi.MAP_ANONYMOUS;
+    val prot: u64 = abi.PROT_READ | abi.PROT_WRITE;
+    val first: u64 = sys.mmap(0, 4096, prot, flags, 0, 0);
+    val middle: u64 = sys.mmap(0, 4096, prot, flags, 0, 0);
+    val last: u64 = sys.mmap(0, 4096, prot, flags, 0, 0);
+    if (abi.is_err(first) != 0 || middle + 4096 != first || last + 4096 != middle) { ret 1; }
+    @(first::*u8) = 11;
+    @(middle::*u8) = 22;
+    @(last::*u8) = 33;
+    if (sys.mprotect(middle, 4096, abi.PROT_READ) != 0) { ret 2; }
+    if (call(abi.GETRANDOM, middle, 1, 0) != abi.err(abi.E_FAULT)) { ret 3; }
+    @(first::*u8) = 55;
+    @(last::*u8) = 66;
+    if (sys.munmap(middle, 4096) != 0) { ret 4; }
+    if (call(abi.GETRANDOM, middle, 1, 0) != abi.err(abi.E_FAULT)) { ret 5; }
+    if (sys.mmap(middle, 4096, prot, flags | abi.MAP_FIXED, 0, 0) != middle) { ret 6; }
+    if (@(middle::*u8) != 0 || @(first::*u8) != 55 || @(last::*u8) != 66) { ret 7; }
+    if (sys.munmap(last, 12288) != 0) { ret 8; }
+    ret 0;
+}

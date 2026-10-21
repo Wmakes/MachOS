@@ -1,0 +1,50 @@
+# Test fixture: relay the guest's standard DNS port to an unprivileged host
+# port. This lets wget exercise its normal resolver, including UDP retries.
+use std.runtime;
+use std.print;
+use std.system.os;
+use std.net.ip;
+use std.net.udp;
+use std.net.socket;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use io_error: std.io.error;
+
+#[symbol("main")]
+fun main() u8 {
+    val local: res[udp.Socket, io_error.Error] = udp.bind_with_flags(
+        ip.endpoint(127, 0, 0, 1, 53), socket.async_flags());
+    val host: res[udp.Socket, io_error.Error] = udp.bind_with_flags(
+        ip.endpoint(0, 0, 0, 0, 0), socket.async_flags());
+    if (sel local.err) { ret 1; }
+    if (sel host.err) { ret 1; }
+    var listener: udp.Socket = local.ok;
+    var relay: udp.Socket = host.ok;
+    var data: [1500]u8;
+    var client: ip.Endpoint;
+    var pending: bool = false;
+    print.println("dns-proxy ready");
+    for (true) {
+        var progressed: bool = false;
+        var peer: ip.Endpoint;
+        val request: res[usize, io_error.Error] = udp.recv_from(?listener,
+            ?data[0], 1500, ?peer);
+        if (sel request.ok) {
+            client = peer;
+            pending = true;
+            udp.send_to(?relay, ?data[0], request.ok, ip.endpoint(10, 0, 2, 2, 5533));
+            progressed = true;
+        }
+        val response: res[usize, io_error.Error] = udp.recv_from(?relay,
+            ?data[0], 1500, ?peer);
+        if (sel response.ok) {
+            if (pending) { udp.send_to(?listener, ?data[0], response.ok, client); }
+            progressed = true;
+        }
+        if (!progressed) { os.sleep(1000000); }
+    }
+    ret 0;
+}

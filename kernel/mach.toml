@@ -52,3 +52,20 @@ out = "ethernet-tests"
 targets = ["host"]
 link = []
 need = []
+
+# syscall regressions execute in MachOS through the indexed test dispatcher.
+[target.machos]
+isa = "x86_64"
+os = "freestanding"
+abi = "sysv64"
+of = "elf"
+base = 0x400000
+platform = "machos"
+
+[artifact.socket-tests]
+kind = "bin"
+entry = "tests/sockets.mach"
+out = "socket-tests"
+targets = ["machos"]
+link = []
+need = []

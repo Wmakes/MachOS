@@ -19,7 +19,7 @@ use heap:   machos.mm.heap;
 use mem:    machos.kern.mem;
 use netio:  machos.net.io;
 use net:    machos.net.net;
-use apic:   machos.arch.x86_64.apic;
+use clock:  machos.kern.clock;
 
 val ENTRIES: u64 = 128;
 
@@ -118,7 +118,7 @@ pub fun control(q: *Queue, op: u64, fd: u64, h: *file.Handle, want: u64, context
 }
 
 # collect what is ready into out (max records); how many
-fun collect(q: *Queue, out: *abi.QueueEvent, max: u64, handles: *[64]u64) u64 {
+fun collect(q: *Queue, out: *abi.QueueEvent, max: u64, handles: *[256]u64) u64 {
     var n: u64 = 0;
     if (q.wake != 0 && n < max) {
         q.wake = 0;
@@ -131,7 +131,7 @@ fun collect(q: *Queue, out: *abi.QueueEvent, max: u64, handles: *[64]u64) u64 {
     for (i < ENTRIES && n < max) {
         val x: *Entry = ?q.entries[i];
         if (x.used != 0 && x.armed != 0) {
-            if (x.fd >= 64 || (@handles)[x.fd] != x.h) {
+            if (x.fd >= abi.MAX_HANDLES || (@handles)[x.fd] != x.h) {
                 x.used = 0; # its fd was closed or reused
             } or {
                 val ready: u64 = readiness(x.h::*file.Handle);
@@ -152,18 +152,21 @@ fun collect(q: *Queue, out: *abi.QueueEvent, max: u64, handles: *[64]u64) u64 {
 
 # QUEUE_WAIT: up to max events into out, waiting at most `ms` milliseconds
 # (0xFFFFFFFF: for ever, 0: not at all); how many, or an error
-pub fun wait(q: *Queue, out: *abi.QueueEvent, max: u64, ms: u64, handles: *[64]u64) u64 {
-    val start: u64 = proc.uptime_ticks();
+pub fun wait(q: *Queue, out: *abi.QueueEvent, max: u64, ms: u64, handles: *[256]u64) u64 {
+    val start: u64 = clock.mono_ns();
     for {
         net.poll();
         val n: u64 = collect(q, out, max, handles);
         if (n > 0) { ret n; }
         if (ms == 0) { ret 0; }
-        if (ms != 0xFFFFFFFF && (proc.uptime_ticks() - start) * 1000 >= ms * apic.HZ) { ret 0; }
+        if (ms != 0xFFFFFFFF && (clock.mono_ns() - start) / 1000000 >= ms) { ret 0; }
         if (proc.interrupted(proc.current()) != 0) { ret e(abi.E_INTR); }
-        proc.sleep_ticks(1);
+        proc.sleep_on_for(q::u64, 1);
     }
     ret 0;
 }
 
-pub fun wake(q: *Queue) { q.wake = 1; }
+pub fun wake(q: *Queue) {
+    q.wake = 1;
+    proc.wakeup(q::u64);
+}

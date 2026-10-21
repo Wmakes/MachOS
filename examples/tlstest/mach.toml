@@ -1,0 +1,73 @@
+# Upstream TLS and protocol tests cross-built as static MachOS executables.
+[project]
+id = "tlstest"
+version = "0.1.0"
+mach = "^6.10"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+# a MachOS program: a static x86_64 ELF linked at 4 MiB. `platform` is what
+# selects std's MachOS layer
+[target.machos]
+isa      = "x86_64"
+os       = "freestanding"
+abi      = "sysv64"
+of       = "elf"
+base     = 0x400000
+platform = "machos"
+
+[artifact.tlstest]
+kind = "bin"
+entry = "main.mach"
+out = "tlstest"
+targets = ["*"]
+link = []
+need = []
+
+[dep.std]
+git = "git@github.com:Wmakes/machos-std.git"
+ref = "commit/97475a1514ea1cf7a8773563d94435bf24b6700e"
+
+[dep.crypto]
+git = "https://github.com/briar-systems/mach-crypto.git"
+ref = "commit/568395358be3c4c454a40d283d07eebe8474ae6c"
+
+[dep.pki]
+git = "https://github.com/briar-systems/mach-pki.git"
+ref = "commit/16145a4f2eae83efb60f93375fc1f1c849316788"
+
+[dep.tls]
+git = "https://github.com/briar-systems/mach-tls.git"
+ref = "commit/10c2463fa72a212c53db934190f46046692236e8"
+
+[dep.http]
+git = "https://github.com/briar-systems/mach-http.git"
+ref = "commit/b1f2aedd05f2f632f8e3d1d4f10c8ea5145c8dac"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[artifact.dns-proxy]
+kind = "bin"
+entry = "dns_proxy.mach"
+out = "dns-proxy"
+targets = ["machos"]
+link = []
+need = []

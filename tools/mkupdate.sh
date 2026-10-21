@@ -18,6 +18,8 @@ cp machboot/out/uefi/release/BOOTX64.EFI "$S/boot/BOOTX64.EFI"
 cp userland/out/machos/release/bin/* "$S/bin/"
 cp root/etc/motd "$S/etc/motd"
 cp root/etc/machos.conf "$S/etc/machos.conf"
+cp root/etc/hosts root/etc/services "$S/etc/"
+cp -r root/etc/ssl "$S/etc/ssl"
 chmod 0755 "$S/bin/"*
 tar --format=ustar --owner=0 --group=0 -C "$S" -cf - . | gzip -9 > "$OUT"
 rm -rf "$S"

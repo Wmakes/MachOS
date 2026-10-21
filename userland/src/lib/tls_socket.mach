@@ -1,0 +1,288 @@
+# Verified TLS over an existing TCP stream. The transport follows mach-tls's
+# interop adapter; cryptography and certificate policy remain in mach-tls/PKI.
+use crypto.contracts;
+use crypto.secret;
+use pki.cert;
+use A: std.allocator;
+use std.allocator.page;
+use std.chrono.time;
+use io_error: std.io.error;
+use io_runtime: std.io.runtime;
+use std.net.tcp;
+use std.sync.cancel;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str_len;
+use std.types.string.str;
+use tls.client;
+use tls.clock;
+use tls.config;
+use tls.engine;
+use tls.error;
+use tls.memory_range;
+use tls.stream;
+use tls.transport;
+use tls.tls13;
+use pool: userland.lib.tls_pool;
+
+rec BlockingTransport {
+    runtime: *io_runtime.Runtime;
+    stream:  *tcp.Stream;
+}
+
+fun blocking_aliases_state(context: ptr, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret true; }
+    if (len == 0)                       { ret false; }
+    if (!memory_range.valid(context::*u8, $size_of(BlockingTransport))) {
+        ret true;
+    }
+    val state: *BlockingTransport = context::*BlockingTransport;
+    if (!memory_range.valid(state.stream::*u8, $size_of(tcp.Stream)) ||
+        memory_range.overlap(state::*u8, $size_of(BlockingTransport),
+        state.stream::*u8, $size_of(tcp.Stream)) ||
+        io_runtime.aliases(state.runtime, state::*u8,
+        $size_of(BlockingTransport)) ||
+        io_runtime.aliases(state.runtime, state.stream::*u8,
+        $size_of(tcp.Stream))) { ret true; }
+    ret memory_range.overlap(state::*u8, $size_of(BlockingTransport),
+        data, len) ||
+        memory_range.overlap(state.stream::*u8, $size_of(tcp.Stream),
+        data, len) || io_runtime.aliases(state.runtime, data, len);
+}
+
+fun submit(state: *BlockingTransport, scope: *cancel.Scope,
+    kind: io_runtime.Kind, buffer: *u8, length: usize,
+    context: usize) res[io_runtime.Token, io_error.Error] {
+    val operation: io_runtime.Operation = io_runtime.Operation{kind: kind,
+        resource: state.stream.handle.value, buffer: buffer, length: length,
+        offset:   0, context: context};
+    ret io_runtime.submit_scoped(state.runtime, scope, operation);
+}
+
+fun blocking_read(context: ptr, scope: *cancel.Scope, buffer: *u8,
+    length: usize, token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
+    val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.READ, buffer, length, token_context);
+    if (sel submitted.err) { ret submitted; }
+    val token:    io_runtime.Token           = submitted.ok;
+    val received: res[usize, io_error.Error] = tcp.stream_read(state.stream,
+        buffer, length);
+    if (sel received.err) {
+        io_runtime.fail(state.runtime, token,
+            received.err);
+    }
+    if (sel received.ok) {
+        val bytes: usize = received.ok;
+        io_runtime.complete(state.runtime, token, bytes,
+            state.stream.handle.value, bytes == 0);
+    }
+    ret submitted;
+}
+
+fun blocking_write(context: ptr, scope: *cancel.Scope, buffer: *u8,
+    length: usize, token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
+    val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.WRITE, buffer, length, token_context);
+    if (sel submitted.err) { ret submitted; }
+    val token:   io_runtime.Token           = submitted.ok;
+    val written: res[usize, io_error.Error] = tcp.stream_write(state.stream,
+        buffer, length);
+    if (sel written.err) {
+        io_runtime.fail(state.runtime, token,
+            written.err);
+    }
+    if (sel written.ok) {
+        io_runtime.complete(state.runtime, token,
+            written.ok, state.stream.handle.value, false);
+    }
+    ret submitted;
+}
+
+fun blocking_shutdown(context: ptr, scope: *cancel.Scope,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
+    val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.SHUTDOWN, nil, 0, token_context);
+    if (sel submitted.err) { ret submitted; }
+    val token:   io_runtime.Token    = submitted.ok;
+    val stopped: err[io_error.Error] = tcp.stream_shutdown(state.stream,
+        os.SHUT_WR);
+    if (sel stopped.err) {
+        io_runtime.fail(state.runtime, token,
+            stopped.err);
+    }
+    or {
+        io_runtime.complete(state.runtime, token, 0, state.stream.handle.value, false);
+    }
+    ret submitted;
+}
+
+fun blocking_close(context: ptr, scope: *cancel.Scope,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
+    val resource:  usize                                 = state.stream.handle.value;
+    val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.CLOSE, nil, 0, token_context);
+    if (sel submitted.err) { ret submitted; }
+    val token:  io_runtime.Token    = submitted.ok;
+    val closed: err[io_error.Error] = tcp.stream_close(state.stream);
+    if (sel closed.err) {
+        io_runtime.fail(state.runtime, token,
+            closed.err);
+    }
+    or {
+        io_runtime.complete(state.runtime, token, 0, resource, false);
+    }
+    ret submitted;
+}
+
+
+# One download owns one connection at a time. Large handshake state belongs in
+# static storage rather than consuming the application's initial stack pages.
+var pages: A.Allocator;
+var runtime: io_runtime.Runtime;
+var memory: pool.Harness;
+var lower_state: BlockingTransport;
+var lower: transport.Transport;
+var secure: stream.Stream;
+var core: client.Handshake;
+var configuration: config.ClientConfig;
+var entropy: secret.Entropy;
+var clock_source: clock.Source;
+var scope: cancel.Scope;
+var generation: usize;
+var last_error: error.Error;
+var versions: [1]u16;
+var suites: [3]tls13.CipherSuite;
+var groups: [2]tls13.NamedGroup;
+var signatures: [5]tls13.SignatureScheme;
+var protocols: [1]config.ProtocolName;
+
+fun token() transport.Token {
+    generation = generation + 1;
+    ret transport.Token{index: 1, generation: generation::u32};
+}
+
+fun finish(lane: *stream.Lane) bool {
+    for (transport.snapshot(?lane.operation).state != transport.OPERATION_TERMINAL) {
+        if (lane.park == stream.PARK_MEMORY) {
+            if (!pool.ready(?memory) || !stream.resume(?secure)) { ret false; }
+        }
+        var completion: io_runtime.Completion;
+        val waited: res[usize, io_error.Error] = io_runtime.wait(?runtime,
+            ?completion, 1, 30000);
+        if (sel waited.err) { ret false; }
+        if (waited.ok != 1 || !stream.accept(?secure, ?completion)) { ret false; }
+    }
+    ret true;
+}
+
+fun release(lane: *stream.Lane) bool {
+    ret stream.destroy_operation(?secure, lane.operation.token);
+}
+
+pub fun open(socket: *tcp.Stream, hostname: *u8, trust: *cert.TrustStore) bool {
+    last_error = error.INTERNAL_ERROR;
+    val made: err[A.Error] = page.make(?pages);
+    if (sel made.err) { ret false; }
+    val started: err[io_error.Error] = io_runtime.make(?runtime, ?pages, 16);
+    if (sel started.err) { ret false; }
+    lower_state = BlockingTransport{runtime: ?runtime, stream: socket};
+    lower = transport.Transport{runtime: ?runtime, context: (?lower_state)::ptr,
+        context_size: $size_of(BlockingTransport), aliases_state: blocking_aliases_state,
+        submit_read: blocking_read, submit_write: blocking_write,
+        submit_shutdown: blocking_shutdown, submit_close: blocking_close,
+        submit_abort: blocking_close};
+    if (!pool.make(?memory, 1 << 24, 1 << 22)) { ret false; }
+    versions[0] = tls13.VERSION;
+    suites[0] = tls13.AES_128_GCM_SHA256;
+    suites[1] = tls13.AES_256_GCM_SHA384;
+    suites[2] = tls13.CHACHA20_POLY1305_SHA256;
+    groups[0] = tls13.X25519;
+    groups[1] = tls13.SECP256R1;
+    signatures[0] = tls13.ED25519;
+    signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
+    signatures[2] = tls13.ECDSA_SECP384R1_SHA384;
+    signatures[3] = tls13.RSA_PSS_RSAE_SHA256;
+    signatures[4] = tls13.RSA_PSS_RSAE_SHA384;
+    protocols[0] = config.ProtocolName{data: "http/1.1"::*u8, len: 8};
+    entropy = secret.system_entropy();
+    clock_source = clock.system();
+    configuration = config.no_client_config();
+    configuration.server_name = contracts.Bytes{data: hostname,
+        len: str_len(hostname::str)};
+    configuration.alpn = ?protocols[0];
+    configuration.alpn_len = 1;
+    configuration.trust = trust;
+    configuration.versions = ?versions[0];
+    configuration.version_len = 1;
+    configuration.suites = ?suites[0];
+    configuration.suite_len = 3;
+    configuration.groups = ?groups[0];
+    configuration.group_len = 2;
+    configuration.signatures = ?signatures[0];
+    configuration.signature_len = 5;
+    configuration.entropy = ?entropy;
+    configuration.clock = ?clock_source;
+    configuration.limits = config.production_limits();
+    val scoped: cancel.Operation = cancel.make_root(?scope, opt[time.Instant].none{});
+    if (sel scoped.err) { ret false; }
+    val extra: client.ExtraExtension = client.ExtraExtension{kind: 0,
+        data: contracts.Bytes{data: nil, len: 0}};
+    if (!client.init(?core, ?configuration, pool.lease(?memory), extra, 0)) { ret false; }
+    if (!stream.connect(?secure, ?core, pool.lease(?memory), pool.secret_lease(?memory),
+        ?lower, ?scope, token(), 0)) { ret false; }
+    if (!finish(?secure.writing)) { ret false; }
+    val result: transport.Snapshot = transport.snapshot(?secure.writing.operation);
+    val negotiated: engine.Snapshot = stream.negotiated(?secure);
+    last_error = result.terminal_error;
+    val accepted: bool = result.terminal_error == error.OK && negotiated.authenticated;
+    if (!release(?secure.writing)) { ret false; }
+    ret accepted;
+}
+
+pub fun read(data: *u8, length: usize) i64 {
+    if (stream.snapshot(?secure).peer_closed) { ret 0; }
+    if (!stream.read(?secure, ?scope, token(), data, length, 0) ||
+        !finish(?secure.reading)) { ret 0 - 1; }
+    val result: transport.Snapshot = transport.snapshot(?secure.reading.operation);
+    val released: bool = release(?secure.reading);
+    if (!released || result.terminal_error != error.OK) { ret 0 - 1; }
+    ret result.application_bytes::i64;
+}
+
+pub fun write(data: *u8, length: usize) i64 {
+    if (!stream.write(?secure, ?scope, token(), data, length, 0) ||
+        !finish(?secure.writing)) { ret 0 - 1; }
+    val result: transport.Snapshot = transport.snapshot(?secure.writing.operation);
+    val released: bool = release(?secure.writing);
+    if (!released || result.terminal_error != error.OK) { ret 0 - 1; }
+    ret result.application_bytes::i64;
+}
+
+# Release all per-connection plaintext and secret buffers before a redirect.
+pub fun destroy() {
+    stream.destroy(?secure);
+    cancel.destroy(?scope);
+    pool.destroy(?memory);
+    io_runtime.close(?runtime);
+    io_runtime.destroy(?runtime);
+}
+
+# Explain authentication failures without exposing transport implementation codes.
+pub fun reason() *u8 {
+    if (last_error == error.CERTIFICATE_EXPIRED) { ret "certificate expired or not yet valid"; }
+    if (last_error == error.UNKNOWN_CA) { ret "untrusted certificate chain"; }
+    if (last_error == error.HOSTNAME_MISMATCH) { ret "certificate does not match the host"; }
+    if (last_error == error.BAD_CERTIFICATE) { ret "invalid certificate or signature"; }
+    if (last_error == error.NO_APPLICATION_PROTOCOL) { ret "server did not select HTTP/1.1"; }
+    ret "TLS negotiation failed";
+}
