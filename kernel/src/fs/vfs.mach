@@ -478,6 +478,8 @@ pub fun create_ram(dir: *Node, name: *u8, n: u64, kind: u64) *Node {
 # returns 0 and sets *out, or an error
 pub fun create(dir: *Node, name: *u8, n: u64, kind: u64, mode: u64, out: **Node) u64 {
     if (n > abi.NAME_MAX) { ret e(abi.E_NAMETOOLONG); }
+    # FAT decoders retain their existing 59-byte filename contract.
+    if ((dir.fs == FS_FAT || dir.fs == FS_EXFAT) && n > 59) { ret e(abi.E_NAMETOOLONG); }
     if (dir.fs == FS_PROC) { ret e(abi.E_PERM); }
     if (dir.fs == FS_RAM) {
         val nd: *Node = create_ram(dir, name, n, kind);
@@ -687,6 +689,7 @@ pub fun replace(nd: *Node, old: *Node) u64 {
 
 # move `nd` into `dir` as `name` (which must not exist there yet)
 pub fun rename(nd: *Node, dir: *Node, name: *u8, n: u64) u64 {
+    if ((dir.fs == FS_FAT || dir.fs == FS_EXFAT) && n > 59) { ret e(abi.E_NAMETOOLONG); }
     if (n > abi.NAME_MAX) { ret e(abi.E_NAMETOOLONG); }
     if (nd.fs == FS_PROC || dir.fs == FS_PROC) { ret e(abi.E_PERM); }
     if (nd == root || nd.mount_of != nil || nd.mounted != nil) { ret e(abi.E_BUSY); }

@@ -1057,6 +1057,18 @@ TESTS = [
 ]
 
 
+# FAT/exFAT retain their supported name limit without creating names that truncate on remount.
+for index, (name, keep, fsck, steps, expect) in enumerate(TESTS):
+    if name in ("fat-usb", "exfat-usb"):
+        long_name = "x" * 60
+        TESTS[index] = (name, keep, fsck,
+                        steps + ["send:mount /dev/sdb /mnt; touch /mnt/" + long_name +
+                                 "; echo long-create-status $?; echo kept > /mnt/boundary; mv /mnt/boundary /mnt/" +
+                                 long_name + "; echo long-rename-status $?; cat /mnt/boundary; rm /mnt/boundary; umount /mnt\\n",
+                                 "wait:" + P],
+                        expect + ["long-create-status 1", "long-rename-status 1", "kept"])
+
+
 # Verify the shipped trust store and updater on every system-copy path.
 import hashlib
 with open(os.path.join(ROOT, "root", "etc", "ssl", "certs", "ca-certificates.crt"), "rb") as source:

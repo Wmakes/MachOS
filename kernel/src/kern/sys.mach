@@ -1731,6 +1731,14 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
         if (ok(b, c, 0) == 0) { ret e(abi.E_FAULT); }
         ret file.write(h, b, c);
     }
+    if (n == abi.PUBLICATION_CAPABILITIES) {
+        val f: *file.Handle = handle(a);
+        if (f == nil) { ret e(abi.E_BADF); }
+        if (f.kind != file.NODE) { ret 0; }
+        if ((f.node.kind == abi.KIND_FILE || f.node.kind == abi.KIND_DIR || f.node.kind == abi.KIND_LINK) &&
+            (f.node.fs == vfs.FS_RAM || f.node.fs == vfs.FS_EXT2)) { ret 4; }
+        ret 0;
+    }
     if (n == abi.SYMLINK) { ret sys_symlink(a, b, c, d); }
     if (n == abi.FCHMOD) { ret sys_fchmod(a, b); }
     if (n == abi.THREAD_NAME) { ret sys_thread_name(a, b, c, d); }

@@ -300,6 +300,7 @@ test regression__replacement_preserves_held_readers_on_ram_and_ext2 {
         sys.close(old);
         sys.close(new);
         val held: u64 = sys.open(to, io.len(to), abi.O_READ);
+        if (call(abi.PUBLICATION_CAPABILITIES, held, 0, 0) != 4) { ret 7; }
         if (sys.rename(from, io.len(from), to, io.len(to)) != 0) { ret 3; }
         val replaced: u64 = sys.open(to, io.len(to), abi.O_READ);
         var byte: u8;
@@ -403,6 +404,9 @@ test regression__adjacent_mappings_preserve_page_boundaries {
 
 # Metadata handles retain an inode without granting access to its contents.
 test regression__metadata_handles_cannot_acquire_content_access {
+    val efi: u64 = sys.open("/boot/efi", 9, abi.O_READ | abi.O_DIRECTORY);
+    if (abi.is_err(efi) != 0 || call(abi.PUBLICATION_CAPABILITIES, efi, 0, 0) != 0) { ret 8; }
+    sys.close(efi);
     val pathname: *u8 = "/root/metadata-test";
     sys.remove(pathname, io.len(pathname));
     val fd: u64 = sys.open_mode(pathname, io.len(pathname), abi.O_CREATE | abi.O_WRITE, 0);
