@@ -37,3 +37,18 @@ need = []
 
 [dep.sdk]
 path = "../sdk"
+
+# host tests exercise the driver contract without touching PCI hardware.
+[target.host]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+of = "elf"
+
+[artifact.ethernet-tests]
+kind = "bin"
+entry = "tests/ethernet.mach"
+out = "ethernet-tests"
+targets = ["host"]
+link = []
+need = []

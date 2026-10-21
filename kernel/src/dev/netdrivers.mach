@@ -1,0 +1,26 @@
+# built-in Ethernet drivers. add a probe here when adding a driver; the
+# protocol stack only uses dev.ethernet and never imports a hardware driver.
+
+use machos.dev.e1000;
+use machos.dev.ethernet;
+use machos.dev.pci;
+use machos.kern.kprint;
+
+var started: u8 = 0;
+
+# bind supported PCI Ethernet functions once, in PCI discovery order.
+pub fun init() u64 {
+    if (started != 0) { ret ethernet.device_count(); }
+    started = 1;
+    var drivers: [1]ethernet.Driver;
+    drivers[0].probe = e1000.probe;
+    var i: u64 = 0;
+    for (i < pci.device_count()) {
+        ethernet.probe(pci.get(i), ?drivers[0], 1);
+        i = i + 1;
+    }
+    kprint.info("ethernet\0");
+    kprint.dec(ethernet.device_count());
+    kprint.puts(" device(s) ready\n\0");
+    ret ethernet.device_count();
+}

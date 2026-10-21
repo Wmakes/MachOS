@@ -5,12 +5,13 @@
 # the card fills and empties by DMA. frames are collected by polling (from
 # the timer tick and whenever the network is used), so no interrupt is needed
 
-use pci:    machos.dev.pci;
-use vmm:    machos.mm.vmm;
-use pmm:    machos.mm.pmm;
-use mem:    machos.kern.mem;
-use kprint: machos.kern.kprint;
-use cpu:    machos.arch.x86_64.cpu;
+use machos.arch.x86_64.cpu;
+use machos.dev.ethernet;
+use machos.dev.pci;
+use machos.kern.kprint;
+use machos.kern.mem;
+use machos.mm.pmm;
+use machos.mm.vmm;
 
 # registers
 val CTRL:   u64 = 0x0000;
@@ -35,10 +36,10 @@ val MTA:    u64 = 0x5200;
 val RAL:    u64 = 0x5400;
 val RAH:    u64 = 0x5404;
 
-val CTRL_ASDE: u32 = 0x20;       # find the link speed by itself
-val CTRL_SLU:  u32 = 0x40;       # set link up
+val CTRL_ASDE: u32 = 0x20; # find the link speed by itself
+val CTRL_SLU:  u32 = 0x40; # set link up
 val CTRL_RST:  u32 = 0x04000000;
-val STATUS_LU: u32 = 0x02;       # the link is up
+val STATUS_LU: u32 = 0x02; # the link is up
 
 val RCTL_EN:    u32 = 0x00000002;
 val RCTL_BAM:   u32 = 0x00008000; # broadcasts too
@@ -79,10 +80,10 @@ rec Tx {
 }
 
 pub rec Nic {
-    regs:    u64;      # BAR0, mapped
-    rx:      u64;      # the rings (virtual)
+    regs:    u64; # BAR0, mapped
+    rx:      u64; # the rings (virtual)
     tx:      u64;
-    rx_buf:  [32]u64;  # each buffer, virtual (physical in the descriptor)
+    rx_buf:  [32]u64; # each buffer, virtual (physical in the descriptor)
     tx_buf:  [32]u64;
     rx_next: u64;
     tx_next: u64;
@@ -90,25 +91,27 @@ pub rec Nic {
     model:   *u8;
 }
 
-val MAX: u64 = 4;
-var nics: [4]Nic;
+val MAX:   u64 = 4;
+var nics:  [4]Nic;
 var count: u64 = 0;
 
-fun rd(n: *Nic, off: u64) u32 { ret (@((n.regs + off)::*Reg)).v; }
-fun wr(n: *Nic, off: u64, v: u32) { (@((n.regs + off)::*Reg)).v = v; }
+fun rd(n: *Nic, off: u64) u32 {
+    ret (@((n.regs + off)::*Reg)).v;
+}
 
-pub fun nic_count() u64 { ret count; }
-pub fun get(i: u64) *Nic { ret ?nics[i]; }
+fun wr(n: *Nic, off: u64, v: u32) {
+    (@((n.regs + off)::*Reg)).v = v;
+}
 
 # the models this driver knows (all speak the same legacy descriptors)
 fun model_of(vendor: u16, device: u16) *u8 {
-    if (vendor != 0x8086) { ret nil; }
-    if (device == 0x100E) { ret "82540EM\0"; }
+    if (vendor != 0x8086)                                         { ret nil; }
+    if (device == 0x100E)                                         { ret "82540EM\0"; }
     if (device == 0x100F || device == 0x1011 || device == 0x1026) { ret "82545EM\0"; }
-    if (device == 0x1004) { ret "82543GC\0"; }
-    if (device == 0x100C || device == 0x1015) { ret "82544\0"; }
-    if (device == 0x107C) { ret "82541PI\0"; }
-    if (device == 0x10D3) { ret "82574L\0"; }
+    if (device == 0x1004)                                         { ret "82543GC\0"; }
+    if (device == 0x100C || device == 0x1015)                     { ret "82544\0"; }
+    if (device == 0x107C)                                         { ret "82541PI\0"; }
+    if (device == 0x10D3)                                         { ret "82574L\0"; }
     ret nil;
 }
 
@@ -148,9 +151,9 @@ fun read_mac(n: *Nic) {
     var w: u32 = 0;
     for (w < 3) {
         val v: u16 = eeprom(n, w);
-        n.mac[w * 2] = (v & 0xFF)::u8;
+        n.mac[w * 2]     = (v & 0xFF)::u8;
         n.mac[w * 2 + 1] = (v >> 8)::u8;
-        w = w + 1;
+        w                = w + 1;
     }
     # the address filter: receive what is sent to it
     wr(n, RAL, n.mac[0]::u32 | (n.mac[1]::u32 << 8) | (n.mac[2]::u32 << 16) | (n.mac[3]::u32 << 24));
@@ -189,16 +192,16 @@ fun setup(n: *Nic, d: *pci.Device) u8 {
     val rpa: u64 = dma_page(?rva);
     var tva: u64 = 0;
     val tpa: u64 = dma_page(?tva);
-    if (rpa == 0 || tpa == 0) { ret 0; }
     n.rx = rva;
     n.tx = tva;
+    if (rpa == 0 || tpa == 0) { ret 0; }
     i = 0;
     for (i < RING) {
         if (i % 2 == 0) {
             var bva: u64 = 0;
             val bpa: u64 = dma_page(?bva);
             if (bpa == 0) { ret 0; }
-            n.rx_buf[i] = bva;
+            n.rx_buf[i]     = bva;
             n.rx_buf[i + 1] = bva + BUF;
             val r0: *Rx = (rva + i * 16)::*Rx;
             r0.addr = bpa;
@@ -207,13 +210,13 @@ fun setup(n: *Nic, d: *pci.Device) u8 {
             var tbva: u64 = 0;
             val tbpa: u64 = dma_page(?tbva);
             if (tbpa == 0) { ret 0; }
-            n.tx_buf[i] = tbva;
+            n.tx_buf[i]     = tbva;
             n.tx_buf[i + 1] = tbva + BUF;
             val t0: *Tx = (tva + i * 16)::*Tx;
-            t0.addr = tbpa;
+            t0.addr   = tbpa;
             t0.status = DD;
             val t1: *Tx = (tva + (i + 1) * 16)::*Tx;
-            t1.addr = tbpa + BUF;
+            t1.addr   = tbpa + BUF;
             t1.status = DD;
         }
         i = i + 2;
@@ -236,30 +239,76 @@ fun setup(n: *Nic, d: *pci.Device) u8 {
     ret 1;
 }
 
-# find and start every card; how many
-pub fun init() u64 {
-    var i: u64 = 0;
-    for (i < pci.device_count() && count < MAX) {
-        val d: *pci.Device = pci.get(i);
-        val model: *u8 = model_of(d.vendor, d.device);
-        if (model != nil) {
-            val n: *Nic = ?nics[count];
-            n.model = model;
-            if (setup(n, d) != 0) {
-                count = count + 1;
-            } or {
-                kprint.level(kprint.WARN);
-                kprint.puts("e1000: \0");
-                kprint.puts(model);
-                kprint.puts(" could not be started (out of memory)\n\0");
-            }
-        }
-        i = i + 1;
+# bind one supported PCI function to the shared Ethernet interface.
+pub fun probe(d: *pci.Device, out: *ethernet.Device) u8 {
+    if (count == MAX || d.class != 2 || d.subclass != 0) { ret 0; }
+    val model: *u8 = model_of(d.vendor, d.device);
+    if (model == nil) { ret 0; }
+    val n: *Nic = ?nics[count];
+    n.model = model;
+    if (setup(n, d) == 0) {
+        stop(n);
+        kprint.warn("e1000\0");
+        kprint.puts(model);
+        kprint.puts(" could not be started\n\0");
+        ret 0;
     }
-    ret count;
+    out.context = n::u64;
+    out.model   = model;
+    mem.copy((?out.mac[0])::u64, (?n.mac[0])::u64, 6);
+    out.send    = send_frame;
+    out.receive = receive_frame;
+    out.link_up = device_link;
+    out.speed   = device_speed;
+    count       = count + 1;
+    ret 1;
 }
 
-pub fun link_up(n: *Nic) u8 { ret ((rd(n, STATUS) & STATUS_LU) != 0)::u8; }
+# stop DMA before returning pages from a partially initialized device.
+fun stop(n: *Nic) {
+    wr(n, RCTL, 0);
+    wr(n, TCTL, 0);
+    var i: u64 = 0;
+    for (i < RING) {
+        if (n.rx_buf[i] != 0) {
+            pmm.free(vmm.kernel_phys(n.rx_buf[i]));
+            n.rx_buf[i] = 0;
+        }
+        if (n.tx_buf[i] != 0) {
+            pmm.free(vmm.kernel_phys(n.tx_buf[i]));
+            n.tx_buf[i] = 0;
+        }
+        i = i + 2;
+    }
+    if (n.rx != 0) {
+        pmm.free(vmm.kernel_phys(n.rx));
+        n.rx = 0;
+    }
+    if (n.tx != 0) {
+        pmm.free(vmm.kernel_phys(n.tx));
+        n.tx = 0;
+    }
+}
+
+fun send_frame(context: u64, frame: *u8, len: u64) u8 {
+    ret send(context::*Nic, frame, len);
+}
+
+fun receive_frame(context: u64, out: *u8, capacity: u64) u64 {
+    ret receive(context::*Nic, out, capacity);
+}
+
+fun device_link(context: u64) u8 {
+    ret link_up(context::*Nic);
+}
+
+fun device_speed(context: u64) u64 {
+    ret speed(context::*Nic);
+}
+
+pub fun link_up(n: *Nic) u8 {
+    ret ((rd(n, STATUS) & STATUS_LU) != 0)::u8;
+}
 
 # the link speed in Mbit/s
 pub fun speed(n: *Nic) u64 {
@@ -276,29 +325,28 @@ pub fun send(n: *Nic, frame: *u8, len: u64) u8 {
     val t: *Tx = (n.tx + n.tx_next * 16)::*Tx;
     if ((t.status & DD) == 0) { ret 0; } # the ring is full
     mem.copy(n.tx_buf[n.tx_next], frame::u64, len);
-    t.length = len::u16;
-    t.cmd = CMD_EOP | CMD_IFCS | CMD_RS;
-    t.status = 0;
+    t.length  = len::u16;
+    t.cmd     = CMD_EOP | CMD_IFCS | CMD_RS;
+    t.status  = 0;
     n.tx_next = (n.tx_next + 1) % RING;
     wr(n, TDT, n.tx_next::u32);
     ret 1;
 }
 
-# the next frame received, copied into out (BUF bytes); its length, 0 when
-# none is waiting
-pub fun receive(n: *Nic, out: *u8) u64 {
+# the next valid frame that fits in out; its length, 0 when none is waiting
+pub fun receive(n: *Nic, out: *u8, capacity: u64) u64 {
     for {
         val r: *Rx = (n.rx + n.rx_next * 16)::*Rx;
         if ((r.status & DD) == 0) { ret 0; }
-        var len: u64 = r.length::u64;
-        val whole: u8 = r.status & EOP;
-        val bad: u8 = r.errors;
-        if (len > BUF) { len = BUF; }
-        if (whole != 0 && bad == 0) { mem.copy(out::u64, n.rx_buf[n.rx_next], len); }
+        var len:   u64 = r.length::u64;
+        val whole: u8  = r.status & EOP;
+        val bad:   u8  = r.errors;
+        if (len > BUF || len > capacity)        { len = 0; }
+        if (whole != 0 && bad == 0 && len != 0) { mem.copy(out::u64, n.rx_buf[n.rx_next], len); }
         r.status = 0;
         wr(n, RDT, n.rx_next::u32);
         n.rx_next = (n.rx_next + 1) % RING;
-        if (whole != 0 && bad == 0) { ret len; }
+        if (whole != 0 && bad == 0 && len != 0) { ret len; }
     }
     ret 0;
 }

@@ -1,0 +1,209 @@
+# host-side contract tests use fake drivers; no hardware is accessed.
+
+use machos.dev.e1000;
+use machos.dev.ethernet;
+use machos.dev.pci;
+
+var refused:  u64 = 0;
+var claimed:  u64 = 0;
+var sent:     u64 = 0;
+var received: u64 = 0;
+var rxlen:    u64 = 64;
+
+fun reject(d: *pci.Device, out: *ethernet.Device) u8 {
+    refused = refused + 1;
+    ret 0;
+}
+
+fun transmit(context: u64, frame: *u8, len: u64) u8 {
+    if (context != 42 || frame[0] != 7 || len != 64) { ret 0; }
+    sent = sent + 1;
+    ret 1;
+}
+
+fun receive(context: u64, out: *u8, capacity: u64) u64 {
+    if (context != 42 || capacity < ethernet.FRAME_MAX) { ret 0; }
+    received = received + 1;
+    out[0]   = 9;
+    ret rxlen;
+}
+
+fun link(context: u64) u8 {
+    ret (context == 42)::u8;
+}
+
+fun speed(context: u64) u64 {
+    if (context != 42) { ret 0; }
+    ret 1000;
+}
+
+fun claim(d: *pci.Device, out: *ethernet.Device) u8 {
+    claimed     = claimed + 1;
+    out.context = 42;
+    out.mac[0]  = 2;
+    out.model   = "test\0";
+    out.send    = transmit;
+    out.receive = receive;
+    out.link_up = link;
+    out.speed   = speed;
+    ret 1;
+}
+
+# registration, ownership and frame bounds are checked together because the
+# device registry lasts for the whole boot and has no runtime reset.
+test ethernet__driver_selection_and_frame_contract {
+    var d: pci.Device;
+    d.class    = 1;
+    d.subclass = 0;
+    var drivers: [3]ethernet.Driver;
+    drivers[0].probe = reject;
+    drivers[1].probe = claim;
+    drivers[2].probe = claim;
+    if (ethernet.probe(?d, ?drivers[0], 3) != 0 || refused != 0 || claimed != 0) { ret 1; }
+    d.class    = 2;
+    d.subclass = 0x80;
+    if (ethernet.probe(?d, ?drivers[0], 3) != 0 || claimed != 0) { ret 2; }
+    d.subclass = 0;
+    if (ethernet.probe(?d, ?drivers[0], 1) != 0 || ethernet.device_count() != 0) { ret 3; }
+    if (ethernet.probe(?d, ?drivers[0], 3) == 0)                                 { ret 4; }
+    if (claimed != 1 || ethernet.device_count() != 1)                            { ret 5; }
+    val n: *ethernet.Device = ethernet.get(0);
+    if (n == nil || n.mac[0] != 2 || ethernet.get(1) != nil)   { ret 6; }
+    if (ethernet.link_up(n) == 0 || ethernet.speed(n) != 1000) { ret 7; }
+    var frame: [1515]u8;
+    frame[0] = 7;
+    if (ethernet.send(n, ?frame[0], 64) == 0 || sent != 1)                                           { ret 8; }
+    if (ethernet.send(n, ?frame[0], 13) != 0 || ethernet.send(n, ?frame[0], 1515) != 0 || sent != 1) { ret 9; }
+    if (ethernet.send(nil, ?frame[0], 64) != 0 || ethernet.send(n, nil, 64) != 0)                    { ret 10; }
+    if (ethernet.receive(n, ?frame[0], 1514) != 64 || frame[0] != 9 || received != 1)                { ret 11; }
+    if (ethernet.receive(n, ?frame[0], 1513) != 0 || received != 1)                                  { ret 12; }
+    rxlen = 1515;
+    if (ethernet.receive(n, ?frame[0], 1515) != 0) { ret 13; }
+    rxlen = 13;
+    if (ethernet.receive(n, ?frame[0], 1514) != 0) { ret 14; }
+    rxlen = 0;
+    if (ethernet.receive(n, ?frame[0], 1514) != 0)                                          { ret 15; }
+    if (ethernet.receive(nil, ?frame[0], 1514) != 0 || ethernet.receive(n, nil, 1514) != 0) { ret 16; }
+    if (ethernet.link_up(nil) != 0 || ethernet.speed(nil) != 0)                             { ret 17; }
+    for (ethernet.device_count() < ethernet.MAX) {
+        if (ethernet.probe(?d, ?drivers[0], 3) == 0) { ret 18; }
+    }
+    val before: u64 = claimed;
+    if (ethernet.probe(?d, ?drivers[0], 3) != 0 || claimed != before) { ret 19; }
+    ret 0;
+}
+
+test e1000__unsupported_devices_are_not_claimed {
+    var d:   pci.Device;
+    var out: ethernet.Device;
+    d.class    = 2;
+    d.subclass = 0;
+    d.vendor   = 0x1234;
+    d.device   = 0x100E;
+    if (e1000.probe(?d, ?out) != 0) { ret 1; }
+    d.vendor = 0x8086;
+    d.device = 0xFFFF;
+    if (e1000.probe(?d, ?out) != 0) { ret 2; }
+    d.device = 0x100E;
+    d.class  = 1;
+    if (e1000.probe(?d, ?out) != 0) { ret 3; }
+    ret 0;
+}
+
+# the host test dispatcher provides main; this entry needs no standard
+# library or MachOS runtime and exits through the Linux syscall ABI.
+#[naked]
+#[symbol("_start")]
+fun start() {
+    asm x86_64 {
+        mov rdi, [rsp]
+        lea rsi, [rsp + 8]
+        and rsp, -16
+        call main
+        mov rdi, rax
+        mov rax, 60
+        syscall
+    }
+}
+
+# a completed descriptor is consumed even when its frame cannot fit; the
+# following valid frame must still be delivered without touching the guard.
+test e1000__receive_respects_capacity_and_recycles_bad_descriptors {
+    var n:    e1000.Nic;
+    var regs: [4096]u32;
+    var ring: [512]u8;
+    var data: [2048]u8;
+    var out:  [65]u8;
+    n.regs      = (?regs[0])::u64;
+    n.rx        = (?ring[0])::u64;
+    n.rx_next   = 0;
+    n.rx_buf[0] = (?data[0])::u64;
+    n.rx_buf[1] = (?data[0])::u64;
+    data[0]     = 73;
+    out[64]     = 99;
+    # little-endian Rx.length at byte 8, status at 12, errors at 13.
+    ring[8]  = 65;
+    ring[12] = 3;
+    ring[24] = 64;
+    ring[28] = 3;
+    if (e1000.receive(?n, ?out[0], 64) != 64)              { ret 1; }
+    if (out[0] != 73 || out[64] != 99 || n.rx_next != 2)   { ret 2; }
+    if (ring[12] != 0 || ring[28] != 0 || regs[2566] != 1) { ret 3; }
+    if (e1000.receive(?n, ?out[0], 64) != 0)               { ret 4; }
+    n.rx_next = 0;
+    ring[8]   = 64;
+    ring[12]  = 3;
+    ring[13]  = 1;
+    ring[28]  = 1; # a descriptor without end-of-packet is also discarded.
+    if (e1000.receive(?n, ?out[0], 64) != 0 || n.rx_next != 2) { ret 5; }
+    ret 0;
+}
+
+test e1000__transmit_refuses_a_full_ring_and_copies_accepted_frames {
+    var n:     e1000.Nic;
+    var regs:  [4096]u32;
+    var ring:  [512]u8;
+    var data:  [2048]u8;
+    var frame: [64]u8;
+    n.regs      = (?regs[0])::u64;
+    n.tx        = (?ring[0])::u64;
+    n.tx_next   = 0;
+    n.tx_buf[0] = (?data[0])::u64;
+    frame[0]    = 73;
+    if (e1000.send(?n, ?frame[0], 64) != 0 || n.tx_next != 0) { ret 1; }
+    ring[12] = 1; # Tx.status: descriptor done, available for reuse.
+    if (e1000.send(?n, ?frame[0], 2049) != 0 || n.tx_next != 0) { ret 2; }
+    if (e1000.send(?n, ?frame[0], 64) == 0 || n.tx_next != 1)   { ret 3; }
+    frame[0] = 0;
+    if (data[0] != 73 || ring[8] != 64 || ring[11] != 11 || ring[12] != 0) { ret 4; }
+    if (regs[3590] != 1)                                                   { ret 5; } # TDT at 0x3818.
+    ret 0;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    ret 0;
+}
+
+fun accept(context: u64, frame: *u8, len: u64) u8 {
+    sent = sent + 1;
+    ret (context == 42)::u8;
+}
+
+test ethernet__frame_boundaries_and_driver_refusal_are_preserved {
+    var pci_device: pci.Device;
+    var d:          ethernet.Device;
+    claim(?pci_device, ?d);
+    d.send = accept;
+    var frame: [1514]u8;
+    if (ethernet.send(?d, ?frame[0], 14) == 0 || ethernet.send(?d, ?frame[0], 1514) == 0) { ret 1; }
+    if (sent != 2)                                                                        { ret 2; }
+    rxlen = 14;
+    if (ethernet.receive(?d, ?frame[0], 1514) != 14) { ret 3; }
+    rxlen = 1514;
+    if (ethernet.receive(?d, ?frame[0], 1514) != 1514) { ret 4; }
+    d.context = 0;
+    if (ethernet.send(?d, ?frame[0], 64) != 0 || sent != 3)   { ret 5; }
+    if (ethernet.link_up(?d) != 0 || ethernet.speed(?d) != 0) { ret 6; }
+    ret 0;
+}

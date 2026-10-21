@@ -1,0 +1,72 @@
+# Ethernet devices and their driver operations. calls run under the kernel
+# lock. drivers own their state; frame buffers belong to the caller and
+# must be copied before an operation returns. frames exclude the CRC.
+
+use machos.dev.pci;
+
+pub val MAX:       u64 = 8;
+pub val FRAME_MAX: u64 = 1514; # Ethernet header and a 1500-byte payload
+
+pub rec Device {
+    context: u64;
+    mac:     [6]u8;
+    model:   *u8;
+    send:    fun(u64, *u8, u64) u8;
+    receive: fun(u64, *u8, u64) u64;
+    link_up: fun(u64) u8;
+    speed:   fun(u64) u64;
+}
+
+pub rec Driver {
+    probe: fun(*pci.Device, *Device) u8;
+}
+
+var devices: [8]Device;
+var count:   u64 = 0;
+
+pub fun device_count() u64 {
+    ret count;
+}
+
+pub fun get(i: u64) *Device {
+    if (i >= count) { ret nil; }
+    ret ?devices[i];
+}
+
+# try drivers in order; the first successful probe owns the PCI function.
+# a failed probe must release its resources and leave the device stopped.
+pub fun probe(d: *pci.Device, drivers: *Driver, n: u64) u8 {
+    if (d.class != 2 || d.subclass != 0 || count == MAX) { ret 0; }
+    var i: u64 = 0;
+    for (i < n) {
+        if (drivers[i].probe(d, ?devices[count]) != 0) {
+            count = count + 1;
+            ret 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the standard Ethernet MTU keeps protocol buffers independent of a driver.
+pub fun send(d: *Device, frame: *u8, len: u64) u8 {
+    if (d == nil || frame == nil || len < 14 || len > FRAME_MAX) { ret 0; }
+    ret d.send(d.context, frame, len);
+}
+
+pub fun receive(d: *Device, out: *u8, capacity: u64) u64 {
+    if (d == nil || out == nil || capacity < FRAME_MAX) { ret 0; }
+    val n: u64 = d.receive(d.context, out, capacity);
+    if (n < 14 || n > FRAME_MAX || n > capacity) { ret 0; }
+    ret n;
+}
+
+pub fun link_up(d: *Device) u8 {
+    if (d == nil) { ret 0; }
+    ret d.link_up(d.context);
+}
+
+pub fun speed(d: *Device) u64 {
+    if (d == nil) { ret 0; }
+    ret d.speed(d.context);
+}

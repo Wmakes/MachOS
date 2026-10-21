@@ -7,7 +7,7 @@
 # the address comes from DHCP (net/dhcp.mach) unless it is set by hand
 # (through /proc/net/config)
 
-use e1000:  machos.dev.e1000;
+use ethernet: machos.dev.ethernet;
 use socket: machos.net.socket;
 use mem:    machos.kern.mem;
 use kprint: machos.kern.kprint;
@@ -53,7 +53,7 @@ pub var loop_packets: u64 = 0;
 pub rec Iface {
     present: u8;
     up:      u8;    # it has an address
-    nic:     *e1000.Nic;
+    nic:     *ethernet.Device;
     mac:     [6]u8;
     ip:      u32;
     mask:    u32;
@@ -123,7 +123,7 @@ var frame: [2048]u8;   # the one being built
 var rxbuf: [2048]u8;   # the one being taken apart
 
 fun eth_send(dst: *u8, kind: u16, payload: *u8, len: u64) u8 {
-    if (ifc.present == 0 || len + 14 > e1000.BUF) {
+    if (ifc.present == 0 || len + 14 > ethernet.FRAME_MAX) {
         ifc.tx_dropped = ifc.tx_dropped + 1;
         ret 0;
     }
@@ -136,7 +136,7 @@ fun eth_send(dst: *u8, kind: u16, payload: *u8, len: u64) u8 {
         mem.fill((?frame[n])::u64, 0, 60 - n);
         n = 60;
     }
-    if (e1000.send(ifc.nic, ?frame[0], n) == 0) {
+    if (ethernet.send(ifc.nic, ?frame[0], n) == 0) {
         ifc.tx_dropped = ifc.tx_dropped + 1;
         ret 0;
     }
@@ -416,7 +416,7 @@ pub fun poll() {
     if (ifc.present == 0) { ret; }
     var budget: u64 = 64;
     for (budget > 0) {
-        val n: u64 = e1000.receive(ifc.nic, ?rxbuf[0]);
+        val n: u64 = ethernet.receive(ifc.nic, ?rxbuf[0], 2048);
         if (n == 0) { brk; }
         budget = budget - 1;
         ifc.rx_packets = ifc.rx_packets + 1;
@@ -515,12 +515,12 @@ pub fun init() u8 {
         NONE[i] = 0;
         i = i + 1;
     }
-    if (e1000.init() == 0) { ret 0; }
+    if (ethernet.device_count() == 0) { ret 0; }
     ifc.present = 1;
-    ifc.nic = e1000.get(0);
+    ifc.nic = ethernet.get(0);
     mem.copy((?ifc.mac[0])::u64, (?ifc.nic.mac[0])::u64, 6);
     kprint.level(kprint.INFO);
-    kprint.puts("net: eth0: Intel \0");
+    kprint.puts("net: eth0: \0");
     kprint.puts(ifc.nic.model);
     kprint.puts(", MAC \0");
     i = 0;
@@ -531,9 +531,9 @@ pub fun init() u8 {
         kprint.putc(digits[ifc.mac[i] & 15]);
         i = i + 1;
     }
-    if (e1000.link_up(ifc.nic) != 0) {
+    if (ethernet.link_up(ifc.nic) != 0) {
         kprint.puts(", link up at \0");
-        kprint.dec(e1000.speed(ifc.nic));
+        kprint.dec(ethernet.speed(ifc.nic));
         kprint.puts(" Mbit/s\n\0");
     } or {
         kprint.puts(", no link\n\0");

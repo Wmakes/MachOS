@@ -442,6 +442,29 @@ TESTS = [
       "wait:" + P],
      ["testbox", "CE", "00", "1"]),
 
+    # driver discovery must tolerate missing and unsupported Ethernet cards.
+    ("ethernet-none", False, False,
+     ["--qemu=-nic", "--qemu=none", "wait:" + P,
+      "send:ip; ping -c 1 127.0.0.1\\n", "wait:packet loss", "wait:" + P],
+     ["ethernet: 0 device(s) ready", "64 bytes from 127.0.0.1", "0% packet loss"]),
+
+    ("ethernet-unsupported", False, False,
+     ["--qemu=-nic", "--qemu=none", "--qemu=-netdev", "--qemu=user,id=lan",
+      "--qemu=-device", "--qemu=virtio-net-pci,netdev=lan", "wait:" + P,
+      "send:ping -c 1 127.0.0.1\\n", "wait:packet loss", "wait:" + P],
+     ["ethernet: 0 device(s) ready", "64 bytes from 127.0.0.1", "0% packet loss"]),
+
+    # skip an unsupported function, bind both supported cards, and use the
+    # first registered card for DHCP and traffic through the shared contract.
+    ("ethernet-discovery", False, False,
+     ["--qemu=-nic", "--qemu=none", "--qemu=-netdev", "--qemu=user,id=unknown",
+      "--qemu=-device", "--qemu=virtio-net-pci,netdev=unknown",
+      "--qemu=-netdev", "--qemu=user,id=lan", "--qemu=-device", "--qemu=e1000,netdev=lan",
+      "--qemu=-netdev", "--qemu=user,id=lan2", "--qemu=-device", "--qemu=e1000e,netdev=lan2",
+      "wait:" + P, "send:sleep 2; ip; ping -c 2 10.0.2.2\\n", "wait:" + P],
+     ["ethernet: 2 device(s) ready", "net: eth0: 82540EM", "address 10.0.2.15/24",
+      "method dhcp", "0% packet loss"]),
+
     ("network", False, False,
      ["--prep", udp_echo, "--boot", disk,
       "wait:" + P, "send:ip; cat /proc/net/resolv.conf; ping -c 2 10.0.2.2\\n", "wait:packet loss", "wait:" + P,
