@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest a capability or improvement for MachOS.
+title: "feature: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would this help you do?
+      description: Describe the task or limitation behind the request.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain how it should work, with examples where useful.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and context
+      description: Include workarounds, related issues, or relevant hardware.

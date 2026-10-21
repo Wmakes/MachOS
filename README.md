@@ -70,3 +70,7 @@ tools/boot.sh IMAGE|/dev/sdX    # boot an existing install as it is
 
 MachOS is a hobby system. It runs on QEMU and boots from USB sticks and disks, but expect rough edges.
 
+## License
+
+MachOS is licensed under GNU General Public License, version 3 only. Third-party components retain their respective licences.
+

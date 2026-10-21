@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible problem in MachOS.
+title: "bug: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include commands, inputs, and whether this happens on a fresh disk.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: MachOS version or commit
+      description: Include the build profile if you built it yourself.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: QEMU version and full invocation, or hardware model, CPU, RAM, firmware and relevant devices. For build failures, include the host OS and Mach compiler version.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and diagnostics
+      description: Paste relevant serial output, panic messages, or test failures. Remove passwords and other private information first.
+      render: text
