@@ -37,6 +37,9 @@ ROOT_MB=190
 
 mkdir -p "$OUT"
 
+# initialize missing library submodules before resolving the Mach projects
+tools/deps.sh >&2
+
 # kernel and userland are separate mach projects; each pulls a fresh copy of the SDK
 (cd kernel && mach dep pull . >/dev/null && mach build . -t kernel -p "$PROFILE") >&2
 (cd userland && mach dep pull . >/dev/null && mach build . -t machos -p "$PROFILE") >&2

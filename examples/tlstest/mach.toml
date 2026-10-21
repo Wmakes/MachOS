@@ -40,24 +40,19 @@ link = []
 need = []
 
 [dep.std]
-git = "git@github.com:Wmakes/machos-std.git"
-ref = "commit/97475a1514ea1cf7a8773563d94435bf24b6700e"
+path = "../../deps/machos-std"
 
 [dep.crypto]
-git = "https://github.com/briar-systems/mach-crypto.git"
-ref = "commit/568395358be3c4c454a40d283d07eebe8474ae6c"
+path = "../../deps/mach-crypto"
 
 [dep.pki]
-git = "https://github.com/briar-systems/mach-pki.git"
-ref = "commit/16145a4f2eae83efb60f93375fc1f1c849316788"
+path = "../../deps/mach-pki"
 
 [dep.tls]
-git = "https://github.com/briar-systems/mach-tls.git"
-ref = "commit/10c2463fa72a212c53db934190f46046692236e8"
+path = "../../deps/mach-tls"
 
 [dep.http]
-git = "https://github.com/briar-systems/mach-http.git"
-ref = "commit/b1f2aedd05f2f632f8e3d1d4f10c8ea5145c8dac"
+path = "../../deps/mach-http"
 
 [target.linux-x86_64]
 isa = "x86_64"

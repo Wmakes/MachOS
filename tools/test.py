@@ -91,7 +91,7 @@ def with_stdsuite():
     fixtures = os.path.join(ROOT, "out", "headless", "std-fixtures")
     shutil.rmtree(fixtures, ignore_errors=True)
     for platform in ("darwin", "windows"):
-        shutil.copytree(os.path.join(project, "dep", "std", "src", "system", "os", platform),
+        shutil.copytree(os.path.join(ROOT, "deps", "machos-std", "src", "system", "os", platform),
                         os.path.join(fixtures, "src", "system", "os", platform))
     put_test_tree(fixtures, "/root")
     with open(os.path.join(ROOT, "out", "headless", "stdtest-tests.txt"), "w") as f:
@@ -100,6 +100,36 @@ def with_stdsuite():
 
 TLS_SUITE = []
 
+def tls_test_project():
+    """Prepare the patched test copy while leaving dependency submodules pristine."""
+    # Apply the documented upstream test correction in an isolated source copy.
+    # The submodule checkouts retain the exact shipped upstream revisions.
+    import shutil
+    original = os.path.join(ROOT, "examples", "tlstest")
+    project = os.path.join(ROOT, "out", "headless", "tlstest-project")
+    os.makedirs(project, exist_ok=True)
+    tls_source = os.path.join(project, "sources", "tls")
+    shutil.rmtree(tls_source, ignore_errors=True)
+    shutil.copytree(os.path.join(ROOT, "deps", "mach-tls"), tls_source,
+                    ignore=shutil.ignore_patterns(".git", "dep", "out"))
+    subprocess.run(["git", "apply", "--directory", os.path.relpath(tls_source, ROOT),
+                    "tools/patches/mach-tls-pki-0.4-tests.patch"], cwd=ROOT, check=True)
+    with open(os.path.join(original, "mach.toml")) as source:
+        manifest = source.read()
+    for name in ("std", "crypto", "pki", "tls", "http"):
+        repository = "machos-std" if name == "std" else "mach-" + name
+        path = tls_source if name == "tls" else os.path.join(ROOT, "deps", repository)
+        manifest, changed = re.subn(r'\[dep\.' + name + r'\]\n(?:(?!\[)[^\n]*\n)*',
+                                   '[dep.' + name + ']\npath = "' + path + '"\n\n',
+                                   manifest, count=1)
+        if changed != 1:
+            raise RuntimeError("TLS test project has no " + name + " dependency")
+    with open(os.path.join(project, "mach.toml"), "w") as output:
+        output.write(manifest)
+    shutil.copytree(os.path.join(original, "src"), os.path.join(project, "src"), dirs_exist_ok=True)
+    return project
+
+
 def with_tlssuite():
     """Build upstream crypto, PKI, TLS and HTTP tests and keep their index/name mapping."""
     p = PROFILE[0]
@@ -107,32 +137,7 @@ def with_tlssuite():
                    stdout=subprocess.PIPE)
     project = os.path.join(ROOT, "examples", "tlstest")
     subprocess.run(["mach", "dep", "pull", "."], cwd=project, check=True)
-    # Apply the documented upstream test correction in an isolated source copy.
-    # The dependency manifests above keep the exact shipped upstream revisions.
-    import shutil
-    original = project
-    project = os.path.join(ROOT, "out", "headless", "tlstest-project")
-    os.makedirs(project, exist_ok=True)
-    tls_source = os.path.join(project, "sources", "tls")
-    shutil.rmtree(tls_source, ignore_errors=True)
-    shutil.copytree(os.path.join(original, "dep", "tls"), tls_source,
-                    ignore=shutil.ignore_patterns(".git", "dep", "out"))
-    subprocess.run(["git", "apply", "--directory", os.path.relpath(tls_source, ROOT),
-                    "tools/patches/mach-tls-pki-0.4-tests.patch"], cwd=ROOT, check=True)
-    with open(os.path.join(original, "mach.toml")) as source:
-        manifest = source.read()
-    manifest, changed = re.subn(r'\[dep\.std\]\n(?:(?!\[)[^\n]*\n)*',
-                               '[dep.std]\npath = "' + os.path.join(original, "dep", "std") + '"\n\n',
-                               manifest, count=1)
-    if changed != 1:
-        raise RuntimeError("TLS test project has no std dependency")
-    for name in ("crypto", "pki", "tls", "http"):
-        path = tls_source if name == "tls" else os.path.join(original, "dep", name)
-        manifest = re.sub(r'git = "https://github.com/briar-systems/mach-' + name +
-                          r'\.git"\nref = "[^"]+"', 'path = "' + path + '"', manifest)
-    with open(os.path.join(project, "mach.toml"), "w") as output:
-        output.write(manifest)
-    shutil.copytree(os.path.join(original, "src"), os.path.join(project, "src"), dirs_exist_ok=True)
+    project = tls_test_project()
     subprocess.run(["mach", "dep", "pull", "."], cwd=project, check=True)
     subprocess.run(["mach", "build", "examples/stdtest", "-a", "runtests", "-t", "machos", "-p", p],
                    cwd=ROOT, check=True)

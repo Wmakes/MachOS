@@ -1,0 +1,15 @@
+[submodule "deps/machos-std"]
+	path = deps/machos-std
+	url = git@github.com:Wmakes/machos-std.git
+[submodule "deps/mach-crypto"]
+	path = deps/mach-crypto
+	url = https://github.com/briar-systems/mach-crypto.git
+[submodule "deps/mach-pki"]
+	path = deps/mach-pki
+	url = https://github.com/briar-systems/mach-pki.git
+[submodule "deps/mach-tls"]
+	path = deps/mach-tls
+	url = https://github.com/briar-systems/mach-tls.git
+[submodule "deps/mach-http"]
+	path = deps/mach-http
+	url = https://github.com/briar-systems/mach-http.git
