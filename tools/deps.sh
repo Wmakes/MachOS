@@ -14,3 +14,6 @@ while read -r key path; do
         exit 1
     fi
 done
+
+# dependency compatibility fixes live only in generated build copies
+python3 tools/patch-deps.py

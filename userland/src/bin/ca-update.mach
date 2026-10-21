@@ -7,8 +7,10 @@ use std.allocator;
 use std.allocator.page;
 use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.result.res;
+use std.types.size.usize;
 use std.types.string.str;
 use tls.cert.bundle;
 use io: userland.lib.cli;
@@ -98,9 +100,17 @@ fun main(argc: i64, argv: **u8) i64 {
     var valid: bool = false;
     if (sel made.ok) {
         if (bundle.load(?pages, (?temporary[0])::str, ?parsed) == bundle.OK) {
-            # A provider update must be entirely well formed. Unsupported roots
-            # remain usable as anchors, but malformed or duplicate PEM is refused.
-            valid = parsed.bundle.skipped == 0;
+            # Preserve valid roots this build cannot use yet, such as P-521.
+            # Malformed certificates and duplicate blocks still refuse the update.
+            valid = true;
+            var i: usize = 0;
+            for (i < parsed.bundle.skipped) {
+                if (parsed.bundle.skips[i].reason != bundle.UNSUPPORTED) { valid = false; }
+                i = i + 1;
+            }
+            if (valid && parsed.bundle.skipped != 0) {
+                io.err("ca-update: warning: some CA roots are unsupported by this build\n");
+            }
             bundle.release(?pages, ?parsed);
         }
     }

@@ -65,6 +65,20 @@ class DependencyCheckout(unittest.TestCase):
                 finally:
                     source.write_bytes(previous)
 
+    def test_crypto_patch_is_reproducible_and_isolated(self):
+        original = self.checkout / 'deps/mach-crypto/src/encoding/pem.mach'
+        prepared = self.checkout / 'deps/.patched/mach-crypto/src/encoding/pem.mach'
+        self.assertNotIn('line_width', original.read_text())
+        self.assertIn('line_width', prepared.read_text())
+        run(['git', 'apply', '--reverse', '--check', '--directory',
+             'deps/.patched/mach-crypto', 'tools/patches/mach-crypto-pem-76.patch'],
+            self.checkout, self.env)
+        first = prepared.read_bytes()
+        run(['tools/deps.sh'], self.checkout, self.env)
+        self.assertEqual(prepared.read_bytes(), first)
+        self.assertEqual(run(['git', 'status', '--porcelain'],
+                             self.checkout / 'deps/mach-crypto', self.env), '')
+
     def test_manifests_stay_inside_the_checkout(self):
         manifests = run(["git", "ls-files", "*/mach.toml"],
                         self.checkout, self.env).splitlines()
@@ -105,6 +119,8 @@ class DependencyCheckout(unittest.TestCase):
             with self.subTest(dependency=name):
                 repository = "machos-std" if name == "std" else "mach-" + name
                 expected = project / "sources/tls" if name == "tls" else self.checkout / "deps" / repository
+                if name == "crypto":
+                    expected = self.checkout / "deps/.patched" / repository
                 self.assertEqual(Path(spec["path"]), expected)
         run(["git", "apply", "--reverse", "--check", "--directory",
              str(project.relative_to(self.checkout) / "sources/tls"),

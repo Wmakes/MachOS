@@ -1,0 +1,21 @@
+mach-crypto Mozilla PEM compatibility
+
+Upstream: https://github.com/briar-systems/mach-crypto
+Base: 568395358be3c4c454a40d283d07eebe8474ae6c
+
+curl's https://curl.se/ca/cacert.pem uses 76-column base64 lines. The
+upstream bounded PEM reader only accepts 64 columns, so it rejects every
+certificate in that real Mozilla bundle. Its encoder can remain canonical
+at 64 columns; public and secret decoders need to accept the provider's
+76-column wrapping too. Padding, bounds, overlap and truncation checks remain.
+
+mach-crypto-pem-76.patch contains the complete source and regression change.
+The four affected PEM tests pass, including public and secret decoding and
+all truncation boundaries. No cryptographic algorithm is changed.
+
+This is a local compatibility change prepared for upstreaming, not an
+upstream release. tools/deps.sh prepares deps/.patched/mach-crypto with this
+patch; the upstream submodule remains at the exact base revision above.
+Userland and TLS test manifests consume that generated build copy. The
+copy is ignored by Git and recreated from the submodule, including local
+source edits, whenever dependencies are prepared. No GitHub fork is needed.

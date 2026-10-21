@@ -119,6 +119,8 @@ def tls_test_project():
     for name in ("std", "crypto", "pki", "tls", "http"):
         repository = "machos-std" if name == "std" else "mach-" + name
         path = tls_source if name == "tls" else os.path.join(ROOT, "deps", repository)
+        if name == "crypto":
+            path = os.path.join(ROOT, "deps", ".patched", repository)
         manifest, changed = re.subn(r'\[dep\.' + name + r'\]\n(?:(?!\[)[^\n]*\n)*',
                                    '[dep.' + name + ']\npath = "' + path + '"\n\n',
                                    manifest, count=1)
@@ -425,13 +427,22 @@ def https_server():
     subprocess.run(["tools/put.sh", os.path.join(directory, "ca.pem"), "/root/test-ca.pem", disk()],
                    cwd=ROOT, check=True)
 
+    # Exercise the real Mozilla bundle and its 76-column PEM in guest updates.
+    with open(os.path.join(ROOT, "root/etc/ssl/certs/ca-certificates.crt"), "rb") as source:
+        provider_bundle = source.read()
+    raw_ca = ca.public_bytes(serialization.Encoding.PEM).splitlines()
+    encoded_ca = b"".join(raw_ca[1:-1])
+    provider_bundle += (raw_ca[0] + b"\n" +
+                        b"\n".join(encoded_ca[i:i + 76] for i in range(0, len(encoded_ca), 76)) +
+                        b"\n" + raw_ca[-1] + b"\n")
+
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def do_GET(self):
             body = b"hello over verified TLS\n"
             if self.path == "/bundle":
-                body = ca.public_bytes(serialization.Encoding.PEM)
+                body = provider_bundle
             if self.path == "/big":
                 body = b"0123456789abcdef" * 65536
             if self.path in ("/truncated", "/no-notify"):
@@ -928,7 +939,7 @@ TESTS = [
       "send:export SSL_CERT_FILE=/root/test-ca.pem; wget -q -O /tmp/bad https://tls.test:9443/no-notify; echo no-notify-status $?; wget -q -O - https://tls.test:9443/redirect-http; echo downgrade-status $?; time wget -q -O /tmp/rsa https://tls.test:9445/; echo rsa-status $?; wget -q -O - https://tls.test:9443/redirect-tls; echo tls-redirect-status $?\\n", "wait:" + P,
       "send:dns-proxy &\\n", "wait:" + P,
       "send:sleep 1; export SSL_CERT_FILE=/root/test-ca.pem; ip set 10.0.2.15/24 10.0.2.2 127.0.0.1; cat /proc/net/resolv.conf; wget -q -O - https://alias.test:9443/; echo dns-chain-retry-status $?\\n", "wait:" + P,
-      "send:export SSL_CERT_FILE=/root/test-ca.pem; wget -q -O /tmp/ip-san https://10.0.2.2:9443/; echo ip-san-status $?; ca-update --url https://tls.test:9443/bundle; echo ca-update-status $?; cat /etc/ssl/certs/SOURCE; cp /etc/ssl/certs/ca-certificates.crt /tmp/before-ca; ca-update --url https://tls.test:9443/; echo invalid-bundle-status $?; diff /tmp/before-ca /etc/ssl/certs/ca-certificates.crt; echo bundle-kept-status $?; ca-update --url http://tls.test:9080/; echo insecure-url-status $?; ca-update --url https://tls.test:9443/redirect-http; echo insecure-redirect-status $?; diff /tmp/before-ca /etc/ssl/certs/ca-certificates.crt; echo redirect-kept-status $?\\n", "wait:" + P],
+      "send:export SSL_CERT_FILE=/root/test-ca.pem; wget -q -O /tmp/ip-san https://10.0.2.2:9443/; echo ip-san-status $?; ca-update --url https://tls.test:9443/bundle; echo ca-update-status $?; cat /etc/ssl/certs/SOURCE; cp /etc/ssl/certs/ca-certificates.crt /tmp/before-ca; ca-update --url https://tls.test:9443/; echo invalid-bundle-status $?; test \"$(sha256sum < /tmp/before-ca)\" = \"$(sha256sum < /etc/ssl/certs/ca-certificates.crt)\"; echo bundle-kept-status $?; ca-update --url http://tls.test:9080/; echo insecure-url-status $?; ca-update --url https://tls.test:9443/redirect-http; echo insecure-redirect-status $?; test \"$(sha256sum < /tmp/before-ca)\" = \"$(sha256sum < /etc/ssl/certs/ca-certificates.crt)\"; echo redirect-kept-status $?; unset SSL_CERT_FILE; wget -q -O - https://tls.test:9443/; echo updated-roots-status $?\\n", "wait:" + P],
      ["hello over verified TLS", "https-status 0", "big-status 0",
       __import__("hashlib").sha256(b"0123456789abcdef" * 65536).hexdigest(),
       "hello chunked!", "chunk-status 0", "hello over verified TLS", "redirect-status 0",
@@ -939,7 +950,7 @@ TESTS = [
       "plain HTTP after TLS redirect", "downgrade-status 0", "rsa-status 0", "tls-redirect-status 0", "dns-proxy ready", "nameserver 127.0.0.1", "hello over verified TLS", "dns-chain-retry-status 0", "ip-san-status 0", "ca-update: CA bundle updated", "ca-update-status 0", "# Source: https://tls.test:9443/bundle",
       "invalid CA bundle; existing CA bundle kept", "invalid-bundle-status 1", "bundle-kept-status 0",
       "HTTPS URL is required", "insecure-url-status 1", "ca-update: download failed; existing CA bundle kept",
-      "insecure-redirect-status 1", "redirect-kept-status 0"]),
+      "insecure-redirect-status 1", "redirect-kept-status 0", "hello over verified TLS", "updated-roots-status 0"]),
 
     ("wget", False, False,
      ["--prep", http_server, "--boot", disk,
