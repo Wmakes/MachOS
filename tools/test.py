@@ -93,7 +93,7 @@ def with_stdsuite():
     for platform in ("darwin", "windows"):
         shutil.copytree(os.path.join(ROOT, "deps", "machos-std", "src", "system", "os", platform),
                         os.path.join(fixtures, "src", "system", "os", platform))
-    put_test_tree(fixtures, "/root")
+    put_test_tree(fixtures, "/home/stdtest")
     with open(os.path.join(ROOT, "out", "headless", "stdtest-tests.txt"), "w") as f:
         f.write("".join(f"{i} {name}\n" for i, name in enumerate(STD_SUITE)))
 
@@ -196,7 +196,11 @@ def put_test_tree(source, destination):
             for child in dirs:
                 ensure_dir(target + "/" + child)
             for child in files:
-                commands.append(f'write "{directory}/{child}" "{target}/{child}"')
+                source_file = os.path.join(directory, child)
+                if os.path.islink(source_file):
+                    commands.append(f'symlink "{target}/{child}" "{os.readlink(source_file)}"')
+                else:
+                    commands.append(f'write "{source_file}" "{target}/{child}"')
         script = os.path.join(temp, "fixtures.cmds")
         with open(script, "w") as output:
             output.write("\n".join(commands) + "\n")
@@ -225,7 +229,10 @@ def tlssuite_steps():
 
 
 def stdsuite_steps():
-    steps = ["wait:" + P, f"send:runtests /bin/stdsuite 0 {len(STD_SUITE) - 1}\\n"]
+    # Permission regressions must run as an ordinary owner, not uid 0.
+    steps = ["wait:" + P, "send:adduser stdtest\\n", "wait:" + P,
+             "send:su stdtest\\n", r"wait:stdtest@[^\r\n :]+:[^\r\n]*[$] ",
+             f"send:cd /home/stdtest; runtests /bin/stdsuite 0 {len(STD_SUITE) - 1}\\n"]
     for i in range(len(STD_SUITE)):
         steps.append(rf"wait:(?:ok {i}|HANG {i}|FAIL {i} [^\n]*)\r?\n")
     return steps + ["wait:runtests:", "wait:" + P]
@@ -251,6 +258,11 @@ def with_kernel_sockets():
     for src, dest in ((output, "/bin/socket-tests"),
                       (os.path.join(project, "out", "machos", p, "runtests"), "/bin/runtests")):
         subprocess.run(["tools/put.sh", src, dest, disk()], cwd=ROOT, check=True)
+    # debugfs creates a standard ext2 fast symlink, unlike the kernel's block-backed links.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="machos-symlinks-") as fixture:
+        os.symlink("/etc/motd", os.path.join(fixture, "fast-link"))
+        put_test_tree(fixture, "/root")
 
 
 UDP_ECHO = []
@@ -713,7 +725,7 @@ TESTS = [
     ("dualboot", False, False,
      ["--prep", fake_windows, "--boot", DUAL, "--nologin", "sleep:2.5", "keys:<down><down><down>", "sleep:0.5",
       "keys:<ret>", "wait:booting Windows", "wait:login: ", "send:root\\n", "wait:" + P],
-     ["Windows", "machboot: booting Windows", "machboot 0.8.6"]),
+     ["Windows", "machboot: booting Windows", "machboot 0.9.0"]),
 
     # machboot hide: no menu, straight into MachOS
     ("hidden-menu", False, True,
@@ -728,10 +740,10 @@ TESTS = [
      ["--prep", update_stick] + usb_stick() + [
       "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update; update /mnt/update.tgz; umount /mnt; machboot\\n",
       "wait:" + P],
-     ["updating MachOS", "installing the programs", "MachOS is updated to 0.8.6", "MachOS (previous)"]),
+     ["updating MachOS", "installing the programs", "MachOS is updated to 0.9.0", "MachOS (previous)"]),
     ("update-reboot", True, True,
      ["wait:" + P, "send:ls /boot; uname -a\\n", "wait:" + P],
-     ["kernel.old.elf", "MachOS 0.8.6"]),
+     ["kernel.old.elf", "MachOS 0.9.0"]),
 
     # MachOS installed on a USB stick, then booted from the stick alone
     ("usb-install", False, False,
@@ -765,6 +777,11 @@ TESTS = [
       "send:seq 1 100000000 | wc\\n", "sleep:1", "send:\\x03", "wait:" + P,
       "send:echo alive\\n", "wait:alive\\r\\n.*" + P],
      ["sleep", "running", "^C", "Done", "^C", "alive"]),
+
+    ("shell-groups", False, False,
+     ["wait:" + P, "send:sh -c 'sleep 1 & echo child=$!; wait; echo waited'\\n",
+      r"wait:\r\nchild=[0-9]+\r\n", "wait:waited", "wait:" + P],
+     ["waited"]),
 
     ("files", False, True,
      ["wait:" + P,
@@ -806,13 +823,18 @@ TESTS = [
 
     ("socket-kernel", False, True,
      ["--prep", with_kernel_sockets, "--boot", disk,
-      "wait:" + P, "send:runtests /bin/socket-tests 0 14\\n", "wait:runtests:", "wait:" + P],
-     ["runtests: 15 passed, 0 failed, 0 hung"]),
+      "wait:" + P, "send:runtests /bin/socket-tests 0 19\\n", "wait:runtests:", "wait:" + P],
+     ["runtests: 20 passed, 0 failed, 0 hung"]),
+
+    ("socket-kernel-smp", False, True,
+     ["--prep", with_kernel_sockets, "--boot", disk, "--qemu=-smp", "--qemu=4",
+      "wait:" + P, "send:runtests /bin/socket-tests 0 19\\n", "wait:runtests:", "wait:" + P],
+     ["runtests: 20 passed, 0 failed, 0 hung"]),
 
     ("socket-kernel-no-entropy", False, True,
      ["--prep", with_kernel_sockets, "--boot", disk, "--qemu=-cpu", "--qemu=max,-rdrand,-rdseed",
-      "wait:" + P, "send:runtests /bin/socket-tests 0 14\\n", "wait:runtests:", "wait:" + P],
-     ["runtests: 15 passed, 0 failed, 0 hung"]),
+      "wait:" + P, "send:runtests /bin/socket-tests 0 19\\n", "wait:runtests:", "wait:" + P],
+     ["runtests: 20 passed, 0 failed, 0 hung"]),
 
     ("tlstest", False, False,
      ["--prep", with_tlssuite, "--boot", disk, tlssuite_steps],
@@ -828,8 +850,8 @@ TESTS = [
      ["wait:" + P, "send:cat /proc/version; head -2 /proc/meminfo; cat /proc/self/status; ls /proc/sys/kernel; cat /proc/stat\\n",
       "wait:" + P,
       "send:uname -a; free; uptime; ps; df; id; whoami; tty; neofetch | grep -c Memory\\n", "wait:" + P],
-     ["MachOS version 0.8.6", "MemTotal:", "Name:", "cat", "Uid:", "hostname", "cpu0",
-      "MachOS 0.8.6 x86_64 on machos", "total", "processes", "PID", "init", "Filesystem", "/dev/sda2",
+     ["MachOS version 0.9.0", "MemTotal:", "Name:", "cat", "Uid:", "hostname", "cpu0",
+      "MachOS 0.9.0 x86_64 on machos", "total", "processes", "PID", "init", "Filesystem", "/dev/sda2",
       "uid=0(root)", "root", "/dev/tty1", "1"]),
 
     ("events", False, False,
@@ -1159,29 +1181,20 @@ def run(name, keep, fsck, steps, expect, profile):
     if name == "stdtest":
         with open(os.path.join(ROOT, "out", "headless", "stdtest.log"), "w") as f:
             f.write(out)
-        import json
-        with open(os.path.join(ROOT, "tools", "fixtures", "std-baseline.json")) as source:
-            baseline = json.load(source)["failures"]
-        known = 0
-        regressions = 0
-        for match in re.finditer(r"^(FAIL|HANG) (\d+)(.*)$", out, re.MULTILINE):
+        results = list(re.finditer(r"^(ok|FAIL|HANG) (\d+)(.*)$", out, re.MULTILINE))
+        failures = [match for match in results if match[1] != "ok"]
+        for match in failures:
             index = int(match[2])
             label = STD_SUITE[index] if index < len(STD_SUITE) else "unknown test"
-            expected = match[1] == "FAIL" and baseline.get(label) == match[3].strip()
-            if expected:
-                known += 1
-            else:
-                regressions += 1
-            suffix = " (pre-existing, outside networking)" if expected else ""
-            print(f"     | {match[1]} {index} {label}{match[3]}{suffix}", flush=True)
+            print(f"     | {match[1]} {index} {label}{match[3]}", flush=True)
         summary = re.search(r"runtests: (\d+) passed, (\d+) failed, (\d+) hung", out)
         if summary:
             print("     | " + summary[0], flush=True)
             completed = sum(int(summary[i]) for i in (1, 2, 3))
-            if completed != len(STD_SUITE) or regressions:
-                problems.append(summary[0] + f"; {regressions} new or prerequisite failures")
-            if known:
-                print(f"     | {known} pre-existing failures outside networking remain; no tests skipped", flush=True)
+            indices = [int(match[2]) for match in results]
+            if (completed != len(STD_SUITE) or indices != list(range(len(STD_SUITE)))
+                    or failures or int(summary[2]) or int(summary[3])):
+                problems.append(summary[0] + f" ({len(results)}/{len(STD_SUITE)} completed)")
         else:
             problems.append("std test dispatcher did not finish")
     at = 0
@@ -1197,12 +1210,17 @@ def run(name, keep, fsck, steps, expect, profile):
 def main():
     import json
     ap = argparse.ArgumentParser()
-    ap.add_argument("-p", "--profile", default="debug")
+    ap.add_argument("-p", "--profile", choices=("debug", "release"), default="debug")
     ap.add_argument("names", nargs="*")
     a = ap.parse_args()
     sys.stdout.reconfigure(line_buffering=True)  # progress shows even when logged to a file
+    unknown = set(a.names) - {test[0] for test in TESTS}
+    if unknown:
+        ap.error("unknown tests: " + ", ".join(sorted(unknown)))
+    chosen = [test for test in TESTS if not a.names or test[0] in a.names]
     PROFILE[0] = a.profile
-    chosen = [t for t in TESTS if not a.names or t[0] in a.names]
+    subprocess.run(["tools/build.sh", a.profile], cwd=ROOT, check=True)
+    os.environ["MACHOS_PREBUILT_PROFILE"] = a.profile
     failed = 0
     results = []
     for name, keep, fsck, steps, expect in chosen:

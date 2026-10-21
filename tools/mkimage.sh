@@ -37,13 +37,15 @@ ROOT_MB=190
 
 mkdir -p "$OUT"
 
-# initialize missing library submodules before resolving the Mach projects
-tools/deps.sh >&2
-
-# kernel and userland are separate mach projects; each pulls a fresh copy of the SDK
-(cd kernel && mach dep pull . >/dev/null && mach build . -t kernel -p "$PROFILE") >&2
-(cd userland && mach dep pull . >/dev/null && mach build . -t machos -p "$PROFILE") >&2
-MACHBOOT=$(tools/machboot.sh release)
+# tests compile once per profile, but still assemble each requested disk afresh
+if [ "${MACHOS_PREBUILT_PROFILE:-}" != "$PROFILE" ]; then
+    tools/build.sh "$PROFILE" >&2
+fi
+MACHBOOT=machboot/out/uefi/release/BOOTX64.EFI
+[ -f "$KERNEL" ] && [ -d "$BIN" ] && [ -f "$MACHBOOT" ] || {
+    echo "mkimage.sh: missing prebuilt artifacts; run tools/build.sh $PROFILE" >&2
+    exit 1
+}
 
 # the root tree: root/ as is, every program in /bin, and what `install`
 # puts on a new disk's EFI partition in /boot

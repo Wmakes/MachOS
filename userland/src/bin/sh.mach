@@ -46,6 +46,8 @@ val PID_MARK:    u8 = 5; # $$
 val HOME_MARK:   u8 = 6; # a leading ~
 val CMD_MARK:    u8 = 7; # $(command): CMD_MARK, the command, CMD_END
 val CMD_END:     u8 = 8;
+val BG_MARK:     u8 = 14; # $!: the last asynchronous pipeline
+var last_background: u64 = 0;
 
 var tk: [128]u8;  # token kinds
 var ts: [128]u64; # word start in wbuf
@@ -219,6 +221,14 @@ fun expand(t: u64, out: *u8, cap: u64) u64 {
                 n = n + vl;
             }
             i = ne;
+        } or (w[i] == BG_MARK) {
+            if (last_background != 0) {
+                var num: [20]u8;
+                val k: u64 = io.fmt_dec(last_background, ?num[0]);
+                if (n + k >= cap) { ret NONE; }
+                io.copy(?out[n], ?num[0], k);
+                n = n + k;
+            }
         } or (w[i] == PID_MARK) {
             var num: [20]u8;
             val k: u64 = io.fmt_dec(sys.getpid(), ?num[0]);
@@ -302,6 +312,7 @@ fun scan_dollar(line: *u8, n: u64, i: u64) u64 {
         push(CMD_END);
         ret k;
     }
+    if (c == 33) { push(BG_MARK); ret i + 2; }
     if (c == 63) {
         push(STATUS_MARK);
         ret i + 2;
@@ -802,7 +813,7 @@ fun job_new(group: u64, pids: *u64, n: u64) *Job {
 fun wait_job(j: *Job) {
     # (a pipeline of builtins only runs in the shell's own group, which must
     # never become the foreground: ^C would reach the shell)
-    if (j.group != sys.getpgid(0)) { sys.tcsetpgrp(abi.STDIN, j.group); }
+    if (interactive != 0 && j.group != sys.getpgid(0)) { sys.tcsetpgrp(abi.STDIN, j.group); }
     var k: u64 = 0;
     for (k < j.npids) {
         if (j.done[k] == 0) {
@@ -826,7 +837,7 @@ fun wait_job(j: *Job) {
         k = k + 1;
     }
     j.used = 0;
-    sys.tcsetpgrp(abi.STDIN, 0);
+    if (interactive != 0) { sys.tcsetpgrp(abi.STDIN, 0); }
 }
 
 fun is_builtin(name: *u8) u8 {
@@ -1077,7 +1088,9 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
                 status = 127;
             } or {
                 var g: u64 = group;
-                if (g == 0) { g = abi.NEW_GROUP; }
+                # scripts inherit their caller's group so group termination reaches descendants
+                if (interactive == 0) { g = 0; }
+                or (g == 0) { g = abi.NEW_GROUP; }
                 var how: abi.Spawn;
                 f = 0;
                 for (f < 10) {
@@ -1127,7 +1140,7 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
                 } or {
                     pids[spawned] = pid;
                     spawned = spawned + 1;
-                    if (group == 0) { group = pid; }
+                    if (interactive != 0 && group == 0) { group = pid; }
                 }
             }
         }
@@ -1152,11 +1165,14 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
         ret;
     }
     if (background != 0) {
-        io.out("[\0");
-        io.dec(j.id);
-        io.out("] \0");
-        io.dec(g);
-        io.putc(10);
+        last_background = pids[spawned - 1];
+        if (interactive != 0) {
+            io.out("[\0");
+            io.dec(j.id);
+            io.out("] \0");
+            io.dec(g);
+            io.putc(10);
+        }
         status = 0;
         ret;
     }

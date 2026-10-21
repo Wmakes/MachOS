@@ -101,7 +101,13 @@ pub val SOCK_STATUS: u64 = 89;  # (fd, 0)  a connect's outcome: 0, E_INPROGRESS,
                                 # (fd, 1)  without reading: 1 data waits, 0 the end, E_AGAIN not yet
 pub val ACCEPT4: u64 = 91; # (fd, *sockaddr_in or 0, SOCK_NONBLOCK | SOCK_CLOEXEC) -> fd
 pub val RECVMSG: u64 = 92; # (fd, buf, len, *RecvMeta) -> copied bytes, with datagram metadata
-pub val COUNT:   u64 = 93;
+pub val SYMLINK: u64 = 93; # (target, length, path, length)
+pub val FCHMOD: u64 = 95; # (fd, mode): operate on the held node
+pub val THREAD_NAME: u64 = 97; # (set, buffer, capacity, tid or 0)
+pub val AFFINITY: u64 = 98; # (set, words, capacity, required words)
+pub val STACK_BOUNDS: u64 = 99; # (*low, *high): initial user stack
+pub val READDIR_LONG: u64 = 100; # (fd, index, *LongEntry), names up to 255 bytes
+pub val COUNT: u64 = 101;
 
 pub val QUEUE_ADD: u64 = 1;
 pub val QUEUE_DEL: u64 = 2;
@@ -250,8 +256,11 @@ pub val O_APPEND: u64 = 16;
 pub val O_CLOEXEC: u64 = 32; # closed in the new program after exec
 pub val O_EXCL:   u64 = 64;  # with O_CREATE: fail with E_EXIST if it is there
 pub val O_DIRECTORY: u64 = 128; # fail with E_NOTDIR unless it is a directory
-pub val O_NOFOLLOW: u64 = 256; # accepted; MachOS has no symbolic links
+pub val O_NOFOLLOW: u64 = 256; # refuse a final symbolic link when opening content
 pub val O_NONBLOCK: u64 = 512; # pipes, terminals, sockets: E_AGAIN instead of waiting
+# metadata handles pin an inode without permitting content reads or writes
+pub val O_METADATA: u64 = 1024;
+pub val O_METADATA_READ: u64 = 2048; # also require read authorization
 
 # errors, returned negated
 pub val E_NOENT:    u64 = 1;  # no such file or directory
@@ -392,8 +401,9 @@ pub val KIND_FILE: u64 = 1;
 pub val KIND_DIR:  u64 = 2;
 pub val KIND_DEV:  u64 = 3;
 pub val KIND_PIPE: u64 = 4;
+pub val KIND_LINK: u64 = 6;
 
-pub val NAME_MAX: u64 = 59;
+pub val NAME_MAX: u64 = 255;
 
 pub rec Stat {
     kind:  u64;
@@ -483,4 +493,15 @@ pub rec ProcInfo {
     cpu_ticks: u64; # timer ticks it was running on a core (100 a second)
     name_len: u64;
     name:     [32]u8;
+}
+
+pub rec LongEntry {
+    kind:     u64;
+    size:     u64;
+    mtime:    u64;
+    mode:     u64;
+    uid:      u64;
+    gid:      u64;
+    name_len: u64;
+    name:     [256]u8;
 }

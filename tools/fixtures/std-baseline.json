@@ -1,5 +1,5 @@
 {
-  "description": "Pre-existing failures outside the networking/TLS prerequisites. Every test still runs and every failure is reported. New failures, signals and all hangs fail the regression scenario.",
+  "description": "Historical snapshot before the 0.9.0 std fixes; retained for before/after comparison. This file is not a test allowance: tools/test.py rejects every failure and hang.",
   "compiler": "6.10.1",
   "profile": "release",
   "std_commit": "981c0beec08f363faef1d6a23b5a9ed8812aa1ea",
@@ -32,5 +32,11 @@
     "std.process.exec#wait_within__expired_deadline_reaches_a_grandchild": "exit 2",
     "std.process.exec#spawn_with_options__applies_the_directory_the_redirection_and_the_group": "exit 2",
     "std.log.record#log_record__typed_fields_encode": "exit 2"
+  },
+  "after_0_9_0": {
+    "passed": 711,
+    "failed": 0,
+    "hung": 0,
+    "std_commit": "5a86c311956e0b5554783945c8ffb664118b11b3"
   }
 }

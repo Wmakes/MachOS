@@ -170,6 +170,7 @@ fun write_inode(fs: *Fs, ino: u64, i: *Inode) u8 {
 pub fun kind_of(i: *Inode) u64 {
     val t: u16 = i.mode & S_IFMT;
     if (t == S_IFDIR) { ret abi.KIND_DIR; }
+    if (t == 0xA000) { ret abi.KIND_LINK; }
     if (t == S_IFCHR) { ret abi.KIND_DEV; }
     ret abi.KIND_FILE;
 }
@@ -386,6 +387,8 @@ fun free_tree(fs: *Fs, b: u64, depth: u64) {
 }
 
 fun free_blocks(fs: *Fs, i: *Inode) {
+    # Fast symlinks store text in the block array, not block numbers.
+    if ((i.mode & S_IFMT) == 0xA000 && i.blocks == 0) { ret; }
     var k: u64 = 0;
     for (k < 12) {
         free_tree(fs, i.block[k]::u64, 0);
@@ -411,6 +414,10 @@ pub fun read(fs: *Fs, ino: u64, off: u64, dst: u64, n: u64) u64 {
     if (off >= size) { ret 0; }
     var want: u64 = n;
     if (want > size - off) { want = size - off; }
+    if ((i.mode & S_IFMT) == 0xA000 && i.blocks == 0 && size <= 60) {
+        mem.copy(dst, (?i.block[0])::u64 + off, want);
+        ret want;
+    }
     val buf: u64 = heap.alloc(BS);
     if (buf == 0) { ret e(abi.E_NOMEM); }
     var done: u64 = 0;
@@ -682,6 +689,7 @@ pub fun create(fs: *Fs, dir: u64, name: *u8, nl: u64, kind: u64, mode: u64, uid:
         i.size = BS::u32;
     } or {
         i.mode = S_IFREG | (mode & 0xFFF)::u16;
+        if (kind == abi.KIND_LINK) { i.mode = 0xA000 | (mode & 0xFFF)::u16; ft = 7; }
         i.links = 1;
     }
     i.uid = (uid & 0xFFFF)::u16;
@@ -732,7 +740,11 @@ fun dir_replace(fs: *Fs, dir: u64, name: *u8, nl: u64, ino: u64) u64 {
                 if (@(at::*u32) != 0 && (@((at + 6)::*u8))::u64 == nl &&
                     mem.equal((at + 8)::*u8, name, nl) != 0) {
                     @(at::*u32) = ino::u32;
-                    @((at + 7)::*u8) = FT_REG;
+                    var replaced: Inode;
+                    var ft: u8 = FT_REG;
+                    if (read_inode(fs, ino, ?replaced) == 0) { heap.free(buf); ret e(abi.E_IO); }
+                    if (kind_of(?replaced) == abi.KIND_LINK) { ft = 7; }
+                    @((at + 7)::*u8) = ft;
                     val written: u8 = blk.write(fs.part, pb, buf);
                     heap.free(buf);
                     if (written == 0) { ret e(abi.E_IO); }
@@ -778,6 +790,8 @@ pub fun release(fs: *Fs, ino: u64) {
 pub fun rename(fs: *Fs, odir: u64, oname: *u8, onl: u64, ndir: u64, nname: *u8, nnl: u64, ino: u64, is_dir: u8) u64 {
     var ft: u8 = FT_REG;
     if (is_dir != 0) { ft = FT_DIR; }
+    var source: Inode;
+    if (read_inode(fs, ino, ?source) != 0 && kind_of(?source) == abi.KIND_LINK) { ft = 7; }
     val r: u64 = dir_add(fs, ndir, nname, nnl, ino, ft);
     if (abi.is_err(r) != 0) { ret r; }
     dir_remove(fs, odir, oname, onl);

@@ -400,3 +400,110 @@ test regression__adjacent_mappings_preserve_page_boundaries {
     if (sys.munmap(last, 12288) != 0) { ret 8; }
     ret 0;
 }
+
+# Metadata handles retain an inode without granting access to its contents.
+test regression__metadata_handles_cannot_acquire_content_access {
+    val pathname: *u8 = "/root/metadata-test";
+    sys.remove(pathname, io.len(pathname));
+    val fd: u64 = sys.open_mode(pathname, io.len(pathname), abi.O_CREATE | abi.O_WRITE, 0);
+    if (abi.is_err(fd) != 0) { ret 1; }
+    sys.close(fd);
+    val held: u64 = sys.open(pathname, io.len(pathname), abi.O_METADATA | abi.O_READ);
+    if (abi.is_err(held) != 0) { ret 2; }
+    var byte: u8;
+    if (sys.read(held, ?byte, 1) != abi.err(abi.E_BADF)) { ret 3; }
+    if (sys.open(pathname, io.len(pathname), abi.O_METADATA | abi.O_WRITE) != abi.err(abi.E_INVAL)) { ret 4; }
+    if (call(abi.FCHMOD, held, 0x180, 0) != 0) { ret 5; }
+    if (sys.remove(pathname, io.len(pathname)) != 0) { ret 6; }
+    var st: abi.Stat;
+    if (sys.fstat(held, ?st) != 0 || st.nlink != 0 || st.mode != 0x180) { ret 7; }
+    sys.close(held);
+    ret 0;
+}
+
+# A no-follow lookup sees the link; a following lookup reports a bounded loop.
+test regression__symlink_nofollow_and_loop_refusals {
+    val pathname: *u8 = "/root/loop-test";
+    val length: u64 = io.len(pathname);
+    sys.remove(pathname, length);
+    if (sys.raw(abi.SYMLINK, pathname::u64, length, pathname::u64, length, 0) != 0) { ret 1; }
+    var st: abi.Stat;
+    if (sys.raw(abi.STAT, pathname::u64, length, (?st)::u64, 256, 0) != 0 || st.kind != abi.KIND_LINK) { ret 2; }
+    if (sys.stat(pathname, length, ?st) != abi.err(abi.E_LOOP)) { ret 3; }
+    if (sys.open(pathname, length, abi.O_READ | abi.O_NOFOLLOW) != abi.err(abi.E_LOOP)) { ret 4; }
+    if (sys.raw(abi.CHMOD, pathname::u64, length, 0, 1, 0) != abi.err(abi.E_NOTSUP)) { ret 5; }
+    if (sys.remove(pathname, length) != 0) { ret 6; }
+    ret 0;
+}
+
+# The extended directory ABI preserves long names without overrunning the old ABI.
+test regression__long_names_preserve_legacy_directory_buffers {
+    val dirname: *u8 = "/root/long-test";
+    if (sys.mkdir(dirname, io.len(dirname)) != 0) { ret 1; }
+    var pathname: [256]u8;
+    var i: u64 = 0;
+    for (i < 15) { pathname[i] = dirname[i]; i = i + 1; }
+    pathname[15] = 47;
+    i = 16;
+    for (i < 255) { pathname[i] = 120; i = i + 1; }
+    val fd: u64 = sys.open(?pathname[0], 255, abi.O_CREATE | abi.O_WRITE);
+    if (abi.is_err(fd) != 0) { ret 2; }
+    sys.close(fd);
+    val dir: u64 = sys.open(dirname, io.len(dirname), abi.O_READ | abi.O_DIRECTORY);
+    var entry: abi.LongEntry;
+    if (call(abi.READDIR_LONG, dir, 0, (?entry)::u64) != 1 || entry.name_len != 239) { ret 3; }
+    var legacy: [128]u8;
+    legacy[120] = 73;
+    if (call(abi.READDIR, dir, 0, (?legacy[0])::u64) != 1 || legacy[120] != 73) { ret 4; }
+    sys.close(dir);
+    if (sys.remove(?pathname[0], 255) != 0 || sys.remove(dirname, io.len(dirname)) != 0) { ret 5; }
+    ret 0;
+}
+
+# The thread APIs validate pointers and expose real stack and CPU constraints.
+test regression__thread_interfaces_validate_buffers_and_masks {
+    var low: u64;
+    var high: u64;
+    if (call(abi.STACK_BOUNDS, (?low)::u64, (?high)::u64, 0) != 0 || low >= high || high - low < 1048576) { ret 1; }
+    if (call(abi.STACK_BOUNDS, 0, (?high)::u64, 0) != abi.err(abi.E_FAULT)) { ret 2; }
+    var mask: u64;
+    var needed: u64 = 0;
+    if (sys.raw(abi.AFFINITY, 0, 0, 0, (?needed)::u64, 0) != abi.err(abi.E_RANGE) || needed != 1) { ret 3; }
+    if (sys.raw(abi.AFFINITY, 0, (?mask)::u64, 1, (?needed)::u64, 0) != 0 || mask == 0) { ret 4; }
+    val original: u64 = mask;
+    mask = 0;
+    if (sys.raw(abi.AFFINITY, 1, (?mask)::u64, 1, 0, 0) != abi.err(abi.E_INVAL)) { ret 5; }
+    mask = original & (0 - original);
+    if (sys.raw(abi.AFFINITY, 1, (?mask)::u64, 1, 0, 0) != 0) { ret 8; }
+    val child: u64 = sys.fork();
+    if (child == 0) {
+        var inherited: u64;
+        if (sys.raw(abi.AFFINITY, 0, (?inherited)::u64, 1, (?needed)::u64, 0) != 0 || inherited != mask) { sys.exit(1); }
+        sys.exit(0);
+    }
+    if (abi.is_err(child) != 0 || sys.wait(child) != 0) { ret 9; }
+    mask = original;
+    if (sys.raw(abi.AFFINITY, 1, (?mask)::u64, 1, 0, 0) != 0) { ret 10; }
+    val name: *u8 = "mach-regression";
+    if (sys.raw(abi.THREAD_NAME, 1, name::u64, 15, 0, 0) != 0) { ret 6; }
+    var buffer: [16]u8;
+    if (sys.raw(abi.THREAD_NAME, 0, (?buffer[0])::u64, 16, 0, 0) != 15 || buffer[0] != 109 || buffer[15] != 0) { ret 7; }
+    ret 0;
+}
+
+# Existing ext2 images can store short link targets inside the inode itself.
+test regression__ext2_fast_symlinks_resolve_and_release_without_freeing_text {
+    val pathname: *u8 = "/root/fast-link";
+    val direct: u64 = sys.open("/etc/motd", 9, abi.O_READ);
+    val linked: u64 = sys.open(pathname, io.len(pathname), abi.O_READ);
+    if (abi.is_err(direct) != 0 || abi.is_err(linked) != 0) { ret 1; }
+    var first: u8;
+    var second: u8;
+    if (sys.read(direct, ?first, 1) != 1 || sys.read(linked, ?second, 1) != 1 || first != second) { ret 2; }
+    sys.close(direct);
+    sys.close(linked);
+    if (sys.remove(pathname, io.len(pathname)) != 0) { ret 3; }
+    var st: abi.Stat;
+    if (sys.stat("/etc/motd", 9, ?st) != 0 || st.kind != abi.KIND_FILE || st.size == 0) { ret 4; }
+    ret 0;
+}

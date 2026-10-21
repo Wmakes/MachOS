@@ -1,6 +1,6 @@
 # path normalization: absolute result, no ".", "..", or repeated slashes
 
-pub val MAX: u64 = 256;
+pub val MAX: u64 = 512;
 
 # append the components of `p` to the absolute path in out[0..len]
 fun walk(out: *u8, len: u64, p: *u8, n: u64) u64 {

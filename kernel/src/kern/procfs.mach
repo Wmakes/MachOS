@@ -2,7 +2,7 @@
 # whenever they are read, so any program (std's included) can read them
 # without system calls of its own
 #
-#   /proc/version                 "MachOS version 0.8.6 x86_64"
+#   /proc/version                 "MachOS version 0.9.0 x86_64"
 #   /proc/uptime                  seconds since boot, and idle seconds
 #   /proc/meminfo                 MemTotal, MemFree, MemUsed, KernelHeap (kB)
 #   /proc/cpuinfo                 a block per core: processor, model name
@@ -15,7 +15,7 @@
 #   /proc/kmsg                    the kernel log, "<level>seq,us;text" lines;
 #                                 root clears it by writing to it
 #   /proc/sys/kernel/ostype       "MachOS"
-#   /proc/sys/kernel/osrelease    "0.8.6"
+#   /proc/sys/kernel/osrelease    "0.9.0"
 #   /proc/sys/kernel/hostname     the machine's name; root sets it by writing
 #   /proc/sys/kernel/clock        "SECONDS.NANOSECONDS" since 1970 (UTC); root
 #                                 sets the time (and the RTC) by writing seconds
@@ -331,7 +331,7 @@ fun mounts(o: *Out) {
         putc(o, 32);
         if (m.root == nil) { putc(o, 47); }
         or {
-            var dir: [256]u8;
+            var dir: [512]u8;
             put(o, ?dir[0], vfs.path_of(m.root, ?dir[0]));
         }
         putc(o, 32);

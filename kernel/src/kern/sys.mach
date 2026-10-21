@@ -59,6 +59,17 @@ fun user_path(va: u64, n: u64, out: *u8) u64 {
     if (n == 0) { ret e(abi.E_NOENT); }
     if (n >= path.MAX) { ret e(abi.E_NAMETOOLONG); }
     if (ok(va, n, 0) == 0) { ret e(abi.E_FAULT); }
+    val text: *u8 = va::*u8;
+    var component: u64 = 0;
+    var i: u64 = 0;
+    for (i < n) {
+        if (text[i] == 47) { component = 0; }
+        or {
+            component = component + 1;
+            if (component > abi.NAME_MAX) { ret e(abi.E_NAMETOOLONG); }
+        }
+        i = i + 1;
+    }
     val p: *proc.Proc = cur();
     val len: u64 = path.resolve(?p.cwd[0], p.cwd_len, va::*u8, n, out);
     if (len == 0) { ret e(abi.E_NAMETOOLONG); }
@@ -70,6 +81,7 @@ fun user_path(va: u64, n: u64, out: *u8) u64 {
 fun find_node(p: *u8, n: u64, out: **vfs.Node) u64 {
     val nd: *vfs.Node = vfs.lookup(p, n);
     if (nd == nil) {
+        if (vfs.was_looped() != 0) { ret e(abi.E_LOOP); }
         if (vfs.was_denied() != 0) { ret e(abi.E_ACCES); }
         ret e(abi.E_NOENT);
     }
@@ -137,6 +149,7 @@ fun spawn(parent: *proc.Proc, nd: *vfs.Node, full: *u8, full_len: u64,
     if (c == nil) { ret e(abi.E_AGAIN); }
     c.umask = 0x12; # 022
     if (parent != nil) {
+        c.affinity = proc.current_thread().affinity;
         c.uid = parent.uid;
         c.gid = parent.gid;
         c.euid = parent.euid;
@@ -222,7 +235,7 @@ pub fun spawn_init(p: *u8, rescue: u8) u64 {
 }
 
 fun sys_spawn(pva: u64, plen: u64, ava: u64, alen: u64, sva: u64) u64 {
-    var full: [256]u8;
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     var nd: *vfs.Node = nil;
@@ -339,6 +352,7 @@ fun sys_fork() u64 {
         ret e(abi.E_NOMEM);
     }
     c.ppid = p.pid;
+    c.affinity = proc.current_thread().affinity;
     c.group = p.group;
     c.session = p.session;
     c.uid = p.uid;
@@ -410,7 +424,7 @@ fun setid(p: *proc.Proc, nd: *vfs.Node) {
 fun sys_execve(pva: u64, plen: u64, ava: u64, alen: u64, eva: u64) u64 {
     # only the first thread may: the program replaced is the process's
     if (proc.current_thread() != cur()) { ret e(abi.E_BUSY); }
-    var full: [256]u8;
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     var nd: *vfs.Node = nil;
@@ -511,15 +525,21 @@ fun sys_execve(pva: u64, plen: u64, ava: u64, alen: u64, eva: u64) u64 {
 }
 
 fun sys_open(pva: u64, plen: u64, flags: u64, mode: u64) u64 {
-    var full: [256]u8;
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     var f: u64 = flags;
-    if ((f & (abi.O_READ | abi.O_WRITE)) == 0) { f = f | abi.O_READ; }
-    var nd: *vfs.Node = vfs.lookup(?full[0], n);
+    if ((f & abi.O_METADATA) == 0 && (f & (abi.O_READ | abi.O_WRITE)) == 0) { f = f | abi.O_READ; }
+    if ((f & abi.O_METADATA) != 0) {
+        if ((f & (abi.O_CREATE | abi.O_TRUNC | abi.O_WRITE)) != 0) { ret e(abi.E_INVAL); }
+        f = f & ~abi.O_READ;
+    }
+    var nd: *vfs.Node = vfs.lookup_mode(?full[0], n, ((flags & abi.O_NOFOLLOW) == 0)::u8);
+    if (nd != nil && nd.kind == abi.KIND_LINK && (f & abi.O_METADATA) == 0) { ret e(abi.E_LOOP); }
     if (nd != nil && (flags & (abi.O_CREATE | abi.O_EXCL)) == (abi.O_CREATE | abi.O_EXCL)) { ret e(abi.E_EXIST); }
     if (nd != nil && (flags & abi.O_DIRECTORY) != 0 && nd.kind != abi.KIND_DIR) { ret e(abi.E_NOTDIR); }
     if (nd == nil) {
+        if (vfs.was_looped() != 0) { ret e(abi.E_LOOP); }
         if (vfs.was_denied() != 0) { ret e(abi.E_ACCES); }
         if ((flags & abi.O_CREATE) == 0 || (flags & abi.O_DIRECTORY) != 0) { ret e(abi.E_NOENT); }
         val dir: *vfs.Node = vfs.parent_dir(?full[0], n);
@@ -531,6 +551,7 @@ fun sys_open(pva: u64, plen: u64, flags: u64, mode: u64) u64 {
         if (abi.is_err(cr) != 0) { ret cr; }
     } or {
         var want: u64 = 0;
+        if ((f & abi.O_METADATA_READ) != 0) { want = abi.R_OK; }
         if ((f & abi.O_READ) != 0) { want = want | abi.R_OK; }
         if ((f & abi.O_WRITE) != 0) { want = want | abi.W_OK; }
         if (vfs.allowed(nd, want) == 0) { ret e(abi.E_ACCES); }
@@ -571,17 +592,20 @@ fun sys_readdir(h: u64, idx: u64, out: u64) u64 {
     en.uid = c.uid;
     en.gid = c.gid;
     en.name_len = c.name_len;
-    mem.copy((?en.name[0])::u64, (?c.name[0])::u64, c.name_len);
+    if (en.name_len > 59) { en.name_len = 59; }
+    mem.copy((?en.name[0])::u64, (?c.name[0])::u64, en.name_len);
     ret 1;
 }
 
-fun sys_stat(pva: u64, plen: u64, out: u64) u64 {
-    var full: [256]u8;
+fun sys_stat(pva: u64, plen: u64, out: u64, flags: u64) u64 {
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     if (ok(out, $size_of(abi.Stat)::u64, 1) == 0) { ret e(abi.E_FAULT); }
     var nd: *vfs.Node = nil;
-    val fr: u64 = find_node(?full[0], n, ?nd);
+    nd = vfs.lookup_mode(?full[0], n, ((flags & abi.O_NOFOLLOW) == 0)::u8);
+    var fr: u64 = 0;
+    if (nd == nil) { fr = e(abi.E_NOENT); if (vfs.was_looped() != 0) { fr = e(abi.E_LOOP); } if (vfs.was_denied() != 0) { fr = e(abi.E_ACCES); } }
     if (abi.is_err(fr) != 0) { ret fr; }
     fill_stat(nd, out::*abi.Stat);
     ret 0;
@@ -614,7 +638,7 @@ fun fill_stat(nd: *vfs.Node, st: *abi.Stat) {
 }
 
 fun sys_mkdir(pva: u64, plen: u64, mode: u64) u64 {
-    var full: [256]u8;
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     if (vfs.lookup(?full[0], n) != nil) { ret e(abi.E_EXIST); }
@@ -629,11 +653,13 @@ fun sys_mkdir(pva: u64, plen: u64, mode: u64) u64 {
 }
 
 fun sys_remove(pva: u64, plen: u64) u64 {
-    var full: [256]u8;
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     var nd: *vfs.Node = nil;
-    val fr: u64 = find_node(?full[0], n, ?nd);
+    nd = vfs.lookup_mode(?full[0], n, 0);
+    var fr: u64 = 0;
+    if (nd == nil) { fr = e(abi.E_NOENT); }
     if (abi.is_err(fr) != 0) { ret fr; }
     if (nd.parent != nil) {
         val ch: u64 = may_change(nd.parent, nd);
@@ -642,12 +668,15 @@ fun sys_remove(pva: u64, plen: u64) u64 {
     ret vfs.unlink(nd);
 }
 
-fun sys_chmod(pva: u64, plen: u64, mode: u64) u64 {
-    var full: [256]u8;
+fun sys_chmod(pva: u64, plen: u64, mode: u64, nofollow: u64) u64 {
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     var nd: *vfs.Node = nil;
-    val fr: u64 = find_node(?full[0], n, ?nd);
+    nd = vfs.lookup_mode(?full[0], n, (nofollow == 0)::u8);
+    var fr: u64 = 0;
+    if (nd == nil) { fr = e(abi.E_NOENT); }
+    if (nd != nil && nd.kind == abi.KIND_LINK) { ret e(abi.E_NOTSUP); }
     if (abi.is_err(fr) != 0) { ret fr; }
     if (is_root() == 0 && cur().euid != nd.uid) { ret e(abi.E_PERM); }
     vfs.set_attr(nd, mode & 0xFFF, nd.uid, nd.gid);
@@ -655,7 +684,7 @@ fun sys_chmod(pva: u64, plen: u64, mode: u64) u64 {
 }
 
 fun sys_chown(pva: u64, plen: u64, uid: u64, gid: u64) u64 {
-    var full: [256]u8;
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     var nd: *vfs.Node = nil;
@@ -672,7 +701,7 @@ fun sys_chown(pva: u64, plen: u64, uid: u64, gid: u64) u64 {
 }
 
 fun sys_access(pva: u64, plen: u64, want: u64) u64 {
-    var full: [256]u8;
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     var nd: *vfs.Node = nil;
@@ -712,16 +741,18 @@ fun sys_setgid(gid: u64) u64 {
 }
 
 fun sys_rename(fva: u64, flen: u64, tva: u64, tlen: u64) u64 {
-    var from: [256]u8;
-    var to: [256]u8;
+    var from: [512]u8;
+    var to: [512]u8;
     val fnl: u64 = user_path(fva, flen, ?from[0]);
     if (abi.is_err(fnl) != 0) { ret fnl; }
     val tnl: u64 = user_path(tva, tlen, ?to[0]);
     if (abi.is_err(tnl) != 0) { ret tnl; }
     var src: *vfs.Node = nil;
-    val fr: u64 = find_node(?from[0], fnl, ?src);
+    src = vfs.lookup_mode(?from[0], fnl, 0);
+    var fr: u64 = 0;
+    if (src == nil) { fr = e(abi.E_NOENT); }
     if (abi.is_err(fr) != 0) { ret fr; }
-    val displaced: *vfs.Node = vfs.lookup(?to[0], tnl);
+    val displaced: *vfs.Node = vfs.lookup_mode(?to[0], tnl, 0);
     val dir: *vfs.Node = vfs.parent_dir(?to[0], tnl);
     if (dir == nil) { ret e(abi.E_NOENT); }
     if (src.parent != nil) {
@@ -740,7 +771,7 @@ fun sys_rename(fva: u64, flen: u64, tva: u64, tlen: u64) u64 {
 }
 
 fun sys_chdir(pva: u64, plen: u64) u64 {
-    var full: [256]u8;
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     var nd: *vfs.Node = nil;
@@ -960,7 +991,7 @@ fun sys_sbrk(n: u64) u64 {
 
 fun sys_mount(dva: u64, dlen: u64, pva: u64, plen: u64) u64 {
     if (is_root() == 0) { ret e(abi.E_PERM); }
-    var dp: [256]u8;
+    var dp: [512]u8;
     val dn: u64 = user_path(dva, dlen, ?dp[0]);
     if (abi.is_err(dn) != 0) { ret dn; }
     val dev: *vfs.Node = vfs.lookup(?dp[0], dn);
@@ -968,7 +999,7 @@ fun sys_mount(dva: u64, dlen: u64, pva: u64, plen: u64) u64 {
     if (dev.kind != abi.KIND_DEV) { ret e(abi.E_INVAL); }
     val b: *parts.Bdev = parts.get(dev.dev);
     if (b == nil) { ret e(abi.E_INVAL); }
-    var full: [256]u8;
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     val at: *vfs.Node = vfs.lookup(?full[0], n);
@@ -1012,7 +1043,10 @@ fun sys_mounts(idx: u64, out: u64) u64 {
     if (m.root == nil) {
         mi.dir[0] = 47;
     } or {
-        vfs.path_of(m.root, ?mi.dir[0]);
+        var full: [512]u8;
+        var length: u64 = vfs.path_of(m.root, ?full[0]);
+        if (length > 255) { length = 255; }
+        mem.copy((?mi.dir[0])::u64, (?full[0])::u64, length);
     }
     mount.space(m, ?mi.total, ?mi.free);
     val kn: *u8 = mount.kind_name(m);
@@ -1022,7 +1056,7 @@ fun sys_mounts(idx: u64, out: u64) u64 {
 
 fun sys_umount(pva: u64, plen: u64) u64 {
     if (is_root() == 0) { ret e(abi.E_PERM); }
-    var full: [256]u8;
+    var full: [512]u8;
     val n: u64 = user_path(pva, plen, ?full[0]);
     if (abi.is_err(n) != 0) { ret n; }
     val r: *vfs.Node = vfs.lookup(?full[0], n);
@@ -1139,7 +1173,7 @@ fun sys_fdpath(h: u64, buf: u64, len: u64) u64 {
     if (f == nil) { ret e(abi.E_BADF); }
     if (f.kind != file.NODE) { ret e(abi.E_INVAL); }
     if (f.node.unlinked != 0) { ret e(abi.E_NOENT); }
-    var p: [256]u8;
+    var p: [512]u8;
     val n: u64 = vfs.path_of(f.node, ?p[0]);
     var k: u64 = n;
     if (k > len) { k = len; }
@@ -1558,6 +1592,126 @@ fun sys_sleep(ms: u64) u64 {
     ret 0;
 }
 
+# symlinks store their target without following the final directory entry
+fun sys_symlink(target: u64, length: u64, pva: u64, plen: u64) u64 {
+    if (length == 0 || length >= path.MAX) { ret e(abi.E_INVAL); }
+    if (ok(target, length, 0) == 0) { ret e(abi.E_FAULT); }
+    var full: [512]u8;
+    val n: u64 = user_path(pva, plen, ?full[0]);
+    if (abi.is_err(n) != 0) { ret n; }
+    if (vfs.lookup_mode(?full[0], n, 0) != nil) { ret e(abi.E_EXIST); }
+    if (vfs.was_denied() != 0) { ret e(abi.E_ACCES); }
+    val dir: *vfs.Node = vfs.parent_dir(?full[0], n);
+    if (dir == nil) { ret e(abi.E_NOENT); }
+    val permission: u64 = may_change(dir, nil);
+    if (abi.is_err(permission) != 0) { ret permission; }
+    val b: u64 = path.base_index(?full[0], n);
+    var nd: *vfs.Node = nil;
+    val made: u64 = vfs.create(dir, ?full[b], n - b, abi.KIND_LINK, 0x1FF, ?nd);
+    if (abi.is_err(made) != 0) { ret made; }
+    val wrote: u64 = vfs.write(nd, 0, target, length);
+    if (wrote != length) {
+        vfs.unlink(nd);
+        if (abi.is_err(wrote) != 0) { ret wrote; }
+        ret e(abi.E_IO);
+    }
+    ret 0;
+}
+
+fun sys_fchmod(fd: u64, mode: u64) u64 {
+    val f: *file.Handle = handle(fd);
+    if (f == nil || f.kind != file.NODE) { ret e(abi.E_BADF); }
+    val nd: *vfs.Node = f.node;
+    if (nd.kind == abi.KIND_LINK) { ret e(abi.E_NOTSUP); }
+    if (is_root() == 0 && cur().euid != nd.uid) { ret e(abi.E_PERM); }
+    vfs.set_attr(nd, mode & 0xFFF, nd.uid, nd.gid);
+    ret 0;
+}
+
+fun sys_thread_name(set: u64, buffer: u64, capacity: u64, tid: u64) u64 {
+    var t: *proc.Proc = proc.current_thread();
+    if (tid != 0) {
+        t = nil;
+        var i: u64 = 0;
+        for (i < proc.MAX) {
+            val candidate: *proc.Proc = proc.slot(i);
+            if (candidate.state != proc.FREE && candidate.pid == tid && proc.process_of(candidate) == cur()) { t = candidate; brk; }
+            i = i + 1;
+        }
+        if (t == nil) { ret e(abi.E_SRCH); }
+    }
+    if (set != 0) {
+        if (capacity > 15) { ret e(abi.E_RANGE); }
+        if (ok(buffer, capacity, 0) == 0) { ret e(abi.E_FAULT); }
+        mem.copy((?t.name[0])::u64, buffer, capacity);
+        t.name_len = capacity;
+        ret 0;
+    }
+    if (capacity <= t.name_len) { ret e(abi.E_RANGE); }
+    if (ok(buffer, t.name_len + 1, 1) == 0) { ret e(abi.E_FAULT); }
+    mem.copy(buffer, (?t.name[0])::u64, t.name_len);
+    @((buffer + t.name_len)::*u8) = 0;
+    ret t.name_len;
+}
+
+# CPU ids use one mask word: this kernel supports at most sixteen CPUs
+fun sys_affinity(set: u64, words: u64, capacity: u64, required: u64) u64 {
+    var allowed: u64 = 1;
+    var cpu_index: u64 = 1;
+    for (cpu_index < smp.MAX) {
+        if (smp.is_up(cpu_index) != 0) { allowed = allowed | (1u64 << cpu_index); }
+        cpu_index = cpu_index + 1;
+    }
+    val t: *proc.Proc = proc.current_thread();
+    if (set != 0) {
+        if (capacity == 0 || capacity > 256) { ret e(abi.E_INVAL); }
+        if (ok(words, capacity * 8, 0) == 0) { ret e(abi.E_FAULT); }
+        val mask: u64 = @(words::*u64);
+        if (mask == 0 || (mask & ~allowed) != 0) { ret e(abi.E_INVAL); }
+        var i: u64 = 1;
+        for (i < capacity) {
+            if (@((words + i * 8)::*u64) != 0) { ret e(abi.E_INVAL); }
+            i = i + 1;
+        }
+        t.affinity = mask;
+        ret 0;
+    }
+    if (ok(required, 8, 1) == 0) { ret e(abi.E_FAULT); }
+    @(required::*u64) = 1;
+    if (capacity == 0) { ret e(abi.E_RANGE); }
+    if (ok(words, 8, 1) == 0) { ret e(abi.E_FAULT); }
+    var mask: u64 = t.affinity;
+    if (mask == 0) { mask = allowed; }
+    @(words::*u64) = mask;
+    ret 0;
+}
+
+fun sys_stack_bounds(low: u64, high: u64) u64 {
+    if (ok(low, 8, 1) == 0 || ok(high, 8, 1) == 0) { ret e(abi.E_FAULT); }
+    @(low::*u64) = exec.STACK_TOP - exec.STACK_RESERVE;
+    @(high::*u64) = exec.STACK_TOP;
+    ret 0;
+}
+
+fun sys_readdir_long(fd: u64, index: u64, out: u64) u64 {
+    val f: *file.Handle = handle(fd);
+    if (f == nil || f.kind != file.NODE) { ret e(abi.E_BADF); }
+    if (f.node.kind != abi.KIND_DIR) { ret e(abi.E_NOTDIR); }
+    if (ok(out, $size_of(abi.LongEntry)::u64, 1) == 0) { ret e(abi.E_FAULT); }
+    val c: *vfs.Node = vfs.nth_child(f.node, index);
+    if (c == nil) { ret 0; }
+    val en: *abi.LongEntry = out::*abi.LongEntry;
+    en.kind = c.kind;
+    en.size = c.size;
+    en.mtime = vfs.mtime_of(c);
+    en.mode = c.mode;
+    en.uid = c.uid;
+    en.gid = c.gid;
+    en.name_len = c.name_len;
+    mem.copy((?en.name[0])::u64, (?c.name[0])::u64, c.name_len);
+    ret 1;
+}
+
 fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.EXIT) {
         exit_with(a);
@@ -1577,6 +1731,12 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
         if (ok(b, c, 0) == 0) { ret e(abi.E_FAULT); }
         ret file.write(h, b, c);
     }
+    if (n == abi.SYMLINK) { ret sys_symlink(a, b, c, d); }
+    if (n == abi.FCHMOD) { ret sys_fchmod(a, b); }
+    if (n == abi.THREAD_NAME) { ret sys_thread_name(a, b, c, d); }
+    if (n == abi.AFFINITY) { ret sys_affinity(a, b, c, d); }
+    if (n == abi.STACK_BOUNDS) { ret sys_stack_bounds(a, b); }
+    if (n == abi.READDIR_LONG) { ret sys_readdir_long(a, b, c); }
     if (n == abi.OPEN)    { ret sys_open(a, b, c, d); }
     if (n == abi.CLOSE)   { ret sys_close(a); }
     if (n == abi.SPAWN)   { ret sys_spawn(a, b, c, d, f5); }
@@ -1585,9 +1745,9 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
     if (n == abi.EXECVE)  { ret sys_execve(a, b, c, d, f5); }
     if (n == abi.GETPPID) { ret cur().ppid; }
     if (n == abi.READDIR) { ret sys_readdir(a, b, c); }
-    if (n == abi.STAT)    { ret sys_stat(a, b, c); }
+    if (n == abi.STAT)    { ret sys_stat(a, b, c, d); }
     if (n == abi.MKDIR)   { ret sys_mkdir(a, b, c); }
-    if (n == abi.CHMOD)   { ret sys_chmod(a, b, c); }
+    if (n == abi.CHMOD)   { ret sys_chmod(a, b, c, d); }
     if (n == abi.CHOWN)   { ret sys_chown(a, b, c, d); }
     if (n == abi.ACCESS)  { ret sys_access(a, b, c); }
     if (n == abi.SETUID)  { ret sys_setuid(a); }

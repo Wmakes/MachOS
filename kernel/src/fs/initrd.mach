@@ -41,7 +41,7 @@ pub fun unpack(tar: u64, len: u64) u64 {
     var files: u64 = 0;
     var off: u64 = 0;
     var raw: [256]u8;
-    var norm: [256]u8;
+    var norm: [512]u8;
     for (off + 512 <= len) {
         val h: *u8 = (tar + off)::*u8;
         if (h[0] == 0) { brk; }

@@ -38,7 +38,7 @@ pub val BLOCKED:  u64 = 3;
 pub val ZOMBIE:   u64 = 4;
 pub val STOPPED:  u64 = 5;
 
-pub val CWD_MAX: u64 = 256;
+pub val CWD_MAX: u64 = 512;
 
 # wait channels for things that are not a process or a kernel object
 pub val CHAN_TTY:   u64 = 1;
@@ -47,6 +47,7 @@ pub val CHAN_EVENTS: u64 = 3; # readers of /dev/events
 pub val CHAN_FUTEX:  u64 = 4; # threads in FUTEX_WAIT (Proc.futex: the word)
 
 pub rec Proc {
+    affinity: u64; # zero means every online CPU, otherwise an allowed CPU mask
     pid:       u64;
     ppid:      u64;  # 0 once the parent is gone
     group:     u64;
@@ -81,7 +82,7 @@ pub rec Proc {
     cpu_ticks: u64;  # timer ticks spent running
     handles:   [256]u64;
     fdflags:   [256]u8; # FD_CLOEXEC per fd
-    cwd:       [256]u8;
+    cwd:       [512]u8;
     cwd_len:   u64;
     name:      [32]u8;
     name_len:  u64;
@@ -285,6 +286,7 @@ pub fun alloc_thread(p: *Proc) *Proc {
             t.kstack = heap.alloc(KSTACK);
             if (t.kstack == 0) { ret nil; }
             t.pml4 = p.pml4;
+            t.affinity = current_thread().affinity;
             t.leader = p;
             t.pid = next_pid;
             next_pid = next_pid + 1;
@@ -617,7 +619,7 @@ pub fun scheduler(me: u64) {
         for (n < MAX && picked == nil) {
             last = (last + 1) % MAX;
             # one thread of a process at a time: its siblings wait their turn
-            if (table[last].state == RUNNABLE && process_of(?table[last]).on_cpu == 0) { picked = ?table[last]; }
+            if (table[last].state == RUNNABLE && (table[last].affinity == 0 || (table[last].affinity & (1 << me)) != 0) && process_of(?table[last]).on_cpu == 0) { picked = ?table[last]; }
             n = n + 1;
         }
         if (picked == nil) {
