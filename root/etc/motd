@@ -1,8 +1,18 @@
 
-  Welcome to MachOS -- a kernel and userland written in mach.
-  `ls /bin` lists the programs; arrows recall history, tab completes.
-  `nano FILE` edits text, `less FILE` reads it; `shutdown` switches off.
-  alt+F1..F6 switch terminals; shift+PgUp/PgDn scroll back.
-  To install MachOS on a disk: `ls -l /dev`, then `install /dev/sdX` (or nvme0n1).
-  Accounts: `adduser NAME`, `passwd NAME`, `su`. root has no password until you set one.
+  Welcome to MachOS!
+  A small operating system with a kernel and userland written in mach.
+
+  To install MachOS on your disk:
+    Run `ls -l /dev` to find your disk, then `install /dev/sdX`.
+    For an NVMe disk, use `install /dev/nvme0n1`.
+    Choose the whole disk, not a partition. Installation erases that disk.
+
+  Getting started:
+    `ls /bin` lists commands; `ls --help` explains listing options.
+    `config --help` shows how to change persistent system settings.
+    `nano FILE` edits text; `less FILE` reads it; `shutdown` powers off.
+    `passwd` sets your password; `adduser NAME` creates another account.
+
+  Arrows recall commands; Tab completes names; Alt+F1..F6 switch terminals.
+  Shift+PgUp/PgDn scroll back. Root has no password on the live image.
 

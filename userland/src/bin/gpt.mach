@@ -52,20 +52,60 @@ fun header(h: *u8, me: u64, other: u64, entries_at: u64, last_usable: u64, disk:
     bd.put32(h, 16, bd.crc32(h, 92));
 }
 
+# Match the kernel's whole-disk names, then compare device identities. This
+# also accepts aliases without mistaking a partition or character device for a disk.
+fun disk_name(name: *u8, n: u64) u8 {
+    if (n >= 3 && name[0] == 115 && name[1] == 100) {
+        var i: u64 = 2;
+        for (i < n && name[i] >= 97 && name[i] <= 122) { i = i + 1; }
+        ret (i == n)::u8;
+    }
+    if (n < 7 || io.eq(name, 4, "nvme", 4) == 0) { ret 0; }
+    var i: u64 = 4; val start: u64 = i;
+    for (i < n && name[i] >= 48 && name[i] <= 57) { i = i + 1; }
+    if (i == start || i == n || name[i] != 110) { ret 0; }
+    i = i + 1; val namespace: u64 = i;
+    for (i < n && name[i] >= 48 && name[i] <= 57) { i = i + 1; }
+    ret (i > namespace && i == n)::u8;
+}
+
+fun whole_disk(st: *abi.Stat) u8 {
+    if (st.kind != abi.KIND_DEV || st.sector == 0) { ret 0; }
+    val h: u64 = sys.open("/dev", 4, abi.O_READ);
+    if (abi.is_err(h) != 0) { ret 0; }
+    var index: u64 = 0; var found: u8 = 0;
+    for {
+        var entry: abi.Entry;
+        val got: u64 = sys.readdir(h, index, ?entry);
+        if (abi.is_err(got) != 0 || got == 0) { brk; }
+        index = index + 1;
+        if (disk_name(?entry.name[0], entry.name_len) == 0) { cnt; }
+        var path: [128]u8;
+        io.copy(?path[0], "/dev/", 5);
+        io.copy(?path[5], ?entry.name[0], entry.name_len); path[5 + entry.name_len] = 0;
+        var candidate: abi.Stat;
+        if (abi.is_err(sys.stat(?path[0], 5 + entry.name_len, ?candidate)) == 0 &&
+            candidate.kind == abi.KIND_DEV && candidate.sector != 0 && candidate.rdev == st.rdev) { found = 1; brk; }
+    }
+    sys.close(h); ret found;
+}
+
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
-    if (argc != 2) {
-        io.err("usage: gpt DISK\n\0");
-        ret 2;
-    }
+    var check: u8 = 0; var target: *u8 = nil;
+    if (argc == 3 && io.streq(argv[1], "--check") != 0) { check = 1; target = argv[2]; }
+    or (argc == 2 && io.streq(argv[1], "--check") == 0) { target = argv[1]; }
+    or { io.err("usage: gpt [--check] DISK\n"); ret 2; }
     var st: abi.Stat;
-    sys.stat(argv[1], io.len(argv[1]), ?st);
+    val stat_result: u64 = sys.stat(target, io.len(target), ?st);
+    if (abi.is_err(stat_result) != 0) { io.fail("gpt", target, stat_result); ret 1; }
+    if (whole_disk(?st) == 0) { io.err("gpt: target must be a whole disk, not a partition or character device\n"); ret 1; }
     if (st.sector != 0 && st.sector != 512) {
         io.err("gpt: this disk has 4096-byte sectors; MachOS can only partition\n\0");
         io.err("     512-byte-sector disks so far (most disks are)\n\0");
         ret 1;
     }
-    val sectors: u64 = bd.disk_size(argv[1]) / bd.SECTOR;
+    val sectors: u64 = bd.disk_size(target) / bd.SECTOR;
     val last: u64 = sectors - 1;
     val last_usable: u64 = last - 33;
     val root_start: u64 = ESP_START + ESP_SECTORS;
@@ -73,9 +113,10 @@ fun main(argc: u64, argv: **u8) u64 {
         io.err("gpt: the disk is too small (at least 100 MiB)\n\0");
         ret 1;
     }
+    if (check != 0) { ret 0; }
     var root_count: u64 = (last_usable + 1 - root_start) / 2048 * 2048;
     if (root_count > ROOT_MAX) { root_count = ROOT_MAX; }
-    val h: u64 = bd.open_disk("gpt\0", argv[1], 1);
+    val h: u64 = bd.open_disk("gpt\0", target, 1);
     if (abi.is_err(h) != 0) { ret 1; }
 
     bd.clear(?table[0], 16384);
@@ -113,16 +154,16 @@ fun main(argc: u64, argv: **u8) u64 {
         ret 1;
     }
     io.out("gpt: \0");
-    io.out(argv[1]);
+    io.out(target);
     # partitions are DISK1 / DISK2, or DISKp1 / DISKp2 when DISK ends in a digit
-    val dn: u64 = io.len(argv[1]);
+    val dn: u64 = io.len(target);
     var sep: *u8 = "\0";
-    if (dn > 0 && argv[1][dn - 1] >= 48 && argv[1][dn - 1] <= 57) { sep = "p\0"; }
+    if (dn > 0 && target[dn - 1] >= 48 && target[dn - 1] <= 57) { sep = "p\0"; }
     io.out(": \0");
-    io.out(argv[1]);
+    io.out(target);
     io.out(sep);
     io.out("1 EFI system 64 MiB, \0");
-    io.out(argv[1]);
+    io.out(target);
     io.out(sep);
     io.out("2 MachOS root \0");
     io.dec(root_count / 2048);

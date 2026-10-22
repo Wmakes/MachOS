@@ -1244,14 +1244,29 @@ fun add_str(at: u64, s2: *u8) u64 {
 var me: [32]u8; # the user's name, found once
 var me_len: u64 = 0;
 
-# "user@machos:/cwd$ " in colour ("#" for root), NUL-terminated
+# "user@hostname:/cwd$ " in colour ("#" for root), NUL-terminated
 fun prompt() *u8 {
     if (me_len == 0) { me_len = users.user_name(sys.geteuid(), ?me[0]); }
     var dir: [256]u8;
     val n: u64 = cwd(?dir[0], 256);
     var at: u64 = add_str(0, "\x1b[1;32m\0");
     io.copy(?prompt_buf[at], ?me[0], me_len);
-    at = add_str(at + me_len, "@machos\x1b[0m:\x1b[1;34m\0");
+    at = add_str(at + me_len, "@");
+    # Read at each prompt so live hostname changes do not leave a stale name.
+    var host: [64]u8;
+    var host_len: u64 = 0;
+    val h: u64 = sys.open("/proc/sys/kernel/hostname", 25, abi.O_READ);
+    if (abi.is_err(h) == 0) {
+        val r: u64 = sys.read(h, ?host[0], 63);
+        sys.close(h);
+        if (abi.is_err(r) == 0) {
+            host_len = r;
+            for (host_len > 0 && (host[host_len - 1] == 10 || host[host_len - 1] == 13)) { host_len = host_len - 1; }
+        }
+    }
+    if (host_len == 0) { at = add_str(at, "machos"); }
+    or { io.copy(?prompt_buf[at], ?host[0], host_len); at = at + host_len; }
+    at = add_str(at, "\x1b[0m:\x1b[1;34m");
     io.copy(?prompt_buf[at], ?dir[0], n);
     if (sys.geteuid() == 0) { at = add_str(at + n, "\x1b[0m# \0"); }
     or                      { at = add_str(at + n, "\x1b[0m$ \0"); }

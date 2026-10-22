@@ -652,6 +652,12 @@ TESTS = [
      ["command not found", "status 127", "or-ok", "and-ok",
       "single $? quotes a   b", "/etc", "from-script"]),
 
+    ("hostname-prompt", False, False,
+     ["wait:" + P, "send:echo prompt-check > /proc/sys/kernel/hostname\\n",
+      "wait:root@prompt-check", "send:uname -n; echo machos > /proc/sys/kernel/hostname\\n",
+      "wait:root@machos"],
+     ["root@prompt-check", "\nprompt-check\n", "root@machos"]),
+
     ("line-editing", False, False,
      ["wait:" + P, "send:echo one\\n", "wait:" + P, "send:echo two\\n", "wait:" + P,
       "send:\\x1b[A\\x1b[A", "sleep:0.3", "send:\\n", "wait:" + P,
@@ -776,7 +782,7 @@ TESTS = [
     # an update from a package on a USB stick, then a reboot into it
     ("update", False, True,
      ["--prep", update_stick] + usb_stick() + [
-      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update; update /mnt/update.tgz; umount /mnt; machboot\\n",
+      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; rm -r /usr/share/licenses; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update; update /mnt/update.tgz; umount /mnt; machboot\\n",
       "wait:" + P],
      ["updating MachOS", "installing the programs", "MachOS is updated to 0.9.1", "MachOS (previous)"]),
     ("update-reboot", True, True,
@@ -1063,6 +1069,21 @@ TESTS = [
       "wait:" + P, "send:echo hi > /tmp/z; poweroff\\n", "wait:power: off", "sleep:1"],
      ["power: off"]),
 
+    ("install-guards", False, True,
+     ["--disk2", "blank:" + os.path.join(ROOT, "out/headless/install-guard.img"),
+      "wait:" + P,
+      "send:head -c512 /dev/sdb | sha256sum > /tmp/before; gpt --check /dev/sdb; echo disk-check $?; head -c512 /dev/sdb | sha256sum > /tmp/after; diff /tmp/before /tmp/after; echo check-unchanged $?\\n",
+      "wait:" + P,
+      "send:install /dev/sda2; echo partition-rejected $?; install /dev/zero; echo character-rejected $?; gpt /dev/sda2; echo gpt-partition $?; gpt /dev/null; echo gpt-character $?\\n",
+      "wait:" + P,
+      "send:touch /tmp/mode; chmod 640 /tmp/mode; chmod 10000 /tmp/mode; echo mode-range $?; ls -l /tmp/mode; chmod '' /tmp/mode; echo mode-empty $?; chmod u+r, /tmp/mode; echo mode-comma $?; chmod 7777777777777777777777777777 /tmp/mode; echo mode-overflow $?; ls -l /tmp/mode\\n",
+      "wait:" + P,
+      "send:chmod u+x,go-r /tmp/mode; ls -l /tmp/mode; chmod 7777 /tmp/mode; ls -l /tmp/mode; chmod 0 /tmp/mode; ls -l /tmp/mode\\n",
+      "wait:" + P],
+     ["disk-check 0", "check-unchanged 0", "partition-rejected 2", "character-rejected 2",
+      "gpt-partition 1", "gpt-character 1", "mode-range 2", "-rw-r-----", "mode-empty 2",
+      "mode-comma 2", "mode-overflow 2", "-rw-r-----", "-rwx------", "-rwsrwsrwt", "----------"]),
+
     # install onto a blank second disk, then boot that disk on its own
     ("install", False, False,
      ["--disk2", "blank:" + TARGET,
@@ -1134,6 +1155,24 @@ for index, (name, keep, fsck, steps, expect) in enumerate(TESTS):
         TESTS[index] = (name, keep, fsck,
                         steps + ["send:sha256sum /etc/ssl/certs/ca-certificates.crt; ca-update --provider unsupported; test \"$?\" = 2; echo ca-tool-status $?\\n", "wait:" + P],
                         expect + [CA_BUNDLE_SHA256, "usage: ca-update", "ca-tool-status 0"])
+
+
+# Installed and updated systems must retain every shipped licence and the MOTD.
+NOTICE_FILES = sorted(os.path.relpath(os.path.join(directory, name), os.path.join(ROOT, "root"))
+                      for directory, _, names in os.walk(os.path.join(ROOT, "root", "usr", "share", "licenses"))
+                      for name in names)
+NOTICE_FILES.append("etc/motd")
+NOTICE_HASHES = []
+for path in NOTICE_FILES:
+    with open(os.path.join(ROOT, "root", path), "rb") as source:
+        NOTICE_HASHES.append(hashlib.sha256(source.read()).hexdigest() + "  /" + path)
+for index, (name, keep, fsck, steps, expect) in enumerate(TESTS):
+    if name in ("live-iso", "update", "update-reboot", "usb-installed-boot",
+                "nvme-installed-boot", "installed-boot"):
+        TESTS[index] = (name, keep, fsck,
+                        steps + ["send:sha256sum " + " ".join("/" + path for path in NOTICE_FILES) + "\\n",
+                                 "wait:" + P, "send:ls -l /bin/su /bin/passwd\\n", "wait:" + P],
+                        expect + NOTICE_HASHES + ["-rwsr-xr-x", "-rwsr-xr-x"])
 
 
 def run(name, keep, fsck, steps, expect, profile):

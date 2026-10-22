@@ -1,6 +1,6 @@
 # update FILE: install a MachOS update package (made by tools/mkupdate.sh:
 # a .tgz with VERSION, boot/kernel.elf, boot/initrd.tar, boot/BOOTX64.EFI,
-# bin/*, etc/motd and etc/machos.conf). the running kernel and initrd are kept as
+# bin/*, configuration and usr/share/licenses). the running kernel and initrd are kept as
 # /boot/kernel.old.elf and /boot/initrd.old.tar, and machboot gets an entry
 # "MachOS (previous)" that boots them, in case the new one does not start.
 # the programs in /bin are replaced, machboot too (on the EFI partition as
@@ -179,6 +179,18 @@ fun main(argc: u64, argv: **u8) u64 {
     # the settings file only when there is none yet: the one there is yours
     if (exists("/tmp/update/etc/machos.conf\0") != 0 && exists("/etc/machos.conf\0") == 0) {
         install("etc/machos.conf\0", "/etc/machos.conf\0");
+    }
+
+    # New packages carry notices; older packages without them remain installable.
+    if (exists("/tmp/update/usr/share/licenses") != 0) {
+        sys.mkdir("/usr", 4);
+        sys.mkdir("/usr/share", 10);
+        an = 0;
+        arg("cp"); arg("-r"); arg("/tmp/update/usr/share/licenses"); arg("/usr/share");
+        if (run("/bin/cp", ?a[0], an) != 0) {
+            fail("could not install licence files");
+            failures = failures + 1;
+        }
     }
 
     # every program

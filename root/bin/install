@@ -5,12 +5,13 @@
 #   2. mkfat   the EFI partition, with machboot (the boot loader) only: it
 #              reads its settings, the kernel and the initrd from /boot
 #   3. mkext2  the root partition, an empty filesystem
-#   4. mount it and copy /bin, /etc and /boot over
+#   4. mount it and copy /bin, /etc, /boot and /usr over
 #   5. a root password for the new system (it must have one)
 test -n "$1" || echo "usage: install DISK (see ls -l /dev)"
 test -n "$1" || exit 2
 test -b "$1" || echo "install: $1 is not a disk"
 test -b "$1" || exit 2
+gpt --check "$1" || exit 2
 echo "This erases everything on $1 and installs MachOS there."
 confirm "Type yes to continue: " || exit 1
 ESP=$(partname $1 1)
@@ -21,7 +22,8 @@ mkext2 $ROOT || exit 1
 test -d /mnt || mkdir /mnt
 mount $ROOT /mnt || exit 1
 echo "copying the system..."
-cp -r /bin /etc /boot /mnt || exit 1
+cp -r /bin /etc /boot /usr /mnt || exit 1
+chmod 4755 /mnt/bin/su /mnt/bin/passwd || exit 1
 mkdir /mnt/home
 mkdir /mnt/root
 chmod 700 /mnt/root

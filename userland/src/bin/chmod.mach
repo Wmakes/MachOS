@@ -9,12 +9,15 @@ val NO_MODE: u64 = 0xFFFFFFFFFFFFFFFF; # not a mode
 
 # apply MODE to `old`; NO_ID if MODE makes no sense
 fun apply(m: *u8, n: u64, old: u64) u64 {
+    if (n == 0) { ret NO_MODE; }
     if (n > 0 && m[0] >= 48 && m[0] <= 55) {
         var v: u64 = 0;
         var i: u64 = 0;
         for (i < n) {
             if (m[i] < 48 || m[i] > 55) { ret NO_MODE; }
-            v = v * 8 + (m[i] - 48)::u64;
+            val digit: u64 = (m[i] - 48)::u64;
+            if (v > (0o7777 - digit) / 8) { ret NO_MODE; }
+            v = v * 8 + digit;
             i = i + 1;
         }
         ret v & 0xFFF;
@@ -50,7 +53,7 @@ fun apply(m: *u8, n: u64, old: u64) u64 {
         if (op == 43) { mode = mode | bits; }
         or (op == 45) { mode = mode & ~bits; }
         or { mode = (mode & ~who) | bits; }
-        if (i < n) { i = i + 1; } # the comma
+        if (i < n) { i = i + 1; if (i == n) { ret NO_MODE; } } # The comma must start another clause.
     }
     ret mode & 0xFFF;
 }
