@@ -318,6 +318,7 @@ fun mappings() {
 
     # munmap: gone, and touching it faults
     check("munmap\0", (sys.munmap(a, big) == 0)::u8);
+    check("unmapping preserves a neighboring mapping\0", io.eq(fm::*u8, 16, "mapped file text\0", 16));
     val g: u64 = sys.fork();
     if (g == 0) {
         val x: u64 = @last;

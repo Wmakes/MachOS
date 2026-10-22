@@ -1,5 +1,6 @@
-# physical page allocator: a free list threaded through the free pages
-# themselves, reached through the hhdm
+# Physical page allocator: untouched ranges plus a list of returned pages.
+# Do not write into every free page at boot: large guests would immediately
+# consume their entire RAM allocation on the host before running any work.
 
 use info: machos.boot.info;
 
@@ -9,6 +10,10 @@ var hhdm: u64 = 0;
 var head: u64 = 0; # physical address of the first free page, 0 = empty
 var free_count: u64 = 0;
 var total_count: u64 = 0;
+
+rec Range { start: u64; end: u64; }
+var ranges: [256]Range;
+var range_count: u64 = 0;
 
 fun link_of(phys: u64) *u64 {
     ret (phys + hhdm)::*u64;
@@ -22,19 +27,26 @@ pub fun free(phys: u64) {
 
 # one 4 KiB page as it is (not zeroed), or 0 when out of memory
 pub fun alloc_raw() u64 {
-    if (head == 0) { ret 0; }
-    val phys: u64 = head;
-    head = @link_of(phys);
-    free_count = free_count - 1;
-    ret phys;
+    if (head != 0) {
+        val phys: u64 = head;
+        head = @link_of(phys);
+        free_count = free_count - 1;
+        ret phys;
+    }
+    for (range_count != 0) {
+        val r: *Range = ?ranges[range_count - 1];
+        if (r.end == r.start) { range_count = range_count - 1; cnt; }
+        r.end = r.end - PAGE;
+        free_count = free_count - 1;
+        ret r.end;
+    }
+    ret 0;
 }
 
 # one zeroed 4 KiB page, or 0 when out of memory
 pub fun alloc() u64 {
-    if (head == 0) { ret 0; }
-    val phys: u64 = head;
-    head = @link_of(phys);
-    free_count = free_count - 1;
+    val phys: u64 = alloc_raw();
+    if (phys == 0) { ret 0; }
     val p: *u64 = link_of(phys);
     var i: u64 = 0;
     for (i < PAGE / 8) {
@@ -77,6 +89,10 @@ pub fun release(pa: u64) {
 
 pub fun init(bi: *info.BootInfo) {
     hhdm = bi.hhdm;
+    head = 0;
+    free_count = 0;
+    total_count = 0;
+    range_count = 0;
     # room for the sharing counts: one u16 per page up to the highest one
     var top: u64 = 0;
     var i: u64 = 0;
@@ -112,10 +128,13 @@ pub fun init(bi: *info.BootInfo) {
             val end: u64 = (r.base + r.len) & ~(PAGE - 1);
             if (p == 0) { p = PAGE; }
             if (p == ref_at) { p = p + ref_pages * PAGE; } # the counts live here
-            for (p < end) {
-                free(p);
-                total_count = total_count + 1;
-                p = p + PAGE;
+            if (p < end) {
+                ranges[range_count].start = p;
+                ranges[range_count].end = end;
+                range_count = range_count + 1;
+                val pages: u64 = (end - p) / PAGE;
+                free_count = free_count + pages;
+                total_count = total_count + pages;
             }
         }
         i = i + 1;

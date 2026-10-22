@@ -40,3 +40,19 @@ need = []
 
 [dep.sdk]
 path = "../../sdk"
+
+[artifact.ramtest]
+kind = "bin"
+entry = "ramtest.mach"
+out = "ramtest"
+targets = ["machos"]
+link = []
+need = []
+
+[artifact.smptest]
+kind = "bin"
+entry = "smptest.mach"
+out = "smptest"
+targets = ["machos"]
+link = []
+need = []

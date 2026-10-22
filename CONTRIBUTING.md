@@ -10,9 +10,6 @@ Fork the repository and create a branch from `main`. Clone your fork, then run
 `tools/deps.sh` to initialize the pinned dependencies under `deps/` and prepare
 the generated compatibility copies. No sibling checkouts are required.
 
-The `machos-std` submodule currently uses a GitHub SSH URL, so fetching it requires
-GitHub SSH access. Other upstream dependencies use HTTPS.
-
 Use Mach 6.10.x. On Arch Linux, the host tools can be installed with:
 
 ```sh

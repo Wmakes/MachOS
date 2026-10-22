@@ -14,7 +14,6 @@ use io:     userland.lib.cli;
 use addr:   userland.lib.netaddr;
 use std.types.size.usize;
 use std.types.result.res;
-use std.types.error.err;
 use std.net.ip;
 use std.net.tcp;
 use io_error: std.io.error;

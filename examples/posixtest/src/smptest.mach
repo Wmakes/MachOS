@@ -1,0 +1,77 @@
+# Synchronized CPU-bound processes must make progress on every online core.
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io: sdk.io;
+use rt: sdk.rt;
+
+var children: [16]u64;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    var initial: abi.Info;
+    sys.info(?initial);
+    if (initial.cpus < 2 || initial.cpus > 16) { ret 1; }
+    var ready: [2]u64;
+    var gate: [2]u64;
+    if (sys.pipe(?ready) != 0 || sys.pipe(?gate) != 0) { ret 1; }
+    var i: u64 = 0;
+    for (i < initial.cpus) {
+        val pid: u64 = sys.fork();
+        if (abi.is_err(pid) != 0) { ret 1; }
+        if (pid == 0) {
+            var mask: u64 = 1u64 << i;
+            if (sys.raw(abi.AFFINITY, 1, (?mask)::u64, 1, 0, 0) != 0) { sys.exit(1); }
+            var token: u8 = 1;
+            if (sys.write(ready[1], ?token, 1) != 1 || sys.read(gate[0], ?token, 1) != 1) { sys.exit(1); }
+            var now: abi.Info;
+            sys.info(?now);
+            val start: u64 = now.uptime_ms;
+            var value: u64 = i + 1;
+            for (now.uptime_ms - start < 2000) {
+                var n: u64 = 0;
+                for (n < 100000) {
+                    value = (value ^ (value >> 13)) * 6364136223846793005 + 1;
+                    n = n + 1;
+                }
+                sys.info(?now);
+            }
+            sys.exit((value == 0)::u64);
+        }
+        children[i] = pid;
+        i = i + 1;
+    }
+    var token: u8 = 1;
+    i = 0;
+    for (i < initial.cpus) {
+        if (sys.read(ready[0], ?token, 1) != 1) { ret 1; }
+        i = i + 1;
+    }
+    var before: abi.Info;
+    sys.info(?before);
+    i = 0;
+    for (i < initial.cpus) { sys.write(gate[1], ?token, 1); i = i + 1; }
+    i = 0;
+    for (i < initial.cpus) {
+        var status: u64 = 0;
+        if (sys.waitpid(children[i], ?status, 0) != children[i] || status != 0) { ret 1; }
+        i = i + 1;
+    }
+    var after: abi.Info;
+    sys.info(?after);
+    var busy: u64 = 0;
+    i = 0;
+    for (i < initial.cpus) {
+        val ticks: u64 = after.cpu_busy[i] - before.cpu_busy[i];
+        io.out("cpu\0"); io.dec(i); io.out(" busy ticks: \0"); io.dec(ticks); io.putc(10);
+        if (ticks < 10) { io.out("FAIL idle core\n\0"); ret 1; }
+        busy = busy + ticks;
+        i = i + 1;
+    }
+    # More than one CPU's worth of busy ticks proves overlapping execution.
+    if (busy * 10 <= (after.uptime_ms - before.uptime_ms) * 3 / 2) {
+        io.out("FAIL serialized CPU work\n\0"); ret 1;
+    }
+    io.out("ok parallel CPUs: \0"); io.dec(initial.cpus); io.putc(10);
+    ret 0;
+}

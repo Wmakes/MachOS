@@ -7,7 +7,6 @@ use std.runtime;
 use users:  userland.lib.accounts;
 use system: userland.lib.system;
 use tmos:   std.terminal.machos;
-use std.types.size.usize;
 
 val MAXP: u64 = 256;
 

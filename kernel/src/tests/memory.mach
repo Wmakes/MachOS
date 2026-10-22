@@ -1,0 +1,69 @@
+# Exercise the real allocator with a synthetic physical memory map.
+
+use pmm: machos.mm.pmm;
+use info: machos.boot.info;
+
+var storage: [262144]u8;
+var boot: info.BootInfo;
+var pages: [64]u64;
+
+test memory__untouched_ranges_reuse_zeroing_and_exhaustion {
+    var i: u64 = 0;
+    for (i < 262144) { storage[i] = 0xA5; i = i + 1; }
+    boot.hhdm = (?storage[0])::u64 - 4096;
+    boot.mem_len = 2;
+    boot.mem[0].base = 4096;
+    boot.mem[0].len = 32 * 4096;
+    boot.mem[0].kind = info.MEM_USABLE;
+    # Leave a reserved hole between the two usable runs.
+    boot.mem[1].base = 40 * 4096;
+    boot.mem[1].len = 25 * 4096;
+    boot.mem[1].kind = info.MEM_USABLE;
+    pmm.init(?boot);
+    if (pmm.total_pages() != 56 || pmm.free_pages() != 56) { ret 1; }
+    # Only the sharing-count page should have been touched by init.
+    i = 4096;
+    for (i < 262144) {
+        if (storage[i] != 0xA5) { ret 2; }
+        i = i + 1;
+    }
+    val first: u64 = pmm.alloc_raw();
+    pmm.free(first);
+    if (pmm.free_pages() != 56 || pmm.alloc_raw() != first) { ret 10; }
+    pmm.free(first);
+    i = 0;
+    for (i < 56) {
+        val pa: u64 = pmm.alloc_raw();
+        if (pa == 0 || (pa & 4095) != 0 || (pa >= 33 * 4096 && pa < 40 * 4096) || pa < 8192 || pa >= 65 * 4096) { ret 3; }
+        var j: u64 = 0;
+        for (j < i) { if (pages[j] == pa) { ret 4; } j = j + 1; }
+        pages[i] = pa;
+        i = i + 1;
+    }
+    if (pmm.alloc_raw() != 0 || pmm.free_pages() != 0) { ret 5; }
+    pmm.free(pages[0]);
+    if (pmm.alloc() != pages[0] || pmm.free_pages() != 0) { ret 6; }
+    val bytes: *u8 = (pages[0] + boot.hhdm)::*u8;
+    i = 0;
+    for (i < 4096) { if (bytes[i] != 0) { ret 7; } i = i + 1; }
+    pmm.share(pages[0]);
+    pmm.release(pages[0]);
+    if (pmm.free_pages() != 0) { ret 8; }
+    pmm.release(pages[0]);
+    if (pmm.free_pages() != 1 || pmm.alloc_raw() != pages[0]) { ret 9; }
+    ret 0;
+}
+
+#[naked]
+#[symbol("_start")]
+fun start() {
+    asm x86_64 {
+        mov rdi, [rsp]
+        lea rsi, [rsp + 8]
+        and rsp, -16
+        call main
+        mov rdi, rax
+        mov rax, 60
+        syscall
+    }
+}

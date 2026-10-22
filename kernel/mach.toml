@@ -53,6 +53,14 @@ targets = ["host"]
 link = []
 need = []
 
+[artifact.memory-tests]
+kind = "bin"
+entry = "tests/memory.mach"
+out = "memory-tests"
+targets = ["host"]
+link = []
+need = []
+
 # syscall regressions execute in MachOS through the indexed test dispatcher.
 [target.machos]
 isa = "x86_64"

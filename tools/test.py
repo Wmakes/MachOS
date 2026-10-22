@@ -48,6 +48,24 @@ def with_posixtest():
     sh(f"tools/put.sh examples/posixtest/out/machos/{p}/posixtest /bin/posixtest {disk()}")
 
 
+def with_ramtest():
+    """Install the resident-memory stress test without changing shipped programs."""
+    p = PROFILE[0]
+    for command in (["tools/mkimage.sh", p, "--fresh"],
+                    ["mach", "build", "examples/posixtest", "-a", "ramtest", "-t", "machos", "-p", p],
+                    ["tools/put.sh", f"examples/posixtest/out/machos/{p}/ramtest", "/bin/ramtest", disk()]):
+        subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.PIPE)
+
+
+def with_smptest():
+    """Install the synchronized per-core CPU workload."""
+    p = PROFILE[0]
+    for command in (["tools/mkimage.sh", p, "--fresh"],
+                    ["mach", "build", "examples/posixtest", "-a", "smptest", "-t", "machos", "-p", p],
+                    ["tools/put.sh", f"examples/posixtest/out/machos/{p}/smptest", "/bin/smptest", disk()]):
+        subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.PIPE)
+
+
 def with_usability():
     """Install the command/configuration assertions on a fresh test disk."""
     subprocess.run(["tools/mkimage.sh", PROFILE[0], "--fresh"], cwd=ROOT, check=True,
@@ -1114,6 +1132,31 @@ TESTS = [
       "sleep:1"],
      ["root: ext2 on /dev/sda2", "MachOS", "kernel.elf", "on-installed", "busy"]),
 ]
+
+
+# Large-memory tests run separately so only one large guest occupies host RAM.
+for ram, allocation in ((2048, 256), (4096, 512), (8192, 4352),
+                        (16384, 1024), (32768, 1024), (65536, 1024)):
+    # Sparse backing permits address-range tests beyond the host's RAM/swap
+    # reservation limit. The workload above 8 GiB touches only 1 GiB.
+    backing = (["--qemu=-object",
+                f"--qemu=memory-backend-ram,id=ram,size={ram}M,reserve=off",
+                "--qemu=-machine", "--qemu=memory-backend=ram"] if ram >= 16384 else [])
+    TESTS.append((f"ram-{ram // 1024}g", False, False,
+                  ["--prep", with_ramtest, "--boot", disk,
+                   "--qemu=-m", f"--qemu={ram}M", "--qemu=-smp", "--qemu=4"] + backing + [
+                   "wait:" + P,
+                   f"send:free -m; ramtest {ram} {allocation}; echo ram-status $?\\n",
+                   "wait:" + P],
+                  [f"ok resident RAM MiB: {allocation}", "ram-status 0"]))
+
+
+for cores in (4, 8, 16):
+    TESTS.append((f"smp-{cores}", False, False,
+                  ["--prep", with_smptest, "--boot", disk,
+                   "--qemu=-smp", f"--qemu={cores}", "wait:" + P,
+                   "send:smptest; echo smp-status $?\\n", "wait:" + P],
+                  [f"smp: {cores} cpu(s) running", f"ok parallel CPUs: {cores}", "smp-status 0"]))
 
 
 # Reuse protocol scenarios with an explicit Virtio NIC, never QEMU's default NIC.

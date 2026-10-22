@@ -1,6 +1,6 @@
 [submodule "deps/machos-std"]
 	path = deps/machos-std
-	url = git@github.com:Wmakes/machos-std.git
+	url = https://github.com/Wmakes/machos-std.git
 [submodule "deps/mach-crypto"]
 	path = deps/mach-crypto
 	url = https://github.com/briar-systems/mach-crypto.git

@@ -188,6 +188,7 @@ fun unmap_pages(p: *proc.Proc, a: u64, b: u64) {
             pmm.release(pa);
             if (p.pages > 0) { p.pages = p.pages - 1; }
         }
+        if (((va + PAGE) & 0x1FFFFF) == 0 || va + PAGE == b) { vmm.prune(p.pml4, va); }
         va = va + PAGE;
     }
 }
