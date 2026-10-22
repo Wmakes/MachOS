@@ -782,7 +782,7 @@ TESTS = [
     # an update from a package on a USB stick, then a reboot into it
     ("update", False, True,
      ["--prep", update_stick] + usb_stick() + [
-      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; rm -r /usr/share/licenses; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update; update /mnt/update.tgz; umount /mnt; machboot\\n",
+      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; rm -r /usr/share/licenses; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update /bin/install; update /mnt/update.tgz; umount /mnt; machboot\\n",
       "wait:" + P],
      ["updating MachOS", "installing the programs", "MachOS is updated to 0.9.1", "MachOS (previous)"]),
     ("update-reboot", True, True,
@@ -1157,11 +1157,11 @@ for index, (name, keep, fsck, steps, expect) in enumerate(TESTS):
                         expect + [CA_BUNDLE_SHA256, "usage: ca-update", "ca-tool-status 0"])
 
 
-# Installed and updated systems must retain every shipped licence and the MOTD.
+# System-copy paths must retain licence notices, the MOTD and the installer.
 NOTICE_FILES = sorted(os.path.relpath(os.path.join(directory, name), os.path.join(ROOT, "root"))
                       for directory, _, names in os.walk(os.path.join(ROOT, "root", "usr", "share", "licenses"))
                       for name in names)
-NOTICE_FILES.append("etc/motd")
+NOTICE_FILES.extend(("etc/motd", "bin/install"))
 NOTICE_HASHES = []
 for path in NOTICE_FILES:
     with open(os.path.join(ROOT, "root", path), "rb") as source:
