@@ -118,6 +118,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.config]
+kind = "bin"
+entry = "bin/config.mach"
+out = "bin/config"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.confirm]
 kind = "bin"
 entry = "bin/confirm.mach"

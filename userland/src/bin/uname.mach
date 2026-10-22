@@ -1,6 +1,6 @@
-# uname [-a] [-n]: name the system (as the running kernel reports it in
-# /proc); -n: the machine's name
+# Report system identity and release information from the running kernel.
 
+use opt: userland.lib.options;
 use std.runtime;
 use io:     userland.lib.cli;
 use system: userland.lib.system;
@@ -9,17 +9,36 @@ use system: userland.lib.system;
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
-    if (argc > 1 && io.streq(argv[1], "-n") != 0) {
-        var h: [64]u8;
-        system.line("/proc/sys/kernel/hostname", ?h[0], 64);
-        io.out(?h[0]);
-        io.putc(10);
-        ret 0;
+    if (opt.standard(argc, argv, "uname", "usage: uname [-asnrmov]\n  -a, --all  system overview\n  -s, --kernel-name  kernel name\n  -n, --nodename  hostname\n  -r, --kernel-release  release\n  -m, --machine  architecture\n  -o, --operating-system  OS name\n  -v, --kernel-version  kernel version") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv); var fields: u64 = 0;
+    for {
+        val c: u8 = opt.next(?p, "all=a,kernel-name=s,nodename=n,kernel-release=r,machine=m,operating-system=o,kernel-version=v");
+        if (c == 0) { brk; }
+        if (c == 97) { fields = fields | 128; } or (c == 115) { fields = fields | 1; }
+        or (c == 110) { fields = fields | 2; } or (c == 114) { fields = fields | 4; }
+        or (c == 109) { fields = fields | 8; } or (c == 111) { fields = fields | 16; }
+        or (c == 118) { fields = fields | 32; } or { p.bad = 1; }
+    }
+    if (p.bad != 0 || p.at != argc) { ret opt.error("uname"); }
+    if ((fields & 128) == 0 && fields != 0) {
+        var first: u8 = 1; var bit: u64 = 1;
+        for (bit <= 32) {
+            if ((fields & bit) != 0) {
+                if (first == 0) { io.putc(32); } first = 0;
+                var value: [64]u8;
+                if (bit == 1 || bit == 16) { io.out("MachOS"); }
+                or (bit == 2) { system.line("/proc/sys/kernel/hostname", ?value[0], 64); io.out(?value[0]); }
+                or (bit == 8) { io.out("x86_64"); }
+                or { system.release(?value[0], 64); io.out(?value[0]); }
+            }
+            bit = bit * 2;
+        }
+        io.putc(10); ret 0;
     }
     var name: [32]u8;
     system.line("/proc/sys/kernel/ostype", ?name[0], 32);
     io.out(?name[0]);
-    if (argc > 1 && io.streq(argv[1], "-a") != 0) {
+    if ((fields & 128) != 0) {
         var host: [64]u8;
         var rel: [32]u8;
         system.line("/proc/sys/kernel/hostname", ?host[0], 64);

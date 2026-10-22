@@ -1,30 +1,44 @@
-# seq [FIRST] LAST: print numbers
+# Print integer sequences with a signed step and optional separator.
 
-use io:  userland.lib.cli;
+use io: userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 
+fun integer(text: *u8, ok: *u8) i64 {
+    var at: u64 = 0; var negative: u8 = 0;
+    if (text[0] == 45) { negative = 1; at = 1; } or (text[0] == 43) { at = 1; }
+    val n: u64 = io.len(text); val v: u64 = io.parse_dec(?text[at], n - at, ok);
+    if (@ok == 0 || v > 0x7fffffffffffffffu64 + negative::u64) { @ok = 0; ret 0; }
+    if (negative != 0) { ret (0u64 - v)::i64; } ret v::i64;
+}
+fun emit(v: i64) {
+    if (v < 0) { io.putc(45); io.dec(0u64 - v::u64); } or { io.dec(v::u64); }
+}
 #[symbol("main")]
-fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
-
-fun run(argc: u64, argv: **u8) u64 {
-    var first: u64 = 1;
-    var last: u64 = 0;
-    var ok: u8 = 0;
-    if (argc == 2) {
-        last = io.parse_dec(argv[1], io.len(argv[1]), ?ok);
-    } or (argc == 3) {
-        first = io.parse_dec(argv[1], io.len(argv[1]), ?ok);
-        if (ok != 0) { last = io.parse_dec(argv[2], io.len(argv[2]), ?ok); }
+fun main(argc: i64, argv: **u8) i64 {
+    if (opt.standard(argc::u64, argv, "seq", "usage: seq [-s STRING] [--] [FIRST [STEP]] LAST\n  -s, --separator  separate numbers with STRING\n  Integer arguments may be signed; STEP must be nonzero.") != 0) { ret 0; }
+    var at: i64 = 1; var separator: *u8 = "\n";
+    if (at < argc && (io.streq(argv[at], "-s") != 0 || io.streq(argv[at], "--separator") != 0)) {
+        at = at + 1; if (at == argc) { ret opt.error("seq")::i64; } separator = argv[at]; at = at + 1;
     }
-    if (ok == 0) {
-        io.err("usage: seq [FIRST] LAST\n\0");
-        ret 2;
+    if (at < argc && io.streq(argv[at], "--") != 0) { at = at + 1; }
+    if (argc - at < 1 || argc - at > 3) { ret opt.error("seq")::i64; }
+    var values: [3]i64; var count: u64 = 0;
+    for (at < argc) {
+        var ok: u8 = 0; values[count] = integer(argv[at], ?ok);
+        if (ok == 0) { ret opt.error("seq")::i64; } count = count + 1; at = at + 1;
     }
-    var i: u64 = first;
-    for (i <= last) {
-        io.dec(i);
-        io.putc(10);
-        i = i + 1;
+    var first: i64 = 1; var step: i64 = 1; var last: i64 = values[0];
+    if (count == 2) { first = values[0]; last = values[1]; }
+    or (count == 3) { first = values[0]; step = values[1]; last = values[2]; }
+    if (step == 0) { ret opt.error("seq")::i64; }
+    var v: i64 = first; var printed: u8 = 0;
+    for ((step > 0 && v <= last) || (step < 0 && v >= last)) {
+        if (printed != 0) { io.out(separator); } emit(v); printed = 1;
+        # Unsigned distances also cover sequences crossing zero without overflow.
+        if (step > 0 && last::u64 - v::u64 < step::u64) { brk; }
+        if (step < 0 && v::u64 - last::u64 < 0u64 - step::u64) { brk; }
+        v = (v::u64 + step::u64)::i64;
     }
-    ret 0;
+    if (printed != 0) { io.putc(10); } ret 0;
 }

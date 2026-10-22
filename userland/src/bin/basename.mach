@@ -1,27 +1,45 @@
-# basename PATH [SUFFIX]: the last part of PATH, without SUFFIX
+# Print path basenames, optionally removing suffixes and using NUL delimiters.
 
 use io:  userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
-    if (argc < 2) {
-        io.err("usage: basename PATH [SUFFIX]\n\0");
-        ret 2;
+    if (opt.standard(argc, argv, "basename", "usage: basename [-az] [-s SUFFIX] [--] PATH...\n  -a, --multiple  accept multiple paths\n  -s, --suffix    remove suffix; implies -a\n  -z, --zero      terminate with NUL") != 0) { ret 0; }
+    var opts: opt.Parser; opt.init(?opts, argc, argv);
+    var multiple: u8 = 0; var end: u8 = 10; var suffix: *u8 = nil;
+    for {
+        val c: u8 = opt.next(?opts, "multiple=a,suffix=s,zero=z");
+        if (c == 0) { brk; }
+        if (c == 97) { multiple = 1; }
+        or (c == 122) { end = 0; }
+        or (c == 115) { suffix = opt.argument(?opts); multiple = 1; }
+        or { opts.bad = 1; }
     }
-    val p: *u8 = argv[1];
+    if (opts.bad != 0 || opts.at == argc || (multiple == 0 && argc - opts.at > 2)) { ret opt.error("basename"); }
+    if (multiple == 0 && argc - opts.at == 2) { suffix = argv[argc - 1]; }
+    var count: u64 = argc;
+    if (multiple == 0) { count = opts.at + 1; }
+    for (opts.at < count) {
+        emit(argv[opts.at], suffix, end); opts.at = opts.at + 1;
+    }
+    ret 0;
+}
+
+fun emit(path: *u8, suffix: *u8, end: u8) {
+    val p: *u8 = path;
     var e: u64 = io.len(p);
     for (e > 1 && p[e - 1] == 47) { e = e - 1; }
     var s: u64 = e;
     for (s > 0 && p[s - 1] != 47) { s = s - 1; }
     if (e == 1 && p[0] == 47) { s = 0; }
-    if (argc > 2) {
-        val sl: u64 = io.len(argv[2]);
-        if (sl < e - s && io.eq(?p[e - sl], sl, argv[2], sl) != 0) { e = e - sl; }
+    if (suffix != nil) {
+        val sl: u64 = io.len(suffix);
+        if (sl < e - s && io.eq(?p[e - sl], sl, suffix, sl) != 0) { e = e - sl; }
     }
     io.outn(?p[s], e - s);
-    io.putc(10);
-    ret 0;
+    io.putc(end);
 }

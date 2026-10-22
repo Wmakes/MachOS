@@ -1,23 +1,31 @@
-# dirname PATH: PATH without its last part
+# Print parent directories for paths, optionally using NUL delimiters.
 
 use io:  userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
-    if (argc != 2) {
-        io.err("usage: dirname PATH\n\0");
-        ret 2;
+    if (opt.standard(argc, argv, "dirname", "usage: dirname [-z] [--] PATH...\n  -z, --zero  terminate with NUL") != 0) { ret 0; }
+    var opts: opt.Parser; opt.init(?opts, argc, argv); var end: u8 = 10;
+    for {
+        val c: u8 = opt.next(?opts, "zero=z"); if (c == 0) { brk; }
+        if (c == 122) { end = 0; } or { opts.bad = 1; }
     }
-    val p: *u8 = argv[1];
+    if (opts.bad != 0 || opts.at == argc) { ret opt.error("dirname"); }
+    for (opts.at < argc) { emit(argv[opts.at], end); opts.at = opts.at + 1; }
+    ret 0;
+}
+
+fun emit(path: *u8, end: u8) {
+    val p: *u8 = path;
     var e: u64 = io.len(p);
     for (e > 1 && p[e - 1] == 47) { e = e - 1; }
     for (e > 0 && p[e - 1] != 47) { e = e - 1; }
     for (e > 1 && p[e - 1] == 47) { e = e - 1; }
     if (e == 0) { io.out(".\0"); }
     or          { io.outn(p, e); }
-    io.putc(10);
-    ret 0;
+    io.putc(end);
 }

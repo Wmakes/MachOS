@@ -1,22 +1,53 @@
-# sleep SECONDS: wait that long, even when stopped and continued on the way
+# Wait for one or more durations, with optional fractions and s/m/h/d suffixes.
 
-use os:  std.system.os;
-use io:  userland.lib.cli;
+use io: userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 
-#[symbol("main")]
-fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
-
-fun run(argc: u64, argv: **u8) u64 {
-    var ok: u8 = 0;
-    if (argc == 2) {
-        val s: u64 = io.parse_dec(argv[1], io.len(argv[1]), ?ok);
-        if (ok != 0) {
-            val until: u64 = io.now_ms() + s * 1000;
-            for (io.now_ms() < until) { io.sleep_ms(until - io.now_ms()); }
-            ret 0;
+fun duration(text: *u8, ok: *u8) u64 {
+    @ok = 0; var n: u64 = io.len(text); var scale: u64 = 1000;
+    if (n == 0) { ret 0; }
+    val last: u8 = text[n - 1];
+    if (last == 115) { n = n - 1; }
+    or (last == 109) { scale = 60000; n = n - 1; }
+    or (last == 104) { scale = 3600000; n = n - 1; }
+    or (last == 100) { scale = 86400000; n = n - 1; }
+    var dot: u64 = 0; for (dot < n && text[dot] != 46) { dot = dot + 1; }
+    var valid: u8 = 0; var whole: u64 = 0;
+    if (dot > 0) { whole = io.parse_dec(text, dot, ?valid); if (valid == 0) { ret 0; } }
+    if (dot == 0 && n == 0) { ret 0; }
+    var fraction: u64 = 0; var divisor: u64 = 1;
+    if (dot < n) {
+        var i: u64 = dot + 1;
+        if (i == n && dot == 0) { ret 0; }
+        for (i < n) {
+            if (text[i] < 48 || text[i] > 57) { ret 0; }
+            if (divisor < 1000000000) { fraction = fraction * 10 + (text[i] - 48)::u64; divisor = divisor * 10; }
+            i = i + 1;
         }
     }
-    io.err("usage: sleep SECONDS\n\0");
-    ret 2;
+    if (whole > (0x7fffffffffffffffu64 - scale) / scale) { ret 0; }
+    @ok = 1;
+    val partial: u64 = fraction * scale;
+    ret whole * scale + partial / divisor + (partial % divisor != 0)::u64;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    if (opt.standard(argc::u64, argv, "sleep", "usage: sleep [--] NUMBER[s|m|h|d]...\n  Fractions are accepted; durations are added.") != 0) { ret 0; }
+    var at: i64 = 1; if (argc > 1 && io.streq(argv[1], "--") != 0) { at = 2; }
+    if (at == argc) { ret opt.error("sleep")::i64; }
+    var total: u64 = 0;
+    for (at < argc) {
+        var ok: u8 = 0; val value: u64 = duration(argv[at], ?ok);
+        if (ok == 0 || value > 0x7fffffffffffffffu64 - total) { ret opt.error("sleep")::i64; }
+        total = total + value; at = at + 1;
+    }
+    val start: u64 = io.now_ms();
+    for {
+        val elapsed: u64 = io.now_ms() - start;
+        if (elapsed >= total) { brk; }
+        io.sleep_ms(total - elapsed);
+    }
+    ret 0;
 }

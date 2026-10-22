@@ -2,12 +2,14 @@
 # filled from the ARGs in turn (the format repeats while ARGs are left)
 
 use io:  userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
+    if (opt.standard(argc, argv, "printf", "usage: printf FORMAT [ARG...]\n  Conversions: %s %d %c %%\n  Escapes: \\n \\t \\r \\a \\b \\f \\v \\e \\0 \\c \\\\; \\c stops output.") != 0) { ret 0; }
     if (argc < 2) {
         io.err("usage: printf FORMAT [ARG...]\n\0");
         ret 2;
@@ -25,6 +27,12 @@ fun run(argc: u64, argv: **u8) u64 {
                 val e: u8 = f[i];
                 if (e == 110) { io.putc(10); }
                 or (e == 116) { io.putc(9); }
+                or (e == 114) { io.putc(13); }
+                or (e == 97) { io.putc(7); }
+                or (e == 98) { io.putc(8); }
+                or (e == 102) { io.putc(12); }
+                or (e == 118) { io.putc(11); }
+                or (e == 99) { ret 0; }
                 or (e == 101) { io.putc(27); }
                 or (e == 48) { io.putc(0); }
                 or { io.putc(e); }

@@ -1,115 +1,98 @@
-# grep [-v] [-c] TEXT [FILE...]: lines containing TEXT (-v: not containing,
-# -c: just count them)
+# Select lines using a literal pattern, with optional case folding and prefixes.
 
-use os:  std.system.os;
-use io:  userland.lib.cli;
+use io: userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 
-var invert: u8 = 0;
-var count_only: u8 = 0;
-var pat: *u8 = nil;
-var plen: u64 = 0;
-var matches: u64 = 0;
+var invert: u8 = 0; var count_only: u8 = 0; var quiet: u8 = 0;
+var insensitive: u8 = 0; var exact: u8 = 0; var numbered: u8 = 0;
+var filenames: u8 = 0; var labels: u8 = 0;
+var pat: *u8 = nil; var plen: u64 = 0;
+var matches: u64 = 0; var file_matches: u64 = 0; var line_number: u64 = 0;
+var buf: [8192]u8; var line: [65536]u8;
 
-var buf: [4096]u8;
-var line: [4096]u8;
-
-fun contains(s: *u8, n: u64) u8 {
-    if (plen == 0) { ret 1; }
-    if (plen > n) { ret 0; }
+fun fold(c: u8) u8 { if (insensitive != 0 && c >= 65 && c <= 90) { ret c + 32; } ret c; }
+fun contains(n: u64) u8 {
+    if (plen > n || (exact != 0 && plen != n)) { ret 0; }
     var i: u64 = 0;
     for (i + plen <= n) {
-        if (io.eq(?s[i], plen, pat, plen) != 0) { ret 1; }
-        i = i + 1;
+        var j: u64 = 0;
+        for (j < plen && fold(line[i + j]) == fold(pat[j])) { j = j + 1; }
+        if (j == plen) { ret 1; }
+        if (exact != 0) { ret 0; } i = i + 1;
     }
     ret 0;
 }
-
+fun prefix(name: *u8) { if (name != nil) { io.out(name); io.putc(58); } }
 fun check(n: u64, name: *u8) {
-    var hit: u8 = contains(?line[0], n);
-    if (invert != 0) { hit = hit ^ 1; }
+    line_number = line_number + 1;
+    var hit: u8 = contains(n); if (invert != 0) { hit = hit ^ 1; }
     if (hit == 0) { ret; }
-    matches = matches + 1;
-    if (count_only != 0) { ret; }
-    if (name != nil) {
-        io.out("\x1b[35m\0");
-        io.out(name);
-        io.out("\x1b[0m:\0");
-    }
-    io.outn(?line[0], n);
-    io.putc(10);
+    matches = matches + 1; file_matches = file_matches + 1;
+    if (count_only != 0 || quiet != 0 || filenames != 0) { ret; }
+    prefix(name);
+    if (numbered != 0) { io.dec(line_number); io.putc(58); }
+    io.outn(?line[0], n); io.putc(10);
 }
-
-fun scan(h: i64, name: *u8) u8 {
-    var n: u64 = 0;
+fun scan(h: i64, name: *u8, display: *u8) u8 {
+    var n: u64 = 0; file_matches = 0; line_number = 0;
     for {
-        val r: i64 = io.read(h, ?buf[0], 4096);
-        if (r < 0) {
-            io.fail("grep\0", name, r);
-            ret 0;
-        }
+        val r: i64 = io.read(h, ?buf[0], 8192);
+        if (r < 0) { io.fail("grep", name, r); ret 0; }
         if (r == 0) { brk; }
         var i: u64 = 0;
         for (i < r::u64) {
             if (buf[i] == 10) {
-                check(n, name);
-                n = 0;
-            } or (n < 4096) {
-                line[n] = buf[i];
-                n = n + 1;
+                check(n, display); n = 0;
+                if (quiet != 0 && file_matches != 0) { ret 1; }
+            } or {
+                if (n == 65536) { io.err("grep: input line exceeds 65536 bytes\n"); ret 0; }
+                line[n] = buf[i]; n = n + 1;
             }
             i = i + 1;
         }
     }
-    if (n > 0) { check(n, name); }
+    if (n > 0) { check(n, display); }
+    if (quiet == 0) {
+        if (filenames != 0 && file_matches != 0) { io.out(name); io.putc(10); }
+        or (count_only != 0) { prefix(display); io.dec(file_matches); io.putc(10); }
+    }
     ret 1;
 }
-
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
-
 fun run(argc: u64, argv: **u8) u64 {
-    var i: u64 = 1;
-    for (i < argc && argv[i][0] == 45 && argv[i][1] != 0) {
-        if (io.streq(argv[i], "-v\0") != 0) { invert = 1; }
-        or (io.streq(argv[i], "-c\0") != 0) { count_only = 1; }
+    if (opt.standard(argc, argv, "grep", "usage: grep [-FivcxnqlHh] [--] TEXT [FILE...]\n  Literal text matching (ASCII case folding).\n  -F, --fixed-strings  literal pattern\n  -i, --ignore-case    ignore ASCII case\n  -v, --invert-match   select nonmatching lines\n  -x, --line-regexp    match the whole line\n  -c, --count          counts per input\n  -n, --line-number    prefix line numbers\n  -q, --quiet          exit status only\n  -l, --files-with-matches  print matching filenames\n  -H, --with-filename / -h, --no-filename  filename prefixes") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv);
+    for {
+        val c: u8 = opt.next(?p, "fixed-strings=F,ignore-case=i,invert-match=v,line-regexp=x,count=c,line-number=n,quiet=q,silent=q,files-with-matches=l,with-filename=H,no-filename=h");
+        if (c == 0) { brk; }
+        if (c == 70) { }
+        or (c == 105) { insensitive = 1; } or (c == 118) { invert = 1; }
+        or (c == 120) { exact = 1; } or (c == 99) { count_only = 1; }
+        or (c == 110) { numbered = 1; } or (c == 113) { quiet = 1; }
+        or (c == 108) { filenames = 1; } or (c == 72) { labels = 2; }
+        or (c == 104) { labels = 1; } or { p.bad = 1; }
+    }
+    if (p.bad != 0 || p.at == argc) { ret opt.error("grep"); }
+    pat = argv[p.at]; plen = io.len(pat); p.at = p.at + 1;
+    var status: u64 = 0; val many: u8 = (argc - p.at > 1)::u8;
+    if (p.at == argc) {
+        var label: *u8 = nil; if (labels == 2) { label = "(standard input)"; }
+        if (scan(io.STDIN, "(standard input)", label) == 0) { status = 2; }
+    }
+    for (p.at < argc) {
+        val path: *u8 = argv[p.at]; var h: i64 = io.STDIN;
+        if (io.streq(path, "-") == 0) { h = io.open_read(path); }
+        if (h < 0) { io.fail("grep", path, h); status = 2; }
         or {
-            io.err("usage: grep [-v] [-c] TEXT [FILE...]\n\0");
-            ret 2;
+            var label: *u8 = nil; if (labels == 2 || (labels == 0 && many != 0)) { label = path; }
+            if (scan(h, path, label) == 0) { status = 2; }
+            if (h != io.STDIN) { io.close(h); }
+            if (quiet != 0 && matches != 0) { ret 0; }
         }
-        i = i + 1;
+        p.at = p.at + 1;
     }
-    if (i == argc) {
-        io.err("usage: grep [-v] [-c] TEXT [FILE...]\n\0");
-        ret 2;
-    }
-    pat = argv[i];
-    plen = io.len(pat);
-    i = i + 1;
-    var status: u64 = 0;
-    if (i == argc) {
-        if (scan(io.STDIN, nil) == 0) { status = 2; }
-    } or {
-        val many: u8 = (argc - i > 1)::u8;
-        for (i < argc) {
-            val h: i64 = io.open_mode(argv[i], os.O_RDONLY, 0o666);
-            if (h < 0) {
-                io.fail("grep\0", argv[i], h);
-                status = 2;
-            } or {
-                var label: *u8 = nil;
-                if (many != 0) { label = argv[i]; }
-                scan(h, label);
-                io.close(h);
-            }
-            i = i + 1;
-        }
-    }
-    if (count_only != 0) {
-        io.dec(matches);
-        io.putc(10);
-    }
-    if (status != 0) { ret status; }
-    if (matches == 0) { ret 1; }
-    ret 0;
+    if (quiet != 0 && matches != 0) { ret 0; }
+    if (status != 0) { ret status; } ret (matches == 0)::u64;
 }

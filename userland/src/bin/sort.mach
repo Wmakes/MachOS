@@ -1,8 +1,8 @@
-# sort [-r] [-n] [-u] [FILE]: sort lines (-r reverse, -n by leading number,
-# -u drop repeated lines)
+# Sort lines with selectable ordering, comparison and output options.
 
 use os:  std.system.os;
 use io:  userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 use text: userland.lib.text;
 
@@ -16,41 +16,64 @@ var tmp: [262144]u64;
 var reverse: u8 = 0;
 var numeric: u8 = 0;
 var unique: u8 = 0;
+var insensitive: u8 = 0;
+var blanks: u8 = 0;
 
-fun num(i: u64) u64 {
-    var v: u64 = 0;
-    var k: u64 = 0;
-    val s: *u8 = ?buf[starts[i]];
-    for (k < lens[i] && s[k] == 32) { k = k + 1; }
-    for (k < lens[i] && s[k] >= 48 && s[k] <= 57) {
-        v = v * 10 + (s[k] - 48)::u64;
-        k = k + 1;
+# Compare signed leading integers by magnitude, avoiding fixed-width overflow.
+fun cmp_number(a: u64, b: u64) u64 {
+    val sa: *u8 = ?buf[starts[a]]; val sb: *u8 = ?buf[starts[b]];
+    var ka: u64 = 0; var kb: u64 = 0;
+    for (ka < lens[a] && (sa[ka] == 32 || sa[ka] == 9)) { ka = ka + 1; }
+    for (kb < lens[b] && (sb[kb] == 32 || sb[kb] == 9)) { kb = kb + 1; }
+    var na: u8 = 0; var nb: u8 = 0;
+    if (ka < lens[a] && sa[ka] == 45) { na = 1; ka = ka + 1; }
+    if (kb < lens[b] && sb[kb] == 45) { nb = 1; kb = kb + 1; }
+    for (ka < lens[a] && sa[ka] == 48) { ka = ka + 1; }
+    for (kb < lens[b] && sb[kb] == 48) { kb = kb + 1; }
+    var ea: u64 = ka; var eb: u64 = kb;
+    for (ea < lens[a] && sa[ea] >= 48 && sa[ea] <= 57) { ea = ea + 1; }
+    for (eb < lens[b] && sb[eb] >= 48 && sb[eb] <= 57) { eb = eb + 1; }
+    if (ea == ka) { na = 0; } if (eb == kb) { nb = 0; }
+    if (na != nb) { if (na != 0) { ret 0; } ret 2; }
+    var r: u64 = 1;
+    if (ea - ka < eb - kb) { r = 0; } or (ea - ka > eb - kb) { r = 2; }
+    or {
+        for (ka < ea) {
+            if (sa[ka] < sb[kb]) { r = 0; brk; }
+            if (sa[ka] > sb[kb]) { r = 2; brk; }
+            ka = ka + 1; kb = kb + 1;
+        }
     }
-    ret v;
+    if (na != 0) { r = 2 - r; } ret r;
 }
 
 # <0, 0, >0 as 0, 1, 2
 fun cmp_text(a: u64, b: u64) u64 {
     val sa: *u8 = ?buf[starts[a]];
     val sb: *u8 = ?buf[starts[b]];
-    var k: u64 = 0;
-    for (k < lens[a] && k < lens[b]) {
-        if (sa[k] < sb[k]) { ret 0; }
-        if (sa[k] > sb[k]) { ret 2; }
-        k = k + 1;
+    var ka: u64 = 0; var kb: u64 = 0;
+    if (blanks != 0) {
+        for (ka < lens[a] && (sa[ka] == 32 || sa[ka] == 9)) { ka = ka + 1; }
+        for (kb < lens[b] && (sb[kb] == 32 || sb[kb] == 9)) { kb = kb + 1; }
     }
-    if (lens[a] < lens[b]) { ret 0; }
-    if (lens[a] > lens[b]) { ret 2; }
+    for (ka < lens[a] && kb < lens[b]) {
+        var ca: u8 = sa[ka]; var cb: u8 = sb[kb];
+        if (insensitive != 0) {
+            if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+            if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+        }
+        if (ca < cb) { ret 0; } if (ca > cb) { ret 2; }
+        ka = ka + 1; kb = kb + 1;
+    }
+    if (lens[a] - ka < lens[b] - kb) { ret 0; }
+    if (lens[a] - ka > lens[b] - kb) { ret 2; }
     ret 1;
 }
 
 fun cmp(a: u64, b: u64) u64 {
     var r: u64 = 1;
     if (numeric != 0) {
-        val na: u64 = num(a);
-        val nb: u64 = num(b);
-        if (na < nb) { r = 0; }
-        or (na > nb) { r = 2; }
+        r = cmp_number(a, b);
     }
     if (r == 1) { r = cmp_text(a, b); }
     if (reverse != 0) { r = 2 - r; }
@@ -86,40 +109,49 @@ fun merge_sort(lo: u64, hi: u64) {
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
-    var i: u64 = 1;
-    for (i < argc && argv[i][0] == 45 && argv[i][1] != 0) {
-        var k: u64 = 1;
-        for (argv[i][k] != 0) {
-            if (argv[i][k] == 114) { reverse = 1; }
-            or (argv[i][k] == 110) { numeric = 1; }
-            or (argv[i][k] == 117) { unique = 1; }
-            or {
-                io.err("usage: sort [-r] [-n] [-u] [FILE]\n\0");
-                ret 2;
-            }
-            k = k + 1;
-        }
-        i = i + 1;
+    if (opt.standard(argc, argv, "sort", "usage: sort [-rnufb] [-o FILE] [--] [FILE]\n  -r, --reverse  reverse order\n  -n, --numeric-sort  compare leading integers\n  -u, --unique  omit repeated lines\n  -f, --ignore-case  fold ASCII case\n  -b, --ignore-leading-blanks  ignore initial spaces and tabs\n  -o, --output  write to FILE (may also be the input)") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv); var dest: *u8 = nil;
+    for {
+        val c: u8 = opt.next(?p, "reverse=r,numeric-sort=n,unique=u,ignore-case=f,ignore-leading-blanks=b,output=o");
+        if (c == 0) { brk; }
+        if (c == 114) { reverse = 1; } or (c == 110) { numeric = 1; }
+        or (c == 117) { unique = 1; } or (c == 102) { insensitive = 1; }
+        or (c == 98) { blanks = 1; } or (c == 111) { dest = opt.argument(?p); } or { p.bad = 1; }
     }
+    if (p.bad != 0 || argc - p.at > 1) { ret opt.error("sort"); }
+    val i: u64 = p.at;
     var path: *u8 = nil;
     if (i < argc) { path = argv[i]; }
     val h: i64 = text.open_in("sort\0", path);
     if (h < 0) { ret 1; }
-    val n: u64 = text.read_all(h, ?buf[0], CAP);
+    var n: u64 = 0;
+    for (n < CAP) {
+        val r: i64 = io.read(h, ?buf[n], CAP - n);
+        if (r < 0) { io.fail("sort", "read", r); if (h != io.STDIN) { io.close(h); } ret 1; }
+        if (r == 0) { brk; } n = n + r::u64;
+    }
+    var extra: u8 = 0; val more: i64 = io.read(h, ?extra, 1);
+    if (h != io.STDIN) { io.close(h); }
+    if (more != 0) { io.err("sort: input exceeds capacity or read failed\n"); ret 1; }
     val count: u64 = text.split_lines(?buf[0], n, ?starts[0], ?lens[0], MAXL);
+    if (count == MAXL && starts[count - 1] + lens[count - 1] + 1 < n) { io.err("sort: too many lines\n"); ret 1; }
     var k: u64 = 0;
     for (k < count) {
         order[k] = k;
         k = k + 1;
     }
     merge_sort(0, count);
+    var output: i64 = io.STDOUT;
+    if (dest != nil) { output = io.open_mode(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666); }
+    if (output < 0) { io.fail("sort", dest, output); ret 1; }
+    var status: u64 = 0;
     k = 0;
     for (k < count) {
         if (unique == 0 || k == 0 || cmp_text(order[k], order[k - 1]) != 1) {
-            io.outn(?buf[starts[order[k]]], lens[order[k]]);
-            io.putc(10);
+            if (io.write_all(output, ?buf[starts[order[k]]], lens[order[k]]) == 0 || io.write_all(output, "\n", 1) == 0) { status = 1; brk; }
         }
         k = k + 1;
     }
-    ret 0;
+    if (output != io.STDOUT) { io.close(output); }
+    ret status;
 }

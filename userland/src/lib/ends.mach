@@ -1,0 +1,96 @@
+# Shared head/tail argument handling and bounded stream processing.
+
+use io: userland.lib.cli;
+use opt: userland.lib.options;
+
+var buffer: [65536]u8;
+var ring: [4194304]u8;
+
+fun output(h: i64, name: *u8, want: u64, bytes: u8, last: u8) u64 {
+    var seen: u64 = 0; var stored: u64 = 0; var at: u64 = 0; var overflow: u8 = 0;
+    if (last == 0 && want == 0) { ret 0; }
+    for {
+        var amount: u64 = 65536;
+        if (last == 0 && bytes != 0 && amount > want - seen) { amount = want - seen; }
+        val r: i64 = io.read(h, ?buffer[0], amount);
+        if (r < 0) { io.fail(name, "read", r); ret 1; }
+        if (r == 0) { brk; }
+        var i: u64 = 0;
+        if (last == 0) {
+            if (bytes != 0) { i = r::u64; seen = seen + i; }
+            or {
+                for (i < r::u64 && seen < want) {
+                    if (buffer[i] == 10) { seen = seen + 1; } i = i + 1;
+                }
+            }
+            if (io.write_all(io.STDOUT, ?buffer[0], i) == 0) { ret 1; }
+            if (seen == want) { ret 0; }
+        } or {
+            for (i < r::u64) {
+                ring[at] = buffer[i]; at = (at + 1) % 4194304;
+                if (stored < 4194304) { stored = stored + 1; } or { overflow = 1; }
+                i = i + 1;
+            }
+        }
+    }
+    if (last == 0 || want == 0 || stored == 0) { ret 0; }
+    var take: u64 = stored;
+    if (bytes != 0) { if (take > want) { take = want; } }
+    or {
+        # A terminal newline terminates the last line; it does not start another.
+        take = 0; var lines: u64 = 0;
+        for (take < stored) {
+            val c: u8 = ring[(at + 4194304 - take - 1) % 4194304];
+            if (c == 10 && take != 0) { lines = lines + 1; if (lines == want) { brk; } }
+            take = take + 1;
+        }
+        if (take == stored && overflow != 0 && lines < want) {
+            io.err(name); io.err(": requested lines exceed buffer capacity\n"); ret 1;
+        }
+    }
+    var start: u64 = (at + 4194304 - take) % 4194304;
+    var first: u64 = 4194304 - start; if (first > take) { first = take; }
+    if (io.write_all(io.STDOUT, ?ring[start], first) == 0) { ret 1; }
+    if (take > first && io.write_all(io.STDOUT, ?ring[0], take - first) == 0) { ret 1; }
+    ret 0;
+}
+
+pub fun run(argc: u64, argv: **u8, name: *u8, last: u8) u64 {
+    if (opt.standard(argc, argv, name, "usage: head|tail [-n COUNT | -c COUNT] [-qv] [--] [FILE...]\n  -n, --lines  select lines (default 10); -N is also accepted\n  -c, --bytes  select bytes (tail: up to 4 MiB)\n  -q, --quiet  suppress file headers\n  -v, --verbose  always print headers\n  -            read standard input") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv);
+    var want: u64 = 10; var bytes: u8 = 0; var headers: u8 = 0;
+    if (argc > 1 && argv[1][0] == 45 && argv[1][1] >= 48 && argv[1][1] <= 57) {
+        var ok: u8 = 0; want = io.parse_dec(?argv[1][1], io.len(argv[1]) - 1, ?ok);
+        if (ok == 0) { ret opt.error(name); } p.at = 2;
+    }
+    for {
+        val c: u8 = opt.next(?p, "lines=n,bytes=c,quiet=q,silent=q,verbose=v"); if (c == 0) { brk; }
+        if (c == 110 || c == 99) {
+            val value: *u8 = opt.argument(?p); var ok: u8 = 0;
+            if (value != nil) { want = io.parse_dec(value, io.len(value), ?ok); }
+            if (ok == 0) { p.bad = 1; } bytes = (c == 99)::u8;
+        } or (c == 113) { headers = 1; } or (c == 118) { headers = 2; } or { p.bad = 1; }
+    }
+    if (p.bad != 0 || (last != 0 && bytes != 0 && want > 4194304)) { ret opt.error(name); }
+    var status: u64 = 0; var printed: u8 = 0;
+    val many: u8 = (argc - p.at > 1)::u8;
+    if (p.at == argc) {
+        if (headers == 2) { io.out("==> standard input <==\n"); }
+        ret output(io.STDIN, name, want, bytes, last);
+    }
+    for (p.at < argc) {
+        val path: *u8 = argv[p.at]; var h: i64 = io.STDIN;
+        if (io.streq(path, "-") == 0) { h = io.open_read(path); }
+        if (h < 0) { io.fail(name, path, h); status = 1; }
+        or {
+            if (headers == 2 || (headers == 0 && many != 0)) {
+                if (printed != 0) { io.putc(10); }
+                io.out("==> "); io.out(path); io.out(" <==\n"); printed = 1;
+            }
+            if (output(h, name, want, bytes, last) != 0) { status = 1; }
+            if (h != io.STDIN) { io.close(h); }
+        }
+        p.at = p.at + 1;
+    }
+    ret status;
+}

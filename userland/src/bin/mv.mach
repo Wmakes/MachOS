@@ -1,39 +1,44 @@
-# mv FROM TO: rename or move a file or directory
+# Move files and directories, preserving source names when moving into a directory.
 
-use os:  std.system.os;
-use io:  userland.lib.cli;
+use os: std.system.os;
+use io: userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
-    if (argc != 3) {
-        io.err("usage: mv FROM TO\n\0");
-        ret 2;
+    if (opt.standard(argc, argv, "mv", "usage: mv [-fnv] [--] SOURCE... DEST\n  -f, --force        replace destination\n  -n, --no-clobber   keep existing destination\n  -v, --verbose      print moved paths") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv);
+    var keep: u8 = 0; var verbose: u8 = 0;
+    for {
+        val c: u8 = opt.next(?p, "force=f,no-clobber=n,verbose=v"); if (c == 0) { brk; }
+        if (c == 102) { keep = 0; } or (c == 110) { keep = 1; }
+        or (c == 118) { verbose = 1; } or { p.bad = 1; }
     }
-    # moving into an existing directory keeps the name
-    var to: [256]u8;
-    var tn: u64 = io.len(argv[2]);
-    if (tn >= 256) { tn = 255; }
-    io.copy(?to[0], argv[2], tn);
-    var st: os.stat_t;
-    if (io.stat(argv[2], ?st) >= 0 && io.kind_of(st.st_mode) == io.KIND_DIR) {
-        val from: *u8 = argv[1];
-        val fl: u64 = io.len(from);
-        var b: u64 = fl;
-        for (b > 0 && from[b - 1] != 47) { b = b - 1; }
-        if (tn + 1 + fl - b < 256) {
-            to[tn] = 47;
-            io.copy(?to[tn + 1], ?from[b], fl - b);
-            tn = tn + 1 + fl - b;
+    if (p.bad != 0 || argc - p.at < 2) { ret opt.error("mv"); }
+    val dest: *u8 = argv[argc - 1]; var st: os.stat_t;
+    val directory: u8 = (io.stat(dest, ?st) >= 0 && io.is_dir(?st))::u8;
+    if (argc - p.at > 2 && directory == 0) { io.err("mv: destination must be a directory\n"); ret 1; }
+    var status: u64 = 0;
+    for (p.at + 1 < argc) {
+        val from: *u8 = argv[p.at]; var to: [4096]u8; var n: u64 = io.len(dest);
+        var end: u64 = io.len(from); for (end > 1 && from[end - 1] == 47) { end = end - 1; }
+        var start: u64 = end; for (start > 0 && from[start - 1] != 47) { start = start - 1; }
+        var extra: u64 = 0; if (directory != 0) { extra = 1 + end - start; }
+        if (n + extra >= 4096) { io.err("mv: destination path too long\n"); status = 1; }
+        or {
+            io.copy(?to[0], dest, n);
+            if (directory != 0) { to[n] = 47; n = n + 1; io.copy(?to[n], ?from[start], end - start); n = n + end - start; }
+            to[n] = 0;
+            if (keep == 0 || io.stat(?to[0], ?st) < 0) {
+                val r: i64 = io.rename(from, ?to[0]);
+                if (r < 0) { io.fail("mv", from, r); status = 1; }
+                or (verbose != 0) { io.out(from); io.out(" -> "); io.out(?to[0]); io.putc(10); }
+            }
         }
+        p.at = p.at + 1;
     }
-    to[tn] = 0;
-    val r: i64 = io.rename(argv[1], ?to[0]);
-    if (r < 0) {
-        io.fail("mv\0", argv[1], r);
-        ret 1;
-    }
-    ret 0;
+    ret status;
 }

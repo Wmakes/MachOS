@@ -28,7 +28,7 @@ pub fun line(path: *u8, buf: *u8, cap: u64) u64 {
     ret n;
 }
 
-# the kernel's version ("0.9.0")
+# the kernel's version ("0.9.1")
 pub fun release(buf: *u8, cap: u64) u64 { ret line("/proc/sys/kernel/osrelease", buf, cap); }
 
 # --- reading the text ---------------------------------------------------------

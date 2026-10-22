@@ -1,19 +1,31 @@
-# free: memory use (from /proc/meminfo)
+# Report memory use in bytes, KiB, MiB or readable IEC sizes.
 
+use opt: userland.lib.options;
 use std.runtime;
 use io:     userland.lib.cli;
 use system: userland.lib.system;
+
+var unit: u64 = 1024;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun row(name: *u8, bytes: u64) {
     io.out(name);
-    io.dec_pad(bytes / 1024, 10);
-    io.out(" KiB\n");
+    opt.size(bytes, unit);
+    if (unit == 1024) { io.out(" KiB"); } or (unit == 1048576) { io.out(" MiB"); }
+    io.putc(10);
 }
 
 fun run(argc: u64, argv: **u8) u64 {
+    if (opt.standard(argc, argv, "free", "usage: free [-bhkm]\n  -b, --bytes  bytes\n  -h, --human  readable IEC sizes\n  -k, --kibi   KiB (default)\n  -m, --mebi   MiB") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv);
+    for {
+        val c: u8 = opt.next(?p, "bytes=b,human=h,kibi=k,mebi=m"); if (c == 0) { brk; }
+        if (c == 98) { unit = 0; } or (c == 104) { unit = 1; }
+        or (c == 107) { unit = 1024; } or (c == 109) { unit = 1048576; } or { p.bad = 1; }
+    }
+    if (p.bad != 0 || p.at != argc) { ret opt.error("free"); }
     var m: system.Memory;
     system.memory(?m);
     row("total ", m.total);

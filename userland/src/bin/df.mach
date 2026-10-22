@@ -1,5 +1,6 @@
-# df: size and free space of every mounted filesystem (from /proc/mounts)
+# Report mounted filesystem space in selectable units.
 
+use opt: userland.lib.options;
 use std.runtime;
 use io:     userland.lib.cli;
 use system: userland.lib.system;
@@ -7,7 +8,11 @@ use system: userland.lib.system;
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
-fun col(v: u64, width: u64) { io.dec_pad(v / 1024, width); }
+var unit: u64 = 1024;
+fun col(v: u64, width: u64) {
+    if (unit == 1024) { io.dec_pad(v / 1024, width); }
+    or { io.putc(32); opt.size(v, unit); io.putc(32); }
+}
 
 # the number in word w (from 0) of line b[s..e]
 fun word(b: *u8, s: u64, e: u64, w: u64, at: *u64, len: *u64) {
@@ -37,7 +42,16 @@ fun num(b: *u8, s: u64, e: u64, w: u64) u64 {
 }
 
 fun run(argc: u64, argv: **u8) u64 {
-    io.out("Filesystem        KiB      Used     Avail Use% Mounted on\n");
+    if (opt.standard(argc, argv, "df", "usage: df [-hkm]\n  -h, --human-readable  readable IEC sizes\n  -k  KiB (default)\n  -m  MiB") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv);
+    for {
+        val c: u8 = opt.next(?p, "human-readable=h"); if (c == 0) { brk; }
+        if (c == 104) { unit = 1; } or (c == 107) { unit = 1024; }
+        or (c == 109) { unit = 1048576; } or { p.bad = 1; }
+    }
+    if (p.bad != 0 || p.at != argc) { ret opt.error("df"); }
+    if (unit == 1024) { io.out("Filesystem        KiB      Used     Avail Use% Mounted on\n"); }
+    or { io.out("Filesystem Size Used Avail Use% Mounted on\n"); }
     var b: [8192]u8;
     val n: u64 = system.read_file("/proc/mounts", ?b[0], 8192);
     var s: u64 = 0;

@@ -1,7 +1,7 @@
 <p align="center"><img src=".github/logo.png" alt="MachOS" width="600"></p>
 
 <p align="center">
-<img src="https://img.shields.io/badge/version-0.9.0-blue" alt="version 0.9.0"> <img src="https://img.shields.io/badge/arch-x86__64-informational" alt="x86_64"> <a href="https://machlang.org/"><img src="https://img.shields.io/badge/written%20in-mach-8957e5" alt="written in mach"></a> <img src="https://img.shields.io/badge/boot-UEFI-orange" alt="UEFI">
+<img src="https://img.shields.io/badge/version-0.9.1-blue" alt="version 0.9.1"> <img src="https://img.shields.io/badge/arch-x86__64-informational" alt="x86_64"> <a href="https://machlang.org/"><img src="https://img.shields.io/badge/written%20in-mach-8957e5" alt="written in mach"></a> <img src="https://img.shields.io/badge/boot-UEFI-orange" alt="UEFI">
 </p>
 
 A small Unix-like operating system for x86_64, written in [mach](https://machlang.org/): the kernel, the boot loader and the userland.

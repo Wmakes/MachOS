@@ -1,7 +1,8 @@
-# ls [-l] [PATH...]: list directories (directories end in /)
+# List paths with optional details, hidden names, sizes and color.
 
 use os:    std.system.os;
 use io:    userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 use std.types.size.usize;
 use text:  userland.lib.text;
@@ -24,6 +25,10 @@ val S_ISGID: u64 = 0o2000;
 val S_ISVTX: u64 = 0o1000;
 
 var long: u8 = 0;
+var human: u8 = 0;
+var directory: u8 = 0;
+var hidden: u8 = 0;
+var classify: u8 = 0;
 var color: u8 = 0; # only on a terminal: pipes get plain names
 
 # names of the last uid and gid looked up (ls lists many of the same)
@@ -82,7 +87,7 @@ fun show(e: *Item) {
         pad_out(?uname[0], uname_len, 8);
         io.putc(32);
         pad_out(?gname[0], gname_len, 8);
-        io.dec_pad(e.size, 8);
+        if (human != 0) { io.putc(32); opt.size(e.size, 1); } or { io.dec_pad(e.size, 8); }
         io.out("  \0");
         var t: [16]u8;
         io.outn(?t[0], text.fmt_time(e.mtime, ?t[0]));
@@ -97,6 +102,7 @@ fun show(e: *Item) {
     io.outn(e.name, e.name_len);
     if (color != 0 && paint != nil) { io.out("\x1b[0m\0"); }
     if (e.kind == io.KIND_DIR) { io.putc(47); }
+    or (classify != 0 && (e.mode & 0o111) != 0) { io.putc(42); }
     io.putc(10);
 }
 
@@ -119,7 +125,7 @@ fun list(p: *u8) u8 {
         ret 0;
     }
     var e: Item;
-    if (!io.is_dir(?st)) {
+    if (directory != 0 || !io.is_dir(?st)) {
         item(?e, ?st, p, io.len(p));
         show(?e);
         ret 1;
@@ -131,6 +137,7 @@ fun list(p: *u8) u8 {
         ret 0;
     }
     for (io.dir_next(?dir) > 0) {
+        if (hidden == 0 && dir.name[0] == 46) { cnt; }
         var est: os.stat_t;
         if (os.stat_path(dir.handle::usize, dir.name, ?est, 0) >= 0) {
             item(?e, ?est, dir.name, dir.len);
@@ -146,11 +153,24 @@ fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
     color = io.isatty(io.STDOUT);
-    var i: u64 = 1;
-    if (argc > 1 && io.streq(argv[1], "-l\0") != 0) {
-        long = 1;
-        i = 2;
+    if (opt.standard(argc, argv, "ls", "usage: ls [-lahdF] [--color=WHEN] [--] [PATH...]\n  -l  detailed listing\n  -a, -A, --all  include hidden names\n  -h, --human-readable  readable sizes with -l\n  -d, --directory  list directory itself\n  -F, --classify  mark executable files with *\n  --color=auto|always|never  select color output") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv);
+    for {
+        val c: u8 = opt.next(?p, "all=a,almost-all=A,human-readable=h,directory=d,classify=F,color=C"); if (c == 0) { brk; }
+        if (c == 108) { long = 1; } or (c == 104) { human = 1; }
+        or (c == 100) { directory = 1; } or (c == 70) { classify = 1; }
+        or (c == 97 || c == 65) { hidden = 1; }
+        or (c == 67) {
+            val value: *u8 = opt.argument(?p);
+            if (value != nil) {
+                if (io.streq(value, "always") != 0) { color = 1; }
+                or (io.streq(value, "never") != 0) { color = 0; }
+                or (io.streq(value, "auto") != 0) { color = io.isatty(io.STDOUT); } or { p.bad = 1; }
+            }
+        } or { p.bad = 1; }
     }
+    if (p.bad != 0) { ret opt.error("ls"); }
+    var i: u64 = p.at;
     if (i == argc) {
         if (list(".\0") == 0) { ret 1; }
         ret 0;

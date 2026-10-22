@@ -1,19 +1,21 @@
-# du [-s] [PATH...]: disk use of each directory in KiB (-s: totals only)
+# Report apparent sizes of files and directories in selectable units.
 
 use os:  std.system.os;
 use io:  userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 
 var summary: u8 = 0;
-
-fun kib(bytes: u64) u64 { ret (bytes + 1023) / 1024; }
+var unit: u64 = 1024;
+var status: u64 = 0;
 
 fun walk(p: *u8, n: u64, top: u8) u64 {
     var st: os.stat_t;
-    if (io.stat(p, ?st) < 0) { ret 0; }
+    val sr: i64 = io.stat(p, ?st);
+    if (sr < 0) { io.fail("du", p, sr); status = 1; ret 0; }
     if (io.kind_of(st.st_mode) != io.KIND_DIR) {
         if (top != 0) {
-            io.dec(kib(st.st_size::u64));
+            opt.size(st.st_size::u64, unit);
             io.putc(9);
             io.outn(p, n);
             io.putc(10);
@@ -22,12 +24,12 @@ fun walk(p: *u8, n: u64, top: u8) u64 {
     }
     var total: u64 = 0;
     val h: i64 = io.open_read(p);
-    if (h < 0) { ret 0; }
+    if (h < 0) { io.fail("du", p, h); status = 1; ret 0; }
     var dir: io.Dir;
-    if (io.dir_from(?dir, h) < 0) { ret 0; }
+    if (io.dir_from(?dir, h) < 0) { io.close(h); status = 1; ret 0; }
     for (io.dir_next(?dir) > 0) {
         if (io.dir_kind(?dir) == io.KIND_DEV) { cnt; }
-        if (n + 1 + dir.len >= 256) { cnt; }
+        if (n + 1 + dir.len >= 256) { io.err("du: path too long\n"); status = 1; cnt; }
         var c: [256]u8;
         io.copy(?c[0], p, n);
         var cn: u64 = n;
@@ -41,7 +43,7 @@ fun walk(p: *u8, n: u64, top: u8) u64 {
     }
     io.dir_close(?dir);
     if (summary == 0 || top != 0) {
-        io.dec(kib(total));
+        opt.size(total, unit);
         io.putc(9);
         io.outn(p, n);
         io.putc(10);
@@ -53,18 +55,23 @@ fun walk(p: *u8, n: u64, top: u8) u64 {
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
-    var i: u64 = 1;
-    if (i < argc && io.streq(argv[i], "-s\0") != 0) {
-        summary = 1;
-        i = i + 1;
+    if (opt.standard(argc, argv, "du", "usage: du [-shkmb] [--] [PATH...]\n  Reports apparent file sizes.\n  -s, --summarize  totals only\n  -h, --human-readable  readable IEC sizes\n  -k  KiB (default)\n  -m  MiB\n  -b, --bytes  bytes") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv);
+    for {
+        val c: u8 = opt.next(?p, "summarize=s,human-readable=h,bytes=b"); if (c == 0) { brk; }
+        if (c == 115) { summary = 1; } or (c == 104) { unit = 1; }
+        or (c == 107) { unit = 1024; } or (c == 109) { unit = 1048576; }
+        or (c == 98) { unit = 0; } or { p.bad = 1; }
     }
+    if (p.bad != 0) { ret opt.error("du"); }
+    var i: u64 = p.at;
     if (i == argc) {
         walk(".", 1, 1);
-        ret 0;
+        ret status;
     }
     for (i < argc) {
         walk(argv[i], io.len(argv[i]), 1);
         i = i + 1;
     }
-    ret 0;
+    ret status;
 }

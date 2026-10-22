@@ -1,11 +1,15 @@
-# cp [-r] SRC... DEST: copy files. with several sources, or when DEST is a
-# directory, the copies go inside it. -r copies directories recursively
+# Copy files and directory trees, optionally retaining existing destinations.
 
 use os:  std.system.os;
 use io:  userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 
 var recursive: u8 = 0;
+var keep: u8 = 0;
+var verbose: u8 = 0;
+var root_dev: u64 = 0;
+var root_ino: u64 = 0;
 var buf: [8192]u8;
 
 fun is_dir(p: *u8, n: u64) u8 {
@@ -30,7 +34,14 @@ fun copy_file(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
         ret 0;
     }
     var st: os.stat_t;
-    io.fstat(from, ?st);
+    if (io.fstat(from, ?st) < 0) { io.close(from); io.err("cp: cannot stat source\n"); ret 0; }
+    var dstst: os.stat_t;
+    if (io.stat(dst, ?dstst) >= 0) {
+        if (st.st_dev == dstst.st_dev && st.st_ino == dstst.st_ino) {
+            io.close(from); io.err("cp: source and destination are the same file\n"); ret 0;
+        }
+        if (keep != 0) { io.close(from); ret 1; }
+    }
     val to: i64 = io.open_mode(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, io.perms(?st) & 0x1FF);
     if (to < 0) {
         io.close(from);
@@ -56,14 +67,22 @@ fun copy_file(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
     }
     io.close(from);
     io.close(to);
-    # the copy gets the original's mode, set-id bits too: it belongs to
-    # whoever made it (as cp -p does it)
-    io.chmod(dst, io.perms(?st));
+    # Do not grant set-id privileges when creating a copy owned by another user.
+    io.chmod(dst, io.perms(?st) & 0o777);
+    if (ok != 0 && verbose != 0) { io.outn(src, sn); io.out(" -> "); io.outn(dst, dn); io.putc(10); }
     ret ok;
 }
 
 fun copy(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
+    var identity: os.stat_t;
+    if (io.stat(src, ?identity) >= 0 && identity.st_dev::u64 == root_dev && identity.st_ino::u64 == root_ino) {
+        io.err("cp: cannot copy a directory into itself\n"); ret 0;
+    }
     if (is_dir(src, sn) == 0) { ret copy_file(src, sn, dst, dn); }
+    var target: os.stat_t;
+    if (io.stat(dst, ?target) >= 0 && io.stat(src, ?identity) >= 0 && target.st_dev == identity.st_dev && target.st_ino == identity.st_ino) {
+        io.err("cp: source and destination are the same directory\n"); ret 0;
+    }
     if (recursive == 0) {
         io.err("cp: \0");
         io.errn(src, sn);
@@ -79,6 +98,9 @@ fun copy(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
             ret 0;
         }
     }
+    var created: os.stat_t;
+    if (io.stat(dst, ?created) < 0) { io.err("cp: cannot stat destination\n"); ret 0; }
+    if (root_ino == 0) { root_dev = created.st_dev::u64; root_ino = created.st_ino::u64; }
     val h: i64 = io.open_read(src);
     if (h < 0) {
         complain(src, sn, h);
@@ -116,15 +138,15 @@ fun copy(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
-    var i: u64 = 1;
-    if (argc > 1 && io.streq(argv[1], "-r\0") != 0) {
-        recursive = 1;
-        i = 2;
+    if (opt.standard(argc, argv, "cp", "usage: cp [-rRnv] [--] SOURCE... DEST\n  -r, -R, --recursive  copy directories\n  -n, --no-clobber     keep existing files\n  -v, --verbose        print copied paths") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv);
+    for {
+        val c: u8 = opt.next(?p, "recursive=r,no-clobber=n,verbose=v"); if (c == 0) { brk; }
+        if (c == 114 || c == 82) { recursive = 1; } or (c == 110) { keep = 1; }
+        or (c == 118) { verbose = 1; } or { p.bad = 1; }
     }
-    if (argc - i < 2) {
-        io.err("usage: cp [-r] SRC... DEST\n\0");
-        ret 2;
-    }
+    if (p.bad != 0 || argc - p.at < 2) { ret opt.error("cp"); }
+    var i: u64 = p.at;
     val dest: *u8 = argv[argc - 1];
     val dl: u64 = io.len(dest);
     val into: u8 = is_dir(dest, dl);
@@ -136,6 +158,7 @@ fun run(argc: u64, argv: **u8) u64 {
     }
     var status: u64 = 0;
     for (i < argc - 1) {
+        root_dev = 0; root_ino = 0;
         val src: *u8 = argv[i];
         val sl: u64 = io.len(src);
         if (into == 0) {

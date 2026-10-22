@@ -1,15 +1,28 @@
-# rm [-r] PATH...: remove files and empty directories (-r: and everything in them)
+# Remove files and directory trees, with optional force and verbose modes.
 
 use os:  std.system.os;
 use io:  userland.lib.cli;
+use error: std.io.error;
+use opt: userland.lib.options;
 use std.runtime;
 use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 
 var recursive: u8 = 0;
+var force: u8 = 0;
+var verbose: u8 = 0;
 
 fun remove(p: *u8, n: u64) u8 {
+    var identity: os.stat_t; var root: os.stat_t;
+    if (io.stat(p, ?identity) >= 0 && io.stat("/", ?root) >= 0 && identity.st_dev == root.st_dev && identity.st_ino == root.st_ino) {
+        io.err("rm: refusing to remove root directory\n"); ret 0;
+    }
+    var end: u64 = n; for (end > 0 && p[end - 1] == 47) { end = end - 1; }
+    var start: u64 = end; for (start > 0 && p[start - 1] != 47) { start = start - 1; }
+    if ((end - start == 1 && p[start] == 46) || (end - start == 2 && p[start] == 46 && p[start + 1] == 46)) {
+        io.err("rm: refusing to remove . or ..\n"); ret 0;
+    }
     if (recursive != 0) {
         var st: os.stat_t;
         if (io.stat(p, ?st) >= 0 && io.is_dir(?st)) {
@@ -36,6 +49,7 @@ fun remove(p: *u8, n: u64) u8 {
     }
     val r: i64 = io.remove(p);
     if (r < 0) {
+        if (force != 0 && os.error_kind(r) == error.NOT_FOUND) { ret 1; }
         io.err("rm: \0");
         io.errn(p, n);
         io.err(": \0");
@@ -43,6 +57,7 @@ fun remove(p: *u8, n: u64) u8 {
         io.err("\n\0");
         ret 0;
     }
+    if (verbose != 0) { io.out("removed "); io.outn(p, n); io.putc(10); }
     ret 1;
 }
 
@@ -50,15 +65,15 @@ fun remove(p: *u8, n: u64) u8 {
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
-    var i: u64 = 1;
-    if (argc > 1 && io.streq(argv[1], "-r\0") != 0) {
-        recursive = 1;
-        i = 2;
+    if (opt.standard(argc, argv, "rm", "usage: rm [-frRv] [--] PATH...\n  -f, --force      ignore nonexistent files\n  -r, -R, --recursive  remove directory trees\n  -v, --verbose    print removed paths") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv);
+    for {
+        val c: u8 = opt.next(?p, "force=f,recursive=r,verbose=v"); if (c == 0) { brk; }
+        if (c == 102) { force = 1; } or (c == 114 || c == 82) { recursive = 1; }
+        or (c == 118) { verbose = 1; } or { p.bad = 1; }
     }
-    if (i == argc) {
-        io.err("usage: rm [-r] PATH...\n\0");
-        ret 2;
-    }
+    if (p.bad != 0 || (p.at == argc && force == 0)) { ret opt.error("rm"); }
+    var i: u64 = p.at;
     var status: u64 = 0;
     for (i < argc) {
         if (remove(argv[i], io.len(argv[i])) == 0) { status = 1; }

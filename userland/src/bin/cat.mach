@@ -1,64 +1,70 @@
-# cat [FILE...]: copy files (or stdin) to stdout
+# Copy files or standard input, optionally numbering and displaying line endings.
 
+use io: userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
-use std.print;
-use std.filesystem;
-use std.types.result.res;
-use std.types.size.usize;
-use std.types.string.str;
-use std.types.bool.bool;
-use std.types.bool.true;
-use std.types.bool.false;
-use std.system.os;
-use io_error: std.io.error;
 
-var buf: [4096]u8;
+var buf: [8192]u8;
+var number: u8 = 0;
+var nonblank: u8 = 0;
+var squeeze: u8 = 0;
+var ends: u8 = 0;
+var tabs: u8 = 0;
+var line: u64 = 1;
+var beginning: u8 = 1;
+var previous_blank: u8 = 0;
 
-fun complain(name: str, e: io_error.Error) {
-    print.eprintlnf("cat: {}: {}", name, os.message(e));
-}
-
-# copy everything f has to stdout; whether it all went
-fun pump(f: filesystem.File, name: str) bool {
+fun pump(h: i64, name: *u8) u64 {
     for {
-        val r: res[usize, io_error.Error] = filesystem.read(f, ?buf[0], 4096);
-        if (sel r.err) {
-            complain(name, r.err);
-            ret false;
+        val r: i64 = io.read(h, ?buf[0], 8192);
+        if (r < 0) { io.fail("cat", name, r); ret 1; }
+        if (r == 0) { ret 0; }
+        if (number == 0 && nonblank == 0 && squeeze == 0 && ends == 0 && tabs == 0) {
+            if (io.write_all(io.STDOUT, ?buf[0], r::u64) == 0) { ret 1; }
+            cnt;
         }
-        val n: usize = r.ok;
-        if (n == 0) { ret true; }
-        var at: usize = 0;
-        for (at < n) {
-            val w: res[usize, io_error.Error] = filesystem.write(filesystem.STDOUT, ?buf[at], n - at);
-            if (sel w.err) { ret false; }
-            at = at + w.ok;
+        var i: u64 = 0;
+        for (i < r::u64) {
+            val c: u8 = buf[i]; i = i + 1;
+            if (beginning != 0) {
+                if (c == 10 && squeeze != 0 && previous_blank != 0) { cnt; }
+                previous_blank = (c == 10)::u8;
+                if ((nonblank != 0 && c != 10) || (number != 0 && nonblank == 0)) {
+                    io.dec_pad(line, 6); io.putc(9); line = line + 1;
+                }
+            }
+            if (c == 10 && ends != 0) { io.putc(36); }
+            if (c == 9 && tabs != 0) { io.out("^I"); }
+            or { if (io.write_all(io.STDOUT, ?buf[i - 1], 1) == 0) { ret 1; } }
+            beginning = (c == 10)::u8;
         }
     }
-    ret true;
+    ret 0;
 }
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    if (argc < 2) {
-        if (!pump(filesystem.STDIN, "stdin")) { ret 1; }
-        ret 0;
+    if (opt.standard(argc::u64, argv, "cat", "usage: cat [-nbsET] [--] [FILE...]\n  -n, --number           number all lines\n  -b, --number-nonblank  number nonempty lines\n  -s, --squeeze-blank    collapse repeated empty lines\n  -E, --show-ends        display $ at line endings\n  -T, --show-tabs        display tabs as ^I\n  -                     read standard input") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc::u64, argv);
+    for {
+        val c: u8 = opt.next(?p, "number=n,number-nonblank=b,squeeze-blank=s,show-ends=E,show-tabs=T");
+        if (c == 0) { brk; }
+        if (c == 110) { number = 1; } or (c == 98) { nonblank = 1; }
+        or (c == 115) { squeeze = 1; } or (c == 69) { ends = 1; }
+        or (c == 84) { tabs = 1; } or { p.bad = 1; }
     }
-    var status: i64 = 0;
-    var i: i64 = 1;
-    for (i < argc) {
-        val name: str = argv[i]::str;
-        val opened: res[filesystem.File, io_error.Error] = filesystem.open(name);
-        if (sel opened.ok) {
-            var f: filesystem.File = opened.ok;
-            if (!pump(f, name)) { status = 1; }
-            filesystem.close(?f);
+    if (p.bad != 0) { ret opt.error("cat")::i64; }
+    if (p.at == argc::u64) { ret pump(io.STDIN, "stdin")::i64; }
+    var status: u64 = 0;
+    for (p.at < argc::u64) {
+        val path: *u8 = argv[p.at]; var h: i64 = io.STDIN;
+        if (io.streq(path, "-") == 0) { h = io.open_read(path); }
+        if (h < 0) { io.fail("cat", path, h); status = 1; }
+        or {
+            if (pump(h, path) != 0) { status = 1; }
+            if (h != io.STDIN) { io.close(h); }
         }
-        if (sel opened.err) {
-            complain(name, opened.err);
-            status = 1;
-        }
-        i = i + 1;
+        p.at = p.at + 1;
     }
-    ret status;
+    ret status::i64;
 }

@@ -1,26 +1,57 @@
-# mkdir DIR...: make directories
+# Make directories, optionally creating missing parents.
 
-use os:  std.system.os;
-use io:  userland.lib.cli;
+use os: std.system.os;
+use io: userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
-fun run(argc: u64, argv: **u8) u64 {
-    if (argc < 2) {
-        io.err("usage: mkdir DIR...\n\0");
-        ret 2;
+fun create(path: *u8, mode: u64, parents: u8, verbose: u8) u64 {
+    val r: i64 = io.mkdir(path, mode);
+    if (r < 0) {
+        var st: os.stat_t;
+        if (parents != 0 && io.stat(path, ?st) >= 0 && io.is_dir(?st) != 0) { ret 0; }
+        io.fail("mkdir", path, r); ret 1;
     }
+    if (verbose != 0) { io.out("mkdir: created directory '"); io.out(path); io.out("'\n"); }
+    ret 0;
+}
+
+fun run(argc: u64, argv: **u8) u64 {
+    if (opt.standard(argc, argv, "mkdir", "usage: mkdir [-pv] [-m MODE] [--] DIR...\n  -p, --parents  create parents\n  -m, --mode     octal permissions\n  -v, --verbose  print created directories") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv);
+    var parents: u8 = 0; var verbose: u8 = 0; var mode: u64 = 0o777;
+    for {
+        val c: u8 = opt.next(?p, "parents=p,mode=m,verbose=v");
+        if (c == 0) { brk; }
+        if (c == 112) { parents = 1; }
+        or (c == 118) { verbose = 1; }
+        or (c == 109) { var ok: u8 = 0; mode = opt.octal(opt.argument(?p), ?ok); if (ok == 0) { p.bad = 1; } }
+        or { p.bad = 1; }
+    }
+    if (p.bad != 0 || p.at == argc) { ret opt.error("mkdir"); }
     var status: u64 = 0;
-    var i: u64 = 1;
-    for (i < argc) {
-        val r: i64 = io.mkdir(argv[i], 0o777);
-        if (r < 0) {
-            io.fail("mkdir\0", argv[i], r);
-            status = 1;
+    for (p.at < argc) {
+        val path: *u8 = argv[p.at]; val n: u64 = io.len(path);
+        if (n == 0 || n >= 4096) { io.err("mkdir: invalid path\n"); status = 1; }
+        or {
+            var buf: [4096]u8; io.copy(?buf[0], path, n + 1);
+            var i: u64 = 1;
+            if (parents != 0) {
+                for (i < n) {
+                    if (buf[i] == 47 && buf[i - 1] != 47) {
+                        buf[i] = 0;
+                        if (create(?buf[0], 0o777, 1, verbose) != 0) { status = 1; }
+                        buf[i] = 47;
+                    }
+                    i = i + 1;
+                }
+            }
+            if (create(?buf[0], mode, parents, verbose) != 0) { status = 1; }
         }
-        i = i + 1;
+        p.at = p.at + 1;
     }
     ret status;
 }

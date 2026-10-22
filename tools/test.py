@@ -48,6 +48,14 @@ def with_posixtest():
     sh(f"tools/put.sh examples/posixtest/out/machos/{p}/posixtest /bin/posixtest {disk()}")
 
 
+def with_usability():
+    """Install the command/configuration assertions on a fresh test disk."""
+    subprocess.run(["tools/mkimage.sh", PROFILE[0], "--fresh"], cwd=ROOT, check=True,
+                   stdout=subprocess.PIPE)
+    subprocess.run(["tools/put.sh", "tools/fixtures/usability.sh", "/bin/usability-test", disk()],
+                   cwd=ROOT, check=True, stdout=subprocess.PIPE)
+
+
 def with_stdtest():
     """a fresh dev disk with examples/stdtest (mach's std on MachOS) on it
     as /bin/stdtest"""
@@ -616,6 +624,17 @@ USB_HUB = ["--qemu=-machine", "--qemu=i8042=off", "--qemu=-device", "--qemu=qemu
 
 TESTS = [
     # name, keep previous disk, fsck, steps, expected output in order
+    ("usability", False, True,
+     ["--prep", with_usability, "--boot", disk,
+      "wait:" + P, "send:sh /bin/usability-test; echo usability-status $?\\n", "wait:" + P,
+      "send:config set hostname configured; config set ttys 1; uname -n\\n", "wait:" + P],
+     ["usability: all assertions passed", "usability-status 0", "config: saved", "machos"]),
+
+    ("usability-reboot", True, True,
+     ["wait:" + P,
+      "send:uname -n; config get ttys; test \"$(uname -n)\" = configured; echo boot-config-status $?\\n", "wait:" + P],
+     ["MachOS 0.9.1", "configured", "1", "boot-config-status 0"]),
+
     ("boot", False, False,
      ["wait:" + P, "send:uname -a; ls /\\n", "wait:" + P],
      ["root: ext2 on /dev/sda2", "MachOS", "bin/", "etc/", "dev/", "tmp/"]),
@@ -744,7 +763,7 @@ TESTS = [
     ("dualboot", False, False,
      ["--prep", fake_windows, "--boot", DUAL, "--nologin", "sleep:2.5", "keys:<down><down><down>", "sleep:0.5",
       "keys:<ret>", "wait:booting Windows", "wait:login: ", "send:root\\n", "wait:" + P],
-     ["Windows", "machboot: booting Windows", "machboot 0.9.0"]),
+     ["Windows", "machboot: booting Windows", "machboot 0.9.1"]),
 
     # machboot hide: no menu, straight into MachOS
     ("hidden-menu", False, True,
@@ -759,10 +778,10 @@ TESTS = [
      ["--prep", update_stick] + usb_stick() + [
       "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update; update /mnt/update.tgz; umount /mnt; machboot\\n",
       "wait:" + P],
-     ["updating MachOS", "installing the programs", "MachOS is updated to 0.9.0", "MachOS (previous)"]),
+     ["updating MachOS", "installing the programs", "MachOS is updated to 0.9.1", "MachOS (previous)"]),
     ("update-reboot", True, True,
      ["wait:" + P, "send:ls /boot; uname -a\\n", "wait:" + P],
-     ["kernel.old.elf", "MachOS 0.9.0"]),
+     ["kernel.old.elf", "MachOS 0.9.1"]),
 
     # MachOS installed on a USB stick, then booted from the stick alone
     ("usb-install", False, False,
@@ -869,8 +888,8 @@ TESTS = [
      ["wait:" + P, "send:cat /proc/version; head -2 /proc/meminfo; cat /proc/self/status; ls /proc/sys/kernel; cat /proc/stat\\n",
       "wait:" + P,
       "send:uname -a; free; uptime; ps; df; id; whoami; tty; neofetch | grep -c Memory\\n", "wait:" + P],
-     ["MachOS version 0.9.0", "MemTotal:", "Name:", "cat", "Uid:", "hostname", "cpu0",
-      "MachOS 0.9.0 x86_64 on machos", "total", "processes", "PID", "init", "Filesystem", "/dev/sda2",
+     ["MachOS version 0.9.1", "MemTotal:", "Name:", "cat", "Uid:", "hostname", "cpu0",
+      "MachOS 0.9.1 x86_64 on machos", "total", "processes", "PID", "init", "Filesystem", "/dev/sda2",
       "uid=0(root)", "root", "/dev/tty1", "1"]),
 
     ("events", False, False,

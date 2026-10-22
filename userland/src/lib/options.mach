@@ -1,0 +1,105 @@
+# Shared command-line handling: clustered short options, long aliases,
+# attached values and an explicit -- operand boundary.
+
+use io: userland.lib.cli;
+use system: userland.lib.system;
+
+pub rec Parser {
+    argc: u64;
+    argv: **u8;
+    at: u64;
+    cluster: *u8;
+    attached: *u8;
+    bad: u8;
+    ended: u8;
+}
+
+pub fun init(p: *Parser, argc: u64, argv: **u8) {
+    p.argc = argc; p.argv = argv; p.at = 1;
+    p.cluster = nil; p.attached = nil; p.bad = 0; p.ended = 0;
+}
+
+# aliases is a comma-separated list such as "parents=p,mode=m". A caller
+# consumes a value immediately after next() returns the corresponding option.
+pub fun next(p: *Parser, aliases: *u8) u8 {
+    if (p.bad != 0 || p.ended != 0) { ret 0; }
+    if (p.attached != nil) { p.bad = 1; ret 0; } # A flag was given an unwanted value.
+    if (p.cluster != nil && p.cluster[0] != 0) {
+        val c: u8 = p.cluster[0]; p.cluster = ?p.cluster[1]; ret c;
+    }
+    p.cluster = nil;
+    if (p.at == p.argc) { ret 0; }
+    val word: *u8 = p.argv[p.at];
+    if (word[0] != 45 || word[1] == 0) { ret 0; }
+    p.at = p.at + 1;
+    if (word[1] != 45) {
+        p.cluster = ?word[2]; ret word[1];
+    }
+    if (word[2] == 0) { p.ended = 1; ret 0; }
+    var n: u64 = 2;
+    for (word[n] != 0 && word[n] != 61) { n = n + 1; }
+    var i: u64 = 0;
+    for (aliases[i] != 0) {
+        val start: u64 = i;
+        for (aliases[i] != 0 && aliases[i] != 61 && aliases[i] != 44) { i = i + 1; }
+        if (aliases[i] == 61 && io.eq(?word[2], n - 2, ?aliases[start], i - start) != 0) {
+            if (word[n] == 61) { p.attached = ?word[n + 1]; }
+            ret aliases[i + 1];
+        }
+        for (aliases[i] != 0 && aliases[i] != 44) { i = i + 1; }
+        if (aliases[i] == 44) { i = i + 1; }
+    }
+    p.bad = 1;
+    ret 0;
+}
+
+pub fun argument(p: *Parser) *u8 {
+    if (p.attached != nil) {
+        val value: *u8 = p.attached; p.attached = nil; ret value;
+    }
+    if (p.cluster != nil && p.cluster[0] != 0) {
+        val value: *u8 = p.cluster; p.cluster = nil; ret value;
+    }
+    p.cluster = nil;
+    if (p.at == p.argc) { p.bad = 1; ret nil; }
+    val value: *u8 = p.argv[p.at]; p.at = p.at + 1; ret value;
+}
+
+pub fun error(name: *u8) u64 {
+    io.err(name); io.err(": invalid option or argument; try --help\n"); ret 2;
+}
+
+pub fun standard(argc: u64, argv: **u8, name: *u8, help: *u8) u8 {
+    if (argc != 2) { ret 0; }
+    if (io.streq(argv[1], "--help") != 0) {
+        io.out(help); io.out("\n  --help       show this help\n  --version    show the MachOS version\n"); ret 1;
+    }
+    if (io.streq(argv[1], "--version") != 0) {
+        var release: [64]u8;
+        system.release(?release[0], 64);
+        io.out(name); io.out(" (MachOS) "); io.out(?release[0]); io.putc(10); ret 1;
+    }
+    ret 0;
+}
+
+pub fun octal(text: *u8, ok: *u8) u64 {
+    @ok = 0;
+    if (text == nil || text[0] == 0) { ret 0; }
+    var value: u64 = 0; var i: u64 = 0;
+    for (text[i] != 0) {
+        if (text[i] < 48 || text[i] > 55 || value > 0o7777 / 8) { ret 0; }
+        value = value * 8 + (text[i] - 48)::u64; i = i + 1;
+    }
+    @ok = 1; ret value;
+}
+
+# IEC size formatting shared by ls, du, df and free.
+pub fun size(bytes: u64, unit: u64) {
+    if (unit == 0) { io.dec(bytes); ret; }
+    if (unit > 1) { io.dec(bytes / unit + (bytes % unit != 0)::u64); ret; }
+    var value: u64 = bytes; var scale: u64 = 1; var suffix: u64 = 0;
+    for (value >= 1024 && suffix < 6) { value = value / 1024; scale = scale * 1024; suffix = suffix + 1; }
+    io.dec(value);
+    if (suffix != 0 && value < 10) { io.putc(46); io.dec((bytes % scale) * 10 / scale); }
+    val units: *u8 = "BKMGTPE"; io.putc(units[suffix]);
+}

@@ -96,7 +96,9 @@ pub fun parse_dec(s: *u8, n: u64, ok: *u8) u64 {
     var i: u64 = 0;
     for (i < n) {
         if (s[i] < 48 || s[i] > 57) { ret 0; }
-        v = v * 10 + (s[i] - 48)::u64;
+        val digit: u64 = (s[i] - 48)::u64;
+        if (v > (0xffffffffffffffffu64 - digit) / 10) { ret 0; }
+        v = v * 10 + digit;
         i = i + 1;
     }
     @ok = 1;

@@ -1,7 +1,8 @@
-# tee [-a] FILE...: copy stdin to stdout and to every FILE (-a appends)
+# Copy standard input to standard output and files, optionally appending.
 
 use os:  std.system.os;
 use io:  userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 
 var buf: [8192]u8;
@@ -10,12 +11,15 @@ var buf: [8192]u8;
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
+    if (opt.standard(argc, argv, "tee", "usage: tee [-a] [--] [FILE...]\n  -a, --append  append instead of replacing") != 0) { ret 0; }
+    var p: opt.Parser; opt.init(?p, argc, argv);
     var flags: i32 = os.O_WRONLY | os.O_CREAT | os.O_TRUNC;
-    var i: u64 = 1;
-    if (i < argc && io.streq(argv[i], "-a\0") != 0) {
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND;
-        i = i + 1;
+    for {
+        val c: u8 = opt.next(?p, "append=a"); if (c == 0) { brk; }
+        if (c == 97) { flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND; } or { p.bad = 1; }
     }
+    if (p.bad != 0 || argc - p.at > 14) { ret opt.error("tee"); }
+    var i: u64 = p.at;
     var outs: [14]i64;
     var nout: u64 = 0;
     var status: u64 = 0;
@@ -32,13 +36,16 @@ fun run(argc: u64, argv: **u8) u64 {
     }
     for {
         val r: i64 = io.read(io.STDIN, ?buf[0], 8192);
-        if (r <= 0) { brk; }
-        io.write_all(io.STDOUT, ?buf[0], r::u64);
+        if (r < 0) { io.fail("tee", "stdin", r); status = 1; brk; }
+        if (r == 0) { brk; }
+        if (io.write_all(io.STDOUT, ?buf[0], r::u64) == 0) { status = 1; }
         var k: u64 = 0;
         for (k < nout) {
-            io.write_all(outs[k], ?buf[0], r::u64);
+            if (io.write_all(outs[k], ?buf[0], r::u64) == 0) { status = 1; }
             k = k + 1;
         }
     }
+    var k: u64 = 0;
+    for (k < nout) { io.close(outs[k]); k = k + 1; }
     ret status;
 }
