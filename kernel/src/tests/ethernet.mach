@@ -3,6 +3,8 @@
 use machos.dev.e1000;
 use machos.dev.ethernet;
 use machos.dev.pci;
+use machos.dev.rtl8125;
+use machos.dev.virtio_net;
 
 var refused:  u64 = 0;
 var claimed:  u64 = 0;

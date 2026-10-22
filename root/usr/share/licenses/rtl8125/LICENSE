@@ -1,0 +1,28 @@
+RTL8125B driver reference:
+OpenBSD sys/dev/pci/if_rge.c revision 1.47 (2026-10-13)
+OpenBSD sys/dev/pci/if_rgereg.h revision 1.19 (2026-10-13)
+https://github.com/openbsd/src/tree/master/sys/dev/pci
+
+Copyright (c) 2019, 2020, 2023-2026 Kevin Lo <kevlo@openbsd.org>
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+Firmware data:
+OpenBSD sys/dev/microcode/rge/rgemcode.h revision 1.1 (2026-10-13)
+https://github.com/openbsd/src/blob/master/sys/dev/microcode/rge/rgemcode.h
+
+Copyright (c) 2026 Realtek Semiconductor Corporation
+
+Permission is hereby granted for the distribution of this firmware
+data in hexadecimal or equivalent format, provided this copyright
+notice is accompanying it.

@@ -119,8 +119,6 @@ def tls_test_project():
     for name in ("std", "crypto", "pki", "tls", "http"):
         repository = "machos-std" if name == "std" else "mach-" + name
         path = tls_source if name == "tls" else os.path.join(ROOT, "deps", repository)
-        if name == "crypto":
-            path = os.path.join(ROOT, "deps", ".patched", repository)
         manifest, changed = re.subn(r'\[dep\.' + name + r'\]\n(?:(?!\[)[^\n]*\n)*',
                                    '[dep.' + name + ']\npath = "' + path + '"\n\n',
                                    manifest, count=1)
@@ -317,14 +315,18 @@ def http_server():
 
 
 DNS_COUNTS = {}
+DNS_SERVER = []
 
 
 def dns_fixture():
     """Drop the first A query, then answer through two CNAMEs deterministically."""
     import socket, struct
+    DNS_COUNTS.clear()
+    if DNS_SERVER:
+        return
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server.bind(("127.0.0.1", 5533))
-    DNS_COUNTS.clear()
+    DNS_SERVER.append(server)
 
     def name(text):
         return b"".join(bytes([len(part)]) + part.encode("ascii") for part in text.split(".")) + b"\x00"
@@ -375,6 +377,12 @@ def https_server():
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec, rsa
     from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+    # Each adapter scenario gets its own CA; release the previous TLS fixtures.
+    for server in list(HTTP_SERVER):
+        if server.server_address[1] in (9080, 9443, 9444, 9445):
+            server.shutdown()
+            server.server_close()
+            HTTP_SERVER.remove(server)
     subprocess.run(["tools/mkimage.sh", PROFILE[0], "--fresh"], cwd=ROOT, check=True,
                    stdout=subprocess.PIPE)
     directory = os.path.join(ROOT, "out", "headless", "https")
@@ -1068,6 +1076,23 @@ TESTS = [
 ]
 
 
+# Reuse protocol scenarios with an explicit Virtio NIC, never QEMU's default NIC.
+for source, name, adapter in (("tcp", "virtio-net", "virtio"),
+                              ("https", "virtio-https", "virtio"),
+                              ("https", "virtio-modern-https", "virtio-modern")):
+    _, keep, fsck, steps, expect = next(test for test in TESTS if test[0] == source)
+    extra = []
+    if source == "tcp":
+        extra = ["mon:set_link nic0 off", "sleep:0.5",
+                 "send:ping -c 1 10.0.2.2; echo virtio-link-down $?\\n", "wait:" + P,
+                 "mon:set_link nic0 on", "sleep:0.5",
+                 "send:ping -c 1 10.0.2.2; echo virtio-link-up $?; ip; ip stats\\n", "wait:" + P]
+    TESTS.append((name, keep, fsck, ["--nic", adapter] + steps + extra,
+                  ["[1af4:1041]" if adapter == "virtio-modern" else "[1af4:1000]",
+                   "virtio-net: modern PCI, polled RX/TX ready", "net: eth0: Virtio-net"] + expect +
+                  (["virtio-link-down 1", "virtio-link-up 0", "address 10.0.2.15/24"] if extra else [])))
+
+
 # FAT/exFAT retain their supported name limit without creating names that truncate on remount.
 for index, (name, keep, fsck, steps, expect) in enumerate(TESTS):
     if name in ("fat-usb", "exfat-usb"):
@@ -1180,7 +1205,7 @@ def run(name, keep, fsck, steps, expect, profile):
     os.makedirs(os.path.join(ROOT, "out", "headless"), exist_ok=True)
     with open(os.path.join(ROOT, "out", "headless", name + ".log"), "w") as f:
         f.write(out)
-    if name == "https":
+    if name == "https" or name.endswith("-https"):
         timings = [float(value) for value in re.findall(r"\breal\s+(\d+\.\d+)s", out)]
         if len(timings) < 2:
             problems.append("TLS handshake timing results are missing")

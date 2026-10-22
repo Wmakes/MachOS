@@ -4,6 +4,8 @@
 use machos.dev.e1000;
 use machos.dev.ethernet;
 use machos.dev.pci;
+use machos.dev.rtl8125;
+use machos.dev.virtio_net;
 use machos.kern.kprint;
 
 var started: u8 = 0;
@@ -12,11 +14,13 @@ var started: u8 = 0;
 pub fun init() u64 {
     if (started != 0) { ret ethernet.device_count(); }
     started = 1;
-    var drivers: [1]ethernet.Driver;
+    var drivers: [3]ethernet.Driver;
     drivers[0].probe = e1000.probe;
+    drivers[1].probe = rtl8125.probe;
+    drivers[2].probe = virtio_net.probe;
     var i: u64 = 0;
     for (i < pci.device_count()) {
-        ethernet.probe(pci.get(i), ?drivers[0], 1);
+        ethernet.probe(pci.get(i), ?drivers[0], 3);
         i = i + 1;
     }
     kprint.info("ethernet\0");

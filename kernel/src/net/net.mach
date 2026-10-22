@@ -532,9 +532,14 @@ pub fun init() u8 {
         i = i + 1;
     }
     if (ethernet.link_up(ifc.nic) != 0) {
-        kprint.puts(", link up at \0");
-        kprint.dec(ethernet.speed(ifc.nic));
-        kprint.puts(" Mbit/s\n\0");
+        kprint.puts(", link up\0");
+        val rate: u64 = ethernet.speed(ifc.nic);
+        if (rate != 0) {
+            kprint.puts(" at \0");
+            kprint.dec(rate);
+            kprint.puts(" Mbit/s\0");
+        }
+        kprint.putc(10);
     } or {
         kprint.puts(", no link\n\0");
     }

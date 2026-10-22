@@ -1,0 +1,766 @@
+# Virtio-net over modern PCI capabilities, with one polled split RX/TX pair.
+# References: OpenBSD sys/dev/pv/if_vio.c revision 1.81 (2026-06-23),
+# sys/dev/pv/virtio.c revision 1.40 and sys/dev/pci/virtio_pci.c revision 1.54
+# (2026-10-11), plus virtioreg.h and virtio_pcireg.h:
+# https://github.com/openbsd/src/tree/master/sys/dev/pv
+# https://github.com/openbsd/src/tree/master/sys/dev/pci
+# Modern-capable transitional and non-transitional network devices only.
+# No legacy I/O transport, packed rings, mergeable buffers, offloads or MSI.
+
+# Copyright (c) 2012 Stefan Fritsch, Alexander Fiveg.
+# Copyright (c) 2010 Minoura Makoto.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+# NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# Copyright (c) 2019 Stefan Fritsch <sf@openbsd.org>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+# Copyright (c) 2012 Stefan Fritsch.
+# Copyright (c) 2010 Minoura Makoto.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+# NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# An interface for efficient virtio implementation.
+#
+# This header is BSD licensed so anyone can use the definitions
+# to implement compatible drivers/servers.
+#
+# Copyright 2007, 2009, IBM Corporation
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+# 3. Neither the name of IBM nor the names of its contributors
+#    may be used to endorse or promote products derived from this software
+#    without specific prior written permission.
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS ``AS IS'' AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL IBM OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+# OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+
+use machos.arch.x86_64.cpu;
+use machos.dev.ethernet;
+use machos.dev.pci;
+use machos.kern.kprint;
+use machos.kern.mem;
+use machos.mm.pmm;
+use machos.mm.vmm;
+
+val MAX_QUEUE: u64 = 64;
+val HEADER:    u64 = 12; # VERSION_1 includes num_buffers even without mergeable RX.
+val BUFFER:    u64 = 2048;
+val F_MAC:     u32 = 1 << 5;
+val F_STATUS:  u32 = 1 << 16;
+val F_SPEED:   u32 = 1 << 31; # High feature word: bit 63 overall.
+
+#[volatile]
+rec Reg8       { v: u8; }
+#[volatile]
+rec Reg16      { v: u16; }
+#[volatile]
+rec Reg32      { v: u32; }
+#[volatile]
+rec Descriptor { addr: u64; len: u32; flags: u16; next: u16; }
+#[volatile]
+rec Used       { id: u32; len: u32; }
+
+rec Queue {
+    desc:      u64;
+    avail:     u64;
+    used:      u64;
+    size:      u64;
+    buffers:   [64]u64;
+    busy:      [64]u8;
+    avail_idx: u16;
+    used_idx:  u16;
+    next:      u64;
+    notify:    u64;
+    number:    u16;
+}
+
+rec Nic {
+    common:         u64;
+    config:         u64;
+    config_len:     u64;
+    notify:         u64;
+    notify_len:     u64;
+    multiplier:     u64;
+    isr:            u64;
+    device:         *pci.Device;
+    rx:             Queue;
+    tx:             Queue;
+    mac:            [6]u8;
+    status_feature: u8;
+    speed_feature:  u8;
+    running:        u8;
+    failed:         u8;
+}
+
+rec Capability { base: u64; len: u64; multiplier: u64; }
+var nics:  [4]Nic;
+var count: u64 = 0;
+
+fun rd8(addr: u64) u8 {
+    ret (@(addr::*Reg8)).v;
+}
+
+fun rd16(addr: u64) u16 {
+    ret (@(addr::*Reg16)).v;
+}
+
+fun rd32(addr: u64) u32 {
+    ret (@(addr::*Reg32)).v;
+}
+
+fun wr8(addr: u64, value: u8) {
+    (@(addr::*Reg8)).v = value;
+}
+
+fun wr16(addr: u64, value: u16) {
+    (@(addr::*Reg16)).v = value;
+}
+
+fun wr32(addr: u64, value: u32) {
+    (@(addr::*Reg32)).v = value;
+}
+
+fun wr64(addr: u64, value: u64) {
+    wr32(addr, value::u32);
+    wr32(addr + 4, (value >> 32)::u32);
+}
+
+fun barrier() {
+    asm x86_64 { mfence }
+}
+
+fun advance(index: u16) u16 {
+    ret (index::u32 + 1)::u16;
+}
+
+fun pending(q: *Queue) u64 {
+    ret ((rd16(q.used + 2)::u32 + 65536 - q.used_idx::u32) % 65536)::u64;
+}
+
+fun choose_size(offered: u16) u64 {
+    if (offered == 0) { ret 0; }
+    var size: u64 = 1;
+    for (size * 2 <= offered::u64 && size * 2 <= MAX_QUEUE) { size = size * 2; }
+    ret size;
+}
+
+fun supports(d: *pci.Device) u8 {
+    ret (d != nil && d.vendor == 0x1af4 && d.class == 2 && d.subclass == 0 &&
+        (d.device == 0x1000 || d.device == 0x1041))::u8;
+}
+
+# Do not mistake the upper half of a 64-bit BAR for a separate memory BAR.
+fun memory_bar(d: *pci.Device, wanted: u8) u64 {
+    var i: u8 = 0;
+    for (i < 6) {
+        val raw:  u32 = pci.read32(d, 0x10 + i * 4);
+        val wide: u8  = ((raw & 7) == 4)::u8;
+        if (i == wanted) {
+            if (raw == 0 || raw == 0xffffffff || (raw & 1) != 0 ||
+                ((raw & 6) != 0 && wide == 0) || (wide != 0 && i == 5)) { ret 0; }
+            ret pci.bar(d, i);
+        }
+        i = i + 1 + wide;
+    }
+    ret 0;
+}
+
+fun valid_region(off: u64, len: u64, minimum: u64) u8 {
+    # Bound mappings even for malformed capability lists.
+    ret (len >= minimum && len <= 0x10000 && off <= 0x100000 &&
+        off + len <= 0x110000 && (off & 3) == 0)::u8;
+}
+
+fun find_cap(d: *pci.Device, wanted: u8, minimum: u64, out: *Capability) u8 {
+    var at:     u8  = (pci.read32(d, 0x34) & 0xfc)::u8;
+    var visits: u64 = 0;
+    for (at >= 0x40 && at <= 0xfc && visits < 48) {
+        val head: u32 = pci.read32(d, at);
+        val len:  u8  = (head >> 16)::u8;
+        if (head::u8 == 9 && (head >> 24)::u8 == wanted) {
+            if (at > 0xf0 || len < 16 || at::u64 + len::u64 > 256) { ret 0; }
+            val bar:    u8  = pci.read32(d, at + 4)::u8;
+            val off:    u64 = pci.read32(d, at + 8)::u64;
+            val length: u64 = pci.read32(d, at + 12)::u64;
+            if (bar >= 6 || valid_region(off, length, minimum) == 0) { ret 0; }
+            val base: u64 = memory_bar(d, bar);
+            if (base == 0 || base + off < base || base + off + length < base + off) { ret 0; }
+            out.base = vmm.map_phys(base + off, length, 1);
+            out.len  = length;
+            if (wanted == 2) {
+                if (len < 20 || at > 0xec) { ret 0; }
+                out.multiplier = pci.read32(d, at + 16)::u64;
+            }
+            ret 1;
+        }
+        at     = ((head >> 8) & 0xfc)::u8;
+        visits = visits + 1;
+    }
+    ret 0;
+}
+
+fun disable_interrupts(d: *pci.Device) {
+    # Command/status is written with a zero upper half to preserve W1C status.
+    pci.write32(d, 4, ((pci.read32(d, 4) & 0xffff) & ~4::u32) | 0x402);
+    var at:     u8  = (pci.read32(d, 0x34) & 0xfc)::u8;
+    var visits: u64 = 0;
+    for (at >= 0x40 && at <= 0xfc && visits < 48) {
+        val cap: u32 = pci.read32(d, at);
+        if (cap::u8 == 5)    { pci.write32(d, at, cap & ~0x00010000::u32); }
+        if (cap::u8 == 0x11) { pci.write32(d, at, cap & ~0x80000000::u32); }
+        at     = ((cap >> 8) & 0xfc)::u8;
+        visits = visits + 1;
+    }
+}
+
+fun reset(n: *Nic) u8 {
+    wr8(n.common + 20, 0);
+    var i: u64 = 0;
+    for (i < 1000) {
+        if (rd8(n.common + 20) == 0) { ret 1; }
+        cpu.delay_us(10);
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun fault(n: *Nic) {
+    n.running = 0;
+    n.failed  = 1;
+    if (n.common != 0) { wr8(n.common + 20, rd8(n.common + 20) | 0x80); }
+}
+
+fun negotiate(n: *Nic) u8 {
+    wr8(n.common + 20, 1);
+    wr8(n.common + 20, 3);
+    wr32(n.common, 0);
+    val low: u32 = rd32(n.common + 4);
+    wr32(n.common, 1);
+    val high: u32 = rd32(n.common + 4);
+    if ((high & 1) == 0 || (low & F_MAC) == 0) { ret 0; }
+    var selected: u32 = F_MAC;
+    if ((low & F_STATUS) != 0 && n.config_len >= 8) {
+        selected         = selected | F_STATUS;
+        n.status_feature = 1;
+    }
+    var selected_high: u32 = 1; # VERSION_1, with direct coherent DMA.
+    if ((high & F_SPEED) != 0 && n.config_len >= 17) {
+        selected_high   = selected_high | F_SPEED;
+        n.speed_feature = 1;
+    }
+    wr32(n.common + 8, 0);
+    wr32(n.common + 12, selected);
+    wr32(n.common + 8, 1);
+    wr32(n.common + 12, selected_high);
+    wr8(n.common + 20, 11);
+    ret ((rd8(n.common + 20) & 0xc8) == 8)::u8;
+}
+
+fun read_mac(n: *Nic) u8 {
+    var tries: u64 = 0;
+    for (tries < 16) {
+        val generation: u8  = rd8(n.common + 21);
+        var any:        u8  = 0;
+        var i:          u64 = 0;
+        for (i < 6) {
+            n.mac[i] = rd8(n.config + i);
+            any      = any | n.mac[i];
+            i        = i + 1;
+        }
+        if (generation == rd8(n.common + 21)) { ret (any != 0 && (n.mac[0] & 1) == 0)::u8; }
+        tries = tries + 1;
+    }
+    ret 0;
+}
+
+fun dma_page(out: *u64) u64 {
+    val pa: u64 = pmm.alloc();
+    if (pa != 0) { @out = vmm.phys_to_virt(pa); }
+    ret pa;
+}
+
+fun descriptor(q: *Queue, id: u64) *Descriptor {
+    ret (q.desc + id * 16)::*Descriptor;
+}
+
+fun used_entry(q: *Queue) *Used {
+    ret (q.used + 4 + (q.used_idx::u64 % q.size) * 8)::*Used;
+}
+
+fun publish(q: *Queue, id: u16) {
+    wr16(q.avail + 4 + (q.avail_idx::u64 % q.size) * 2, id);
+    barrier();
+    q.avail_idx = advance(q.avail_idx);
+    wr16(q.avail + 2, q.avail_idx);
+    barrier();
+}
+
+fun notify(q: *Queue) {
+    barrier();
+    wr16(q.notify, q.number);
+}
+
+fun queue_init(n: *Nic, q: *Queue, number: u16, writable: u8) u8 {
+    wr16(n.common + 22, number);
+    if (rd16(n.common + 28) != 0) { ret 0; }
+    q.number = number;
+    q.size   = choose_size(rd16(n.common + 24));
+    if (q.size == 0) { ret 0; }
+    val off: u64 = rd16(n.common + 30)::u64 * n.multiplier;
+    if (off % 2 != 0 || off + 2 > n.notify_len) { ret 0; }
+    q.notify = n.notify + off;
+    val desc_pa:  u64 = dma_page(?q.desc);
+    val avail_pa: u64 = dma_page(?q.avail);
+    val used_pa:  u64 = dma_page(?q.used);
+    if (desc_pa == 0 || avail_pa == 0 || used_pa == 0) { ret 0; }
+    wr16(q.avail, 1); # Suppress interrupts; PCI INTx/MSI are disabled as well.
+    var i: u64 = 0;
+    for (i < q.size) {
+        val pa: u64 = dma_page(?q.buffers[i]);
+        if (pa == 0) { ret 0; }
+        val d: *Descriptor = descriptor(q, i);
+        d.addr = pa;
+        d.len  = BUFFER::u32;
+        if (writable != 0) {
+            d.flags   = 2;
+            q.busy[i] = 1;
+            publish(q, i::u16);
+        }
+        i = i + 1;
+    }
+    wr16(n.common + 24, q.size::u16);
+    wr16(n.common + 26, 0xffff);
+    wr64(n.common + 32, desc_pa);
+    wr64(n.common + 40, avail_pa);
+    wr64(n.common + 48, used_pa);
+    barrier();
+    wr16(n.common + 28, 1);
+    ret (rd16(n.common + 28) == 1)::u8;
+}
+
+fun free_queue(q: *Queue) {
+    var i: u64 = 0;
+    for (i < MAX_QUEUE) {
+        if (q.buffers[i] != 0) {
+            pmm.free(vmm.kernel_phys(q.buffers[i]));
+            q.buffers[i] = 0;
+        }
+        i = i + 1;
+    }
+    if (q.desc != 0) {
+        pmm.free(vmm.kernel_phys(q.desc));
+        q.desc = 0;
+    }
+    if (q.avail != 0) {
+        pmm.free(vmm.kernel_phys(q.avail));
+        q.avail = 0;
+    }
+    if (q.used != 0) {
+        pmm.free(vmm.kernel_phys(q.used));
+        q.used = 0;
+    }
+}
+
+pub fun probe(d: *pci.Device, out: *ethernet.Device) u8 {
+    if (supports(d) == 0 || out == nil || count == 4) { ret 0; }
+    val n: *Nic = ?nics[count];
+    mem.fill(n::u64, 0, $size_of(Nic));
+    var common:       Capability;
+    var config:       Capability;
+    var notification: Capability;
+    var isr:          Capability;
+    if (find_cap(d, 1, 56, ?common) == 0 || find_cap(d, 2, 2, ?notification) == 0 ||
+        find_cap(d, 3, 1, ?isr) == 0 || find_cap(d, 4, 6, ?config) == 0) { ret 0; }
+    n.common     = common.base;
+    n.config     = config.base;
+    n.config_len = config.len;
+    n.notify     = notification.base;
+    n.notify_len = notification.len;
+    n.multiplier = notification.multiplier;
+    n.isr        = isr.base;
+    n.device     = d;
+    disable_interrupts(d);
+    var okay: u8 = reset(n);
+    if (okay != 0) { okay = negotiate(n); }
+    if (okay != 0) { okay = read_mac(n); }
+    if (okay != 0) { okay = queue_init(n, ?n.rx, 0, 1); }
+    if (okay != 0) { okay = queue_init(n, ?n.tx, 1, 0); }
+    if (okay != 0) {
+        wr16(n.common + 16, 0xffff);
+        pci.write32(d, 4, (pci.read32(d, 4) & 0xffff) | 0x406);
+        barrier();
+        wr8(n.common + 20, 15);
+        okay = ((rd8(n.common + 20) & 0xcf) == 15)::u8;
+    }
+    if (okay == 0) {
+        # A reset acknowledgement is required before freeing DMA allocations.
+        # If the device refuses reset, retain its pages rather than risk DMA UAF.
+        val stopped: u8 = reset(n);
+        pci.write32(d, 4, (pci.read32(d, 4) & 0xffff) & ~4::u32);
+        if (stopped != 0) {
+            free_queue(?n.rx);
+            free_queue(?n.tx);
+        }
+        kprint.warn("virtio-net\0");
+        kprint.puts("initialization failed\n\0");
+        ret 0;
+    }
+    n.running   = 1;
+    out.context = n::u64;
+    out.model   = "Virtio-net\0";
+    mem.copy((?out.mac[0])::u64, (?n.mac[0])::u64, 6);
+    out.send    = send_frame;
+    out.receive = receive_frame;
+    out.link_up = device_link;
+    out.speed   = device_speed;
+    count       = count + 1;
+    notify(?n.rx);
+    kprint.info("virtio-net\0");
+    kprint.puts("modern PCI, polled RX/TX ready\n\0");
+    ret 1;
+}
+
+fun reclaim_tx(n: *Nic) u8 {
+    val q:       *Queue = ?n.tx;
+    val waiting: u64    = pending(q);
+    if (waiting > q.size) {
+        fault(n);
+        ret 0;
+    }
+    var i: u64 = 0;
+    for (i < waiting) {
+        barrier();
+        val id: u64 = used_entry(q).id::u64;
+        if (id >= q.size || q.busy[id] == 0) {
+            fault(n);
+            ret 0;
+        }
+        q.busy[id] = 0;
+        q.used_idx = advance(q.used_idx);
+        i          = i + 1;
+    }
+    ret 1;
+}
+
+fun send_frame(context: u64, frame: *u8, len: u64) u8 {
+    val n: *Nic = context::*Nic;
+    if (n == nil || n.running == 0 || frame == nil || len < 14 || len > ethernet.FRAME_MAX) { ret 0; }
+    if (reclaim_tx(n) == 0)                                                                 { ret 0; }
+    val q:       *Queue = ?n.tx;
+    var scanned: u64    = 0;
+    var id:      u64    = q.next;
+    for (scanned < q.size && q.busy[id] != 0) {
+        id      = (id + 1) % q.size;
+        scanned = scanned + 1;
+    }
+    if (scanned == q.size) { ret 0; }
+    mem.fill(q.buffers[id], 0, HEADER);
+    mem.copy(q.buffers[id] + HEADER, frame::u64, len);
+    var wire: u64 = len;
+    if (wire < 60) {
+        mem.fill(q.buffers[id] + HEADER + wire, 0, 60 - wire);
+        wire = 60;
+    }
+    val d: *Descriptor = descriptor(q, id);
+    d.len      = (HEADER + wire)::u32;
+    d.flags    = 0;
+    d.next     = 0;
+    q.busy[id] = 1;
+    publish(q, id::u16);
+    notify(q);
+    q.next = (id + 1) % q.size;
+    ret 1;
+}
+
+fun receive_frame(context: u64, out: *u8, capacity: u64) u64 {
+    val n: *Nic = context::*Nic;
+    if (n == nil || n.running == 0 || out == nil) { ret 0; }
+    val q:       *Queue = ?n.rx;
+    var waiting: u64    = pending(q);
+    if (waiting > q.size) {
+        fault(n);
+        ret 0;
+    }
+    # Read ISR to acknowledge any config changes; no interrupt handler is needed.
+    if (n.isr != 0) { rd8(n.isr); }
+    var inspected: u64 = 0;
+    for (waiting != 0 && inspected < q.size) {
+        barrier();
+        val u:   *Used = used_entry(q);
+        val id:  u64   = u.id::u64;
+        val raw: u64   = u.len::u64;
+        if (id >= q.size) {
+            fault(n);
+            ret 0;
+        }
+        var length: u64 = 0;
+        val data:   *u8 = q.buffers[id]::*u8;
+        if (raw >= HEADER + 14 && raw <= HEADER + ethernet.FRAME_MAX && raw <= BUFFER &&
+            (data[0] & ~2::u8) == 0 && data[1] == 0 && raw - HEADER <= capacity) {
+            length = raw - HEADER;
+            mem.copy(out::u64, q.buffers[id] + HEADER, length);
+        }
+        q.used_idx = advance(q.used_idx);
+        val d: *Descriptor = descriptor(q, id);
+        d.len   = BUFFER::u32;
+        d.flags = 2;
+        d.next  = 0;
+        publish(q, id::u16);
+        notify(q);
+        waiting   = waiting - 1;
+        inspected = inspected + 1;
+        if (length != 0) { ret length; }
+    }
+    ret 0;
+}
+
+fun device_link(context: u64) u8 {
+    val n: *Nic = context::*Nic;
+    if (n == nil || n.running == 0) { ret 0; }
+    if (n.status_feature == 0)      { ret 1; } # Virtio specifies link up without STATUS.
+    ret ((rd16(n.config + 6) & 1) != 0)::u8;
+}
+
+fun device_speed(context: u64) u64 {
+    val n: *Nic = context::*Nic;
+    if (device_link(context) == 0 || n.speed_feature == 0) { ret 0; }
+    var i: u64 = 0;
+    for (i < 16) {
+        val generation: u8  = rd8(n.common + 21);
+        val speed:      u32 = rd32(n.config + 12);
+        if (generation == rd8(n.common + 21)) {
+            if (speed == 0xffffffff) { ret 0; }
+            ret speed::u64;
+        }
+        i = i + 1;
+    }
+    ret 0; # A virtual link need not advertise a physical bitrate.
+}
+
+#[testing]
+fun fake_queue(q: *Queue, desc: u64, avail: u64, used: u64, data: u64, bell: u64) {
+    q.desc   = desc;
+    q.avail  = avail;
+    q.used   = used;
+    q.size   = 4;
+    q.notify = bell;
+    var i: u64 = 0;
+    for (i < 4) {
+        q.buffers[i]          = data;
+        descriptor(q, i).addr = 0x1000 + i * 4096;
+        i                     = i + 1;
+    }
+}
+
+test virtio_net__layout_capability_bounds_and_device_selection {
+    var d: Descriptor;
+    if ($size_of(Descriptor) != 16 || $size_of(Used) != 8 ||
+        (?d.len)::u64 - (?d)::u64 != 8 || (?d.flags)::u64 - (?d)::u64 != 12) { ret 1; }
+    if (choose_size(0) != 0 || choose_size(1) != 1 || choose_size(3) != 2 ||
+        choose_size(256) != 64 || advance(65535) != 0) { ret 2; }
+    if (valid_region(0x1000, 56, 56) == 0 || valid_region(0, 55, 56) != 0 ||
+        valid_region(3, 56, 56) != 0 || valid_region(0xfffffff0, 64, 56) != 0) { ret 3; }
+    var device: pci.Device;
+    var out:    ethernet.Device;
+    device.class    = 2;
+    device.subclass = 0;
+    device.vendor   = 0x1af4;
+    device.device   = 0x1041;
+    if (supports(?device) == 0) { ret 4; }
+    device.device = 0x1000;
+    if (supports(?device) == 0) { ret 5; }
+    device.device = 0x1001;
+    out.context   = 91;
+    if (probe(?device, ?out) != 0 || out.context != 91 || probe(nil, ?out) != 0) { ret 6; }
+    ret 0;
+}
+
+test virtio_net__transmit_wrap_full_queue_and_out_of_order_completion {
+    var n:     Nic;
+    var desc:  [4]Descriptor;
+    var avail: [8]u16;
+    var used:  [40]u8;
+    var data:  [2048]u8;
+    var frame: [64]u8;
+    var bell:  u16 = 0;
+    fake_queue(?n.tx, (?desc[0])::u64, (?avail[0])::u64, (?used[0])::u64, (?data[0])::u64, (?bell)::u64);
+    n.running      = 1;
+    n.tx.number    = 1;
+    n.tx.avail_idx = 65534;
+    n.tx.used_idx  = 65535;
+    wr16(n.tx.used + 2, 65535);
+    frame[0]  = 73;
+    frame[13] = 91;
+    mem.fill((?data[0])::u64, 0xaa, 2048);
+    if (send_frame((?n)::u64, nil, 14) != 0 || send_frame((?n)::u64, ?frame[0], 1515) != 0) { ret 1; }
+    var i: u64 = 0;
+    for (i < 4) {
+        if (send_frame((?n)::u64, ?frame[0], 14) == 0) { ret 2; }
+        i = i + 1;
+    }
+    if (n.tx.avail_idx != 2 || avail[1] != 2 || send_frame((?n)::u64, ?frame[0], 64) != 0 ||
+        data[0] != 0 || data[12] != 73 || data[25] != 91 || data[26] != 0 || data[71] != 0 ||
+        desc[0].len != 72 || desc[0].flags != 0 || bell != 1) { ret 3; }
+    val u: *Used = (n.tx.used + 4 + 3 * 8)::*Used;
+    u.id  = 2;
+    u.len = 0;
+    wr16(n.tx.used + 2, 0);
+    if (send_frame((?n)::u64, ?frame[0], 64) == 0 || n.tx.used_idx != 0 ||
+        n.tx.next != 3 || desc[2].len != 76 || desc[2].addr != 0x3000) { ret 4; }
+    frame[0] = 0;
+    if (data[12] != 73) { ret 5; }
+    val bad: *Used = (n.tx.used + 4)::*Used;
+    bad.id = 99;
+    wr16(n.tx.used + 2, 1);
+    if (send_frame((?n)::u64, ?frame[0], 64) != 0 || n.running != 0 || n.failed == 0) { ret 6; }
+    ret 0;
+}
+
+test virtio_net__receive_header_bounds_recycling_and_index_wrap {
+    var n:     Nic;
+    var desc:  [4]Descriptor;
+    var avail: [8]u16;
+    var used:  [40]u8;
+    var data:  [2048]u8;
+    var out:   [65]u8;
+    var bell:  u16 = 0;
+    fake_queue(?n.rx, (?desc[0])::u64, (?avail[0])::u64, (?used[0])::u64, (?data[0])::u64, (?bell)::u64);
+    n.running      = 1;
+    n.rx.used_idx  = 65535;
+    n.rx.avail_idx = 65535;
+    data[12]       = 73;
+    data[75]       = 91;
+    out[64]        = 99;
+    val last: *Used = (n.rx.used + 4 + 3 * 8)::*Used;
+    last.id  = 3;
+    last.len = 76;
+    if (receive_frame((?n)::u64, ?out[0], 64) != 64 || out[0] != 73 || out[63] != 91 ||
+        out[64] != 99 || n.rx.used_idx != 0 || n.rx.avail_idx != 0 || desc[3].flags != 2 ||
+        desc[3].len != 2048 || desc[3].addr != 0x4000) { ret 1; }
+    val entry: *Used = (n.rx.used + 4)::*Used;
+    entry.id  = 0;
+    entry.len = 77;
+    wr16(n.rx.used + 2, 1);
+    if (receive_frame((?n)::u64, ?out[0], 64) != 0 || out[64] != 99 || n.rx.used_idx != 1) { ret 2; }
+    val next: *Used = (n.rx.used + 12)::*Used;
+    next.id  = 1;
+    next.len = 2049;
+    wr16(n.rx.used + 2, 2);
+    if (receive_frame((?n)::u64, ?out[0], 64) != 0 || n.rx.used_idx != 2) { ret 3; }
+    val third: *Used = (n.rx.used + 20)::*Used;
+    third.id  = 2;
+    third.len = 76;
+    data[0]   = 1;
+    wr16(n.rx.used + 2, 3);
+    if (receive_frame((?n)::u64, ?out[0], 64) != 0) { ret 4; } # Unnegotiated checksum offload.
+    last.id  = 3;
+    last.len = 76;
+    data[0]  = 0;
+    data[1]  = 1;
+    wr16(n.rx.used + 2, 4);
+    if (receive_frame((?n)::u64, ?out[0], 64) != 0) { ret 5; } # Unnegotiated GSO.
+    entry.id  = 99;
+    entry.len = 76;
+    wr16(n.rx.used + 2, 5);
+    if (receive_frame((?n)::u64, ?out[0], 64) != 0 || n.failed == 0 || n.running != 0) { ret 6; }
+    ret 0;
+}
+
+test virtio_net__feature_negotiation_link_changes_and_invalid_used_distance {
+    var n:      Nic;
+    var common: [16]u32;
+    var config: [8]u32;
+    var used:   [40]u8;
+    n.common     = (?common[0])::u64;
+    n.config     = (?config[0])::u64;
+    n.config_len = 32;
+    # The memory-backed feature register exposes the same word for both selects.
+    common[1] = F_MAC | F_STATUS | 1;
+    if (negotiate(?n) == 0 || rd8(n.common + 20) != 11 || n.status_feature == 0 || n.speed_feature != 0) { ret 1; }
+    n.running = 1;
+    config[0] = 0x02000002;
+    config[1] = 0x00010000;
+    if (read_mac(?n) == 0 || device_link((?n)::u64) == 0) { ret 2; }
+    config[1] = 0;
+    if (device_link((?n)::u64) != 0) { ret 3; }
+    config[1]       = 0x00010000;
+    config[3]       = 10000;
+    n.speed_feature = 1;
+    if (device_speed((?n)::u64) != 10000) { ret 4; }
+    config[3] = 0xffffffff;
+    if (device_speed((?n)::u64) != 0 || device_link(0) != 0 || device_speed(0) != 0) { ret 5; }
+    common[1] = 1;
+    if (negotiate(?n) != 0) { ret 6; } # Missing MAC feature.
+    n.rx.used = (?used[0])::u64;
+    n.rx.size = 4;
+    wr16(n.rx.used + 2, 5);
+    var out: [64]u8;
+    if (receive_frame((?n)::u64, ?out[0], 64) != 0 || n.failed == 0 || n.running != 0) { ret 7; }
+    ret 0;
+}

@@ -43,7 +43,7 @@ need = []
 path = "../../deps/machos-std"
 
 [dep.crypto]
-path = "../../deps/.patched/mach-crypto"
+path = "../../deps/mach-crypto"
 
 [dep.pki]
 path = "../../deps/mach-pki"

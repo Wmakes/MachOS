@@ -1,0 +1,1061 @@
+# Realtek RTL8125B (10ec:8125, MAC XID 641). One polled RX/TX queue,
+# standard Ethernet frames and autonegotiation; no offloads or interrupts.
+# Initialization and descriptor definitions adapted from OpenBSD:
+# https://github.com/openbsd/src/blob/master/sys/dev/pci/if_rge.c
+#   revision 1.47, 2026-10-13, and if_rgereg.h revision 1.19.
+# Firmware data comes from sys/dev/microcode/rge/rgemcode.h revision 1.1;
+# its separate Realtek distribution notice accompanies the tables below.
+# Other RTL8125 revisions and the RTL8168 family are deliberately not claimed.
+#
+# Copyright (c) 2019, 2020, 2023-2026 Kevin Lo <kevlo@openbsd.org>
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+use machos.arch.x86_64.cpu;
+use machos.dev.ethernet;
+use machos.dev.pci;
+use machos.kern.kprint;
+use machos.kern.mem;
+use machos.mm.pmm;
+use machos.mm.vmm;
+
+val RING:     u64 = 32;
+val BUF:      u64 = 2048;
+val OWN:      u32 = 0x80000000;
+val EOR:      u32 = 0x40000000;
+val TX_WHOLE: u32 = 0x30000000;
+val RX_WHOLE: u32 = 0x03000000;
+val RX_ERROR: u32 = 0x00100000;
+
+#[volatile]
+rec Reg8  { v: u8; }
+#[volatile]
+rec Reg16 { v: u16; }
+#[volatile]
+rec Reg32 { v: u32; }
+
+# RTL8125B uses the 32-byte descriptor format, not RTL8127's 16-byte V2.
+#[volatile]
+rec Tx { status: u32; extra: u32; addr: u64; reserved: [2]u64; }
+#[volatile]
+rec Rx { reserved: [2]u64; addr: u64; extra: u32; status: u32; }
+
+rec Nic {
+    regs:       u64;
+    rx:         u64;
+    tx:         u64;
+    rx_buf:     [32]u64;
+    rx_pa:      [32]u64;
+    tx_buf:     [32]u64;
+    rx_next:    u64;
+    tx_next:    u64;
+    mac:        [6]u8;
+    failed:     u8;
+    running:    u8;
+    stage:      u64;
+    failed_reg: u64;
+}
+
+var nics:  [4]Nic;
+var count: u64 = 0;
+
+fun rd8(n: *Nic, off: u64) u8 {
+    ret (@((n.regs + off)::*Reg8)).v;
+}
+
+fun rd16(n: *Nic, off: u64) u16 {
+    ret (@((n.regs + off)::*Reg16)).v;
+}
+
+fun rd32(n: *Nic, off: u64) u32 {
+    ret (@((n.regs + off)::*Reg32)).v;
+}
+
+fun wr8(n: *Nic, off: u64, v: u8) {
+    (@((n.regs + off)::*Reg8)).v = v;
+}
+
+fun wr16(n: *Nic, off: u64, v: u16) {
+    (@((n.regs + off)::*Reg16)).v = v;
+}
+
+fun wr32(n: *Nic, off: u64, v: u32) {
+    (@((n.regs + off)::*Reg32)).v = v;
+}
+
+fun bits8(n: *Nic, off: u64, clear: u8, set: u8) {
+    wr8(n, off, (rd8(n, off) & ~clear) | set);
+}
+
+# x86 coherent DMA still needs ordering before transferring ownership or
+# ringing a doorbell, and after observing device completion.
+fun barrier() {
+    asm x86_64 { mfence }
+}
+
+fun wait32(n: *Nic, off: u64, mask: u32, want: u32) u8 {
+    var i: u64 = 0;
+    for (i < 20000) {
+        if ((rd32(n, off) & mask) == want) { ret 1; }
+        cpu.delay_us(1);
+        i = i + 1;
+    }
+    n.failed     = 1;
+    n.failed_reg = off;
+    ret 0;
+}
+
+fun mac_read(n: *Nic, reg: u16) u16 {
+    if (n.failed != 0) { ret 0; }
+    wr32(n, 0xb0, (reg::u32 >> 1) << 16);
+    ret rd32(n, 0xb0)::u16;
+}
+
+fun mac_write(n: *Nic, reg: u16, value: u16) {
+    if (n.failed != 0) { ret; }
+    wr32(n, 0xb0, OWN | ((reg::u32 >> 1) << 16) | value::u32);
+}
+
+fun mac_bits(n: *Nic, reg: u16, clear: u16, set: u16) {
+    mac_write(n, reg, (mac_read(n, reg) & ~clear) | set);
+}
+
+fun phy_read(n: *Nic, reg: u16) u16 {
+    if (n.failed != 0) { ret 0; }
+    wr32(n, 0xb8, (reg::u32 >> 1) << 16);
+    if (wait32(n, 0xb8, OWN, OWN) == 0) { ret 0; }
+    ret rd32(n, 0xb8)::u16;
+}
+
+fun phy_write(n: *Nic, reg: u16, value: u16) {
+    if (n.failed != 0) { ret; }
+    wr32(n, 0xb8, OWN | ((reg::u32 >> 1) << 16) | value::u32);
+    wait32(n, 0xb8, OWN, 0);
+}
+
+fun phy_bits(n: *Nic, reg: u16, clear: u16, set: u16) {
+    phy_write(n, reg, (phy_read(n, reg) & ~clear) | set);
+}
+
+fun csi_read(n: *Nic, reg: u32) u32 {
+    if (n.failed != 0) { ret 0; }
+    wr32(n, 0x68, (reg & 0xfff) | 0xf000);
+    if (wait32(n, 0x68, OWN, OWN) == 0) { ret 0; }
+    cpu.delay_us(20);
+    ret rd32(n, 0x64);
+}
+
+fun csi_write(n: *Nic, reg: u32, value: u32) {
+    if (n.failed != 0) { ret; }
+    wr32(n, 0x64, value);
+    wr32(n, 0x68, OWN | (reg & 0xfff) | 0xf000);
+    wait32(n, 0x68, OWN, 0);
+    cpu.delay_us(20);
+}
+
+fun ephy_write(n: *Nic, reg: u16, value: u16) {
+    if (n.failed != 0) { ret; }
+    wr32(n, 0x80, OWN | ((reg::u32 & 0x7f) << 16) | value::u32);
+    wait32(n, 0x80, OWN, 0);
+    cpu.delay_us(20);
+}
+
+fun wait_phy(n: *Nic, reg: u16, mask: u16, want: u16, tries: u64, us: u64) u8 {
+    var i: u64 = 0;
+    for (i < tries && n.failed == 0) {
+        if ((phy_read(n, reg) & mask) == want && n.failed == 0) { ret 1; }
+        cpu.delay_us(us);
+        i = i + 1;
+    }
+    n.failed     = 1;
+    n.failed_reg = reg::u64;
+    ret 0;
+}
+
+fun disable_aspm(n: *Nic) {
+    bits8(n, 0x50, 0, 0xc0);
+    bits8(n, 0x53, 0x80, 0);
+    bits8(n, 0x56, 0x01, 0);
+    bits8(n, 0x50, 0xc0, 0);
+}
+
+fun reset(n: *Nic) u8 {
+    wr32(n, 0x38, 0);
+    wr32(n, 0x44, rd32(n, 0x44) & ~0x3f::u32);
+    bits8(n, 0xf2, 0, 0x08);
+    bits8(n, 0x37, 0, 0x80);
+    cpu.delay_us(200);
+    var i: u64 = 0;
+    for (i < 3000 && (rd8(n, 0xd3) & 0x30) != 0x30) {
+        cpu.delay_us(50);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 3000 && (rd16(n, 0xe2) & 0x103) != 0x103) {
+        cpu.delay_us(50);
+        i = i + 1;
+    }
+    wr8(n, 0x37, rd8(n, 0x37) & 0x0c);
+    wr8(n, 0x37, 0x10);
+    i = 0;
+    for (i < 100) {
+        cpu.delay_us(100);
+        if ((rd8(n, 0x37) & 0x10) == 0) { ret 1; }
+        i = i + 1;
+    }
+    n.failed     = 1;
+    n.failed_reg = 0x37;
+    ret 0;
+}
+
+# Exit firmware-managed OOB mode before touching PHY or DMA configuration.
+fun chip_init(n: *Nic) u8 {
+    mac_write(n, 0xc0bc, 0x00ff);
+    if (reset(n) == 0) { ret 0; }
+    bits8(n, 0xd3, 0x80, 0);
+    mac_bits(n, 0xe8de, 0x4000, 0);
+    var i: u64 = 0;
+    for (i < 10 && (rd16(n, 0xd2) & 0x200) == 0) {
+        cpu.delay_us(100);
+        i = i + 1;
+    }
+    mac_write(n, 0xc0aa, 0x07d0);
+    mac_write(n, 0xc0a6, 0x01b5);
+    mac_write(n, 0xc01e, 0x5555);
+    i = 0;
+    for (i < 10 && (rd16(n, 0xd2) & 0x200) == 0) {
+        cpu.delay_us(100);
+        i = i + 1;
+    }
+    if ((mac_read(n, 0xd42c) & 0x100) != 0) {
+        if (wait_phy(n, 0xa420, 7, 2, 100, 1000) == 0) { ret 0; }
+        mac_bits(n, 0xd42c, 0x100, 0);
+        phy_bits(n, 0xa466, 1, 0);
+        phy_bits(n, 0xa468, 0x0a, 0);
+    }
+    bits8(n, 0x6f, 0, 0xc0);
+    phy_write(n, 0xa400, 0x1000);
+    if (wait_phy(n, 0xa420, 7, 3, 100, 1000) == 0) { ret 0; }
+    disable_aspm(n);
+    bits8(n, 0xf1, 0x80, 0);
+    mac_bits(n, 0xd40a, 0x10, 0);
+    mac_write(n, 0xfc48, 0);
+    var reg: u16 = 0xfc28;
+    for (reg < 0xfc48) {
+        mac_write(n, reg, 0);
+        reg = reg + 2;
+    }
+    cpu.delay_us(3000);
+    mac_write(n, 0xfc26, 0);
+    mac_bits(n, 0xe446, 3, 0);
+    i = 0;
+    for (i < 138 && n.failed == 0) {
+        val pair: u32 = RTL8125B_MAC_BPS[i];
+        mac_write(n, (pair >> 16)::u16, pair::u16);
+        i = i + 1;
+    }
+    csi_write(n, 0x108, csi_read(n, 0x108) | 0x100000);
+    wr32(n, 0x3c, rd32(n, 0x3c));
+    wr32(n, 0x58, 0);
+    wr32(n, 0x5c, 0);
+    wr32(n, 0x8c, 0);
+    wr32(n, 0xf4, 0);
+    if (n.failed != 0) { ret 0; }
+    ret reset(n);
+}
+
+fun phy_init(n: *Nic) u8 {
+    var i: u64 = 0;
+    for (i < 10 && n.failed == 0) {
+        val pair: u32 = MAC_R25B_EPHY[i];
+        ephy_write(n, (pair >> 16)::u16, pair::u16);
+        i = i + 1;
+    }
+    # MII registers 0, 4 and 9 map to OCP a400, a408 and a412.
+    phy_bits(n, 0xa408, 0x01e0, 0);
+    phy_bits(n, 0xa412, 0x0300, 0);
+    phy_bits(n, 0xa5d4, 0x0080, 0);
+    phy_write(n, 0xa400, 0x9200);
+    if (wait_phy(n, 0xa400, 0x8000, 0, 2500, 1000) == 0) { ret 0; }
+    phy_write(n, 0xa436, 0x801e);
+    if (phy_read(n, 0xa438) != 0x0b99 && n.failed == 0) {
+        phy_bits(n, 0xb820, 0, 0x10);
+        if (wait_phy(n, 0xb800, 0x40, 0x40, 1000, 100) == 0) { ret 0; }
+        i = 0;
+        for (i < 1447 && n.failed == 0) {
+            val pair: u32 = MAC_R25B_MCU[i];
+            phy_write(n, (pair >> 16)::u16, pair::u16);
+            i = i + 1;
+        }
+        phy_bits(n, 0xb820, 0x10, 0);
+        if (wait_phy(n, 0xb800, 0x40, 0, 1000, 100) == 0) { ret 0; }
+        phy_write(n, 0xa436, 0x801e);
+        phy_write(n, 0xa438, 0x0b99);
+    }
+    phy_bits(n, 0xa442, 0, 0x0800);
+    phy_bits(n, 0xac46, 0x00f0, 0x0090);
+    phy_bits(n, 0xad30, 3, 1);
+    phy_write(n, 0xb87c, 0x80f5);
+    phy_write(n, 0xb87e, 0x760e);
+    phy_write(n, 0xb87c, 0x8107);
+    phy_write(n, 0xb87e, 0x360e);
+    phy_write(n, 0xb87c, 0x8551);
+    phy_bits(n, 0xb87e, 0xff00, 0x0800);
+    phy_bits(n, 0xbf00, 0xe000, 0xa000);
+    phy_bits(n, 0xbf46, 0x0f00, 0x0300);
+    i = 0;
+    for (i < 10) {
+        phy_write(n, 0xa436, (0x8044 + i * 6)::u16);
+        phy_write(n, 0xa438, 0x2417);
+        i = i + 1;
+    }
+    phy_bits(n, 0xa4ca, 0, 0x0040);
+    phy_bits(n, 0xbf84, 0xe000, 0xa000);
+    phy_write(n, 0xa436, 0x8170);
+    phy_bits(n, 0xa438, 0x2700, 0xd800);
+    phy_bits(n, 0xa424, 0, 8);
+    phy_bits(n, 0xa5b4, 0x8000, 0);
+    # Keep EEE and advanced power saving disabled in the first implementation.
+    mac_bits(n, 0xe040, 3, 0);
+    phy_bits(n, 0xa432, 0, 0x0010);
+    phy_bits(n, 0xa5d0, 6, 0);
+    phy_bits(n, 0xa6d4, 1, 0);
+    phy_bits(n, 0xa6d8, 0x10, 0);
+    phy_bits(n, 0xa428, 0x80, 0);
+    phy_bits(n, 0xa4a2, 0x0200, 0);
+    mac_bits(n, 0xe052, 1, 0);
+    phy_bits(n, 0xa442, 0x3000, 0);
+    phy_bits(n, 0xa430, 0x8000, 0);
+    ret (n.failed == 0)::u8;
+}
+
+fun configure(n: *Nic) u8 {
+    bits8(n, 0x50, 0, 0xc0);
+    bits8(n, 0xf1, 0x80, 0);
+    disable_aspm(n);
+    bits8(n, 0x50, 0, 0xc0);
+    wr16(n, 0x6048, 1564);
+    wr32(n, 0x44, 0x41000c00);
+    wr32(n, 0x40, 0x03000700);
+    csi_write(n, 0x70c, (csi_read(n, 0x70c) & ~0x3f000000::u32) | 0x27000000);
+    wr16(n, 0x382, 0x221b);
+    wr32(n, 0x4500, 0);
+    wr16(n, 0x4800, rd16(n, 0x4800) & ~0x1c::u16);
+    bits8(n, 0x52, 0x10, 0);
+    mac_write(n, 0xc140, 0xffff);
+    mac_write(n, 0xc142, 0xffff);
+    mac_bits(n, 0xeb58, 0, 1);
+    mac_bits(n, 0xe614, 0x0700, 0x0200);
+    mac_bits(n, 0xe63e, 0x0c30, 0x0020);
+    mac_bits(n, 0xc0b4, 1, 0);
+    mac_bits(n, 0xc0b4, 0, 0x0d);
+    mac_bits(n, 0xeb6a, 0x00ff, 0x0033);
+    mac_bits(n, 0xeb50, 0x03e0, 0x0040);
+    mac_bits(n, 0xe056, 0x00f0, 0);
+    wr8(n, 0x57, 0x10);
+    mac_bits(n, 0xe040, 0x1000, 0);
+    mac_bits(n, 0xea1c, 3, 1);
+    mac_write(n, 0xe0c0, 0x4000);
+    mac_bits(n, 0xe052, 0x0088, 0x0060);
+    mac_bits(n, 0xd430, 0x0fff, 0x045f);
+    bits8(n, 0xd0, 0, 0xc0);
+    bits8(n, 0xf2, 0, 0x40);
+    mac_bits(n, 0xe080, 2, 0);
+    mac_bits(n, 0xea1c, 4, 0);
+    mac_bits(n, 0xeb54, 0, 1);
+    cpu.delay_us(1);
+    mac_bits(n, 0xeb54, 1, 0);
+    wr16(n, 0x1880, rd16(n, 0x1880) & ~0x30::u16);
+    bits8(n, 0x34, 1, 0);
+    var i: u64 = 0;
+    for (i < 32) {
+        wr32(n, 0xa00 + i * 4, 0);
+        i = i + 1;
+    }
+    mac_bits(n, 0xc0ac, 0, 0x1f80);
+    mac_write(n, 0xe098, 0xc302);
+    mac_bits(n, 0xe032, 3, 0);
+    csi_write(n, 0x98, csi_read(n, 0x98) & ~0x0000ff00::u32);
+    cpu.delay_us(20);
+    mac_bits(n, 0xe092, 0x00ff, 0);
+    # No VLAN stripping or checksum offload; the protocol stack sees raw frames.
+    wr16(n, 0xe0, rd16(n, 0xe0) & ~0x20::u16);
+    wr16(n, 0xda, 1518);
+    bits8(n, 0xf2, 8, 0);
+    wr32(n, 0x44, (rd32(n, 0x44) & ~0x00c0003f::u32) | 0x0a);
+    wr32(n, 0x08, 0);
+    wr32(n, 0x0c, 0);
+    disable_aspm(n);
+    bits8(n, 0x50, 0xc0, 0);
+    cpu.delay_us(10);
+    # Advertise full-duplex 10/100/1000/2500 with ordinary autonegotiation.
+    phy_bits(n, 0xa428, 0x0200, 0);
+    phy_bits(n, 0xa5ea, 1, 0);
+    phy_write(n, 0xa408, 0x0141);
+    phy_write(n, 0xa412, 0x0200);
+    phy_bits(n, 0xa5d4, 0, 0x0080);
+    phy_write(n, 0xa400, 0x9200);
+    if (wait_phy(n, 0xa400, 0x8000, 0, 2500, 1000) == 0) { ret 0; }
+    ret (n.failed == 0)::u8;
+}
+
+fun dma_page(out: *u64) u64 {
+    val pa: u64 = pmm.alloc();
+    if (pa != 0) { @out = vmm.phys_to_virt(pa); }
+    ret pa;
+}
+
+fun end_flag(index: u64) u32 {
+    if (index == RING - 1) { ret EOR; }
+    ret 0;
+}
+
+fun arm_rx(n: *Nic, index: u64) {
+    val r: *Rx = (n.rx + index * 32)::*Rx;
+    r.reserved[0] = 0;
+    r.reserved[1] = 0;
+    r.addr        = n.rx_pa[index];
+    r.extra       = 0;
+    barrier();
+    r.status = OWN | end_flag(index) | BUF::u32;
+}
+
+fun allocate_rings(n: *Nic) u8 {
+    var rva: u64 = 0;
+    var tva: u64 = 0;
+    val rpa: u64 = dma_page(?rva);
+    n.rx = rva;
+    val tpa: u64 = dma_page(?tva);
+    n.tx = tva;
+    if (rpa == 0 || tpa == 0) { ret 0; }
+    var i: u64 = 0;
+    for (i < RING) {
+        n.rx_pa[i] = dma_page(?n.rx_buf[i]);
+        if (n.rx_pa[i] == 0 || dma_page(?n.tx_buf[i]) == 0) { ret 0; }
+        arm_rx(n, i);
+        val t: *Tx = (n.tx + i * 32)::*Tx;
+        t.addr   = vmm.kernel_phys(n.tx_buf[i]);
+        t.status = end_flag(i);
+        i        = i + 1;
+    }
+    barrier();
+    wr32(n, 0xe4, rpa::u32);
+    wr32(n, 0xe8, (rpa >> 32)::u32);
+    wr32(n, 0x20, tpa::u32);
+    wr32(n, 0x24, (tpa >> 32)::u32);
+    ret 1;
+}
+
+# Failed setup has not enabled TX/RX or published ring addresses unless all
+# allocations succeeded. Stop bus mastering before releasing any DMA pages.
+fun release_pages(n: *Nic) {
+    var i: u64 = 0;
+    for (i < RING) {
+        if (n.rx_buf[i] != 0) {
+            pmm.free(vmm.kernel_phys(n.rx_buf[i]));
+            n.rx_buf[i] = 0;
+        }
+        if (n.tx_buf[i] != 0) {
+            pmm.free(vmm.kernel_phys(n.tx_buf[i]));
+            n.tx_buf[i] = 0;
+        }
+        i = i + 1;
+    }
+    if (n.rx != 0) {
+        pmm.free(vmm.kernel_phys(n.rx));
+        n.rx = 0;
+    }
+    if (n.tx != 0) {
+        pmm.free(vmm.kernel_phys(n.tx));
+        n.tx = 0;
+    }
+}
+
+fun supports(d: *pci.Device) u8 {
+    ret (d != nil && d.class == 2 && d.subclass == 0 &&
+        d.vendor == 0x10ec && d.device == 0x8125)::u8;
+}
+
+fun supported_revision(txconfig: u32) u8 {
+    ret ((txconfig & 0x7cf00000) == 0x64100000)::u8;
+}
+
+# Disable stale Linux/firmware MSI state and put the device in D0. Only the
+# low command/control words are written; PCI status bits are write-one-clear.
+fun prepare_pci(d: *pci.Device) {
+    pci.write32(d, 4, ((pci.read32(d, 4) & 0xffff) & ~4::u32) | 0x402);
+    var off:    u8  = (pci.read32(d, 0x34) & 0xfc)::u8;
+    var visits: u64 = 0;
+    for (off >= 0x40 && off <= 0xfc && visits < 48) {
+        val cap:  u32 = pci.read32(d, off);
+        val kind: u8  = cap::u8;
+        if (kind == 1 && off <= 0xf8) {
+            pci.write32(d, off + 4, (pci.read32(d, off + 4) & 0xffff) & ~3::u32);
+            cpu.delay_us(10000);
+        }
+        if (kind == 5)    { pci.write32(d, off, cap & ~0x00010000::u32); }
+        if (kind == 0x11) { pci.write32(d, off, cap & ~0x80000000::u32); }
+        if (kind == 0x10 && off <= 0xec) {
+            pci.write32(d, off + 0x10, (pci.read32(d, off + 0x10) & 0xffff) & ~3::u32);
+        }
+        off    = ((cap >> 8) & 0xfc)::u8;
+        visits = visits + 1;
+    }
+}
+
+pub fun probe(d: *pci.Device, out: *ethernet.Device) u8 {
+    if (supports(d) == 0 || out == nil || count == 4) { ret 0; }
+    # Check BAR2 before enabling MMIO. RTL8125B exposes its 64-bit register BAR here.
+    val raw: u32 = pci.read32(d, 0x18);
+    if (raw == 0 || raw == 0xffffffff || (raw & 7) != 4) { ret 0; }
+    val base: u64 = pci.bar(d, 2);
+    if (base == 0) { ret 0; }
+    val n: *Nic = ?nics[count];
+    mem.fill(n::u64, 0, $size_of(Nic));
+    prepare_pci(d);
+    n.regs = vmm.map_phys(base, 0x7000, 1);
+    if (supported_revision(rd32(n, 0x40)) == 0) {
+        kprint.warn("rtl8125\0");
+        kprint.puts("unsupported MAC revision\n\0");
+        ret 0;
+    }
+    wr32(n, 0x38, 0);
+    # Read the permanent address before chip initialization changes the filter.
+    val low:  u32 = rd32(n, 0x19e0);
+    val high: u16 = rd16(n, 0x19e4);
+    var i:    u64 = 0;
+    for (i < 4) {
+        n.mac[i] = (low >> (i * 8))::u8;
+        i        = i + 1;
+    }
+    n.mac[4] = high::u8;
+    n.mac[5] = (high >> 8)::u8;
+    if ((n.mac[0] & 1) != 0 || (low == 0 && high == 0)) { ret 0; }
+    n.stage = 1;
+    var okay: u8 = chip_init(n);
+    if (okay != 0) {
+        n.stage = 2;
+        okay    = phy_init(n);
+    }
+    if (okay != 0) {
+        n.stage = 3;
+        okay    = configure(n);
+    }
+    if (okay != 0) {
+        n.stage = 4;
+        okay    = allocate_rings(n);
+    }
+    if (okay == 0) {
+        wr32(n, 0x38, 0);
+        wr8(n, 0x37, 0);
+        pci.write32(d, 4, (pci.read32(d, 4) & 0xffff) & ~4::u32);
+        release_pages(n);
+        bits8(n, 0x50, 0xc0, 0);
+        kprint.warn("rtl8125\0");
+        kprint.puts("RTL8125B initialization failed, stage \0");
+        kprint.dec(n.stage);
+        kprint.puts(" register \0");
+        kprint.hex(n.failed_reg);
+        kprint.putc(10);
+        ret 0;
+    }
+    bits8(n, 0x50, 0, 0xc0);
+    wr32(n, 0, low);
+    wr32(n, 4, high::u32);
+    bits8(n, 0x50, 0xc0, 0);
+    pci.write32(d, 4, (pci.read32(d, 4) & 0xffff) | 0x406);
+    barrier();
+    wr8(n, 0x37, 0x0c);
+    n.running   = 1;
+    out.context = n::u64;
+    out.model   = "RTL8125B\0";
+    mem.copy((?out.mac[0])::u64, (?n.mac[0])::u64, 6);
+    out.send    = send_frame;
+    out.receive = receive_frame;
+    out.link_up = device_link;
+    out.speed   = device_speed;
+    count       = count + 1;
+    kprint.info("rtl8125\0");
+    kprint.puts("RTL8125B ready (polled)\n\0");
+    ret 1;
+}
+
+fun send_frame(context: u64, frame: *u8, len: u64) u8 {
+    val n: *Nic = context::*Nic;
+    if (n == nil || n.running == 0 || frame == nil || len < 14 || len > ethernet.FRAME_MAX) { ret 0; }
+    val t: *Tx = (n.tx + n.tx_next * 32)::*Tx;
+    if ((t.status & OWN) != 0) { ret 0; }
+    barrier();
+    val slot: u64 = n.tx_next;
+    mem.copy(n.tx_buf[slot], frame::u64, len);
+    var wire: u64 = len;
+    if (wire < 60) {
+        mem.fill(n.tx_buf[slot] + wire, 0, 60 - wire);
+        wire = 60;
+    }
+    t.extra       = 0;
+    t.reserved[0] = 0;
+    t.reserved[1] = 0;
+    barrier();
+    t.status = OWN | end_flag(slot) | TX_WHOLE | wire::u32;
+    barrier();
+    wr16(n, 0x90, 1);
+    n.tx_next = (slot + 1) % RING;
+    ret 1;
+}
+
+fun receive_frame(context: u64, out: *u8, capacity: u64) u64 {
+    val n: *Nic = context::*Nic;
+    if (n == nil || n.running == 0 || out == nil) { ret 0; }
+    # Bounded work, even if hardware fills the ring while malformed frames arrive.
+    var inspected: u64 = 0;
+    for (inspected < RING) {
+        val slot:   u64 = n.rx_next;
+        val r:      *Rx = (n.rx + slot * 32)::*Rx;
+        val status: u32 = r.status;
+        if ((status & OWN) != 0) { ret 0; }
+        barrier();
+        val raw: u64 = (status & 0x3fff)::u64;
+        var len: u64 = 0;
+        if ((status & (RX_WHOLE | RX_ERROR)) == RX_WHOLE && raw >= 18 &&
+            raw <= ethernet.FRAME_MAX + 4 && raw <= BUF) { len = raw - 4; }
+        if (len != 0 && len <= capacity) { mem.copy(out::u64, n.rx_buf[slot], len); }
+        or                               { len = 0; }
+        arm_rx(n, slot);
+        n.rx_next = (slot + 1) % RING;
+        inspected = inspected + 1;
+        if (len != 0) { ret len; }
+    }
+    ret 0;
+}
+
+fun device_link(context: u64) u8 {
+    val n: *Nic = context::*Nic;
+    if (n == nil || n.running == 0) { ret 0; }
+    ret ((rd16(n, 0x6c) & 2) != 0)::u8;
+}
+
+fun device_speed(context: u64) u64 {
+    val n: *Nic = context::*Nic;
+    if (n == nil || n.running == 0) { ret 0; }
+    val status: u16 = rd16(n, 0x6c);
+    if ((status & 2) == 0)      { ret 0; }
+    if ((status & 0x0400) != 0) { ret 2500; }
+    if ((status & 0x10) != 0)   { ret 1000; }
+    if ((status & 8) != 0)      { ret 100; }
+    if ((status & 4) != 0)      { ret 10; }
+    ret 0;
+}
+
+# Firmware data, reproduced in equivalent packed register/value format from
+# OpenBSD sys/dev/microcode/rge/rgemcode.h revision 1.1 (2026-10-13).
+# Copyright (c) 2026 Realtek Semiconductor Corporation
+# Permission is hereby granted for the distribution of this firmware
+# data in hexadecimal or equivalent format, provided this copyright
+# notice is accompanying it. The high word is the register; the low word
+# is its value. These sequences must retain their original order.
+val RTL8125B_MAC_BPS: [138]u32 = [138]u32{
+    0xf800e010, 0xf802e01b, 0xf804e026, 0xf806e037, 0xf808e03d, 0xf80ae057,
+    0xf80ce05b, 0xf80ee060, 0xf810e062, 0xf812e064, 0xf814e066, 0xf816e068,
+    0xf818e06a, 0xf81ae06c, 0xf81ce06e, 0xf81ee070, 0xf820740a, 0xf8224846,
+    0xf8244847, 0xf8269c0a, 0xf828c607, 0xf82a74c0, 0xf82c48c6, 0xf82e9cc0,
+    0xf830c602, 0xf832be00, 0xf83413f0, 0xf836e054, 0xf83872ca, 0xf83a4826,
+    0xf83c4827, 0xf83e9aca, 0xf840c607, 0xf84272c0, 0xf84448a6, 0xf8469ac0,
+    0xf848c602, 0xf84abe00, 0xf84c081c, 0xf84ee054, 0xf850c60f, 0xf85274c4,
+    0xf85449cc, 0xf856f109, 0xf858c60c, 0xf85a74ca, 0xf85c48c7, 0xf85e9cca,
+    0xf860c609, 0xf86274c0, 0xf8644846, 0xf8669cc0, 0xf868c602, 0xf86abe00,
+    0xf86c2494, 0xf86ee092, 0xf870e0c0, 0xf872e054, 0xf8747420, 0xf87648c0,
+    0xf8789c20, 0xf87a7444, 0xf87cc602, 0xf87ebe00, 0xf88012dc, 0xf882733a,
+    0xf88421b5, 0xf88625bc, 0xf8881304, 0xf88af111, 0xf88c1b12, 0xf88e1d2a,
+    0xf8903168, 0xf8923ada, 0xf89431ab, 0xf8961a00, 0xf8989ac0, 0xf89a1300,
+    0xf89cf1fb, 0xf89e7620, 0xf8a0236e, 0xf8a2276f, 0xf8a41a3c, 0xf8a622a1,
+    0xf8a841b5, 0xf8aa9ee2, 0xf8ac76e4, 0xf8ae486f, 0xf8b09ee4, 0xf8b2c602,
+    0xf8b4be00, 0xf8b64a26, 0xf8b8733a, 0xf8ba49bb, 0xf8bcc602, 0xf8bebe00,
+    0xf8c047a2, 0xf8c248c1, 0xf8c448c2, 0xf8c69c46, 0xf8c8c402, 0xf8cabc00,
+    0xf8cc0a52, 0xf8cec602, 0xf8d0be00, 0xf8d20000, 0xf8d4c602, 0xf8d6be00,
+    0xf8d80000, 0xf8dac602, 0xf8dcbe00, 0xf8de0000, 0xf8e0c602, 0xf8e2be00,
+    0xf8e40000, 0xf8e6c602, 0xf8e8be00, 0xf8ea0000, 0xf8ecc602, 0xf8eebe00,
+    0xf8f00000, 0xf8f2c602, 0xf8f4be00, 0xf8f60000, 0xf8f8c602, 0xf8fabe00,
+    0xf8fc0000, 0xf8fec602, 0xf900be00, 0xf9020000, 0xfc268000, 0xfc2813e6,
+    0xfc2a0812, 0xfc2c248c, 0xfc2e12da, 0xfc304a20, 0xfc3247a0, 0xfc48003f
+};
+
+val MAC_R25B_EPHY: [10]u32 = [10]u32{
+    0x000ba908, 0x001e20eb, 0x00220023, 0x000260c2, 0x0029ff00, 0x004ba908,
+    0x005e28eb, 0x00620023, 0x004260c2, 0x0069ff00
+};
+
+val MAC_R25B_MCU: [1447]u32 = [1447]u32{
+    0xa4368024, 0xa4383701, 0xa436b82e, 0xa4380001, 0xb8200090, 0xa436a016,
+    0xa4380000, 0xa436a012, 0xa4380000, 0xa436a014, 0xa4381800, 0xa4388010,
+    0xa4381800, 0xa438801a, 0xa4381800, 0xa438803f, 0xa4381800, 0xa4388045,
+    0xa4381800, 0xa4388067, 0xa4381800, 0xa438806d, 0xa4381800, 0xa4388071,
+    0xa4381800, 0xa43880b1, 0xa438d093, 0xa438d1c4, 0xa4381000, 0xa438135c,
+    0xa438d704, 0xa4385fbc, 0xa438d504, 0xa438c9f1, 0xa4381800, 0xa4380fc9,
+    0xa438bb50, 0xa438d505, 0xa438a202, 0xa438d504, 0xa4388c0f, 0xa438d500,
+    0xa4381000, 0xa4381519, 0xa4381000, 0xa438135c, 0xa438d75e, 0xa4385fae,
+    0xa4389b50, 0xa4381000, 0xa438135c, 0xa438d75e, 0xa4387fae, 0xa4381000,
+    0xa438135c, 0xa438d707, 0xa43840a7, 0xa438d719, 0xa4384071, 0xa4381800,
+    0xa4381557, 0xa438d719, 0xa4382f70, 0xa438803b, 0xa4382f73, 0xa438156a,
+    0xa4385e70, 0xa4381800, 0xa438155d, 0xa438d505, 0xa438a202, 0xa438d500,
+    0xa438ffed, 0xa438d709, 0xa4384054, 0xa438a788, 0xa438d70b, 0xa4381800,
+    0xa438172a, 0xa438c0c1, 0xa438c0c0, 0xa438d05a, 0xa438d1ba, 0xa438d701,
+    0xa4382529, 0xa438022a, 0xa438d0a7, 0xa438d1b9, 0xa438a208, 0xa4381000,
+    0xa438080e, 0xa438d701, 0xa438408b, 0xa4381000, 0xa4380a65, 0xa438f003,
+    0xa4381000, 0xa4380a6b, 0xa438d701, 0xa4381000, 0xa4380920, 0xa4381000,
+    0xa4380915, 0xa4381000, 0xa4380909, 0xa438228f, 0xa438804e, 0xa4389801,
+    0xa438d71e, 0xa4385d61, 0xa438d701, 0xa4381800, 0xa438022a, 0xa4382005,
+    0xa438091a, 0xa4383bd9, 0xa4380919, 0xa4381800, 0xa4380916, 0xa438d090,
+    0xa438d1c9, 0xa4381800, 0xa4381064, 0xa438d096, 0xa438d1a9, 0xa438d503,
+    0xa438a104, 0xa4380c07, 0xa4380902, 0xa438d500, 0xa438bc10, 0xa438d501,
+    0xa438ce01, 0xa438a201, 0xa4388201, 0xa438ce00, 0xa438d500, 0xa438c484,
+    0xa438d503, 0xa438cc02, 0xa438cd0d, 0xa438af01, 0xa438d500, 0xa438d703,
+    0xa4384371, 0xa438bd08, 0xa4381000, 0xa438135c, 0xa438d75e, 0xa4385fb3,
+    0xa438d503, 0xa438d0f5, 0xa438d1c6, 0xa4380cf0, 0xa4380e50, 0xa438d704,
+    0xa438401c, 0xa438d0f5, 0xa438d1c6, 0xa4380cf0, 0xa4380ea0, 0xa438401c,
+    0xa438d07b, 0xa438d1c5, 0xa4388ef0, 0xa438401c, 0xa4389d08, 0xa4381000,
+    0xa438135c, 0xa438d75e, 0xa4387fb3, 0xa4381000, 0xa438135c, 0xa438d75e,
+    0xa4385fad, 0xa4381000, 0xa43814c5, 0xa438d703, 0xa4383181, 0xa43880af,
+    0xa43860ad, 0xa4381000, 0xa438135c, 0xa438d703, 0xa4385fba, 0xa4381800,
+    0xa4380cc7, 0xa438a802, 0xa438a301, 0xa438a801, 0xa438c004, 0xa438d710,
+    0xa4384000, 0xa4381800, 0xa4381e79, 0xa436a026, 0xa4381e78, 0xa436a024,
+    0xa4380c93, 0xa436a022, 0xa4381062, 0xa436a020, 0xa4380915, 0xa436a006,
+    0xa438020a, 0xa436a004, 0xa4381726, 0xa436a002, 0xa4381542, 0xa436a000,
+    0xa4380fc7, 0xa436a008, 0xa438ff00, 0xa436a016, 0xa4380010, 0xa436a012,
+    0xa4380000, 0xa436a014, 0xa4381800, 0xa4388010, 0xa4381800, 0xa438801d,
+    0xa4381800, 0xa438802c, 0xa4381800, 0xa438802c, 0xa4381800, 0xa438802c,
+    0xa4381800, 0xa438802c, 0xa4381800, 0xa438802c, 0xa4381800, 0xa438802c,
+    0xa438d700, 0xa4386090, 0xa43860d1, 0xa438c95c, 0xa438f007, 0xa43860b1,
+    0xa438c95a, 0xa438f004, 0xa438c956, 0xa438f002, 0xa438c94e, 0xa4381800,
+    0xa43800cd, 0xa438d700, 0xa4386090, 0xa43860d1, 0xa438c95c, 0xa438f007,
+    0xa43860b1, 0xa438c95a, 0xa438f004, 0xa438c956, 0xa438f002, 0xa438c94e,
+    0xa4381000, 0xa438022a, 0xa4381800, 0xa4380132, 0xa436a08e, 0xa438ffff,
+    0xa436a08c, 0xa438ffff, 0xa436a08a, 0xa438ffff, 0xa436a088, 0xa438ffff,
+    0xa436a086, 0xa438ffff, 0xa436a084, 0xa438ffff, 0xa436a082, 0xa438012f,
+    0xa436a080, 0xa43800cc, 0xa436a090, 0xa4380103, 0xa436a016, 0xa4380020,
+    0xa436a012, 0xa4380000, 0xa436a014, 0xa4381800, 0xa4388010, 0xa4381800,
+    0xa4388020, 0xa4381800, 0xa438802a, 0xa4381800, 0xa4388035, 0xa4381800,
+    0xa438803c, 0xa4381800, 0xa438803c, 0xa4381800, 0xa438803c, 0xa4381800,
+    0xa438803c, 0xa438d107, 0xa438d042, 0xa438a404, 0xa4381000, 0xa43809df,
+    0xa438d700, 0xa4385fb4, 0xa4388280, 0xa438d700, 0xa4386065, 0xa438d125,
+    0xa438f002, 0xa438d12b, 0xa438d040, 0xa4381800, 0xa438077f, 0xa4380cf0,
+    0xa4380c50, 0xa438d104, 0xa438d040, 0xa4381000, 0xa4380aa8, 0xa438d700,
+    0xa4385fb4, 0xa4381800, 0xa4380a2e, 0xa438cb9b, 0xa438d110, 0xa438d040,
+    0xa4381000, 0xa4380b7b, 0xa4381000, 0xa43809df, 0xa438d700, 0xa4385fb4,
+    0xa4381800, 0xa438081b, 0xa4381000, 0xa43809df, 0xa438d704, 0xa4387fb8,
+    0xa438a718, 0xa4381800, 0xa438074e, 0xa436a10e, 0xa438ffff, 0xa436a10c,
+    0xa438ffff, 0xa436a10a, 0xa438ffff, 0xa436a108, 0xa438ffff, 0xa436a106,
+    0xa438074d, 0xa436a104, 0xa4380818, 0xa436a102, 0xa4380a2c, 0xa436a100,
+    0xa438077e, 0xa436a110, 0xa438000f, 0xa436b87c, 0xa4388625, 0xa436b87e,
+    0xa438af86, 0xa4383daf, 0xa4388689, 0xa438af88, 0xa43869af, 0xa4388887,
+    0xa438af88, 0xa4389caf, 0xa43888be, 0xa438af88, 0xa438beaf, 0xa43888be,
+    0xa438bf86, 0xa43849d7, 0xa4380040, 0xa4380277, 0xa4387daf, 0xa4382727,
+    0xa4380000, 0xa4387205, 0xa4380000, 0xa4387208, 0xa4380000, 0xa43871f3,
+    0xa4380000, 0xa43871f6, 0xa4380000, 0xa4387229, 0xa4380000, 0xa438722c,
+    0xa4380000, 0xa4387217, 0xa4380000, 0xa438721a, 0xa4380000, 0xa438721d,
+    0xa4380000, 0xa4387211, 0xa4380000, 0xa4387220, 0xa4380000, 0xa4387214,
+    0xa4380000, 0xa438722f, 0xa4380000, 0xa4387223, 0xa4380000, 0xa4387232,
+    0xa4380000, 0xa4387226, 0xa438f8f9, 0xa438fae0, 0xa43885b3, 0xa4383802,
+    0xa438ad27, 0xa43802ae, 0xa43803af, 0xa4388830, 0xa4381f66, 0xa438ef65,
+    0xa438bfc2, 0xa4381f1a, 0xa43896f7, 0xa43805ee, 0xa438ffd2, 0xa43800da,
+    0xa438f605, 0xa438bfc2, 0xa4382f1a, 0xa43896f7, 0xa43805ee, 0xa438ffd2,
+    0xa43800db, 0xa438f605, 0xa438ef02, 0xa4381f11, 0xa4380d42, 0xa438bf88,
+    0xa4384202, 0xa4386e7d, 0xa438ef02, 0xa4381b03, 0xa4381f11, 0xa4380d42,
+    0xa438bf88, 0xa4384502, 0xa4386e7d, 0xa438ef02, 0xa4381a03, 0xa4381f11,
+    0xa4380d42, 0xa438bf88, 0xa4384802, 0xa4386e7d, 0xa438bfc2, 0xa4383f1a,
+    0xa43896f7, 0xa43805ee, 0xa438ffd2, 0xa43800da, 0xa438f605, 0xa438bfc2,
+    0xa4384f1a, 0xa43896f7, 0xa43805ee, 0xa438ffd2, 0xa43800db, 0xa438f605,
+    0xa438ef02, 0xa4381f11, 0xa4380d42, 0xa438bf88, 0xa4384b02, 0xa4386e7d,
+    0xa438ef02, 0xa4381b03, 0xa4381f11, 0xa4380d42, 0xa438bf88, 0xa4384e02,
+    0xa4386e7d, 0xa438ef02, 0xa4381a03, 0xa4381f11, 0xa4380d42, 0xa438bf88,
+    0xa4385102, 0xa4386e7d, 0xa438ef56, 0xa438d020, 0xa4381f11, 0xa438bf88,
+    0xa4385402, 0xa4386e7d, 0xa438bf88, 0xa4385702, 0xa4386e7d, 0xa438bf88,
+    0xa4385a02, 0xa4386e7d, 0xa438e185, 0xa438a0ef, 0xa4380348, 0xa4380a28,
+    0xa43805ef, 0xa438201b, 0xa43801ad, 0xa4382735, 0xa4381f44, 0xa438e085,
+    0xa43888e1, 0xa4388589, 0xa438bf88, 0xa4385d02, 0xa4386e7d, 0xa438e085,
+    0xa4388ee1, 0xa438858f, 0xa438bf88, 0xa4386002, 0xa4386e7d, 0xa438e085,
+    0xa43894e1, 0xa4388595, 0xa438bf88, 0xa4386302, 0xa4386e7d, 0xa438e085,
+    0xa4389ae1, 0xa438859b, 0xa438bf88, 0xa4386602, 0xa4386e7d, 0xa438af88,
+    0xa4383cbf, 0xa438883f, 0xa438026e, 0xa4389cad, 0xa4382835, 0xa4381f44,
+    0xa438e08f, 0xa438f8e1, 0xa4388ff9, 0xa438bf88, 0xa4385d02, 0xa4386e7d,
+    0xa438e08f, 0xa438fae1, 0xa4388ffb, 0xa438bf88, 0xa4386002, 0xa4386e7d,
+    0xa438e08f, 0xa438fce1, 0xa4388ffd, 0xa438bf88, 0xa4386302, 0xa4386e7d,
+    0xa438e08f, 0xa438fee1, 0xa4388fff, 0xa438bf88, 0xa4386602, 0xa4386e7d,
+    0xa438af88, 0xa4383ce1, 0xa43885a1, 0xa4381b21, 0xa438ad37, 0xa438341f,
+    0xa43844e0, 0xa438858a, 0xa438e185, 0xa4388bbf, 0xa438885d, 0xa438026e,
+    0xa4387de0, 0xa4388590, 0xa438e185, 0xa43891bf, 0xa4388860, 0xa438026e,
+    0xa4387de0, 0xa4388596, 0xa438e185, 0xa43897bf, 0xa4388863, 0xa438026e,
+    0xa4387de0, 0xa438859c, 0xa438e185, 0xa4389dbf, 0xa4388866, 0xa438026e,
+    0xa4387dae, 0xa438401f, 0xa43844e0, 0xa438858c, 0xa438e185, 0xa4388dbf,
+    0xa438885d, 0xa438026e, 0xa4387de0, 0xa4388592, 0xa438e185, 0xa43893bf,
+    0xa4388860, 0xa438026e, 0xa4387de0, 0xa4388598, 0xa438e185, 0xa43899bf,
+    0xa4388863, 0xa438026e, 0xa4387de0, 0xa438859e, 0xa438e185, 0xa4389fbf,
+    0xa4388866, 0xa438026e, 0xa4387dae, 0xa4380ce1, 0xa43885b3, 0xa4383904,
+    0xa438ac2f, 0xa43804ee, 0xa43885b3, 0xa43800af, 0xa43839d9, 0xa43822ac,
+    0xa438eaf0, 0xa438acf6, 0xa438f0ac, 0xa438faf0, 0xa438acf8, 0xa438f0ac,
+    0xa438fcf0, 0xa438ad00, 0xa438f0ac, 0xa438fef0, 0xa438acf0, 0xa438f0ac,
+    0xa438f4f0, 0xa438acf2, 0xa438f0ac, 0xa438b0f0, 0xa438acae, 0xa438f0ac,
+    0xa438acf0, 0xa438acaa, 0xa438a100, 0xa4380ce1, 0xa4388ff7, 0xa438bf88,
+    0xa4388402, 0xa4386e7d, 0xa438af26, 0xa438e9e1, 0xa4388ff6, 0xa438bf88,
+    0xa4388402, 0xa4386e7d, 0xa438af26, 0xa438f520, 0xa438ac86, 0xa438bf88,
+    0xa4383f02, 0xa4386e9c, 0xa438ad28, 0xa43803af, 0xa4383324, 0xa438ad38,
+    0xa43803af, 0xa43832e6, 0xa438af32, 0xa438fbee, 0xa438826a, 0xa4380002,
+    0xa43888a6, 0xa438af04, 0xa43878f8, 0xa438faef, 0xa43869e0, 0xa4388015,
+    0xa438ad20, 0xa43806bf, 0xa43888bb, 0xa4380275, 0xa438b1ef, 0xa43896fe,
+    0xa438fc04, 0xa43800b8, 0xa4387a00, 0xa436b87c, 0xa4388ff6, 0xa436b87e,
+    0xa4380705, 0xa436b87c, 0xa4388ff8, 0xa436b87e, 0xa43819cc, 0xa436b87c,
+    0xa4388ffa, 0xa436b87e, 0xa43828e3, 0xa436b87c, 0xa4388ffc, 0xa436b87e,
+    0xa4381047, 0xa436b87c, 0xa4388ffe, 0xa436b87e, 0xa4380a45, 0xa436b85e,
+    0xa438271e, 0xa436b860, 0xa4383846, 0xa436b862, 0xa43826e6, 0xa436b864,
+    0xa43832e3, 0xa436b886, 0xa4380474, 0xa436b888, 0xa438ffff, 0xa436b88a,
+    0xa438ffff, 0xa436b88c, 0xa438ffff, 0xa436b838, 0xa438001f, 0xb8200010,
+    0xa436846e, 0xa438af84, 0xa43886af, 0xa4388690, 0xa438af86, 0xa438a4af,
+    0xa4388934, 0xa438af89, 0xa43860af, 0xa438897e, 0xa438af89, 0xa438a9af,
+    0xa43889a9, 0xa438ee82, 0xa4385f00, 0xa4380284, 0xa43890af, 0xa4380441,
+    0xa438f8e0, 0xa4388ff3, 0xa438a000, 0xa4380502, 0xa43884a4, 0xa438ae06,
+    0xa438a001, 0xa4380302, 0xa43884c8, 0xa438fc04, 0xa438f8f9, 0xa438ef59,
+    0xa438e080, 0xa43815ad, 0xa4382702, 0xa438ae03, 0xa438af84, 0xa438c3bf,
+    0xa43853ca, 0xa4380252, 0xa438c8ad, 0xa4382807, 0xa4380285, 0xa4382cee,
+    0xa4388ff3, 0xa43801ef, 0xa43895fd, 0xa438fc04, 0xa438f8f9, 0xa438faef,
+    0xa43869bf, 0xa43853ca, 0xa4380252, 0xa438c8ac, 0xa4382822, 0xa438d480,
+    0xa43800bf, 0xa4388684, 0xa4380252, 0xa438a9bf, 0xa4388687, 0xa4380252,
+    0xa438a9bf, 0xa438868a, 0xa4380252, 0xa438a9bf, 0xa438868d, 0xa4380252,
+    0xa438a9ee, 0xa4388ff3, 0xa43800af, 0xa4388526, 0xa438e08f, 0xa438f4e1,
+    0xa4388ff5, 0xa438e28f, 0xa438f6e3, 0xa4388ff7, 0xa4381b45, 0xa438ac27,
+    0xa4380eee, 0xa4388ff4, 0xa43800ee, 0xa4388ff5, 0xa4380002, 0xa438852c,
+    0xa438af85, 0xa43826e0, 0xa4388ff4, 0xa438e18f, 0xa438f52c, 0xa4380001,
+    0xa438e48f, 0xa438f4e5, 0xa4388ff5, 0xa438ef96, 0xa438fefd, 0xa438fc04,
+    0xa438f8f9, 0xa438ef59, 0xa438bf53, 0xa4382202, 0xa43852c8, 0xa438a18b,
+    0xa43802ae, 0xa43803af, 0xa43885da, 0xa438bf57, 0xa4387202, 0xa43852c8,
+    0xa438e48f, 0xa438f8e5, 0xa4388ff9, 0xa438bf57, 0xa4387502, 0xa43852c8,
+    0xa438e48f, 0xa438fae5, 0xa4388ffb, 0xa438bf57, 0xa4387802, 0xa43852c8,
+    0xa438e48f, 0xa438fce5, 0xa4388ffd, 0xa438bf57, 0xa4387b02, 0xa43852c8,
+    0xa438e48f, 0xa438fee5, 0xa4388fff, 0xa438bf57, 0xa4386c02, 0xa43852c8,
+    0xa438a102, 0xa43813ee, 0xa4388ffc, 0xa43880ee, 0xa4388ffd, 0xa43800ee,
+    0xa4388ffe, 0xa43880ee, 0xa4388fff, 0xa43800af, 0xa4388599, 0xa438a101,
+    0xa4380cbf, 0xa438534c, 0xa4380252, 0xa438c8a1, 0xa4380303, 0xa438af85,
+    0xa43877bf, 0xa4385322, 0xa4380252, 0xa438c8a1, 0xa4388b02, 0xa438ae03,
+    0xa438af86, 0xa43864e0, 0xa4388ff8, 0xa438e18f, 0xa438f9bf, 0xa4388684,
+    0xa4380252, 0xa438a9e0, 0xa4388ffa, 0xa438e18f, 0xa438fbbf, 0xa4388687,
+    0xa4380252, 0xa438a9e0, 0xa4388ffc, 0xa438e18f, 0xa438fdbf, 0xa438868a,
+    0xa4380252, 0xa438a9e0, 0xa4388ffe, 0xa438e18f, 0xa438ffbf, 0xa438868d,
+    0xa4380252, 0xa438a9af, 0xa438867f, 0xa438bf53, 0xa4382202, 0xa43852c8,
+    0xa438a144, 0xa4383cbf, 0xa438547b, 0xa4380252, 0xa438c8e4, 0xa4388ff8,
+    0xa438e58f, 0xa438f9bf, 0xa438547e, 0xa4380252, 0xa438c8e4, 0xa4388ffa,
+    0xa438e58f, 0xa438fbbf, 0xa4385481, 0xa4380252, 0xa438c8e4, 0xa4388ffc,
+    0xa438e58f, 0xa438fdbf, 0xa4385484, 0xa4380252, 0xa438c8e4, 0xa4388ffe,
+    0xa438e58f, 0xa438ffbf, 0xa4385322, 0xa4380252, 0xa438c8a1, 0xa4384448,
+    0xa438af85, 0xa438a7bf, 0xa4385322, 0xa4380252, 0xa438c8a1, 0xa438313c,
+    0xa438bf54, 0xa4387b02, 0xa43852c8, 0xa438e48f, 0xa438f8e5, 0xa4388ff9,
+    0xa438bf54, 0xa4387e02, 0xa43852c8, 0xa438e48f, 0xa438fae5, 0xa4388ffb,
+    0xa438bf54, 0xa4388102, 0xa43852c8, 0xa438e48f, 0xa438fce5, 0xa4388ffd,
+    0xa438bf54, 0xa4388402, 0xa43852c8, 0xa438e48f, 0xa438fee5, 0xa4388fff,
+    0xa438bf53, 0xa4382202, 0xa43852c8, 0xa438a131, 0xa43803af, 0xa43885a7,
+    0xa438d480, 0xa43800bf, 0xa4388684, 0xa4380252, 0xa438a9bf, 0xa4388687,
+    0xa4380252, 0xa438a9bf, 0xa438868a, 0xa4380252, 0xa438a9bf, 0xa438868d,
+    0xa4380252, 0xa438a9ef, 0xa43895fd, 0xa438fc04, 0xa438f0d1, 0xa4382af0,
+    0xa438d12c, 0xa438f0d1, 0xa43844f0, 0xa438d146, 0xa438bf86, 0xa438a102,
+    0xa43852c8, 0xa438bf86, 0xa438a102, 0xa43852c8, 0xa438d101, 0xa438af06,
+    0xa438a570, 0xa438ce42, 0xa438ee83, 0xa438c800, 0xa4380286, 0xa438ba02,
+    0xa4388728, 0xa4380287, 0xa438be02, 0xa43887f9, 0xa4380288, 0xa438c3af,
+    0xa4384771, 0xa438f8f9, 0xa438fafb, 0xa438ef69, 0xa438fae0, 0xa4388015,
+    0xa438ad25, 0xa43845d2, 0xa4380002, 0xa4388714, 0xa438ac4f, 0xa43802ae,
+    0xa4380bef, 0xa43846f6, 0xa438273c, 0xa4380400, 0xa438ab26, 0xa438ae30,
+    0xa438e08f, 0xa438e9e1, 0xa4388fea, 0xa4381b46, 0xa438ab26, 0xa438ef32,
+    0xa4380c31, 0xa438bf8f, 0xa438e91a, 0xa43893d8, 0xa43819d9, 0xa4381b46,
+    0xa438ab0a, 0xa43819d8, 0xa43819d9, 0xa4381b46, 0xa438aa02, 0xa438ae0c,
+    0xa438bf57, 0xa4381202, 0xa43858b1, 0xa438bf57, 0xa4381202, 0xa43858a8,
+    0xa438feef, 0xa43896ff, 0xa438fefd, 0xa438fc04, 0xa438f8fb, 0xa438ef79,
+    0xa438a200, 0xa43808bf, 0xa438892e, 0xa4380252, 0xa438c8ef, 0xa43864ef,
+    0xa43897ff, 0xa438fc04, 0xa438f8f9, 0xa438fafb, 0xa438ef69, 0xa438fae0,
+    0xa4388015, 0xa438ad25, 0xa43850d2, 0xa4380002, 0xa438878d, 0xa438ac4f,
+    0xa43802ae, 0xa4380bef, 0xa43846f6, 0xa438273c, 0xa4381000, 0xa438ab31,
+    0xa438ae29, 0xa438e08f, 0xa438ede1, 0xa4388fee, 0xa4381b46, 0xa438ab1f,
+    0xa438a200, 0xa43804ef, 0xa43832ae, 0xa43802d3, 0xa438010c, 0xa43831bf,
+    0xa4388fed, 0xa4381a93, 0xa438d819, 0xa438d91b, 0xa43846ab, 0xa4380e19,
+    0xa438d819, 0xa438d91b, 0xa43846aa, 0xa4380612, 0xa438a205, 0xa438c0ae,
+    0xa4380cbf, 0xa4385712, 0xa4380258, 0xa438b1bf, 0xa4385712, 0xa4380258,
+    0xa438a8fe, 0xa438ef96, 0xa438fffe, 0xa438fdfc, 0xa43804f8, 0xa438fbef,
+    0xa43879a2, 0xa4380005, 0xa438bf89, 0xa4381fae, 0xa4381ba2, 0xa4380105,
+    0xa438bf89, 0xa43822ae, 0xa43813a2, 0xa4380205, 0xa438bf89, 0xa43825ae,
+    0xa4380ba2, 0xa4380305, 0xa438bf89, 0xa43828ae, 0xa43803bf, 0xa438892b,
+    0xa4380252, 0xa438c8ef, 0xa43864ef, 0xa43897ff, 0xa438fc04, 0xa438f8f9,
+    0xa438faef, 0xa43869fa, 0xa438e080, 0xa43815ad, 0xa4382628, 0xa438e081,
+    0xa438abe1, 0xa43881ac, 0xa438ef64, 0xa438bf57, 0xa4381802, 0xa43852c8,
+    0xa4381b46, 0xa438aa0a, 0xa438bf57, 0xa4381b02, 0xa43852c8, 0xa4381b46,
+    0xa438ab0c, 0xa438bf57, 0xa4381502, 0xa43858b1, 0xa438bf57, 0xa4381502,
+    0xa43858a8, 0xa438feef, 0xa43896fe, 0xa438fdfc, 0xa43804f8, 0xa438f9ef,
+    0xa43859f9, 0xa438e080, 0xa43815ad, 0xa4382622, 0xa438bf53, 0xa4382202,
+    0xa43852c8, 0xa4383972, 0xa4389e10, 0xa438e083, 0xa438c9ac, 0xa4382605,
+    0xa4380288, 0xa4382cae, 0xa4380d02, 0xa4388870, 0xa438ae08, 0xa438e283,
+    0xa438c9f6, 0xa43836e6, 0xa43883c9, 0xa438fdef, 0xa43895fd, 0xa438fc04,
+    0xa438f8f9, 0xa438fafb, 0xa438ef79, 0xa438fbbf, 0xa4385718, 0xa4380252,
+    0xa438c8ef, 0xa43864e2, 0xa4388fe5, 0xa438e38f, 0xa438e61b, 0xa438659e,
+    0xa43810e4, 0xa4388fe5, 0xa438e58f, 0xa438e6e2, 0xa43883c9, 0xa438f636,
+    0xa438e683, 0xa438c9ae, 0xa43813e2, 0xa43883c9, 0xa438f736, 0xa438e683,
+    0xa438c902, 0xa4385820, 0xa438ef57, 0xa438e68f, 0xa438e7e7, 0xa4388fe8,
+    0xa438ffef, 0xa43897ff, 0xa438fefd, 0xa438fc04, 0xa438f8f9, 0xa438fafb,
+    0xa438ef79, 0xa438fbe2, 0xa4388fe7, 0xa438e38f, 0xa438e8ef, 0xa43865e2,
+    0xa43881b8, 0xa438e381, 0xa438b9ef, 0xa4387502, 0xa438583b, 0xa438ac50,
+    0xa4381abf, 0xa4385718, 0xa4380252, 0xa438c8ef, 0xa43864e2, 0xa4388fe5,
+    0xa438e38f, 0xa438e61b, 0xa438659e, 0xa4381ce4, 0xa4388fe5, 0xa438e58f,
+    0xa438e6ae, 0xa4380cbf, 0xa4385715, 0xa4380258, 0xa438b1bf, 0xa4385715,
+    0xa4380258, 0xa438a8e2, 0xa43883c9, 0xa438f636, 0xa438e683, 0xa438c9ff,
+    0xa438ef97, 0xa438fffe, 0xa438fdfc, 0xa43804f8, 0xa438f9fa, 0xa438ef69,
+    0xa438e080, 0xa43815ad, 0xa438264b, 0xa438bf53, 0xa438ca02, 0xa43852c8,
+    0xa438ad28, 0xa43842bf, 0xa4388931, 0xa4380252, 0xa438c8ef, 0xa43854bf,
+    0xa438576c, 0xa4380252, 0xa438c8a1, 0xa438001b, 0xa438bf53, 0xa4384c02,
+    0xa43852c8, 0xa438ac29, 0xa4380dac, 0xa4382805, 0xa438a302, 0xa43816ae,
+    0xa43820a3, 0xa4380311, 0xa438ae1b, 0xa438a304, 0xa4380cae, 0xa43816a3,
+    0xa4380802, 0xa438ae11, 0xa438a309, 0xa43802ae, 0xa4380cbf, 0xa4385715,
+    0xa4380258, 0xa438b1bf, 0xa4385715, 0xa4380258, 0xa438a8ef, 0xa43896fe,
+    0xa438fdfc, 0xa43804f0, 0xa438a300, 0xa438f0a3, 0xa43802f0, 0xa438a304,
+    0xa438f0a3, 0xa43806f0, 0xa438a308, 0xa438f0a2, 0xa4388074, 0xa438a600,
+    0xa438ac4f, 0xa43802ae, 0xa4380bef, 0xa43846f6, 0xa438273c, 0xa4381000,
+    0xa438ab1b, 0xa438ae16, 0xa438e081, 0xa438abe1, 0xa43881ac, 0xa4381b46,
+    0xa438ab0c, 0xa438ac32, 0xa43804ef, 0xa43832ae, 0xa43802d3, 0xa43804af,
+    0xa438486c, 0xa438af48, 0xa43882af, 0xa4384888, 0xa438e081, 0xa4389be1,
+    0xa438819c, 0xa438e28f, 0xa438e3ad, 0xa4383009, 0xa4381f55, 0xa438e38f,
+    0xa438e20c, 0xa438581a, 0xa43845e4, 0xa43883a6, 0xa438e583, 0xa438a7af,
+    0xa4382a75, 0xa438e08f, 0xa438e3ad, 0xa438201c, 0xa4381f44, 0xa438e18f,
+    0xa438e10c, 0xa43844ef, 0xa43864e0, 0xa4388232, 0xa438e182, 0xa438331b,
+    0xa438649f, 0xa438091f, 0xa43844e1, 0xa4388fe2, 0xa4380c48, 0xa4381b54,
+    0xa438e683, 0xa438a6e7, 0xa43883a7, 0xa438af2b, 0xa438d900, 0xa436b818,
+    0xa438043d, 0xa436b81a, 0xa43806a3, 0xa436b81c, 0xa438476d, 0xa436b81e,
+    0xa4384852, 0xa436b850, 0xa4382a69, 0xa436b852, 0xa4382bd3, 0xa436b878,
+    0xa438ffff, 0xa436b884, 0xa438ffff, 0xa436b832, 0xa438003f, 0xb844ffff,
+    0xa4368fe9, 0xa4380000, 0xa4368feb, 0xa43802fe, 0xa4368fed, 0xa4380019,
+    0xa4368fef, 0xa4380bdb, 0xa4368ff1, 0xa4380ca4, 0xa4360000, 0xa4380000,
+    0xa436b82e, 0xa4380000, 0xa4368024, 0xa4380000, 0xa436801e, 0xa4380024,
+    0xb8200000
+};
+
+# These tests use ordinary memory for MMIO and descriptors, never a live NIC.
+test rtl8125__descriptor_layout_and_revision_gate {
+    var tx: Tx;
+    var rx: Rx;
+    if ($size_of(Tx) != 32 || $size_of(Rx) != 32) { ret 1; }
+    if ((?tx.addr)::u64 - (?tx)::u64 != 8 || (?rx.addr)::u64 - (?rx)::u64 != 16 ||
+        (?rx.status)::u64 - (?rx)::u64 != 28) { ret 2; }
+    if (supported_revision(0x64100700) == 0 || supported_revision(0x60900000) != 0 ||
+        supported_revision(0x68800000) != 0 || supported_revision(0xffffffff) != 0) { ret 3; }
+    var d: pci.Device;
+    d.class    = 2;
+    d.subclass = 0;
+    d.vendor   = 0x10ec;
+    d.device   = 0x8125;
+    if (supports(?d) == 0) { ret 4; }
+    d.device = 0x8168;
+    if (supports(?d) != 0 || supports(nil) != 0) { ret 5; }
+    var out: ethernet.Device;
+    out.context = 91;
+    if (probe(?d, ?out) != 0 || out.context != 91 || probe(nil, ?out) != 0) { ret 6; }
+    ret 0;
+}
+
+test rtl8125__transmit_wrap_full_ring_and_padding {
+    var n:     Nic;
+    var regs:  [64]u32;
+    var ring:  [32]Tx;
+    var data:  [2048]u8;
+    var frame: [1515]u8;
+    n.regs    = (?regs[0])::u64;
+    n.tx      = (?ring[0])::u64;
+    n.running = 1;
+    frame[0]  = 73;
+    frame[13] = 91;
+    var i: u64 = 0;
+    for (i < RING) {
+        n.tx_buf[i]  = (?data[0])::u64;
+        ring[i].addr = 0x12345000;
+        i            = i + 1;
+    }
+    if (send_frame((?n)::u64, nil, 64) != 0 || send_frame(0, ?frame[0], 64) != 0 ||
+        send_frame((?n)::u64, ?frame[0], 13) != 0 || send_frame((?n)::u64, ?frame[0], 1515) != 0) { ret 1; }
+    i = 0;
+    for (i < RING) {
+        if (send_frame((?n)::u64, ?frame[0], 14) == 0) { ret 2; }
+        i = i + 1;
+    }
+    if (n.tx_next != 0 || send_frame((?n)::u64, ?frame[0], 64) != 0) { ret 3; }
+    if (ring[31].status != (OWN | EOR | TX_WHOLE | 60) || ring[0].addr != 0x12345000 ||
+        data[0] != 73 || data[13] != 91 || data[14] != 0 || data[59] != 0 || regs[36] != 1) { ret 4; }
+    ring[0].status = 0;
+    if (send_frame((?n)::u64, ?frame[0], 1514) == 0 || n.tx_next != 1 ||
+        ring[0].status != (OWN | TX_WHOLE | 1514)) { ret 5; }
+    frame[0] = 0;
+    if (data[0] != 73 || ring[0].extra != 0 || ring[0].reserved[0] != 0) { ret 6; }
+    ret 0;
+}
+
+test rtl8125__receive_recycles_errors_strips_crc_and_preserves_bounds {
+    var n:    Nic;
+    var ring: [32]Rx;
+    var data: [2048]u8;
+    var out:  [65]u8;
+    n.rx      = (?ring[0])::u64;
+    n.running = 1;
+    var i: u64 = 0;
+    for (i < RING) {
+        n.rx_buf[i]    = (?data[0])::u64;
+        n.rx_pa[i]     = 0x12345000 + i * 4096;
+        ring[i].status = OWN;
+        i              = i + 1;
+    }
+    data[0]        = 73;
+    data[63]       = 91;
+    data[64]       = 13;
+    out[64]        = 99;
+    ring[0].status = RX_WHOLE | RX_ERROR | 68;
+    ring[1].status = 0x02000000 | 68; # A fragment cannot be delivered as a frame.
+    ring[2].status = RX_WHOLE | 1519;
+    ring[3].status = RX_WHOLE | 17;
+    ring[4].status = RX_WHOLE | 69; # Larger than the caller's buffer after CRC removal.
+    ring[5].status = RX_WHOLE | 68;
+    if (receive_frame((?n)::u64, ?out[0], 64) != 64 || n.rx_next != 6 ||
+        out[0] != 73 || out[63] != 91 || out[64] != 99) { ret 1; }
+    if (ring[0].status != (OWN | 2048) || ring[5].status != (OWN | 2048) ||
+        ring[5].addr != n.rx_pa[5] || receive_frame((?n)::u64, ?out[0], 64) != 0) { ret 2; }
+    n.rx_next       = 31;
+    ring[31].status = RX_WHOLE | 18;
+    if (receive_frame((?n)::u64, ?out[0], 64) != 14 || n.rx_next != 0 ||
+        ring[31].status != (OWN | EOR | 2048)) { ret 3; }
+    i = 0;
+    for (i < RING) {
+        ring[i].status = RX_ERROR;
+        i              = i + 1;
+    }
+    if (receive_frame((?n)::u64, ?out[0], 64) != 0 || n.rx_next != 0)                 { ret 4; }
+    if (receive_frame(0, ?out[0], 64) != 0 || receive_frame((?n)::u64, nil, 64) != 0) { ret 5; }
+    ret 0;
+}
+
+test rtl8125__link_status_and_access_timeout {
+    var n:    Nic;
+    var regs: [64]u32;
+    n.regs    = (?regs[0])::u64;
+    n.running = 1;
+    if (device_link((?n)::u64) != 0 || device_speed((?n)::u64) != 0) { ret 1; }
+    regs[27] = 0x0402;
+    if (device_link((?n)::u64) == 0 || device_speed((?n)::u64) != 2500) { ret 2; }
+    regs[27] = 0x12;
+    if (device_speed((?n)::u64) != 1000) { ret 3; }
+    regs[27] = 0x0a;
+    if (device_speed((?n)::u64) != 100) { ret 4; }
+    regs[27] = 0x06;
+    if (device_speed((?n)::u64) != 10 || device_link(0) != 0) { ret 5; }
+    # A stuck PHY transaction latches failure and suppresses further commands.
+    if (phy_read(?n, 0xa420) != 0 || n.failed == 0) { ret 6; }
+    val before: u32 = regs[46];
+    phy_write(?n, 0xa400, 0x9200);
+    if (regs[46] != before) { ret 7; }
+    ret 0;
+}

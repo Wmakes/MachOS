@@ -2,7 +2,8 @@
 """Boot MachOS under QEMU with no window and drive it from a script.
 
 usage: tools/headless.py [-p release] [-t SECONDS] [--keep] [--fsck] [--disk2 [nvme:]IMG]
-                         [--boot IMG] [--rescue] [--nvme] [--qemu ARG]... STEP...
+                         [--boot IMG] [--rescue] [--nvme]
+                         [--nic virtio|virtio-modern] [--qemu ARG]... STEP...
 
 The cpu is QEMU's "max" (with SMEP/SMAP) unless QEMU_CPU says otherwise.
 The disk is rebuilt fresh unless --keep is given (then files written by an
@@ -93,6 +94,8 @@ def main():
     ap.add_argument("--boot", help="boot this image as it is instead of building one")
     ap.add_argument("--rescue", action="store_true", help="boot the rescue entry")
     ap.add_argument("--nvme", action="store_true", help="attach the boot disk as NVMe instead of SATA")
+    ap.add_argument("--nic", choices=("virtio", "virtio-modern"),
+                    help="replace QEMU's default NIC with a Virtio network device")
     ap.add_argument("--qemu", action="append", default=[], help="one more QEMU argument")
     ap.add_argument("steps", nargs="*")
     a = ap.parse_args()
@@ -123,6 +126,9 @@ def main():
         "-drive", f"if=pflash,format=raw,file={vars_fd}",
         *disk_args(img, "boot", a.nvme),
         *(disk_args(a.disk2.removeprefix("nvme:"), "second", a.disk2.startswith("nvme:")) if a.disk2 else []),
+        *(["-netdev", "user,id=net0", "-device",
+           "virtio-net-pci,netdev=net0,id=nic0" +
+           (",disable-legacy=on" if a.nic == "virtio-modern" else "")] if a.nic else []),
         *a.qemu,
         "-chardev", f"socket,id=s0,path={ser},server=on,wait=off",
         "-serial", "chardev:s0",

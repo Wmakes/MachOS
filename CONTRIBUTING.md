@@ -35,8 +35,7 @@ Use disposable images for installation, filesystem and recovery work.
 - Add tests for new behavior and bug fixes, using the existing test facilities.
 - Kernel tests belong under `kernel/src/tests/`; serial integration scenarios
   belong in `tools/test.py`.
-- Keep dependency revisions pinned. Describe dependency patches explicitly;
-  generated files under `deps/.patched/` are not the source of a patch.
+- Keep dependency revisions pinned. Describe any dependency patches explicitly.
 - `userland/mach.toml` contains generated program entries. Use
   `tools/programs.sh` when changing that list.
 - Keep README edits separate and discuss them with the maintainer first.
