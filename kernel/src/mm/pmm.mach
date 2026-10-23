@@ -15,18 +15,43 @@ rec Range { start: u64; end: u64; }
 var ranges: [256]Range;
 var range_count: u64 = 0;
 
-fun link_of(phys: u64) *u64 {
-    ret (phys + hhdm)::*u64;
-}
+# Detached pages stay intact until every CPU has discarded old translations.
+var pending: [4096]u64;
+var pending_count: u64 = 0;
+var synchronize: fun();
+var deferred: u8 = 0;
 
-pub fun free(phys: u64) {
+pub fun defer_reuse(sync: fun()) { synchronize = sync; deferred = 1; }
+
+fun return_page(phys: u64) {
     @link_of(phys) = head;
     head = phys;
     free_count = free_count + 1;
 }
 
+pub fun reclaim() {
+    if (pending_count == 0) { ret; }
+    synchronize();
+    for (pending_count != 0) {
+        pending_count = pending_count - 1;
+        return_page(pending[pending_count]);
+    }
+}
+
+fun link_of(phys: u64) *u64 {
+    ret (phys + hhdm)::*u64;
+}
+
+pub fun free(phys: u64) {
+    if (deferred == 0) { return_page(phys); ret; }
+    if (pending_count == 4096) { reclaim(); }
+    pending[pending_count] = phys;
+    pending_count = pending_count + 1;
+}
+
 # one 4 KiB page as it is (not zeroed), or 0 when out of memory
 pub fun alloc_raw() u64 {
+    if (free_count == 0 && pending_count != 0) { reclaim(); }
     if (head != 0) {
         val phys: u64 = head;
         head = @link_of(phys);
@@ -89,6 +114,8 @@ pub fun release(pa: u64) {
 
 pub fun init(bi: *info.BootInfo) {
     hhdm = bi.hhdm;
+    pending_count = 0;
+    deferred = 0;
     head = 0;
     free_count = 0;
     total_count = 0;

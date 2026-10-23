@@ -8,6 +8,7 @@
 #   /proc/cpuinfo                 a block per core: processor, model name
 #   /proc/stat                    "cpuN BUSY TICKS" per core: timer ticks
 #                                 spent running programs, and in all
+#   /proc/kernel-work             unlocked I/O and memory work counters
 #   /proc/screen                  "WIDTH HEIGHT ROWS COLS": the console's pixels
 #                                 (0 0 without a framebuffer) and text size
 #   /proc/mounts                  "DEV DIR TYPE TOTAL FREE" per filesystem
@@ -57,6 +58,7 @@ use clock:   machos.kern.clock;
 use net:     machos.net.net;
 use dhcp:    machos.net.dhcp;
 use tcp:     machos.net.tcp;
+use work: machos.kern.work;
 
 # what each /proc node is (its Node.ino)
 val VERSION:   u64 = 1;
@@ -72,6 +74,7 @@ val HOSTNAME:  u64 = 10;
 val SCREEN:    u64 = 11;
 val CLOCK:     u64 = 12;
 val RTCOFF:    u64 = 13;
+val KERNEL_WORK: u64 = 14;
 val NETCONF:   u64 = 30;
 val NETDEV:    u64 = 31;
 val NETARP:    u64 = 32;
@@ -374,6 +377,14 @@ fun generate(nd: *vfs.Node, o: *Out) {
         kb(o, "MemFree:\0", pmm.free_pages() * 4096);
         kb(o, "MemUsed:\0", (pmm.total_pages() - pmm.free_pages()) * 4096);
         kb(o, "KernelHeap:\0", heap.used());
+    } or (id == KERNEL_WORK) {
+        var stats: work.Stats;
+        work.snapshot(?stats);
+        field(o, "io_releases\0", stats.io_releases);
+        field(o, "memory_releases\0", stats.memory_releases);
+        field(o, "max_parallel\0", stats.max_parallel);
+        field(o, "io_memory_overlap\0", stats.io_memory_overlap);
+        field(o, "memory_parallel\0", stats.memory_parallel);
     } or (id == CPUINFO) {
         var name: [49]u8;
         cpu.brand(?name[0]);
@@ -657,6 +668,7 @@ pub fun init(root: *vfs.Node) {
     vfs.make_proc(d, "meminfo\0", 7, abi.KIND_FILE, MEMINFO, 0, 0x124);
     vfs.make_proc(d, "cpuinfo\0", 7, abi.KIND_FILE, CPUINFO, 0, 0x124);
     vfs.make_proc(d, "stat\0", 4, abi.KIND_FILE, STAT, 0, 0x124);
+    vfs.make_proc(d, "kernel-work\0", 11, abi.KIND_FILE, KERNEL_WORK, 0, 0x124);
     vfs.make_proc(d, "mounts\0", 6, abi.KIND_FILE, MOUNTS, 0, 0x124);
     vfs.make_proc(d, "screen\0", 6, abi.KIND_FILE, SCREEN, 0, 0x124);
     vfs.make_proc(d, "kmsg\0", 4, abi.KIND_FILE, KMSG, 0, 0x1A4);

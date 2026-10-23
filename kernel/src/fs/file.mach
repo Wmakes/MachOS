@@ -16,6 +16,7 @@ use blk:    machos.fs.blk;
 use mount:  machos.fs.mount;
 use parts:  machos.fs.parts;
 use events: machos.kern.events;
+use work: machos.kern.work;
 
 pub val NODE:   u64 = 1;
 pub val PIPE_R: u64 = 2;
@@ -198,7 +199,10 @@ pub fun read(h: *Handle, buf: u64, n: u64) u64 {
             ret events.read(?h.offset, buf::*u8, n);
         }
         if (nd.dev == vfs.DEV_ZERO) {
+            var unlocked: u8 = 0;
+            if (n >= 65536) { unlocked = work.begin(work.MEMORY); }
             mem.fill(buf, 0, n);
+            work.end(unlocked);
             ret n;
         }
         ret 0;

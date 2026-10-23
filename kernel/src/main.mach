@@ -21,6 +21,8 @@ use trap:   machos.kern.trap;
 use syscall: machos.arch.x86_64.syscall;
 use proc:   machos.kern.proc;
 use sys:    machos.kern.sys;
+use fs_lock: machos.kern.fs_lock;
+use work: machos.kern.work;
 use abi:    sdk.abi;
 use procfs: machos.kern.procfs;
 use events: machos.kern.events;
@@ -232,8 +234,10 @@ fun kmain(handoff: u64) {
         tmp.mode = 0x3FF; # 01777: everyone may make files, only owners remove them
     }
 
-    proc.set_idle_work(blk.sync);
+    proc.set_idle_work(fs_lock.sync_idle);
     start_cpus();
+    smp.enable_shootdowns();
+    work.configure(sys.begin_work, sys.end_work);
     kprint.info("boot\0");
     kprint.puts("kernel ready after \0");
     val us: u64 = cpu.us_since_boot(cpu.rdtsc());

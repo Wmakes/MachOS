@@ -36,6 +36,8 @@ use cpu:    machos.arch.x86_64.cpu;
 use fbcon:  machos.dev.fbcon;
 use mmap:   machos.kern.mmap;
 use smp:    machos.arch.x86_64.smp;
+use fs_lock: machos.kern.fs_lock;
+use work: machos.kern.work;
 
 val ARGS_MAX: u64 = 65536;
 val ENV_MAX: u64 = 65536;
@@ -44,6 +46,57 @@ val SYNC_EVERY: u64 = 5; # seconds: dirty blocks never wait longer than this
 var last_sync: u64 = 0; # tick of the last periodic sync
 
 fun cur() *proc.Proc { ret proc.current(); }
+var work_kind: [16]u64;
+var work_credentials: [16]vfs.Credentials;
+
+# The caller keeps its address space pinned, and disk work also retains the
+# filesystem gate. Other processes may enter the kernel while it runs.
+pub fun begin_work(kind: u64) u8 {
+    val t: *proc.Proc = proc.current_thread();
+    val c: u64 = smp.me();
+    if (work_kind[c] != 0) { ret 0; }
+    if (kind == work.IO && fs_lock.owned() == 0) { ret 0; }
+    if (t == nil && kind != work.IO) { ret 0; }
+    if (t != nil) { proc.process_of(t).bulk_owner = t.pid; }
+    work_kind[c] = kind;
+    work.started(kind);
+    work_credentials[c] = vfs.credentials();
+    vfs.set_cred(0, 0);
+    smp.unlock();
+    asm x86_64 { sti }
+    ret 1;
+}
+
+pub fun end_work() {
+    asm x86_64 { cli }
+    smp.lock();
+    proc.entered();
+    val c: u64 = smp.me();
+    work.finished(work_kind[c]);
+    work_kind[c] = 0;
+    val p: *proc.Proc = cur();
+    if (p != nil) {
+        p.bulk_owner = 0;
+        proc.wakeup((?p.bulk_owner)::u64);
+    }
+    vfs.restore_credentials(work_credentials[c]);
+}
+
+fun filesystem_call(n: u64, fd: u64, flags: u64) u8 {
+    if (n == abi.READ || n == abi.WRITE || n == abi.PREAD || n == abi.PWRITE) {
+        val f: *file.Handle = handle(fd);
+        ret (f != nil && f.kind == file.NODE && (f.node.kind != abi.KIND_DEV || f.node.dev >= vfs.DEV_DISK))::u8;
+    }
+    if (n == abi.MMAP) { ret (((flags >> 8) & abi.MAP_ANONYMOUS) == 0)::u8; }
+    ret (n == abi.OPEN || n == abi.CLOSE || n == abi.SPAWN || n == abi.EXECVE ||
+         n == abi.READDIR || n == abi.READDIR_LONG || n == abi.STAT || n == abi.FSTAT ||
+         n == abi.MKDIR || n == abi.REMOVE || n == abi.CHDIR || n == abi.GETCWD ||
+         n == abi.RENAME || n == abi.SEEK || n == abi.SYNC || n == abi.MOUNT ||
+         n == abi.UMOUNT || n == abi.MOUNTS || n == abi.REBOOT || n == abi.DUP ||
+         n == abi.DUP2 || n == abi.FCNTL || n == abi.CHMOD || n == abi.CHOWN ||
+         n == abi.ACCESS || n == abi.FDPATH || n == abi.SYMLINK || n == abi.FCHMOD ||
+         n == abi.PUBLICATION_CAPABILITIES)::u8;
+}
 
 fun ok(va: u64, n: u64, write: u8) u8 {
     if (write != 0 && mmap.denies_write(cur(), va, n) != 0) { ret 0; }
@@ -422,6 +475,7 @@ fun setid(p: *proc.Proc, nd: *vfs.Node) {
 }
 
 fun sys_execve(pva: u64, plen: u64, ava: u64, alen: u64, eva: u64) u64 {
+    val call_frame: *idt.Frame = frame;
     # only the first thread may: the program replaced is the process's
     if (proc.current_thread() != cur()) { ret e(abi.E_BUSY); }
     var full: [512]u8;
@@ -471,6 +525,9 @@ fun sys_execve(pva: u64, plen: u64, ava: u64, alen: u64, eva: u64) u64 {
         heap.free(env);
         ret e(abi.E_NOMEM);
     }
+    nd.opens = nd.opens + 1;
+    proc.pause_siblings();
+    vfs.set_cred(p.euid, p.egid);
     p.pml4 = fresh;
     p.pages = 0;
     var st: exec.Start;
@@ -481,6 +538,8 @@ fun sys_execve(pva: u64, plen: u64, ava: u64, alen: u64, eva: u64) u64 {
         p.pml4 = old;
         p.pages = old_pages;
         vmm.free_space(fresh);
+        vfs.release(nd);
+        proc.resume_siblings();
         ret r;
     }
     # the other threads ran in the old program: they end with it
@@ -491,6 +550,7 @@ fun sys_execve(pva: u64, plen: u64, ava: u64, alen: u64, eva: u64) u64 {
     vmm.free_space(old);
     set_name(p, ?full[0], n);
     setid(p, nd);
+    vfs.release(nd);
     var i: u64 = 0;
     for (i < abi.MAX_HANDLES) {
         if (p.handles[i] != 0 && (p.fdflags[i] & abi.FD_CLOEXEC::u8) != 0) {
@@ -509,7 +569,7 @@ fun sys_execve(pva: u64, plen: u64, ava: u64, alen: u64, eva: u64) u64 {
     }
     p.alarm_at = 0;
     # start over: the frame now returns into the new program
-    val f: *idt.Frame = frame;
+    val f: *idt.Frame = call_frame;
     mem.fill(f::u64, 0, 15 * 8); # r15 ... rax
     f.rip = st.entry;
     f.rsp = st.rsp;
@@ -1904,14 +1964,34 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
 }
 
 #[symbol("syscall_dispatch")]
-fun syscall_dispatch(f: *idt.Frame) {
+fun syscall_dispatch(f: *idt.Frame, cpu_index: u64) {
+    # These identifiers are immutable while this CPU runs the thread. They
+    # require no shared mutation, user-pointer access, or global credentials.
+    # Signals and sibling quiescence still run at the next timer interrupt.
+    if (f.rax == abi.GETPID || f.rax == abi.GETTID) {
+        val t: *proc.Proc = proc.local_thread(cpu_index);
+        if (t != nil) {
+            if (f.rax == abi.GETTID) { f.rax = t.pid; }
+            or { f.rax = proc.process_of(t).pid; }
+            ret;
+        }
+    }
     smp.lock();
     proc.entered();
+    proc.check_pause();
     syscall_body(f);
     smp.unlock();
 }
 
 fun syscall_body(f: *idt.Frame) {
+    var filesystem: u8 = filesystem_call(f.rax, f.rdi, f.rdx);
+    if (filesystem != 0) {
+        fs_lock.acquire();
+        # A descriptor can be closed and reused while acquisition sleeps.
+        # Never retain the filesystem gate for a newly substituted pipe or
+        # socket whose read/write may block waiting for another process.
+        if (filesystem_call(f.rax, f.rdi, f.rdx) == 0) { fs_lock.release(); filesystem = 0; }
+    }
     frame = f;
     vfs.set_cred(cur().euid, cur().egid);
     # user memory is reachable (SMAP) only while the call runs; every user
@@ -1919,13 +1999,15 @@ fun syscall_body(f: *idt.Frame) {
     val smap: u8 = cpu.has_smap();
     if (smap != 0) { cpu.stac(); }
     f.rax = call(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8);
+    if (filesystem != 0) { fs_lock.release(); }
     if (smap != 0) { cpu.clac(); }
     vfs.set_cred(0, 0); # the kernel itself looks things up as root
     # the scheduler syncs whenever the cpu idles; a busy system syncs here
     val now: u64 = proc.uptime_ticks();
     if (now - last_sync >= SYNC_EVERY * apic.HZ) {
         last_sync = now;
-        if (blk.dirty_count() > 0) { blk.sync(); }
+        if (blk.dirty_count() > 0) { fs_lock.sync_idle(); }
     }
+    proc.check_pause();
     signal.deliver(f);
 }

@@ -9,6 +9,7 @@ use pci:    machos.dev.pci;
 use vmm:    machos.mm.vmm;
 use pmm:    machos.mm.pmm;
 use mem:    machos.kern.mem;
+use work: machos.kern.work;
 
 pub val SECTOR: u64 = 512;
 pub val MAX_DISKS: u64 = 8;
@@ -130,12 +131,17 @@ fun command(d: *Disk, cmd: u8, lba: u64, count: u64, buf: u64, bytes: u64, write
 
     wr(port + P_IS, 0xFFFFFFFF);
     wr(port + P_CI, 1);
+    var unlocked: u8 = 0;
+    if ((rd(port + P_CI) & 1) != 0) { unlocked = work.begin(work.IO); }
     var spins: u64 = 0;
+    var good: u8 = 1;
     for ((rd(port + P_CI) & 1) != 0) {
-        if ((rd(port + P_IS) & 0x40000000) != 0) { ret 0; } # task file error
+        if ((rd(port + P_IS) & 0x40000000) != 0) { good = 0; brk; } # task file error
         spins = spins + 1;
-        if (spins > 100000000) { ret 0; }
+        if (spins > 100000000) { good = 0; brk; }
     }
+    work.end(unlocked);
+    if (good == 0) { ret 0; }
     if ((rd(port + P_IS) & 0x40000000) != 0 || (rd(port + P_TFD) & 1) != 0) { ret 0; }
     ret 1;
 }

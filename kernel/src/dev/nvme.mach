@@ -10,6 +10,7 @@ use pci: machos.dev.pci;
 use vmm: machos.mm.vmm;
 use pmm: machos.mm.pmm;
 use mem: machos.kern.mem;
+use work: machos.kern.work;
 
 pub val MAX: u64 = 4;
 val DEPTH: u64 = 64;        # entries per queue
@@ -84,11 +85,17 @@ fun submit(c: *Ctrl, q: u64, cmd: *u32) u32 {
     @tail = (@tail + 1) % DEPTH;
     wr(c, doorbell(c, q, 0), (@tail)::u32);
     val entry: *u32 = (vmm.phys_to_virt(cq) + @head * 16)::*u32;
+    val completion: *Reg = (?entry[3])::*Reg;
+    var unlocked: u8 = 0;
+    if (((completion.v >> 16) & 1) != @phase) { unlocked = work.begin(work.IO); }
     var spins: u64 = 0;
-    for (((entry[3] >> 16) & 1) != @phase) {
+    var good: u8 = 1;
+    for (((completion.v >> 16) & 1) != @phase) {
         spins = spins + 1;
-        if (spins > 500000000) { ret 0xFFFF; }
+        if (spins > 500000000) { good = 0; brk; }
     }
+    work.end(unlocked);
+    if (good == 0) { ret 0xFFFF; }
     val status: u32 = (entry[3] >> 17) & 0x7FFF;
     @head = @head + 1;
     if (@head == DEPTH) {

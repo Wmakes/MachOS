@@ -56,3 +56,19 @@ out = "smptest"
 targets = ["machos"]
 link = []
 need = []
+
+[artifact.threadtest]
+kind = "bin"
+entry = "threadtest.mach"
+out = "threadtest"
+targets = ["machos"]
+link = []
+need = []
+
+[artifact.iommtest]
+kind = "bin"
+entry = "iommtest.mach"
+out = "iommtest"
+targets = ["machos"]
+link = []
+need = []

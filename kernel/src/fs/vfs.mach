@@ -13,6 +13,7 @@ use ext2: machos.fs.ext2;
 use fat:  machos.fs.fat;
 use exfat: machos.fs.exfat;
 use clock: machos.kern.clock;
+use work: machos.kern.work;
 
 pub val FS_RAM:  u64 = 0;
 pub val FS_EXT2: u64 = 1;
@@ -135,6 +136,17 @@ pub fun set_cred(uid: u64, gid: u64) {
     cred_uid = uid;
     cred_gid = gid;
     denied = 0;
+}
+
+# Preserve the complete lookup context while bulk work releases the kernel lock.
+pub rec Credentials { uid: u64; gid: u64; denied: u8; }
+pub fun credentials() Credentials {
+    ret Credentials { uid: cred_uid, gid: cred_gid, denied: denied };
+}
+pub fun restore_credentials(saved: Credentials) {
+    cred_uid = saved.uid;
+    cred_gid = saved.gid;
+    denied = saved.denied;
 }
 
 pub fun was_denied() u8 { ret denied; }
@@ -753,7 +765,10 @@ pub fun read(nd: *Node, off: u64, buf: u64, n: u64) u64 {
     if (off >= nd.size) { ret 0; }
     var k: u64 = nd.size - off;
     if (k > n) { k = n; }
+    var unlocked: u8 = 0;
+    if (k >= 65536) { unlocked = work.begin(work.IO); }
     mem.copy(buf, nd.data + off, k);
+    work.end(unlocked);
     ret k;
 }
 
@@ -765,7 +780,10 @@ fun reserve(nd: *Node, need: u64) u8 {
     val d: u64 = heap.alloc(cap);
     if (d == 0) { ret 0; }
     if (nd.data != 0) {
+        var unlocked: u8 = 0;
+        if (nd.size >= 65536) { unlocked = work.begin(work.IO); }
         mem.copy(d, nd.data, nd.size);
+        work.end(unlocked);
         heap.free(nd.data);
     }
     nd.data = d;
@@ -798,8 +816,11 @@ pub fun write(nd: *Node, off: u64, buf: u64, n: u64) u64 {
         ret k;
     }
     if (reserve(nd, off + n) == 0) { ret e(abi.E_NOMEM); }
+    var unlocked: u8 = 0;
+    if (n >= 65536 || (off > nd.size && off - nd.size >= 65536)) { unlocked = work.begin(work.IO); }
     if (off > nd.size) { mem.fill(nd.data + nd.size, 0, off - nd.size); }
     mem.copy(nd.data + off, buf, n);
+    work.end(unlocked);
     if (off + n > nd.size) { nd.size = off + n; }
     nd.mtime = clock.now();
     ret n;

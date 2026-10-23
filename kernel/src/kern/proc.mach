@@ -1,15 +1,14 @@
-# processes, their threads, and the scheduler. the kernel runs with
-# interrupts off under the big lock, so nothing here needs a lock of its own:
-# a thread gives up the cpu only by blocking, exiting, or being preempted on
-# its way back to user mode.
+# Processes, their threads, and the scheduler. Scheduling metadata stays
+# under the global lock. Bounded I/O and memory work can release it after
+# pinning the caller's address space; that work cannot switch threads.
 #
 # a process is a slot whose `leader` is nil; its threads are slots whose
 # leader is it. the process's slot holds what its threads share (address
 # space, mappings, handles, working directory, ids, signal handlers and
 # pending signals); every thread, the leader too, has its own kernel stack,
 # registers, state and FS base (where std keeps its per-thread block). the
-# threads of a process run on one cpu at a time, so a change to its page
-# tables never has to be flushed from other cpus.
+# threads of a process can run on several CPUs; detached physical pages
+# remain protected until remote translations have been invalidated.
 #
 # each process has its own kernel stack. switching processes means saving
 # callee-saved registers and rsp on one kernel stack and restoring them from
@@ -91,7 +90,10 @@ pub rec Proc {
     clear_tid: u64;    # a thread: the word set to 0 (and woken) when it ends
     futex:     u64;    # CHAN_FUTEX: the address it waits on
     timed_out: u8;     # a timed wait ran out
-    on_cpu:    u64;    # a process: how many of its threads run now (0 or 1)
+    on_cpu:    u64;    # a process: how many of its threads run now
+    quiescing: u64;    # only this thread id may run during exit/exec
+    stop_state: u64;   # the leader's state before a process-wide stop
+    bulk_owner: u64;   # thread pinning this address space during unlocked work
 }
 
 pub rec Region {
@@ -111,6 +113,10 @@ var ticks: u64 = 0;
 # holding the big lock), set on every entry
 var sched_ksp: [16]u64;
 var running: [16]*Proc;
+
+# Read only on CPU c with interrupts disabled. Its running thread cannot
+# migrate or be reclaimed until that CPU leaves it through the scheduler.
+pub fun local_thread(c: u64) *Proc { ret running[c]; }
 
 # the process of the running thread (what system calls act on)
 pub fun current() *Proc {
@@ -153,7 +159,20 @@ pub fun busy_ticks(c: u64) u64 { ret busy[c]; }
 pub fun all_ticks(c: u64) u64 { ret all[c]; }
 
 # a cpu just entered the kernel (and holds the lock)
-pub fun entered() { cur = running[smp.me()]; }
+pub fun entered() {
+    cur = running[smp.me()];
+}
+
+pub fun check_pause() {
+    if (cur != nil) {
+        val p: *Proc = process_of(cur);
+        for (p.bulk_owner != 0 && p.bulk_owner != cur.pid) { sleep_on((?p.bulk_owner)::u64); }
+        if (p.quiescing != 0 && p.quiescing != cur.pid) {
+            cur.state = RUNNABLE;
+            sched();
+        }
+    }
+}
 
 # where a new process's first switch_to "returns": drop the lock the
 # scheduler held, then into user mode
@@ -329,20 +348,32 @@ pub fun futex_wake(p: *Proc, addr: u64, n: u64) u64 {
     ret woke;
 }
 
-# every other thread of the running thread's process ends now (exit, exec)
+# Stop scheduling siblings and wait until those already running enter the
+# kernel and leave their stacks. Keeping the caller runnable avoids waiting
+# for a sibling that is blocked indefinitely in a system call.
+pub fun pause_siblings() {
+    val p: *Proc = current();
+    p.quiescing = cur.pid;
+    for (p.on_cpu > 1) { sleep_on(p::u64); }
+}
+
+pub fun resume_siblings() { current().quiescing = 0; smp.kick(); }
+
+# Every other thread has left its CPU before its kernel stack is freed.
 pub fun end_other_threads() {
+    pause_siblings();
     val p: *Proc = current();
     var i: u64 = 0;
     for (i < MAX) {
         val t: *Proc = ?table[i];
         if (t != cur && t.state != FREE && process_of(t) == p && t != p) {
-            # never running: its process runs on this cpu only
             heap.free(t.kstack);
             t.state = FREE;
             t.pid = 0;
         }
         i = i + 1;
     }
+    p.quiescing = 0;
 }
 
 # the running thread ends (THREAD_EXIT). its clear_tid word is set to 0 and
@@ -499,7 +530,18 @@ fun default_ignored(sig: u64) u8 {
 pub fun send(p: *Proc, sig: u64) {
     if (p.state == FREE || p.state == ZOMBIE || sig == 0 || sig >= abi.NSIG) { ret; }
     if (sig == abi.SIGCONT || sig == abi.SIGKILL) {
-        if (p.state == STOPPED) { p.state = RUNNABLE; }
+        if (p.state == STOPPED) {
+            p.state = p.stop_state;
+            if (p.state == RUNNING || p.state == FREE) { p.state = RUNNABLE; }
+            p.stop_state = 0;
+            p.quiescing = 0;
+            var i: u64 = 0;
+            for (i < MAX) {
+                if (table[i].leader == p && table[i].state == STOPPED) { table[i].state = RUNNABLE; }
+                i = i + 1;
+            }
+            smp.kick();
+        }
         if (sig == abi.SIGCONT) {
             # a pending stop is cancelled by a continue
             p.sig_pending = p.sig_pending & ~(abi.sigbit(abi.SIGSTOP) | abi.sigbit(abi.SIGTSTP));
@@ -548,8 +590,11 @@ pub fun send_group(group: u64, sig: u64) u64 {
 
 # stop the current process until SIGCONT (or SIGKILL); its parent hears of it
 pub fun stop_self(sig: u64) {
-    val p: *Proc = cur;
+    pause_siblings();
+    val p: *Proc = current();
+    p.stop_state = p.state;
     p.state = STOPPED;
+    cur.state = STOPPED;
     p.stop_sig = sig;
     p.report_stop = 1;
     val parent: *Proc = find(p.ppid);
@@ -576,7 +621,6 @@ pub fun exit(code: u64) {
     end_other_threads();
     val p: *Proc = current();
     val t: *Proc = cur;
-    p.on_cpu = 0;
     if (t != p) {
         # a thread ends the process: the process's slot becomes the zombie
         # its parent waits for; this thread's goes once it is off its stack
@@ -618,8 +662,8 @@ pub fun scheduler(me: u64) {
         var n: u64 = 0;
         for (n < MAX && picked == nil) {
             last = (last + 1) % MAX;
-            # one thread of a process at a time: its siblings wait their turn
-            if (table[last].state == RUNNABLE && (table[last].affinity == 0 || (table[last].affinity & (1 << me)) != 0) && process_of(?table[last]).on_cpu == 0) { picked = ?table[last]; }
+            val owner: *Proc = process_of(?table[last]);
+            if (table[last].state == RUNNABLE && (table[last].affinity == 0 || (table[last].affinity & (1u64 << me)) != 0) && (owner.quiescing == 0 || owner.quiescing == table[last].pid) && (owner.bulk_owner == 0 || owner.bulk_owner == table[last].pid)) { picked = ?table[last]; }
             n = n + 1;
         }
         if (picked == nil) {
@@ -637,18 +681,21 @@ pub fun scheduler(me: u64) {
         running[me] = picked;
         picked.state = RUNNING;
         val owner: *Proc = process_of(picked);
-        owner.on_cpu = 1;
+        owner.on_cpu = owner.on_cpu + 1;
         cpu.wrmsr(0xC0000100, picked.fsbase); # FS base: the thread's own block
         gdt.set_rsp0(me, kstack_top(picked));
         syscall.set_kstack(me, kstack_top(picked));
+        smp.user_space(me, 1);
         cpu.set_cr3(picked.pml4);
         switch_to(?sched_ksp[me], picked.ksp);
         # back on this cpu's loop: leave its address space, which may be
         # freed while this cpu idles
         cpu.set_cr3(vmm.kernel_space());
+        smp.user_space(me, 0);
         running[me] = nil;
         cur = nil;
-        owner.on_cpu = 0;
+        owner.on_cpu = owner.on_cpu - 1;
+        if (owner.quiescing != 0 && owner.on_cpu == 0) { wakeup(owner::u64); }
         if (picked.state == ZOMBIE && picked.ppid == 0) { reap(picked); }
     }
 }

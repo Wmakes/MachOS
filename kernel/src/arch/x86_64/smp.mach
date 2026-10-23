@@ -1,11 +1,12 @@
-# the cpus and the big kernel lock. every cpu runs user programs, but only
-# one at a time is inside the kernel: entering it (an interrupt, a system
-# call, the scheduler) takes the lock, returning to user mode or idling
-# drops it. the kernel itself keeps running with interrupts off, as on
-# one cpu, so nothing else in it needs locking
+# CPUs share a kernel lock for scheduling and ordinary kernel state. Selected
+# identifier calls, device waits and private bulk-memory work run outside it;
+# those paths retain their own ownership guarantees. TLB mailboxes are also
+# serviced outside the lock so invalidation cannot deadlock a waiter.
 
 use cpu:  machos.arch.x86_64.cpu;
 use apic: machos.arch.x86_64.apic;
+use pmm: machos.mm.pmm;
+use vmm: machos.mm.vmm;
 
 pub val MAX: u64 = 16;
 
@@ -13,9 +14,57 @@ var lapic_ids: [16]u32;
 var count: u64 = 1;   # cpus known (the first is index 0)
 var ready: [16]u8;    # cpus running (each sets its own)
 
+#[volatile]
+rec Word { value: u64; }
+
 #[symbol("bkl_word")]
-var word: u64 = 0;
+var word: Word;
 var holder: u64 = 0;  # the cpu holding the lock
+var requests: [16]Word;
+var acknowledgements: [16]Word;
+var user_spaces: [16]Word;
+var generation: u64 = 0;
+var shootdowns: u8 = 0;
+
+pub fun enable_shootdowns() { shootdowns = 1; pmm.defer_reuse(flush_tlbs); }
+
+# A switch to the kernel CR3 already discards this CPU's user translations.
+# Idle CPUs therefore need no IPI for subsequent user-page reclamation.
+pub fun user_space(c: u64, active: u64) { user_spaces[c].value = active; }
+
+# This path never takes the kernel lock. A CPU spinning for that lock must
+# service requests too, because its interrupts are disabled at kernel entry.
+pub fun service_tlb() {
+    val c: u64 = here();
+    val request: u64 = requests[c].value;
+    if (request != acknowledgements[c].value) {
+        cpu.set_cr3(cpu.cr3());
+        acknowledgements[c].value = request;
+    }
+}
+
+pub fun flush_tlbs() {
+    if (shootdowns == 0) { vmm.take_changes(); ret; }
+    generation = generation + 1;
+    val me: u64 = here();
+    var i: u64 = 0;
+    for (i < count) {
+        if (i != me && ready_or_first(i) != 0 && user_spaces[i].value != 0) {
+            cpu.xchg(?requests[i].value, generation);
+            apic.send_ipi(lapic_ids[i], apic.TLB_VECTOR);
+        }
+        i = i + 1;
+    }
+    cpu.set_cr3(cpu.cr3());
+    i = 0;
+    for (i < count) {
+        if (i != me && ready_or_first(i) != 0 && user_spaces[i].value != 0) {
+            for (acknowledgements[i].value != generation) { cpu.pause(); }
+        }
+        i = i + 1;
+    }
+    vmm.take_changes();
+}
 
 pub fun set_first(lapic: u32) { lapic_ids[0] = lapic; }
 
@@ -76,12 +125,22 @@ pub fun here() u64 {
 
 pub fun lock() {
     val me: u64 = here();
-    for (cpu.xchg(?word, 1) != 0) { cpu.pause(); }
+    # Spin with reads while occupied instead of bouncing the lock's cache
+    # line between every waiting CPU on each failed atomic exchange.
+    for {
+        for (word.value != 0) { service_tlb(); cpu.pause(); }
+        if (cpu.xchg(?word.value, 1) == 0) { brk; }
+    }
+    service_tlb();
     holder = me;
 }
 
 #[symbol("bkl_unlock")]
-pub fun unlock() { cpu.xchg(?word, 0); }
+pub fun unlock() {
+    pmm.reclaim();
+    if (vmm.take_changes() != 0) { flush_tlbs(); }
+    cpu.xchg(?word.value, 0);
+}
 
 # the cpu inside the kernel (valid while holding the lock)
 pub fun me() u64 { ret holder; }

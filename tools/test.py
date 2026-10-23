@@ -48,22 +48,29 @@ def with_posixtest():
     sh(f"tools/put.sh examples/posixtest/out/machos/{p}/posixtest /bin/posixtest {disk()}")
 
 
-def with_ramtest():
-    """Install the resident-memory stress test without changing shipped programs."""
+def with_posix_artifact(name):
+    """Install one resource-regression program on a fresh test disk."""
     p = PROFILE[0]
     for command in (["tools/mkimage.sh", p, "--fresh"],
-                    ["mach", "build", "examples/posixtest", "-a", "ramtest", "-t", "machos", "-p", p],
-                    ["tools/put.sh", f"examples/posixtest/out/machos/{p}/ramtest", "/bin/ramtest", disk()]):
+                    ["mach", "build", "examples/posixtest", "-a", name, "-t", "machos", "-p", p],
+                    ["tools/put.sh", f"examples/posixtest/out/machos/{p}/{name}", f"/bin/{name}", disk()]):
         subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.PIPE)
+
+
+def with_ramtest():
+    with_posix_artifact("ramtest")
 
 
 def with_smptest():
-    """Install the synchronized per-core CPU workload."""
-    p = PROFILE[0]
-    for command in (["tools/mkimage.sh", p, "--fresh"],
-                    ["mach", "build", "examples/posixtest", "-a", "smptest", "-t", "machos", "-p", p],
-                    ["tools/put.sh", f"examples/posixtest/out/machos/{p}/smptest", "/bin/smptest", disk()]):
-        subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.PIPE)
+    with_posix_artifact("smptest")
+
+
+def with_threadtest():
+    with_posix_artifact("threadtest")
+
+
+def with_iommtest():
+    with_posix_artifact("iommtest")
 
 
 def with_usability():
@@ -1157,6 +1164,33 @@ for cores in (4, 8, 16):
                    "--qemu=-smp", f"--qemu={cores}", "wait:" + P,
                    "send:smptest; echo smp-status $?\\n", "wait:" + P],
                   [f"smp: {cores} cpu(s) running", f"ok parallel CPUs: {cores}", "smp-status 0"]))
+
+
+for cores in (2, 4, 8, 16):
+    TESTS.append((f"threads-{cores}", False, False,
+                  ["--prep", with_threadtest, "--boot", disk,
+                   "--qemu=-smp", f"--qemu={cores}", "wait:" + P,
+                   "send:threadtest; echo thread-status $?\\n", "wait:" + P],
+                  ["ok concurrent process and thread identifiers", "ok concurrent shared-address-space faults",
+                   "ok parallel threads", "ok remote protection",
+                   "ok exit exec and failed exec with running threads",
+                   "ok concurrent fork and copy-on-write",
+                   "ok process-wide stop and continue",
+                   "ok lifecycle with identifier-only threads", "thread-status 0"]))
+
+_, keep, fsck, steps, expect = next(test for test in TESTS if test[0] == "std")
+TESTS.append(("std-smp", keep, fsck,
+              ["--qemu=-smp", "--qemu=4"] + steps, expect))
+
+
+for cores in (2, 4):
+    TESTS.append((f"io-memory-{cores}", False, True,
+                  ["--prep", with_iommtest, "--boot", disk,
+                   "--qemu=-m", "--qemu=512M", "--qemu=-smp", f"--qemu={cores}",
+                   "wait:" + P, "send:iommtest; echo io-memory-status $?\\n", "wait:" + P,
+                   "send:cat /proc/kernel-work\\n", "wait:" + P],
+                  ["ok parallel memory initialization", "ok overlapping file and memory work",
+                   "io-memory-status 0", "io_releases", "memory_releases", "max_parallel"]))
 
 
 # Reuse protocol scenarios with an explicit Virtio NIC, never QEMU's default NIC.

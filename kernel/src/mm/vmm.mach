@@ -8,6 +8,9 @@ use info: machos.boot.info;
 use elf:  machos.kern.elf;
 use cpu:  machos.arch.x86_64.cpu;
 use pmm:  machos.mm.pmm;
+var dirty: u8 = 0;
+
+pub fun take_changes() u8 { val changed: u8 = dirty; dirty = 0; ret changed; }
 
 pub val P:   u64 = 1;       # present
 pub val W:   u64 = 2;       # writable
@@ -72,7 +75,10 @@ fun walk(pml4: u64, va: u64, create: u8) *u64 {
 pub fun map(pml4: u64, va: u64, pa: u64, flags: u64) u8 {
     val e: *u64 = walk(pml4, va, 1);
     if (e == nil) { ret 0; }
+    val previous: u64 = @e;
     @e = (pa & ADDR) | flags | P;
+    # Non-present entries have no cached translation to invalidate.
+    if ((previous & P) != 0 && previous != @e) { dirty = 1; }
     ret 1;
 }
 
@@ -82,13 +88,13 @@ pub fun unmap(pml4: u64, va: u64) u64 {
     if (e == nil || (@e & P) == 0) { ret 0; }
     val pa: u64 = @e & ADDR;
     @e = 0;
+    dirty = 1;
     cpu.invlpg(va);
     ret pa;
 }
 
-# Reclaim empty user page tables after removing a 2 MiB run. The scheduler
-# currently runs only one thread per address space; no remote user can
-# retain a translation while these tables are removed under the kernel lock.
+# Reclaim empty user page tables after removing a 2 MiB run. Physical reuse
+# is deferred until remote CPUs acknowledge the translation invalidation.
 pub fun prune(pml4: u64, va: u64) {
     if (va >= USER_END) { ret; }
     var path: [4]u64;
@@ -108,6 +114,7 @@ pub fun prune(pml4: u64, va: u64) {
             i = i + 1;
         }
         tab(path[level + 1])[index(va, level + 1)] = 0;
+        dirty = 1;
         # Flush paging-structure caches before a table page can be reused.
         if (cpu.cr3() == pml4) { cpu.set_cr3(pml4); }
         pmm.free(path[level]);
@@ -285,6 +292,9 @@ pub fun user_ok(pml4: u64, va: u64, len: u64, write: u8) u8 {
 # page or memory ran out
 pub fun cow_break(pml4: u64, va: u64) u8 {
     val e: *u64 = walk(pml4, va & ~(PAGE - 1), 0);
+    # Another CPU may have resolved the same write fault before this CPU
+    # acquired the kernel lock. Retry with its newly writable translation.
+    if (e != nil && (@e & (P | W | U)) == (P | W | U)) { cpu.invlpg(va); ret 1; }
     if (e == nil || (@e & (P | COW)) != (P | COW)) { ret 0; }
     val old: u64 = @e & ADDR;
     val flags: u64 = (@e & ~ADDR & ~COW) | W;
@@ -304,6 +314,7 @@ pub fun cow_break(pml4: u64, va: u64) u8 {
         @e = old | flags;
     }
     cpu.invlpg(va & ~(PAGE - 1));
+    dirty = 1;
     ret 1;
 }
 
@@ -336,6 +347,7 @@ fun fork_level(src: u64, dst: u64, level: u64, base: u64) u8 {
 # a new address space whose lower half shares every page of `src`,
 # copy-on-write; 0 when memory ran out. the caller flushes src's TLB
 pub fun fork_space(src: u64) u64 {
+    dirty = 1;
     val dst: u64 = new_space();
     if (dst == 0) { ret 0; }
     if (fork_level(src, dst, 3, 0) == 0) {

@@ -6,11 +6,14 @@ use abi:    sdk.abi;
 use kprint: machos.kern.kprint;
 use proc:   machos.kern.proc;
 use file:   machos.fs.file;
+use fs_lock: machos.kern.fs_lock;
 
 pub fun exit_with(code: u64) { do_exit((code & 0xFF) << 8); }
 pub fun killed_by(sig: u64) { do_exit(sig & 0x7F); }
 
 pub fun do_exit(status: u64) {
+    proc.pause_siblings();
+    fs_lock.acquire();
     val p: *proc.Proc = proc.current();
     var i: u64 = 0;
     for (i < abi.MAX_HANDLES) {
@@ -26,5 +29,6 @@ pub fun do_exit(status: u64) {
     events.char(32);
     events.dec(status);
     events.end();
+    fs_lock.release_all();
     proc.exit(status);
 }

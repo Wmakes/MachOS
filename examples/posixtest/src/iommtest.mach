@@ -1,0 +1,169 @@
+# Verify file contents and memory reclamation while independent processes
+# overlap filesystem transfers and anonymous-page initialization.
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io: sdk.io;
+use rt: sdk.rt;
+
+val MIB: u64 = 1048576;
+var source: u64 = 0;
+var fd: u64 = 0;
+var go: [2]u64;
+var ready: [2]u64;
+var children: [2]u64;
+var benchmark: u8 = 0;
+
+fun allocate(bytes: u64) u64 {
+    ret sys.mmap(0, bytes, abi.PROT_READ | abi.PROT_WRITE, abi.MAP_PRIVATE | abi.MAP_ANONYMOUS, 0, 0);
+}
+
+fun memory_worker() u64 {
+    var round: u64 = 0;
+    for (round < 4) {
+        val bytes: u64 = 64 * MIB;
+        val a: u64 = allocate(bytes);
+        if (abi.is_err(a) != 0) { ret 10; }
+        var off: u64 = 0;
+        for (off < bytes) {
+            val p: *u64 = (a + off)::*u64;
+            if (p[0] != 0 || p[511] != 0) { ret 11; }
+            p[0] = off ^ 0x123456789ABCDEF0;
+            p[511] = ~off;
+            off = off + 4096;
+        }
+        off = 0;
+        for (off < bytes) {
+            val p: *u64 = (a + off)::*u64;
+            if (p[0] != (off ^ 0x123456789ABCDEF0) || p[511] != ~off) { ret 12; }
+            off = off + 4096;
+        }
+        if (sys.munmap(a, bytes) != 0) { ret 13; }
+        round = round + 1;
+    }
+    ret 0;
+}
+
+fun io_worker() u64 {
+    val bytes: u64 = 16 * MIB;
+    val buffer: u64 = allocate(bytes);
+    if (abi.is_err(buffer) != 0) { ret 20; }
+    var round: u64 = 0;
+    for (round < 32) {
+        if (sys.raw(abi.PREAD, fd, buffer, bytes, 0, 0) != bytes) { ret 21; }
+        var off: u64 = 0;
+        for (off < bytes) {
+            val p: *u64 = (buffer + off)::*u64;
+            if (p[0] != off + 123 || p[511] != ~off) { ret 22; }
+            off = off + 4096;
+        }
+        round = round + 1;
+    }
+    if (sys.munmap(buffer, bytes) != 0) { ret 23; }
+    ret 0;
+}
+
+fun counter(name: *u8) u64 {
+    val path: *u8 = "/proc/kernel-work\0";
+    val h: u64 = sys.open(path, io.len(path), abi.O_READ);
+    if (abi.is_err(h) != 0) { ret 0; }
+    var buf: [512]u8;
+    val n: u64 = sys.read(h, ?buf[0], 512);
+    sys.close(h);
+    if (abi.is_err(n) != 0) { ret 0; }
+    val length: u64 = io.len(name);
+    var at: u64 = 0;
+    for (at + length < n) {
+        if (io.eq(?buf[at], length, name, length) != 0 && buf[at + length] == 9) {
+            at = at + length + 1;
+            val start: u64 = at;
+            for (at < n && buf[at] >= 48 && buf[at] <= 57) { at = at + 1; }
+            var good: u8 = 0;
+            ret io.parse_dec(?buf[start], at - start, ?good);
+        }
+        for (at < n && buf[at] != 10) { at = at + 1; }
+        at = at + 1;
+    }
+    ret 0;
+}
+
+fun pair(mixed: u8) u8 {
+    if (sys.pipe(?go) != 0 || sys.pipe(?ready) != 0) { ret 0; }
+    var before: abi.Info;
+    sys.info(?before);
+    var label: *u8 = "memory_parallel\0";
+    if (mixed != 0) { label = "io_memory_overlap\0"; }
+    val prior: u64 = counter(label);
+    var started: abi.Timespec;
+    if (sys.raw(abi.CLOCK, abi.CLOCK_MONOTONIC, (?started)::u64, 0, 0, 0) != 0) { ret 0; }
+    var i: u64 = 0;
+    for (i < 2) {
+        val pid: u64 = sys.fork();
+        if (abi.is_err(pid) != 0) { ret 0; }
+        if (pid == 0) {
+            var mask: u64 = 1u64 << i;
+            if (sys.raw(abi.AFFINITY, 1, (?mask)::u64, 1, 0, 0) != 0) { sys.exit(30); }
+            var token: u8 = 1;
+            sys.write(ready[1], ?token, 1);
+            if (sys.read(go[0], ?token, 1) != 1) { sys.exit(31); }
+            if (mixed != 0 && i == 0) { sys.exit(io_worker()); }
+            sys.exit(memory_worker());
+        }
+        children[i] = pid;
+        i = i + 1;
+    }
+    var token: u8 = 1;
+    i = 0;
+    for (i < 2) { if (sys.read(ready[0], ?token, 1) != 1) { ret 0; } i = i + 1; }
+    i = 0;
+    for (i < 2) { sys.write(go[1], ?token, 1); i = i + 1; }
+    i = 0;
+    for (i < 2) {
+        var status: u64 = 0;
+        if (sys.waitpid(children[i], ?status, 0) != children[i] || status != 0) {
+            io.out("worker status \0"); io.dec(status); io.putc(10); ret 0;
+        }
+        i = i + 1;
+    }
+    sys.close(go[0]); sys.close(go[1]); sys.close(ready[0]); sys.close(ready[1]);
+    var after: abi.Info;
+    sys.info(?after);
+    if (after.mem_free + 2 * MIB < before.mem_free) { io.out("FAIL memory reclaimed\n\0"); ret 0; }
+    val current: u64 = counter(label);
+    io.out(label); io.out(" delta \0"); io.dec(current - prior); io.putc(10);
+    var ended: abi.Timespec;
+    if (sys.raw(abi.CLOCK, abi.CLOCK_MONOTONIC, (?ended)::u64, 0, 0, 0) != 0) { ret 0; }
+    io.out(label); io.out(" elapsed ns \0");
+    io.dec((ended.sec - started.sec) * 1000000000 + ended.nsec - started.nsec); io.putc(10);
+    # The explicit benchmark mode still checks data and reclamation, while
+    # allowing comparison against a kernel with no unlocked work enabled.
+    ret (benchmark != 0 || (current > prior && counter("max_parallel\0") >= 2))::u8;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc > 1 && io.eq(argv[1], io.len(argv[1]), "bench\0", 5) != 0) { benchmark = 1; }
+    var info: abi.Info;
+    sys.info(?info);
+    if (info.cpus < 2) { ret 1; }
+    source = allocate(16 * MIB);
+    if (abi.is_err(source) != 0) { ret 1; }
+    var off: u64 = 0;
+    for (off < 16 * MIB) {
+        val p: *u64 = (source + off)::*u64;
+        p[0] = off + 123; p[511] = ~off; off = off + 4096;
+    }
+    val path: *u8 = "/tmp/iomm-data\0";
+    fd = sys.open(path, io.len(path), abi.O_CREATE | abi.O_TRUNC | abi.O_READ | abi.O_WRITE);
+    if (abi.is_err(fd) != 0 || sys.write(fd, source::*u8, 16 * MIB) != 16 * MIB) { ret 1; }
+    if (sys.munmap(source, 16 * MIB) != 0) { ret 1; }
+    io.out("running parallel memory initialization\n\0");
+    if (pair(0) == 0) { io.out("FAIL parallel memory\n\0"); ret 1; }
+    io.out("ok parallel memory initialization\n\0");
+    io.out("running overlapping file and memory work\n\0");
+    if (pair(1) == 0) { io.out("FAIL overlapping file and memory work\n\0"); ret 1; }
+    io.out("ok overlapping file and memory work\n\0");
+    sys.close(fd);
+    sys.remove(path, io.len(path));
+    ret 0;
+}

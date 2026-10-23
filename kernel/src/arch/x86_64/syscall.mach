@@ -9,11 +9,12 @@ use gdt: machos.arch.x86_64.gdt;
 pub val SYSCALL_VECTOR: u64 = 0x7F;
 
 # each cpu's: entry finds it through the kernel GS base (swapgs), using
-# GS only for these two loads and switching straight back, so the kernel
+# GS only during entry and switching straight back, so the kernel
 # itself never depends on GS
 rec PerCpu {
     kstack:   u64; # @0: top of the running process's kernel stack
     user_rsp: u64; # @8: its user rsp while the frame is being built
+    index:    u64; # @16: CPU index passed to the dispatcher without APIC MMIO
 }
 
 var percpu: [16]PerCpu;
@@ -51,6 +52,7 @@ fun syscall_entry() {
         push r14
         push r15
         .byte 0x65, 0x48, 0x8b, 0x04, 0x25, 0x08, 0x00, 0x00, 0x00 :: writes()
+        .byte 0x65, 0x48, 0x8b, 0x34, 0x25, 0x10, 0x00, 0x00, 0x00 :: writes()
         .byte 0x0f, 0x01, 0xf8 :: writes()
         mov [rsp + 160], rax
         mov rax, 0x1b
@@ -74,6 +76,7 @@ pub fun init() { init_cpu(0); }
 # swapgs (0f 01 f8), mov gs:[8], rsp; mov rsp, gs:[0]; ...; mov rax, gs:[8]
 # are written as bytes above
 pub fun init_cpu(c: u64) {
+    percpu[c].index = c;
     cpu.wrmsr(0xC0000101, 0);                       # GS base: user's (none)
     cpu.wrmsr(0xC0000102, (?percpu[c])::u64);       # kernel GS base
     cpu.wrmsr(cpu.MSR_EFER, cpu.rdmsr(cpu.MSR_EFER) | 1); # SCE

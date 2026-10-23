@@ -1,0 +1,40 @@
+# Filesystem metadata and block-cache state remain serialized while disk
+# completion waits release the scheduler lock for unrelated memory work.
+
+use proc: machos.kern.proc;
+use smp: machos.arch.x86_64.smp;
+use blk: machos.fs.blk;
+
+var owner: u64 = 0;
+var depth: u64 = 0;
+
+fun token() u64 {
+    val t: *proc.Proc = proc.current_thread();
+    if (t != nil) { ret t.pid; }
+    ret 0x8000000000000000 | smp.me();
+}
+
+pub fun busy() u8 { ret (owner != 0)::u8; }
+pub fun owned() u8 { ret (owner == token())::u8; }
+
+pub fun acquire() {
+    val me: u64 = token();
+    for (owner != 0 && owner != me) { proc.sleep_on((?owner)::u64); }
+    owner = me;
+    depth = depth + 1;
+}
+
+pub fun release() {
+    depth = depth - 1;
+    if (depth == 0) { owner = 0; proc.wakeup((?owner)::u64); }
+}
+
+pub fun release_all() { for (owned() != 0) { release(); } }
+
+pub fun sync_idle() u8 {
+    if (owner != 0 || blk.dirty_count() == 0) { ret 1; }
+    acquire();
+    val result: u8 = blk.sync();
+    release();
+    ret result;
+}

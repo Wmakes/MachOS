@@ -20,6 +20,7 @@ use signal: machos.kern.signal;
 use mmap:   machos.kern.mmap;
 use smp:    machos.arch.x86_64.smp;
 use pmm:    machos.mm.pmm;
+use fs_lock: machos.kern.fs_lock;
 
 fun name_of(v: u64) *u8 {
     if (v == 0)  { ret "divide error\0"; }
@@ -51,7 +52,7 @@ fun reg(name: *u8, v: u64) {
     kprint.putc(10);
 }
 
-fun dump(f: *idt.Frame) {
+fun dump(f: *idt.Frame, fault_address: u64) {
     kprint.puts("\n*** exception \0");
     kprint.dec(f.vector);
     kprint.puts(": \0");
@@ -62,7 +63,7 @@ fun dump(f: *idt.Frame) {
     reg("  rsp    \0", f.rsp);
     reg("  rflags \0", f.rflags);
     reg("  cs     \0", f.cs);
-    if (f.vector == 14) { reg("  cr2    \0", cpu.cr2()); }
+    if (f.vector == 14) { reg("  cr2    \0", fault_address); }
     reg("  rax    \0", f.rax);
     reg("  rbx    \0", f.rbx);
     reg("  rdi    \0", f.rdi);
@@ -70,7 +71,7 @@ fun dump(f: *idt.Frame) {
 }
 
 # a user program faulted: say so on the console and end it
-fun user_fault(f: *idt.Frame) {
+fun user_fault(f: *idt.Frame, fault_address: u64) {
     val p: *proc.Proc = proc.current();
     # a page it needed could not be had: memory ran out
     if (f.vector == 14 && pmm.free_pages() < 16) {
@@ -101,7 +102,7 @@ fun user_fault(f: *idt.Frame) {
     kprint.hex(f.rip);
     if (f.vector == 14) {
         kprint.puts(", address \0");
-        kprint.hex(cpu.cr2());
+        kprint.hex(fault_address);
     }
     kprint.putc(10);
     var sig: u64 = abi.SIGSEGV;
@@ -117,33 +118,43 @@ fun user_fault(f: *idt.Frame) {
 # panic on its way)
 #[symbol("isr_dispatch")]
 fun isr_dispatch(f: *idt.Frame) {
+    # CR2 belongs to a CPU, not a thread. Save it before any wait can
+    # switch this handler out or resume it on a different CPU.
+    val fault_address: u64 = cpu.cr2();
+    if (f.vector == apic.TLB_VECTOR) {
+        if (cpu.has_smap() != 0) { cpu.clac(); }
+        smp.service_tlb();
+        apic.eoi();
+        ret;
+    }
     if (f.vector < 32 && (f.cs & 3) != 3) {
-        dispatch(f);
+        dispatch(f, fault_address);
         ret;
     }
     smp.lock();
     proc.entered();
-    dispatch(f);
+    if (f.vector < 32) { proc.check_pause(); }
+    dispatch(f, fault_address);
     smp.unlock();
 }
 
-fun dispatch(f: *idt.Frame) {
+fun dispatch(f: *idt.Frame, fault_address: u64) {
     # user mode can set AC itself; never let it carry into the kernel (SMAP)
     if (cpu.has_smap() != 0) { cpu.clac(); }
     val from_user: u8 = ((f.cs & 3) == 3)::u8;
     if (f.vector < 32) {
         # a write to a copy-on-write page (present + write + user): copy it
-        if (f.vector == 14 && from_user != 0 && (f.error & 7) == 7 && mmap.denies_write(proc.current(), cpu.cr2(), 1) == 0) {
-            if (vmm.cow_break(proc.current().pml4, cpu.cr2()) != 0) { ret; }
+        if (f.vector == 14 && from_user != 0 && (f.error & 7) == 7 && mmap.denies_write(proc.current(), fault_address, 1) == 0) {
+            if (vmm.cow_break(proc.current().pml4, fault_address) != 0) { ret; }
         }
         # the first touch of a page mmap reserved
-        if (f.vector == 14 && from_user != 0 && mmap.fault(proc.current(), cpu.cr2(), f.error) != 0) { ret; }
+        if (f.vector == 14 && from_user != 0 && mmap.fault(proc.current(), fault_address, f.error) != 0) { ret; }
         if (from_user != 0) {
-            user_fault(f);
+            user_fault(f, fault_address);
             signal.deliver(f);
             ret;
         }
-        dump(f);
+        dump(f, fault_address);
         kprint.panic("kernel exception\0");
     }
     if (f.vector == apic.SPURIOUS_VECTOR) { ret; } # no eoi for spurious
@@ -153,7 +164,7 @@ fun dispatch(f: *idt.Frame) {
         if (smp.me() == 0) { # the clock counts on one cpu; every cpu preempts
             proc.tick();
             xhci.poll(proc.uptime_ticks());
-            if (xhci.stor_changed() != 0) { parts.usb_hotplug(); }
+            if (fs_lock.busy() == 0 && xhci.stor_changed() != 0) { parts.usb_hotplug(); }
             net.poll();
             dhcp.tick();
             tcp.tick();
@@ -170,6 +181,9 @@ fun dispatch(f: *idt.Frame) {
 
     # only ever switch away on the way back to user mode
     if (from_user != 0) {
+        # Finish the interrupt before parking a sibling: its suspended
+        # frame may be discarded by exec/exit and never reach EOI later.
+        proc.check_pause();
         signal.deliver(f);
         if (preempt != 0) { proc.yield(); }
     }

@@ -1,6 +1,6 @@
 # memory mappings: mmap, munmap, mprotect. a process keeps a list of
-# regions it reserved; their pages are only given memory when first
-# touched (a zeroed page, on the page fault), so reserving a lot is cheap.
+# regions it reserved; a first touch initializes a small forward run of
+# zeroed pages, so reserving a lot remains cheap.
 # a file mapping is a private copy of the file read in at once. new
 # mappings go downward from below the stack; sbrk's heap grows up to them
 
@@ -12,6 +12,7 @@ use pmm:  machos.mm.pmm;
 use mem:  machos.kern.mem;
 use vfs:  machos.fs.vfs;
 use file: machos.fs.file;
+use work: machos.kern.work;
 
 val PAGE: u64 = 4096;
 pub val MAX: u64 = 0xFFFFFFFFFFFFFFFF; # "no such region"
@@ -141,13 +142,34 @@ fun fill(p: *proc.Proc, va: u64, write: u8) u8 {
     if (write != 0 && (prot & abi.PROT_WRITE) == 0) { ret 0; }
     val pg: u64 = va & ~(PAGE - 1);
     if ((vmm.lookup(p.pml4, pg) & vmm.P) != 0) { ret 1; } # already there
-    val pa: u64 = pmm.alloc();
-    if (pa == 0) { ret 0; }
-    if (vmm.map(p.pml4, pg, pa, page_flags(prot)) == 0) {
-        pmm.free(pa);
-        ret 0;
+    # Small forward runs amortize page faults without committing a whole
+    # reservation. Reserve physical pages under the lock, then zero private
+    # pages in parallel; none is user-visible until initialization finishes.
+    var pages: [16]u64;
+    var count: u64 = 0;
+    for (count < 16 && pg + count * PAGE < p.maps[i].end) {
+        if (count != 0 && pmm.free_pages() < 32) { brk; }
+        if ((vmm.lookup(p.pml4, pg + count * PAGE) & vmm.P) != 0) { brk; }
+        val pa: u64 = pmm.alloc_raw();
+        if (pa == 0) { brk; }
+        pages[count] = pa;
+        count = count + 1;
     }
-    p.pages = p.pages + 1;
+    if (count == 0) { ret 0; }
+    var unlocked: u8 = 0;
+    if (count > 1) { unlocked = work.begin(work.MEMORY); }
+    var j: u64 = 0;
+    for (j < count) { mem.fill(vmm.phys_to_virt(pages[j]), 0, PAGE); j = j + 1; }
+    work.end(unlocked);
+    j = 0;
+    for (j < count) {
+        if (vmm.map(p.pml4, pg + j * PAGE, pages[j], page_flags(prot)) == 0) {
+            for (j < count) { pmm.free(pages[j]); j = j + 1; }
+            ret ((vmm.lookup(p.pml4, pg) & vmm.P) != 0)::u8;
+        }
+        p.pages = p.pages + 1;
+        j = j + 1;
+    }
     ret 1;
 }
 
@@ -190,6 +212,10 @@ fun unmap_pages(p: *proc.Proc, a: u64, b: u64) {
         }
         if (((va + PAGE) & 0x1FFFFF) == 0 || va + PAGE == b) { vmm.prune(p.pml4, va); }
         va = va + PAGE;
+        if ((va & 0xFFFFF) == 0 && va < b) {
+            val unlocked: u8 = work.begin(work.MEMORY);
+            work.end(unlocked);
+        }
     }
 }
 

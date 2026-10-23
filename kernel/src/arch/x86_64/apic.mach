@@ -9,6 +9,7 @@ pub val TIMER_VECTOR:    u64 = 48;
 pub val IRQ_BASE:        u64 = 32; # legacy irq n arrives on vector 32 + n
 pub val SPURIOUS_VECTOR: u64 = 63;
 pub val WAKE_VECTOR:     u64 = 49; # an idle cpu is told there is work
+pub val TLB_VECTOR:      u64 = 50; # lock-independent translation invalidation
 pub val HZ:              u64 = 100;
 
 #[volatile]
