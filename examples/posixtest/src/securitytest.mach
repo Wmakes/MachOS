@@ -1,0 +1,301 @@
+# Regressions for safe deletion, archive extraction, account writes, signal
+# restoration, and resources retained by blocking system calls.
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use io: sdk.io;
+use users: sdk.users;
+use rt: sdk.rt;
+use env: sdk.env;
+use path: sdk.path;
+
+#[volatile]
+rec Word { value: u64; }
+var entered: Word;
+var alive: Word;
+var outcome: Word;
+var operation: u64;
+var destination: u64;
+var which: u64;
+var failures: u64;
+#[align(16)]
+var signal_frame: [1024]u8;
+
+fun check(name: *u8, good: u8) {
+    if (good != 0) { io.out("ok \0"); }
+    or { io.out("FAIL \0"); failures = failures + 1; }
+    io.out(name); io.putc(10);
+}
+
+fun shell(command: *u8) u64 {
+    var args: [2048]u8;
+    io.copy(?args[0], "sh\0", 3);
+    io.copy(?args[3], "-c\0", 3);
+    val n: u64 = io.len(command);
+    if (n + 7 > 2048) { ret 127; }
+    io.copy(?args[6], command, n + 1);
+    val pid: u64 = sys.spawn("/bin/sh\0", 7, ?args[0], n + 7, nil);
+    if (abi.is_err(pid) != 0) { ret 127; }
+    ret sys.wait(pid);
+}
+
+fun create(path: *u8, data: *u8, n: u64) u8 {
+    val fd: u64 = sys.open_mode(path, io.len(path), abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC, 0x180);
+    if (abi.is_err(fd) != 0) { ret 0; }
+    val good: u8 = io.write_all(fd, data, n);
+    sys.close(fd);
+    ret good;
+}
+
+fun link(target: *u8, path: *u8) u8 {
+    ret (sys.raw(abi.SYMLINK, target::u64, io.len(target), path::u64, io.len(path), 0) == 0)::u8;
+}
+
+fun file_safety() {
+    check("security setup\0", (shell("mkdir /tmp/security; mkdir /tmp/security/target; echo keep > /tmp/security/target/keep\0") == 0)::u8);
+    check("directory link setup\0", link("/tmp/security/target\0", "/tmp/security/link\0"));
+    check("recursive rm preserves link target\0", (shell("rm -r /tmp/security/link; test -f /tmp/security/target/keep\0") == 0)::u8);
+    check("dangling link setup\0", link("/tmp/security/missing\0", "/tmp/security/dangling\0"));
+    check("rm removes dangling link\0", (shell("rm /tmp/security/dangling\0") == 0)::u8);
+    check("archive link setup\0", link("/tmp/security/target\0", "/tmp/security/link\0"));
+    check("tar rejects directory-link destinations\0", (shell("cd /tmp/security; tar -xf /bin/security-link.tar\0") != 0)::u8);
+    check("tar leaves linked destination intact\0", (shell("test -f /tmp/security/target/keep || exit 1; test -f /tmp/security/target/payload && exit 1; exit 0\0") == 0)::u8);
+    check("tar rejects truncated header\0", (shell("tar -tf /bin/security-short.tar\0") != 0)::u8);
+    check("update rejects invalid archive and cleans staging\0", (shell("update /bin/security-short.tar && exit 1; test -d /root/.machos-update && exit 1; exit 0\0") == 0)::u8);
+}
+
+fun account_safety() {
+    val source: u64 = sys.open("/etc/shadow\0", 11, abi.O_READ);
+    var original: [4096]u8;
+    val n: u64 = sys.read(source, ?original[0], 4096);
+    sys.close(source);
+    if (abi.is_err(n) != 0 || n >= 4096) { check("read shadow backup\0", 0); ret; }
+    var malformed: [137]u8;
+    io.copy(?malformed[0], "root:\0", 5);
+    var i: u64 = 5;
+    for (i < 135) { malformed[i] = 120; i = i + 1; }
+    malformed[135] = 58; malformed[136] = 10;
+    check("write malformed shadow fixture\0", create("/etc/shadow\0", ?malformed[0], 137));
+    var hash: [128]u8;
+    val rejected: u8 = (users.stored("root\0", 4, ?hash[0]) == abi.NO_ID)::u8;
+    check("restore shadow fixture\0", create("/etc/shadow\0", ?original[0], n));
+    check("malformed shadow fails closed\0", rejected);
+    check("new accounts start locked\0", (users.add("securityuser\0", 12, 60000, "/tmp/security/home\0", "/bin/sh\0") != 0 &&
+        users.stored("securityuser\0", 12, ?hash[0]) != abi.NO_ID && users.locked(?hash[0], io.len(?hash[0])) != 0)::u8);
+    val path: *u8 = "/tmp/security/accounts\0";
+    check("account fixture setup\0", create(path, "test:old:\n\0", 10));
+    var temporary: [128]u8;
+    io.copy(?temporary[0], "/tmp/security/accounts.tmp.\0", 27);
+    val length: u64 = 27 + io.fmt_dec(sys.getpid(), ?temporary[27]);
+    temporary[length] = 0;
+    check("account collision setup\0", create(?temporary[0], "keep\0", 4));
+    check("account replacement refuses existing staging\0", (users.set_password_in(path, "test\0", 4, "secret\0", 6) == 0)::u8);
+    val fd: u64 = sys.open(path, io.len(path), abi.O_READ);
+    var unchanged: [32]u8;
+    val got: u64 = sys.read(fd, ?unchanged[0], 32); sys.close(fd);
+    check("failed account update preserves database\0", (got == 10 && io.eq(?unchanged[0], 10, "test:old:\n\0", 10) != 0)::u8);
+    sys.remove(?temporary[0], length);
+    check("account update succeeds after collision removed\0", users.set_password_in(path, "test\0", 4, "secret\0", 6));
+}
+
+fun worker(ignored: u64) {
+    entered.value = 1;
+    if (which == 1 || which == 3) {
+        var length: u64 = 1; if (which == 3) { length = 65536; }
+        outcome.value = sys.read(operation, destination::*u8, length);
+    }
+    or { outcome.value = sys.raw(abi.QUEUE_WAIT, operation, destination, 1, 1000, 0); }
+    sys.raw(abi.THREAD_EXIT, 0, 0, 0, 0, 0);
+    for {}
+}
+
+fun blocking_safety(kind: u64) u8 {
+    var pipe: [2]u64;
+    if (sys.pipe(?pipe) != 0) { ret 0; }
+    which = kind;
+    destination = sys.mmap(0, 4096, abi.PROT_READ | abi.PROT_WRITE, abi.MAP_PRIVATE | abi.MAP_ANONYMOUS, 0, 0);
+    val stack: u64 = sys.mmap(0, 1048576, abi.PROT_READ | abi.PROT_WRITE, abi.MAP_PRIVATE | abi.MAP_ANONYMOUS, 0, 0);
+    if (abi.is_err(destination) != 0 || abi.is_err(stack) != 0) { ret 0; }
+    operation = pipe[0];
+    if (kind == 2) {
+        operation = sys.raw(abi.QUEUE_CREATE, 0, 0, 0, 0, 0);
+        if (abi.is_err(operation) != 0 || sys.raw(abi.QUEUE_CTL, operation, abi.QUEUE_ADD, pipe[0], abi.EV_READ, 1) != 0) { ret 0; }
+    }
+    entered.value = 0; alive.value = 1; outcome.value = 0;
+    val tid: u64 = sys.raw(abi.THREAD_SPAWN, worker::u64, stack + 1048576 - 8, 0, 0, (?alive.value)::u64);
+    if (abi.is_err(tid) != 0) { ret 0; }
+    for (entered.value == 0) { sys.sleep(1); }
+    sys.sleep(30);
+    if (sys.munmap(destination, 4096) != 0 || sys.close(operation) != 0) { ret 0; }
+    var byte: u8 = 1;
+    if (sys.write(pipe[1], ?byte, 1) != 1) { ret 0; }
+    var attempts: u64 = 0;
+    for (alive.value != 0 && attempts < 1000) { sys.sleep(1); attempts = attempts + 1; }
+    if (alive.value != 0) { ret 0; }
+    sys.close(pipe[1]);
+    if (kind == 2) { sys.close(pipe[0]); }
+    sys.munmap(stack, 1048576);
+    ret (abi.err_code(outcome.value) == abi.E_FAULT)::u8;
+}
+
+fun path_safety() u8 {
+    var value: [410]u8;
+    var output: [272]u8;
+    var i: u64 = 0;
+    for (i < 400) { value[i] = 120; i = i + 1; }
+    io.copy(?value[400], ":/bin\0", 6);
+    i = 0; for (i < 272) { output[i] = 0xA5; i = i + 1; }
+    env.set("PATH\0", ?value[0]);
+    val found: u64 = path.lookup("true\0", ?output[0]);
+    env.set("PATH\0", "/bin\0");
+    i = 256;
+    for (i < 272) { if (output[i] != 0xA5) { ret 0; } i = i + 1; }
+    ret (found == 9 && io.streq(?output[0], "/bin/true\0") != 0)::u8;
+}
+
+fun reused_registration() u8 {
+    val queue: u64 = sys.raw(abi.QUEUE_CREATE, 0, 0, 0, 0, 0);
+    var pipe: [2]u64;
+    if (abi.is_err(queue) != 0 || sys.pipe(?pipe) != 0) { ret 0; }
+    if (sys.raw(abi.QUEUE_CTL, queue, abi.QUEUE_ADD, pipe[0], abi.EV_READ, 1) != 0) { ret 0; }
+    sys.close(pipe[0]);
+    val reused: u64 = sys.open("/dev/null\0", 9, abi.O_READ);
+    if (reused != pipe[0]) { ret 0; }
+    var event: abi.QueueEvent;
+    val count: u64 = sys.raw(abi.QUEUE_WAIT, queue, (?event)::u64, 1, 0, 0);
+    sys.close(reused); sys.close(pipe[1]); sys.close(queue);
+    ret (count == 0)::u8;
+}
+
+fun cancel_blocked() u8 {
+    val child: u64 = sys.fork();
+    if (abi.is_err(child) != 0) { ret 0; }
+    if (child == 0) {
+        var pipe: [2]u64;
+        if (sys.pipe(?pipe) != 0) { sys.exit(90); }
+        operation = pipe[0]; which = 3; entered.value = 0; alive.value = 1;
+        destination = sys.mmap(0, 65536, abi.PROT_READ | abi.PROT_WRITE, abi.MAP_PRIVATE | abi.MAP_ANONYMOUS, 0, 0);
+        val stack: u64 = sys.mmap(0, 1048576, abi.PROT_READ | abi.PROT_WRITE, abi.MAP_PRIVATE | abi.MAP_ANONYMOUS, 0, 0);
+        if (abi.is_err(destination) != 0 || abi.is_err(stack) != 0 ||
+            abi.is_err(sys.raw(abi.THREAD_SPAWN, worker::u64, stack + 1048576 - 8, 0, 0, (?alive.value)::u64)) != 0) { sys.exit(91); }
+        for (entered.value == 0) { sys.sleep(1); }
+        sys.sleep(30);
+        sys.execve("/bin/true\0", 9, "true\0", 5);
+        sys.exit(92);
+    }
+    var status: u64;
+    ret (sys.waitpid(child, ?status, 0) == child && status == 0)::u8;
+}
+
+fun cancellation_safety() u8 {
+    if (cancel_blocked() == 0) { ret 0; }
+    var before: abi.Info; sys.info(?before);
+    var i: u64 = 0;
+    for (i < 4) { if (cancel_blocked() == 0) { ret 0; } i = i + 1; }
+    var after: abi.Info; sys.info(?after);
+    ret (after.heap_used <= before.heap_used + 4096)::u8;
+}
+
+fun privilege_bits() u8 {
+    val name: *u8 = "/tmp/security/setid\0";
+    if (create(name, "original\0", 8) == 0) { ret 0; }
+    var round: u64 = 0;
+    for (round < 3) {
+        if (round == 2 && sys.chown(name, io.len(name), 1000, 0) != 0) { ret 0; }
+        if (sys.chmod(name, io.len(name), 0xDFF) != 0) { ret 0; }
+        val child: u64 = sys.fork();
+        if (abi.is_err(child) != 0) { ret 0; }
+        if (child == 0) {
+            if (sys.setgid(1000) != 0 || sys.setuid(1000) != 0) { sys.exit(93); }
+            if (round == 2) {
+                if (sys.chmod(name, io.len(name), 0xDFF) != 0) { sys.exit(94); }
+            } or {
+                var flags: u64 = abi.O_WRITE;
+                if (round == 1) { flags = flags | abi.O_TRUNC; }
+                val fd: u64 = sys.open(name, io.len(name), flags);
+                if (abi.is_err(fd) != 0 || sys.write(fd, "x\0", 1) != 1) { sys.exit(95); }
+                sys.close(fd);
+            }
+            var st: abi.Stat;
+            if (sys.stat(name, io.len(name), ?st) != 0) { sys.exit(96); }
+            var mask: u64 = abi.S_ISUID | abi.S_ISGID;
+            if (round == 2) { mask = abi.S_ISGID; }
+            if ((st.mode & mask) != 0) { sys.exit(97); }
+            sys.exit(0);
+        }
+        var status: u64;
+        if (sys.waitpid(child, ?status, 0) != child || status != 0) { ret 0; }
+        round = round + 1;
+    }
+    ret 1;
+}
+
+#[naked]
+fun restore_frame(address: u64) {
+    asm x86_64 {
+        mov rsp, rdi
+        mov rax, 41
+        syscall
+        .byte 0x0f, 0x0b :: writes()
+    }
+}
+
+#[naked]
+fun invalid_stack() {
+    asm x86_64 {
+        mov rsp, 0x800000000000
+        mov rax, 16
+        syscall
+        .byte 0x0f, 0x0b :: writes()
+    }
+}
+
+fun syscall_return_safety() u8 {
+    val child: u64 = sys.fork();
+    if (abi.is_err(child) != 0) { ret 0; }
+    if (child == 0) {
+        if (sys.setuid(1000) != 0) { sys.exit(99); }
+        invalid_stack();
+        sys.exit(98);
+    }
+    var status: u64;
+    ret (sys.waitpid(child, ?status, 0) == child && abi.wtermsig(status) == abi.SIGSEGV)::u8;
+}
+
+fun restored() { sys.exit(0); }
+
+fun signal_safety(invalid: u8) u8 {
+    val child: u64 = sys.fork();
+    if (abi.is_err(child) != 0) { ret 0; }
+    if (child == 0) {
+        if (sys.setuid(1000) != 0) { sys.exit(99); }
+        val base: u64 = (?signal_frame[0])::u64;
+        @((base + 648)::*u64) = restored::u64;
+        if (invalid != 0) { @((base + 648)::*u64) = 0x800000000000; }
+        @((base + 672)::*u64) = base + 1024;
+        @((base + 24)::*u32) = 0xFFFFFFFF;
+        restore_frame(base);
+        sys.exit(98);
+    }
+    var status: u64;
+    if (sys.waitpid(child, ?status, 0) != child) { ret 0; }
+    if (invalid != 0) { ret (abi.wtermsig(status) == abi.SIGSEGV)::u8; }
+    ret (status == 0)::u8;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    file_safety();
+    account_safety();
+    check("long PATH entries do not overflow command buffer\0", path_safety());
+    check("reused handles discard old queue registrations\0", reused_registration());
+    check("writes and chmod restrict set-id privileges\0", privilege_bits());
+    check("exec releases abandoned blocking I/O resources\0", cancellation_safety());
+    check("blocked pipe survives close and unmap\0", blocking_safety(1));
+    check("blocked queue survives close and unmap\0", blocking_safety(2));
+    check("invalid syscall stack ends only its process\0", syscall_return_safety());
+    check("invalid signal return ends only its process\0", signal_safety(1));
+    check("signal return masks unsupported MXCSR bits\0", signal_safety(0));
+    io.dec(failures); io.out(" security failures\n\0");
+    ret (failures != 0)::u64;
+}

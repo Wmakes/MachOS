@@ -2,6 +2,7 @@
 
 use pmm: machos.mm.pmm;
 use info: machos.boot.info;
+use heap: machos.mm.heap;
 
 var storage: [262144]u8;
 var boot: info.BootInfo;
@@ -12,6 +13,24 @@ var preserved: u8 = 0;
 fun synchronize() {
     sync_count = sync_count + 1;
     preserved = (@((pages[0] + boot.hhdm)::*u64) == 0x123456789ABCDEF0)::u8;
+}
+
+test memory__heap_rejects_overflowing_requests_before_mapping {
+    if (heap.alloc(0xFFFFFFFFFFFFFFFF) != 0 || heap.zalloc(0xFFFFFFFFFFFFFFF0) != 0 ||
+        heap.alloc(0x4000000000) != 0 || heap.used() != 0 || heap.mapped() != 0) { ret 1; }
+    ret 0;
+}
+
+test memory__fragmented_map_without_metadata_space_is_rejected {
+    boot.hhdm = (?storage[0])::u64 - 4096;
+    boot.mem_len = 1;
+    boot.mem[0].base = 0x10000000000;
+    boot.mem[0].len = 4096;
+    boot.mem[0].kind = info.MEM_USABLE;
+    if (pmm.init(?boot) != 0 || pmm.free_pages() != 0) { ret 1; }
+    boot.mem_len = info.MEM_MAX + 1;
+    if (pmm.init(?boot) != 0) { ret 2; }
+    ret 0;
 }
 
 test memory__reuse_waits_for_remote_translation_invalidation {

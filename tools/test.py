@@ -52,6 +52,7 @@ def with_posix_artifact(name):
     """Install one resource-regression program on a fresh test disk."""
     p = PROFILE[0]
     for command in (["tools/mkimage.sh", p, "--fresh"],
+                    ["mach", "dep", "pull", "examples/posixtest"],
                     ["mach", "build", "examples/posixtest", "-a", name, "-t", "machos", "-p", p],
                     ["tools/put.sh", f"examples/posixtest/out/machos/{p}/{name}", f"/bin/{name}", disk()]):
         subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.PIPE)
@@ -71,6 +72,26 @@ def with_threadtest():
 
 def with_iommtest():
     with_posix_artifact("iommtest")
+
+
+def with_securitytest():
+    """Install the boundary-safety regression program and its archive fixtures."""
+    import io
+    import tarfile
+    with_posix_artifact("securitytest")
+    fixtures = os.path.join(ROOT, "out", "headless")
+    os.makedirs(fixtures, exist_ok=True)
+    archive = os.path.join(fixtures, "security-link.tar")
+    with tarfile.open(archive, "w", format=tarfile.USTAR_FORMAT) as output:
+        entry = tarfile.TarInfo("link/payload")
+        entry.size = 7
+        output.addfile(entry, io.BytesIO(b"changed"))
+    short = os.path.join(fixtures, "security-short.tar")
+    with open(short, "wb") as output:
+        output.write(bytes(100))
+    for path in (archive, short):
+        subprocess.run(["tools/put.sh", path, "/bin/" + os.path.basename(path), disk()],
+                       cwd=ROOT, check=True, stdout=subprocess.PIPE)
 
 
 def with_usability():
@@ -658,7 +679,7 @@ TESTS = [
     ("usability-reboot", True, True,
      ["wait:" + P,
       "send:uname -n; config get ttys; test \"$(uname -n)\" = configured; echo boot-config-status $?\\n", "wait:" + P],
-     ["MachOS 0.9.1", "configured", "1", "boot-config-status 0"]),
+     ["MachOS 0.9.2", "configured", "1", "boot-config-status 0"]),
 
     ("boot", False, False,
      ["wait:" + P, "send:uname -a; ls /\\n", "wait:" + P],
@@ -794,7 +815,7 @@ TESTS = [
     ("dualboot", False, False,
      ["--prep", fake_windows, "--boot", DUAL, "--nologin", "sleep:2.5", "keys:<down><down><down>", "sleep:0.5",
       "keys:<ret>", "wait:booting Windows", "wait:login: ", "send:root\\n", "wait:" + P],
-     ["Windows", "machboot: booting Windows", "machboot 0.9.1"]),
+     ["Windows", "machboot: booting Windows", "machboot 0.9.2"]),
 
     # machboot hide: no menu, straight into MachOS
     ("hidden-menu", False, True,
@@ -807,12 +828,12 @@ TESTS = [
     # an update from a package on a USB stick, then a reboot into it
     ("update", False, True,
      ["--prep", update_stick] + usb_stick() + [
-      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; rm -r /usr/share/licenses; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update /bin/install; update /mnt/update.tgz; umount /mnt; machboot\\n",
+      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; rm -r /usr/share/licenses; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update /bin/install; mv /mnt/update.tgz '/mnt/update name;literal.tgz'; mount /dev/sda1 /boot/efi; cd /mnt; update 'update name;literal.tgz'; cd /root; umount /boot/efi; umount /mnt; machboot\\n",
       "wait:" + P],
-     ["updating MachOS", "installing the programs", "MachOS is updated to 0.9.1", "MachOS (previous)"]),
+     ["updating MachOS", "installing the programs", "MachOS is updated to 0.9.2", "MachOS (previous)"]),
     ("update-reboot", True, True,
      ["wait:" + P, "send:ls /boot; uname -a\\n", "wait:" + P],
-     ["kernel.old.elf", "MachOS 0.9.1"]),
+     ["kernel.old.elf", "MachOS 0.9.2"]),
 
     # MachOS installed on a USB stick, then booted from the stick alone
     ("usb-install", False, False,
@@ -919,8 +940,8 @@ TESTS = [
      ["wait:" + P, "send:cat /proc/version; head -2 /proc/meminfo; cat /proc/self/status; ls /proc/sys/kernel; cat /proc/stat\\n",
       "wait:" + P,
       "send:uname -a; free; uptime; ps; df; id; whoami; tty; neofetch | grep -c Memory\\n", "wait:" + P],
-     ["MachOS version 0.9.1", "MemTotal:", "Name:", "cat", "Uid:", "hostname", "cpu0",
-      "MachOS 0.9.1 x86_64 on machos", "total", "processes", "PID", "init", "Filesystem", "/dev/sda2",
+     ["MachOS version 0.9.2", "MemTotal:", "Name:", "cat", "Uid:", "hostname", "cpu0",
+      "MachOS 0.9.2 x86_64 on machos", "total", "processes", "PID", "init", "Filesystem", "/dev/sda2",
       "uid=0(root)", "root", "/dev/tty1", "1"]),
 
     ("events", False, False,
@@ -1181,6 +1202,24 @@ for cores in (2, 4, 8, 16):
 _, keep, fsck, steps, expect = next(test for test in TESTS if test[0] == "std")
 TESTS.append(("std-smp", keep, fsck,
               ["--qemu=-smp", "--qemu=4"] + steps, expect))
+
+
+TESTS.append(("security", False, True,
+              ["--prep", with_securitytest, "--boot", disk,
+               "--qemu=-smp", "--qemu=4", "wait:" + P,
+               "send:securitytest; echo security-status $?\\n", "wait:" + P],
+              ["ok recursive rm preserves link target", "ok rm removes dangling link",
+               "ok tar rejects directory-link destinations", "ok tar rejects truncated header",
+               "ok malformed shadow fails closed", "ok new accounts start locked",
+               "ok failed account update preserves database",
+               "ok long PATH entries do not overflow command buffer",
+               "ok reused handles discard old queue registrations",
+               "ok writes and chmod restrict set-id privileges",
+               "ok exec releases abandoned blocking I/O resources",
+               "ok blocked pipe survives close and unmap", "ok blocked queue survives close and unmap",
+               "ok invalid syscall stack ends only its process",
+               "ok invalid signal return ends only its process",
+               "ok signal return masks unsupported MXCSR bits", "0 security failures", "security-status 0"]))
 
 
 for cores in (2, 4):

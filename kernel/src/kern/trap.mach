@@ -138,6 +138,16 @@ fun isr_dispatch(f: *idt.Frame) {
     smp.unlock();
 }
 
+# IRET faults on noncanonical user return addresses while still in ring 0.
+# Reject them before restoration, including a syscall issued with a bad RSP.
+#[symbol("validate_user_return")]
+fun validate_user_return(f: *idt.Frame) {
+    if ((f.cs & 3) != 3 || (f.rip < vmm.USER_END && f.rsp < vmm.USER_END)) { ret; }
+    smp.lock();
+    proc.entered();
+    sys.killed_by(abi.SIGSEGV);
+}
+
 fun dispatch(f: *idt.Frame, fault_address: u64) {
     # user mode can set AC itself; never let it carry into the kernel (SMAP)
     if (cpu.has_smap() != 0) { cpu.clac(); }

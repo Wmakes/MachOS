@@ -15,7 +15,7 @@ var verbose: u8 = 0;
 
 fun remove(p: *u8, n: u64) u8 {
     var identity: os.stat_t; var root: os.stat_t;
-    if (io.stat(p, ?identity) >= 0 && io.stat("/", ?root) >= 0 && identity.st_dev == root.st_dev && identity.st_ino == root.st_ino) {
+    if (io.lstat(p, ?identity) >= 0 && io.stat("/", ?root) >= 0 && identity.st_dev == root.st_dev && identity.st_ino == root.st_ino) {
         io.err("rm: refusing to remove root directory\n"); ret 0;
     }
     var end: u64 = n; for (end > 0 && p[end - 1] == 47) { end = end - 1; }
@@ -25,7 +25,7 @@ fun remove(p: *u8, n: u64) u8 {
     }
     if (recursive != 0) {
         var st: os.stat_t;
-        if (io.stat(p, ?st) >= 0 && io.is_dir(?st)) {
+        if (io.lstat(p, ?st) >= 0 && io.is_dir(?st)) {
             # read it afresh after each removal: the entries move up
             var more: bool = true;
             for (more) {

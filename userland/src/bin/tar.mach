@@ -9,6 +9,7 @@
 use os:  std.system.os;
 use io:  userland.lib.cli;
 use std.runtime;
+use sdk.abi;
 
 var mode: u8 = 0;      # 99 c, 120 x, 116 t
 var verbose: u8 = 0;
@@ -30,7 +31,11 @@ fun complain(what: *u8, path: *u8, e: i64) {
 
 # --- writing --------------------------------------------------------------
 
-fun write_all(buf: *u8, n: u64) u8 { ret io.write_all(arch, buf, n); }
+fun write_all(buf: *u8, n: u64) u8 {
+    val good: u8 = io.write_all(arch, buf, n);
+    if (good == 0) { failures = failures + 1; }
+    ret good;
+}
 
 fun octal(at: *u8, width: u64, v: u64) {
     # width-1 digits, then NUL
@@ -183,7 +188,7 @@ fun read_exact(buf: *u8, n: u64) u8 {
     var got: u64 = 0;
     for (got < n) {
         val r: i64 = io.read(arch, ?buf[got], n - got);
-        if (r <= 0) { ret 0; }
+        if (r <= 0) { io.err("tar: archive read failed or ended too early\n\0"); failures = failures + 1; ret 0; }
         got = got + r::u64;
     }
     ret 1;
@@ -240,6 +245,41 @@ fun skip_bytes(n: u64) u8 {
     ret 1;
 }
 
+# Refuse existing links in any destination component, including the leaf.
+fun safe_destination(p: *u8, n: u64) u8 {
+    if (n > 255) { ret 0; }
+    var part: [256]u8;
+    io.copy(?part[0], p, n);
+    part[n] = 0;
+    var i: u64 = 0;
+    for (i <= n) {
+        if (i == n || part[i] == 47) {
+            val saved: u8 = part[i];
+            part[i] = 0;
+            var st: os.stat_t;
+            if (i != 0 && io.lstat(?part[0], ?st) >= 0 && (st.st_mode & os.S_IFMT) == os.S_IFLNK) { ret 0; }
+            part[i] = saved;
+        }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# Consume padding through EOF so a piped decompressor can finish and report
+# trailer/CRC errors instead of receiving SIGPIPE after the end markers.
+fun drain_tail() {
+    for {
+        val got: i64 = io.read(arch, ?blockbuf[0], 65536);
+        if (got == 0) { ret; }
+        if (got < 0) { complain("archive read failed\0", "archive\0", got); ret; }
+        var i: u64 = 0;
+        for (i < got::u64) {
+            if (blockbuf[i] != 0) { complain("nonzero data after archive end\0", "archive\0", 0); ret; }
+            i = i + 1;
+        }
+    }
+}
+
 fun extract() {
     var zeros: u64 = 0;
     for {
@@ -252,7 +292,7 @@ fun extract() {
         }
         if (empty != 0) {
             zeros = zeros + 1;
-            if (zeros == 2) { brk; }
+            if (zeros == 2) { drain_tail(); brk; }
             cnt;
         }
         zeros = 0;
@@ -307,10 +347,11 @@ fun extract() {
             if (skip_bytes(padded) == 0) { brk; }
             cnt;
         }
-        if (unsafe != 0 || pn == 0) {
+        if (unsafe != 0 || pn == 0 || safe_destination(p, pn) == 0) {
             io.err("tar: skipping unsafe name \0");
             io.errn(?name[0], nl);
             io.err("\n\0");
+            failures = failures + 1;
             if (skip_bytes(padded) == 0) { brk; }
             cnt;
         }
@@ -332,7 +373,7 @@ fun extract() {
         make_parents(p, pn);
         var zp: [256]u8;
         zcopy(p, pn, ?zp[0]);
-        val h: i64 = io.open_mode(?zp[0], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, fmode);
+        val h: i64 = io.open_mode(?zp[0], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | abi.O_NOFOLLOW::i32, fmode);
         if (h < 0) {
             complain("\0", p, h);
             if (skip_bytes(padded) == 0) { brk; }
@@ -347,7 +388,7 @@ fun extract() {
             if (read_exact(?blockbuf[0], k) == 0) { broken = 1; brk; }
             var w: u64 = k;
             if (w > data) { w = data; }
-            io.write_all(h, ?blockbuf[0], w);
+            if (io.write_all(h, ?blockbuf[0], w) == 0) { broken = 1; brk; }
             data = data - w;
             left = left - k;
         }

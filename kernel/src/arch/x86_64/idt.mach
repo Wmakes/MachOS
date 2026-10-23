@@ -273,6 +273,8 @@ fun isr_common() {
 #[symbol("isr_return")]
 pub fun isr_return() {
     asm x86_64 {
+        lea rdi, [rsp + 512]
+        call validate_user_return
         .byte 0x48, 0x0f, 0xae, 0x0c, 0x24 :: writes()
         add rsp, 512
         pop r15

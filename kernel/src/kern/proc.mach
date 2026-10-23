@@ -93,6 +93,8 @@ pub rec Proc {
     on_cpu:    u64;    # a process: how many of its threads run now
     quiescing: u64;    # only this thread id may run during exit/exec
     stop_state: u64;   # the leader's state before a process-wide stop
+    io_handle: u64;   # reference retained by a blocking system call
+    io_buffer: u64;   # kernel-owned transfer storage, released on cancellation
     bulk_owner: u64;   # thread pinning this address space during unlocked work
 }
 
@@ -117,6 +119,19 @@ var running: [16]*Proc;
 # Read only on CPU c with interrupts disabled. Its running thread cannot
 # migrate or be reclaimed until that CPU leaves it through the scheduler.
 pub fun local_thread(c: u64) *Proc { ret running[c]; }
+
+var resource_cleanup: fun(*Proc);
+var have_cleanup: u8 = 0;
+pub fun set_resource_cleanup(cleanup: fun(*Proc)) { resource_cleanup = cleanup; have_cleanup = 1; }
+fun cleanup_resources(t: *Proc) { if (have_cleanup != 0) { resource_cleanup(t); } }
+pub fun release_resources(p: *Proc) {
+    var i: u64 = 0;
+    for (i < MAX) {
+        if (table[i].state != FREE && process_of(?table[i]) == p) { cleanup_resources(?table[i]); }
+        i = i + 1;
+    }
+}
+
 
 # the process of the running thread (what system calls act on)
 pub fun current() *Proc {
@@ -367,6 +382,7 @@ pub fun end_other_threads() {
     for (i < MAX) {
         val t: *Proc = ?table[i];
         if (t != cur && t.state != FREE && process_of(t) == p && t != p) {
+            cleanup_resources(t);
             heap.free(t.kstack);
             t.state = FREE;
             t.pid = 0;
@@ -607,6 +623,7 @@ pub fun stop_self(sig: u64) {
 
 # free everything a zombie still holds and its slot
 pub fun reap(p: *Proc) {
+    cleanup_resources(p);
     heap.free(p.kstack);
     if (p.leader == nil) { heap.free(p.maps::u64); }
     p.maps = nil;

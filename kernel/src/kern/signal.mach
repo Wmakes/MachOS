@@ -110,12 +110,15 @@ pub fun sigreturn(f: *idt.Frame) u64 {
     if (vmm.user_ok(p.pml4, base, TOTAL, 0) == 0) { exit.killed_by(abi.SIGSEGV); }
     var saved: idt.Frame;
     var mask: u64 = 0;
+    var mxcsr_mask: u32 = @((f::u64 - idt.FPU_AREA + 28)::*u32);
+    if (mxcsr_mask == 0) { mxcsr_mask = 0xFFBF; }
     user_copy(f::u64 - idt.FPU_AREA, base, idt.FPU_AREA);
     user_copy((?saved)::u64, base + idt.FPU_AREA, FRAME);
     user_copy((?mask)::u64, base + idt.FPU_AREA + FRAME, 8);
+    if (saved.rip >= vmm.USER_END || saved.rsp >= vmm.USER_END) { exit.killed_by(abi.SIGSEGV); }
     # a bad MXCSR would make fxrstor fault in the kernel
     val mxcsr: *u32 = (f::u64 - idt.FPU_AREA + 24)::*u32;
-    @mxcsr = @mxcsr & 0xFFFF;
+    @mxcsr = @mxcsr & mxcsr_mask;
     val cs: u64 = f.cs;
     val ss: u64 = f.ss;
     mem.copy(f::u64, (?saved)::u64, FRAME);

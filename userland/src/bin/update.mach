@@ -13,11 +13,13 @@ use sys: sdk.sys;
 use io:  sdk.io;
 use rt:  sdk.rt;
 
-val STAGE: *u8 = "/tmp/update\0";
+val STAGE: *u8 = "/root/.machos-update\0";
 var buf: [65536]u8;
 var failures: u64 = 0;
+var stage_owned: u8 = 0;
 
 fun fail(what: *u8) u64 {
+    cleanup();
     io.err("update: \0");
     io.err(what);
     io.err("\n\0");
@@ -60,14 +62,32 @@ fun exists(p: *u8) u8 {
 
 # copy file src to dst (through dst.new and a rename, so a half-written file
 # never takes the old one's place); whether it worked
+fun publish(temporary: *u8, destination: *u8) u8 {
+    val result: u64 = sys.rename(temporary, io.len(temporary), destination, io.len(destination));
+    if (abi.is_err(result) == 0) { ret 1; }
+    if (abi.err_code(result) != abi.E_NOTSUP) { ret 0; }
+    # FAT cannot replace atomically. Retain the old EFI file under another
+    # name and restore it if publication fails, instead of deleting it first.
+    var backup: [256]u8;
+    path(?backup[0], destination, ".previous\0");
+    if (exists(?backup[0]) != 0) { ret 0; }
+    if (abi.is_err(sys.rename(destination, io.len(destination), ?backup[0], io.len(?backup[0]))) != 0) { ret 0; }
+    if (abi.is_err(sys.rename(temporary, io.len(temporary), destination, io.len(destination))) != 0) {
+        sys.rename(?backup[0], io.len(?backup[0]), destination, io.len(destination));
+        ret 0;
+    }
+    sys.remove(?backup[0], io.len(?backup[0]));
+    ret 1;
+}
+
 fun copy(src: *u8, dst: *u8) u8 {
     val h: u64 = sys.open(src, io.len(src), abi.O_READ);
     if (abi.is_err(h) != 0) { ret 0; }
     var st: abi.Stat;
-    sys.fstat(h, ?st);
+    if (abi.is_err(sys.fstat(h, ?st)) != 0) { sys.close(h); ret 0; }
     var tmp: [256]u8;
     path(?tmp[0], dst, ".new\0");
-    val o: u64 = sys.open_mode(?tmp[0], io.len(?tmp[0]), abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC, st.mode & 0xFFF);
+    val o: u64 = sys.open_mode(?tmp[0], io.len(?tmp[0]), abi.O_WRITE | abi.O_CREATE | abi.O_EXCL, st.mode & 0xFFF);
     if (abi.is_err(o) != 0) {
         sys.close(h);
         ret 0;
@@ -85,21 +105,67 @@ fun copy(src: *u8, dst: *u8) u8 {
         sys.remove(?tmp[0], io.len(?tmp[0]));
         ret 0;
     }
-    sys.remove(dst, io.len(dst));
-    if (abi.is_err(sys.rename(?tmp[0], io.len(?tmp[0]), dst, io.len(dst))) != 0) { ret 0; }
-    sys.chmod(dst, io.len(dst), st.mode & 0xFFF);
-    ret 1;
+    if (publish(?tmp[0], dst) == 0) {
+        sys.remove(?tmp[0], io.len(?tmp[0]));
+        ret 0;
+    }
+    ret (abi.is_err(sys.chmod(dst, io.len(dst), st.mode & 0xFFF)) == 0)::u8;
 }
 
 fun install(src_rel: *u8, dst: *u8) {
     var src: [256]u8;
-    path(?src[0], "/tmp/update/\0", src_rel);
+    path(?src[0], "/root/.machos-update/\0", src_rel);
     if (copy(?src[0], dst) == 0) {
         io.err("update: could not install \0");
         io.err(dst);
         io.err("\n\0");
         failures = failures + 1;
     }
+}
+
+fun cleanup() {
+    if (stage_owned == 0) { ret; }
+    stage_owned = 0;
+    an = 0;
+    arg("rm\0"); arg("-r\0"); arg(STAGE);
+    run("/bin/rm\0", ?a[0], an);
+}
+
+fun start_stream(prog: *u8, args: *u8, length: u64, input: u64, output: u64) u64 {
+    var how: abi.Spawn;
+    how.map_fds = 1;
+    var i: u64 = 0;
+    for (i < abi.SPAWN_FDS) { how.handles[i] = abi.NO_ID; i = i + 1; }
+    how.handles[0] = input; how.handles[1] = output; how.handles[2] = abi.STDERR;
+    ret sys.spawn(prog, io.len(prog), args, length, ?how);
+}
+
+# Pass the archive through stdin instead of inserting its name into shell code.
+# Check both children so a decompression failure cannot be hidden by tar.
+fun unpack(pkg: *u8) u8 {
+    val input: u64 = sys.open(pkg, io.len(pkg), abi.O_READ);
+    if (abi.is_err(input) != 0) { ret 0; }
+    var channel: [2]u64;
+    if (sys.pipe(?channel) != 0) { sys.close(input); ret 0; }
+    var cwd: [512]u8;
+    val length: u64 = sys.getcwd(?cwd[0], 512);
+    if (abi.is_err(length) != 0 || length >= 512 || abi.is_err(sys.chdir(STAGE, io.len(STAGE))) != 0) {
+        sys.close(input); sys.close(channel[0]); sys.close(channel[1]); ret 0;
+    }
+    an = 0; arg("gunzip\0"); arg("-c\0");
+    val inflate: u64 = start_stream("/bin/gunzip\0", ?a[0], an, input, channel[1]);
+    an = 0; arg("tar\0"); arg("-xf\0"); arg("-\0");
+    val extract: u64 = start_stream("/bin/tar\0", ?a[0], an, channel[0], abi.STDOUT);
+    val restored: u8 = (abi.is_err(sys.chdir(?cwd[0], length)) == 0)::u8;
+    sys.close(input); sys.close(channel[0]); sys.close(channel[1]);
+    if (abi.is_err(inflate) != 0 || abi.is_err(extract) != 0) {
+        if (abi.is_err(inflate) == 0) { sys.kill(inflate, abi.SIGKILL); sys.wait(inflate); }
+        if (abi.is_err(extract) == 0) { sys.kill(extract, abi.SIGKILL); sys.wait(extract); }
+        ret 0;
+    }
+    val inflated: u64 = sys.wait(inflate);
+    val extracted: u64 = sys.wait(extract);
+    ret (restored != 0 && inflated == 0 && extracted == 0)::u8;
 }
 
 #[symbol("umain")]
@@ -112,21 +178,16 @@ fun main(argc: u64, argv: **u8) u64 {
     val pkg: *u8 = argv[1];
     if (exists(pkg) == 0) { ret fail("no such file\0"); }
 
-    # unpack it into /tmp/update
-    an = 0;
-    arg("rm\0"); arg("-r\0"); arg(STAGE);
-    run("/bin/rm\0", ?a[0], an);
-    sys.mkdir(STAGE, io.len(STAGE));
-    var cmd: [600]u8;
-    var cl: u64 = path(?cmd[0], "cd /tmp/update && gunzip -c \0", pkg);
-    cl = cl + path(?cmd[cl], " | tar -xf -\0", "\0");
-    an = 0;
-    arg("sh\0"); arg("-c\0"); arg(?cmd[0]);
+    # A private, exclusively created directory also excludes concurrent updates.
+    if (abi.is_err(sys.mkdir_mode(STAGE, io.len(STAGE), 0x1C0)) != 0) {
+        ret fail("cannot create private staging directory (remove a stale /root/.machos-update first)\0");
+    }
+    stage_owned = 1;
     say("unpacking...\n\0");
-    if (run("/bin/sh\0", ?a[0], an) != 0) { ret fail("the package could not be unpacked (is it a .tgz?)\0"); }
+    if (unpack(pkg) == 0) { ret fail("the package could not be unpacked (is it a .tgz?)\0"); }
 
     # what it is
-    val vh: u64 = sys.open("/tmp/update/VERSION\0", 19, abi.O_READ);
+    val vh: u64 = sys.open("/root/.machos-update/VERSION\0", 28, abi.O_READ);
     if (abi.is_err(vh) != 0) { ret fail("this is not a MachOS update package (no VERSION)\0"); }
     var ver: [64]u8;
     var vl: u64 = sys.read(vh, ?ver[0], 63);
@@ -134,7 +195,7 @@ fun main(argc: u64, argv: **u8) u64 {
     if (abi.is_err(vl) != 0) { vl = 0; }
     for (vl > 0 && (ver[vl - 1] == 10 || ver[vl - 1] == 13 || ver[vl - 1] == 32)) { vl = vl - 1; }
     ver[vl] = 0;
-    val kh: u64 = sys.open("/tmp/update/boot/kernel.elf\0", 27, abi.O_READ);
+    val kh: u64 = sys.open("/root/.machos-update/boot/kernel.elf\0", 36, abi.O_READ);
     if (abi.is_err(kh) != 0) { ret fail("the package has no kernel\0"); }
     var magic: [4]u8;
     sys.read(kh, ?magic[0], 4);
@@ -157,36 +218,36 @@ fun main(argc: u64, argv: **u8) u64 {
 
     say("installing the kernel, the initrd and machboot\n\0");
     install("boot/kernel.elf\0", "/boot/kernel.elf\0");
-    if (exists("/tmp/update/boot/initrd.tar\0") != 0) { install("boot/initrd.tar\0", "/boot/initrd.tar\0"); }
-    if (exists("/tmp/update/boot/BOOTX64.EFI\0") != 0) {
+    if (exists("/root/.machos-update/boot/initrd.tar\0") != 0) { install("boot/initrd.tar\0", "/boot/initrd.tar\0"); }
+    if (exists("/root/.machos-update/boot/BOOTX64.EFI\0") != 0) {
         install("boot/BOOTX64.EFI\0", "/boot/BOOTX64.EFI\0");
         if (exists("/boot/efi/EFI/BOOT\0") != 0) { install("boot/BOOTX64.EFI\0", "/boot/efi/EFI/BOOT/BOOTX64.EFI\0"); }
     }
-    if (exists("/tmp/update/etc/motd\0") != 0) { install("etc/motd\0", "/etc/motd\0"); }
-    if (exists("/tmp/update/etc/ssl/certs/ca-certificates.crt\0") != 0) {
+    if (exists("/root/.machos-update/etc/motd\0") != 0) { install("etc/motd\0", "/etc/motd\0"); }
+    if (exists("/root/.machos-update/etc/ssl/certs/ca-certificates.crt\0") != 0) {
         sys.mkdir("/etc/ssl\0", 8);
         sys.mkdir("/etc/ssl/certs\0", 14);
         install("etc/ssl/certs/ca-certificates.crt\0", "/etc/ssl/certs/ca-certificates.crt\0");
         install("etc/ssl/certs/SOURCE\0", "/etc/ssl/certs/SOURCE\0");
         install("etc/ssl/certs/LICENSE.mach-tls\0", "/etc/ssl/certs/LICENSE.mach-tls\0");
     }
-    if (exists("/tmp/update/etc/hosts\0") != 0 && exists("/etc/hosts\0") == 0) {
+    if (exists("/root/.machos-update/etc/hosts\0") != 0 && exists("/etc/hosts\0") == 0) {
         install("etc/hosts\0", "/etc/hosts\0");
     }
-    if (exists("/tmp/update/etc/services\0") != 0 && exists("/etc/services\0") == 0) {
+    if (exists("/root/.machos-update/etc/services\0") != 0 && exists("/etc/services\0") == 0) {
         install("etc/services\0", "/etc/services\0");
     }
     # the settings file only when there is none yet: the one there is yours
-    if (exists("/tmp/update/etc/machos.conf\0") != 0 && exists("/etc/machos.conf\0") == 0) {
+    if (exists("/root/.machos-update/etc/machos.conf\0") != 0 && exists("/etc/machos.conf\0") == 0) {
         install("etc/machos.conf\0", "/etc/machos.conf\0");
     }
 
     # New packages carry notices; older packages without them remain installable.
-    if (exists("/tmp/update/usr/share/licenses") != 0) {
+    if (exists("/root/.machos-update/usr/share/licenses") != 0) {
         sys.mkdir("/usr", 4);
         sys.mkdir("/usr/share", 10);
         an = 0;
-        arg("cp"); arg("-r"); arg("/tmp/update/usr/share/licenses"); arg("/usr/share");
+        arg("cp"); arg("-r"); arg("/root/.machos-update/usr/share/licenses"); arg("/usr/share");
         if (run("/bin/cp", ?a[0], an) != 0) {
             fail("could not install licence files");
             failures = failures + 1;
@@ -195,7 +256,7 @@ fun main(argc: u64, argv: **u8) u64 {
 
     # every program
     say("installing the programs\n\0");
-    val dh: u64 = sys.open("/tmp/update/bin\0", 15, abi.O_READ);
+    val dh: u64 = sys.open("/root/.machos-update/bin\0", 24, abi.O_READ);
     var programs: u64 = 0;
     if (abi.is_err(dh) == 0) {
         var i: u64 = 0;
@@ -227,9 +288,7 @@ fun main(argc: u64, argv: **u8) u64 {
     arg("/boot/kernel.old.elf\0"); arg("/boot/initrd.old.tar\0");
     run("/bin/machboot\0", ?a[0], an);
 
-    an = 0;
-    arg("rm\0"); arg("-r\0"); arg(STAGE);
-    run("/bin/rm\0", ?a[0], an);
+    cleanup();
     sys.sync();
     if (failures > 0) {
         io.dec(failures);

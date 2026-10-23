@@ -54,6 +54,7 @@ pub fun lookup(name: *u8, out: *u8) u64 {
                 out[0] = 46;
                 len = 1;
             } or {
+                if (len + 1 + n >= 256) { s = i + 1; i = i + 1; cnt; }
                 put(out, 0, ?p[s], len);
             }
             if (len + 1 + n < 256) {

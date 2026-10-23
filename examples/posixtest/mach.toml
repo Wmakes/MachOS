@@ -72,3 +72,11 @@ out = "iommtest"
 targets = ["machos"]
 link = []
 need = []
+
+[artifact.securitytest]
+kind = "bin"
+entry = "securitytest.mach"
+out = "securitytest"
+targets = ["machos"]
+link = []
+need = []

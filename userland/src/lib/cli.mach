@@ -139,6 +139,7 @@ pub fun write(h: i64, buf: *u8, n: u64) i64 { ret os.write(h::usize, buf, n::usi
 
 # stat a path (or with h, an open handle)
 pub fun stat(path: *u8, st: *os.stat_t) i64 { ret os.stat_path(os.working_dir(), path, st, 0); }
+pub fun lstat(path: *u8, st: *os.stat_t) i64 { ret os.stat_path(os.working_dir(), path, st, os.AT_SYMLINK_NOFOLLOW); }
 pub fun fstat(h: i64, st: *os.stat_t) i64 { ret os.stat(h::usize, st); }
 
 pub fun is_dir(st: *os.stat_t) bool { ret (st.st_mode & os.S_IFMT) == os.S_IFDIR; }
@@ -178,7 +179,7 @@ pub fun rename(from: *u8, to: *u8) i64 { ret os.rename(os.working_dir(), from, o
 # a file, or an empty directory
 pub fun remove(path: *u8) i64 {
     var st: os.stat_t;
-    val r: i64 = stat(path, ?st);
+    val r: i64 = lstat(path, ?st);
     if (r < 0) { ret r; }
     var flags: i32 = 0;
     if (is_dir(?st)) { flags = os.AT_REMOVEDIR; }

@@ -112,7 +112,7 @@ pub fun release(pa: u64) {
     free(pa);
 }
 
-pub fun init(bi: *info.BootInfo) {
+pub fun init(bi: *info.BootInfo) u8 {
     hhdm = bi.hhdm;
     pending_count = 0;
     deferred = 0;
@@ -120,6 +120,7 @@ pub fun init(bi: *info.BootInfo) {
     free_count = 0;
     total_count = 0;
     range_count = 0;
+    if (bi.mem_len > info.MEM_MAX) { ret 0; }
     # room for the sharing counts: one u16 per page up to the highest one
     var top: u64 = 0;
     var i: u64 = 0;
@@ -139,6 +140,7 @@ pub fun init(bi: *info.BootInfo) {
         if (r.kind == info.MEM_USABLE && end > p && end - p >= ref_pages * PAGE) { ref_at = p; }
         i = i + 1;
     }
+    if (ref_at == 0 || ref_pages == 0) { ret 0; }
     refs = ref_at + hhdm;
     var z: u64 = 0;
     for (z < ref_pages * PAGE / 8) {
@@ -166,4 +168,5 @@ pub fun init(bi: *info.BootInfo) {
         }
         i = i + 1;
     }
+    ret 1;
 }

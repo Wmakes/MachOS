@@ -9,7 +9,6 @@
 use abi:    sdk.abi;
 use sys:    sdk.sys;
 use io:     sdk.io;
-use bd:     sdk.blkdev;
 use sha256: sdk.sha256;
 
 pub val ROUNDS: u64 = 5000;
@@ -33,13 +32,20 @@ fun load(p: *u8) u8 {
     flen = 0;
     val h: u64 = sys.open(p, io.len(p), abi.O_READ);
     if (abi.is_err(h) != 0) { ret 0; }
+    var good: u8 = 1;
     for (flen < CAP) {
         val r: u64 = sys.read(h, ?file[flen], CAP - flen);
-        if (abi.is_err(r) != 0 || r == 0) { brk; }
+        if (abi.is_err(r) != 0) { good = 0; brk; }
+        if (r == 0) { brk; }
         flen = flen + r;
     }
+    if (flen == CAP) {
+        var extra: u8 = 0;
+        if (sys.read(h, ?extra, 1) != 0) { good = 0; }
+    }
     sys.close(h);
-    ret 1;
+    if (good == 0) { flen = 0; }
+    ret good;
 }
 
 # field `k` (0-based, ':'-separated) of the line at file[s..e]
@@ -214,8 +220,7 @@ fun digest(salt: *u8, pw: *u8, pn: u64, rounds: u64, out: *u8) {
 # hash a new password with a fresh salt into out (128 bytes); its length
 pub fun hash(pw: *u8, pn: u64, out: *u8) u64 {
     var salt: [16]u8;
-    bd.put64(?salt[0], 0, bd.random());
-    bd.put64(?salt[0], 8, bd.random());
+    if (sys.raw(abi.GETRANDOM, (?salt[0])::u64, 16, 0, 0, 0) != 16) { ret 0; }
     var d: [32]u8;
     digest(?salt[0], pw, pn, ROUNDS, ?d[0]);
     var n: u64 = 0;
@@ -243,7 +248,7 @@ pub fun stored(name: *u8, n: u64, out: *u8) u64 {
     if (find_line(0, name, n, ?s, ?e) == 0) { ret abi.NO_ID; }
     var fs: u64 = 0;
     var fl: u64 = 0;
-    if (field(s, e, 1, ?fs, ?fl) == 0 || fl > 127) { ret 0; }
+    if (field(s, e, 1, ?fs, ?fl) == 0 || fl > 127) { ret abi.NO_ID; }
     io.copy(out, ?file[fs], fl);
     out[fl] = 0;
     ret fl;
@@ -257,7 +262,7 @@ pub fun matches(h: *u8, hn: u64, pw: *u8, pn: u64) u8 {
     for (i < hn && h[i] != 36) { i = i + 1; }
     var okk: u8 = 0;
     val rounds: u64 = io.parse_dec(?h[8], i - 8, ?okk);
-    if (okk == 0 || i + 1 + 32 + 1 + 64 != hn) { ret 0; }
+    if (okk == 0 || rounds == 0 || rounds > 1000000 || i + 1 + 32 + 1 + 64 != hn) { ret 0; }
     var salt: [16]u8;
     var k: u64 = 0;
     for (k < 16) {
@@ -278,7 +283,21 @@ pub fun locked(h: *u8, hn: u64) u8 {
 
 # replace (or add) the line of `name` in `path` with `line` (no newline)
 fun put_line(path: *u8, key_field: u64, name: *u8, n: u64, line: *u8, ln: u64, mode: u64) u8 {
-    load(path);
+    var lock: [512]u8;
+    val length: u64 = io.len(path);
+    if (length + 6 >= 512) { ret 0; }
+    io.copy(?lock[0], path, length);
+    io.copy(?lock[length], ".lock\0", 6);
+    val held: u64 = sys.open_mode(?lock[0], length + 5, abi.O_WRITE | abi.O_CREATE | abi.O_EXCL, 0x180);
+    if (abi.is_err(held) != 0) { ret 0; }
+    val result: u8 = put_line_locked(path, key_field, name, n, line, ln, mode);
+    sys.close(held);
+    sys.remove(?lock[0], length + 5);
+    ret result;
+}
+
+fun put_line_locked(path: *u8, key_field: u64, name: *u8, n: u64, line: *u8, ln: u64, mode: u64) u8 {
+    if (load(path) == 0) { ret 0; }
     var out: [16384]u8;
     var o: u64 = 0;
     var s: u64 = 0;
@@ -307,11 +326,23 @@ fun put_line(path: *u8, key_field: u64, name: *u8, n: u64, line: *u8, ln: u64, m
         out[o + ln] = 10;
         o = o + ln + 1;
     }
-    val h: u64 = sys.open_mode(path, io.len(path), abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC, mode);
+    # Keep the old database intact until a complete replacement is ready.
+    var temporary: [512]u8;
+    val length: u64 = io.len(path);
+    if (length + 32 >= 512) { ret 0; }
+    io.copy(?temporary[0], path, length);
+    io.copy(?temporary[length], ".tmp.\0", 5);
+    val end: u64 = length + 5 + io.fmt_dec(sys.getpid(), ?temporary[length + 5]);
+    temporary[end] = 0;
+    val h: u64 = sys.open_mode(?temporary[0], end,
+        abi.O_WRITE | abi.O_CREATE | abi.O_EXCL, 0x180);
     if (abi.is_err(h) != 0) { ret 0; }
-    val ok: u8 = io.write_all(h, ?out[0], o);
+    var good: u8 = io.write_all(h, ?out[0], o);
+    if (good != 0 && abi.is_err(sys.raw(abi.FCHMOD, h, mode, 0, 0, 0)) != 0) { good = 0; }
     sys.close(h);
-    ret ok;
+    if (good != 0 && abi.is_err(sys.rename(?temporary[0], end, path, length)) == 0) { ret 1; }
+    sys.remove(?temporary[0], end);
+    ret 0;
 }
 
 # store a new password for `name` (needs root: /etc/shadow is root's)
@@ -324,7 +355,11 @@ pub fun set_password_in(shadow: *u8, name: *u8, n: u64, pw: *u8, pn: u64) u8 {
     io.copy(?line[0], name, n);
     line[n] = 58;
     var l: u64 = n + 1;
-    if (pn > 0) { l = l + hash(pw, pn, ?line[l]); }
+    if (pn > 0) {
+        val hashed: u64 = hash(pw, pn, ?line[l]);
+        if (hashed == 0) { ret 0; }
+        l = l + hashed;
+    }
     line[l] = 58;
     l = l + 1;
     ret put_line(shadow, 0, name, n, ?line[0], l, 0x180);
@@ -365,7 +400,9 @@ pub fun add(name: *u8, n: u64, uid: u64, home: *u8, shell: *u8) u8 {
     line[l] = 58;
     l = l + 1;
     if (put_line("/etc/group\0", 0, name, n, ?line[0], l, 0x1A4) == 0) { ret 0; }
-    ret set_password(name, n, nil, 0);
+    io.copy(?line[0], name, n);
+    line[n] = 58; line[n + 1] = 33; line[n + 2] = 58;
+    ret put_line("/etc/shadow\0", 0, name, n, ?line[0], n + 3, 0x180);
 }
 
 # a free uid from 1000 up

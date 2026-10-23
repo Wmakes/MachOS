@@ -50,7 +50,7 @@ fun release(a: u64) {
 fun grow(need: u64) u8 {
     var pages: u64 = (need + 4095) / 4096;
     if (pages < GROW) { pages = GROW; }
-    if (top + pages * 4096 > LIMIT) { ret 0; }
+    if (pages > (LIMIT - top) / 4096) { ret 0; }
     val start: u64 = top;
     var i: u64 = 0;
     for (i < pages) {
@@ -71,6 +71,7 @@ fun grow(need: u64) u8 {
 
 # `n` bytes, 16-byte aligned, contents undefined; nil when out of memory
 pub fun alloc(n: u64) u64 {
+    if (n > LIMIT - BASE - HDR - 15) { ret 0; }
     var size: u64 = (n + HDR + 15) & ~15::u64;
     if (size < MIN) { size = MIN; }
     for {

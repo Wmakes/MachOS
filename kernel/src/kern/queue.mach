@@ -27,6 +27,7 @@ rec Entry {
     used:    u8;
     armed:   u8;
     fd:      u64;
+    identity: u64;
     h:       u64;   # the handle fd named when it was registered
     context: u64;
     want:    u64;   # EV_READ | EV_WRITE
@@ -83,7 +84,7 @@ fun find(q: *Queue, fd: u64) *Entry {
 # QUEUE_CTL: h is what fd names now
 pub fun control(q: *Queue, op: u64, fd: u64, h: *file.Handle, want: u64, context: u64) u64 {
     var x: *Entry = find(q, fd);
-    if (x != nil && x.h != h::u64) { # a stale registration of an earlier handle
+    if (x != nil && (x.h != h::u64 || (h != nil && x.identity != h.identity))) { # a stale registration of an earlier handle
         x.used = 0;
         x = nil;
     }
@@ -106,6 +107,7 @@ pub fun control(q: *Queue, op: u64, fd: u64, h: *file.Handle, want: u64, context
         x.used = 1;
         x.fd = fd;
         x.h = h::u64;
+        x.identity = h.identity;
     } or (op == abi.QUEUE_MOD) {
         if (x == nil) { ret e(abi.E_NOENT); }
     } or {
@@ -131,7 +133,7 @@ fun collect(q: *Queue, out: *abi.QueueEvent, max: u64, handles: *[256]u64) u64 {
     for (i < ENTRIES && n < max) {
         val x: *Entry = ?q.entries[i];
         if (x.used != 0 && x.armed != 0) {
-            if (x.fd >= abi.MAX_HANDLES || (@handles)[x.fd] != x.h) {
+            if (x.fd >= abi.MAX_HANDLES || (@handles)[x.fd] != x.h || (x.h::*file.Handle).identity != x.identity) {
                 x.used = 0; # its fd was closed or reused
             } or {
                 val ready: u64 = readiness(x.h::*file.Handle);

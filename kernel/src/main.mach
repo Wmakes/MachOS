@@ -109,7 +109,7 @@ fun kmain(handoff: u64) {
     kprint.info("cpu\0");
     kprint.puts("GDT, TSS and IDT loaded (double faults on their own stack)\n\0");
 
-    pmm.init(?boot);
+    if (pmm.init(?boot) == 0) { kprint.panic("no usable memory for allocator metadata\0"); }
     val verr: *u8 = vmm.init(?boot);
     if (verr != nil) { kprint.panic(verr); }
     kprint.info("vmm\0");
@@ -238,6 +238,7 @@ fun kmain(handoff: u64) {
     start_cpus();
     smp.enable_shootdowns();
     work.configure(sys.begin_work, sys.end_work);
+    proc.set_resource_cleanup(sys.cleanup_thread);
     kprint.info("boot\0");
     kprint.puts("kernel ready after \0");
     val us: u64 = cpu.us_since_boot(cpu.rdtsc());

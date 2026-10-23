@@ -82,6 +82,44 @@ pub fun end_work() {
     vfs.restore_credentials(work_credentials[c]);
 }
 
+# Blocking operations own their handle and transfer memory until completion.
+# Exec/exit invoke the same cleanup when discarding a suspended kernel stack.
+pub fun cleanup_thread(t: *proc.Proc) {
+    val buffer: u64 = t.io_buffer;
+    val held: u64 = t.io_handle;
+    t.io_buffer = 0; t.io_handle = 0;
+    heap.free(buffer);
+    if (held != 0) { file.close(held::*file.Handle); }
+}
+
+fun pin_call(n: u64, fd: u64) {
+    if (n != abi.READ && n != abi.WRITE && n != abi.CONNECT && n != abi.SENDTO &&
+        n != abi.RECVFROM && n != abi.RECVMSG && n != abi.ACCEPT && n != abi.QUEUE_WAIT) { ret; }
+    val h: *file.Handle = handle(fd);
+    if (h == nil) { ret; }
+    if (h.kind == file.NODE && (h.node.kind != abi.KIND_DEV || h.node.dev >= vfs.DEV_DISK)) { ret; }
+    proc.current_thread().io_handle = file.dup(h)::u64;
+}
+
+fun transfer_buffer(length: u64) u64 {
+    val storage: u64 = heap.alloc(length);
+    proc.current_thread().io_buffer = storage;
+    ret storage;
+}
+
+fun buffered_io(h: *file.Handle, user: u64, length: u64, writing: u8) u64 {
+    var size: u64 = length;
+    if (size > 65536) { size = 65536; }
+    val buffer: u64 = transfer_buffer(size);
+    if (buffer == 0) { ret e(abi.E_NOMEM); }
+    if (writing != 0) { mem.copy(buffer, user, size); ret file.write(h, buffer, size); }
+    val count: u64 = file.read(h, buffer, size);
+    if (abi.is_err(count) != 0 || count == 0) { ret count; }
+    if (ok(user, count, 1) == 0) { ret e(abi.E_FAULT); }
+    mem.copy(user, buffer, count);
+    ret count;
+}
+
 fun filesystem_call(n: u64, fd: u64, flags: u64) u8 {
     if (n == abi.READ || n == abi.WRITE || n == abi.PREAD || n == abi.PWRITE) {
         val f: *file.Handle = handle(fd);
@@ -300,7 +338,10 @@ fun sys_spawn(pva: u64, plen: u64, ava: u64, alen: u64, sva: u64) u64 {
 
     val p: *proc.Proc = cur();
     if (ok(sva, $size_of(abi.Spawn)::u64, 0) == 0) { ret e(abi.E_FAULT); }
-    val sp: *abi.Spawn = sva::*abi.Spawn;
+    # Snapshot pointer-bearing user metadata before validating its fields.
+    var supplied: abi.Spawn;
+    mem.copy((?supplied)::u64, sva, $size_of(abi.Spawn)::u64);
+    val sp: *abi.Spawn = ?supplied;
     val env_len: u64 = sp.env_len;
     if (env_len > ENV_MAX) { ret e(abi.E_INVAL); }
     if (env_len > 0 && ok(sp.env::u64, env_len, 0) == 0) { ret e(abi.E_FAULT); }
@@ -362,6 +403,7 @@ fun sys_wait(pid: u64, status: u64, flags: u64) u64 {
     if (status != 0 && ok(status, 8, 1) == 0) { ret e(abi.E_FAULT); }
     val p: *proc.Proc = cur();
     for {
+        if (status != 0 && ok(status, 8, 1) == 0) { ret e(abi.E_FAULT); }
         var any: u8 = 0;
         var i: u64 = 0;
         for (i < proc.MAX) {
@@ -618,6 +660,7 @@ fun sys_open(pva: u64, plen: u64, flags: u64, mode: u64) u64 {
     }
     if (nd.kind == abi.KIND_DIR && (f & abi.O_WRITE) != 0) { ret e(abi.E_ISDIR); }
     if (nd.kind == abi.KIND_FILE && (f & abi.O_TRUNC) != 0 && (f & abi.O_WRITE) != 0) {
+        if (is_root() == 0) { vfs.set_attr(nd, nd.mode & ~(abi.S_ISUID | abi.S_ISGID), nd.uid, nd.gid); }
         vfs.truncate(nd);
     }
     val h: *file.Handle = file.open_node(nd, f);
@@ -739,7 +782,9 @@ fun sys_chmod(pva: u64, plen: u64, mode: u64, nofollow: u64) u64 {
     if (nd != nil && nd.kind == abi.KIND_LINK) { ret e(abi.E_NOTSUP); }
     if (abi.is_err(fr) != 0) { ret fr; }
     if (is_root() == 0 && cur().euid != nd.uid) { ret e(abi.E_PERM); }
-    vfs.set_attr(nd, mode & 0xFFF, nd.uid, nd.gid);
+    var permissions: u64 = mode & 0xFFF;
+    if (is_root() == 0 && cur().egid != nd.gid) { permissions = permissions & ~abi.S_ISGID; }
+    vfs.set_attr(nd, permissions, nd.uid, nd.gid);
     ret 0;
 }
 
@@ -1213,6 +1258,7 @@ fun sys_pread(h: u64, buf: u64, n: u64, off: u64, writing: u8) u64 {
     val f: *file.Handle = handle(h);
     if (f == nil) { ret e(abi.E_BADF); }
     if (f.kind != file.NODE) { ret e(abi.E_SPIPE); }
+    if (f.node.kind == abi.KIND_DEV && (vfs.tty_of(f.node.dev) != 0xFF || f.node.dev == vfs.DEV_EVENTS)) { ret e(abi.E_SPIPE); }
     if (off >= abi.ERR_MIN) { ret e(abi.E_INVAL); }
     if (n == 0) { ret 0; }
     if (ok(buf, n, (writing == 0)::u8) == 0) { ret e(abi.E_FAULT); }
@@ -1379,7 +1425,12 @@ fun sys_sendto(h: u64, buf: u64, len: u64, va: u64, alen: u64) u64 {
         val r: u64 = user_addr(va, alen, ?ip, ?port);
         if (abi.is_err(r) != 0) { ret r; }
     }
-    ret netio.send(s, buf::*u8, len, ip, port);
+    var size: u64 = len;
+    if (size > 65536) { if (s.kind != socket.TCP) { ret e(abi.E_2BIG); } size = 65536; }
+    val buffer: u64 = transfer_buffer(size);
+    if (buffer == 0) { ret e(abi.E_NOMEM); }
+    mem.copy(buffer, buf, size);
+    ret netio.send(s, buffer::*u8, size, ip, port);
 }
 
 fun sys_recvfrom(h: u64, buf: u64, len: u64, va: u64, alen: u64) u64 {
@@ -1390,8 +1441,15 @@ fun sys_recvfrom(h: u64, buf: u64, len: u64, va: u64, alen: u64) u64 {
     if (alen != 0 && ok(alen, 4, 1) == 0) { ret e(abi.E_FAULT); }
     var ip: u32 = 0;
     var port: u16 = 0;
-    val n: u64 = netio.recv(s, buf::*u8, len, ?ip, ?port);
+    var size: u64 = len;
+    if (size > 65536) { size = 65536; }
+    val buffer: u64 = transfer_buffer(size);
+    if (buffer == 0) { ret e(abi.E_NOMEM); }
+    val n: u64 = netio.recv(s, buffer::*u8, size, ?ip, ?port);
     if (abi.is_err(n) != 0) { ret n; }
+    if (ok(buf, n, 1) == 0 || (va != 0 && ok(va, 16, 1) == 0) ||
+        (alen != 0 && ok(alen, 4, 1) == 0)) { ret e(abi.E_FAULT); }
+    mem.copy(buf, buffer, n);
     if (va != 0) { socket.put_addr(va::*u8, ip, port); }
     if (alen != 0) { @(alen::*u32) = 16; }
     ret n;
@@ -1405,7 +1463,17 @@ fun sys_recvmsg(h: u64, buf: u64, len: u64, metadata: u64) u64 {
     if (ok(buf, len, 1) == 0 || ok(metadata, $size_of(abi.RecvMeta)::u64, 1) == 0) { ret e(abi.E_FAULT); }
     var ip: u32;
     var port: u16;
-    ret netio.recv_message(s, buf::*u8, len, ?ip, ?port, metadata::*abi.RecvMeta);
+    var size: u64 = len;
+    if (size > 65536) { size = 65536; }
+    val buffer: u64 = transfer_buffer(size);
+    if (buffer == 0) { ret e(abi.E_NOMEM); }
+    var info: abi.RecvMeta;
+    val count: u64 = netio.recv_message(s, buffer::*u8, size, ?ip, ?port, ?info);
+    if (abi.is_err(count) != 0) { ret count; }
+    if (ok(buf, count, 1) == 0 || ok(metadata, $size_of(abi.RecvMeta)::u64, 1) == 0) { ret e(abi.E_FAULT); }
+    mem.copy(buf, buffer, count);
+    mem.copy(metadata, (?info)::u64, $size_of(abi.RecvMeta)::u64);
+    ret count;
 }
 
 fun sys_setsockopt(h: u64, opt: u64, v: u64) u64 {
@@ -1461,6 +1529,7 @@ fun sys_accept(h: u64, va: u64, flags: u64) u64 {
     var err: u64 = 0;
     val ns: *socket.Sock = netio.tcp_accept(s, ?err);
     if (ns == nil) { ret err; }
+    if (va != 0 && ok(va, 16, 1) == 0) { netio.close(ns); socket.release(ns); ret e(abi.E_FAULT); }
     ns.nonblock = ((flags & abi.SOCK_NONBLOCK) != 0)::u8;
     val nh: *file.Handle = file.open_socket(ns);
     if (nh == nil) {
@@ -1542,7 +1611,15 @@ fun sys_queue_wait(qh: u64, out: u64, max: u64, ms: u64) u64 {
     if (q == nil) { ret e(abi.E_BADF); }
     if (max == 0 || max > 1024) { ret e(abi.E_INVAL); }
     if (ok(out, max * $size_of(abi.QueueEvent)::u64, 1) == 0) { ret e(abi.E_FAULT); }
-    ret queue.wait(q, out::*abi.QueueEvent, max, ms, ?cur().handles);
+    val bytes: u64 = max * $size_of(abi.QueueEvent)::u64;
+    val buffer: u64 = transfer_buffer(bytes);
+    if (buffer == 0) { ret e(abi.E_NOMEM); }
+    val count: u64 = queue.wait(q, buffer::*abi.QueueEvent, max, ms, ?cur().handles);
+    if (abi.is_err(count) != 0 || count == 0) { ret count; }
+    val used: u64 = count * $size_of(abi.QueueEvent)::u64;
+    if (ok(out, used, 1) == 0) { ret e(abi.E_FAULT); }
+    mem.copy(out, buffer, used);
+    ret count;
 }
 
 # --- threads ------------------------------------------------------------------
@@ -1684,7 +1761,9 @@ fun sys_fchmod(fd: u64, mode: u64) u64 {
     val nd: *vfs.Node = f.node;
     if (nd.kind == abi.KIND_LINK) { ret e(abi.E_NOTSUP); }
     if (is_root() == 0 && cur().euid != nd.uid) { ret e(abi.E_PERM); }
-    vfs.set_attr(nd, mode & 0xFFF, nd.uid, nd.gid);
+    var permissions: u64 = mode & 0xFFF;
+    if (is_root() == 0 && cur().egid != nd.gid) { permissions = permissions & ~abi.S_ISGID; }
+    vfs.set_attr(nd, permissions, nd.uid, nd.gid);
     ret 0;
 }
 
@@ -1782,6 +1861,7 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
         if (h == nil) { ret e(abi.E_BADF); }
         if (c == 0) { ret 0; }
         if (ok(b, c, 1) == 0) { ret e(abi.E_FAULT); }
+        if (proc.current_thread().io_handle != 0) { ret buffered_io(h, b, c, 0); }
         ret file.read(h, b, c);
     }
     if (n == abi.WRITE) {
@@ -1789,6 +1869,7 @@ fun call(n: u64, a: u64, b: u64, c: u64, d: u64, f5: u64) u64 {
         if (h == nil) { ret e(abi.E_BADF); }
         if (c == 0) { ret 0; }
         if (ok(b, c, 0) == 0) { ret e(abi.E_FAULT); }
+        if (proc.current_thread().io_handle != 0) { ret buffered_io(h, b, c, 1); }
         ret file.write(h, b, c);
     }
     if (n == abi.PUBLICATION_CAPABILITIES) {
@@ -1992,6 +2073,7 @@ fun syscall_body(f: *idt.Frame) {
         # socket whose read/write may block waiting for another process.
         if (filesystem_call(f.rax, f.rdi, f.rdx) == 0) { fs_lock.release(); filesystem = 0; }
     }
+    pin_call(f.rax, f.rdi);
     frame = f;
     vfs.set_cred(cur().euid, cur().egid);
     # user memory is reachable (SMAP) only while the call runs; every user
@@ -1999,6 +2081,7 @@ fun syscall_body(f: *idt.Frame) {
     val smap: u8 = cpu.has_smap();
     if (smap != 0) { cpu.stac(); }
     f.rax = call(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8);
+    cleanup_thread(proc.current_thread());
     if (filesystem != 0) { fs_lock.release(); }
     if (smap != 0) { cpu.clac(); }
     vfs.set_cred(0, 0); # the kernel itself looks things up as root

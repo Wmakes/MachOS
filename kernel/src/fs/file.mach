@@ -32,13 +32,18 @@ pub rec Handle {
     queue:  u64;
     offset: u64;
     flags:  u64; # abi.O_*
+    identity: u64; # distinguishes a reused heap address from an old handle
     refs:   u64;
     wrote:  u8;  # a block device was written through it
 }
 
+var next_identity: u64 = 0;
+
 fun new(kind: u64) *Handle {
     val h: *Handle = heap.zalloc($size_of(Handle)::u64)::*Handle;
     if (h == nil) { ret nil; }
+    next_identity = next_identity + 1;
+    h.identity = next_identity;
     h.kind = kind;
     h.refs = 1;
     ret h;
@@ -208,7 +213,7 @@ pub fun read(h: *Handle, buf: u64, n: u64) u64 {
         ret 0;
     }
     val k: u64 = vfs.read(nd, h.offset, buf, n);
-    h.offset = h.offset + k;
+    if (abi.is_err(k) == 0) { h.offset = h.offset + k; }
     ret k;
 }
 
@@ -231,6 +236,9 @@ pub fun write(h: *Handle, buf: u64, n: u64) u64 {
             }
         }
         ret n;
+    }
+    if (n != 0 && proc.current().euid != 0 && (nd.mode & (abi.S_ISUID | abi.S_ISGID)) != 0) {
+        vfs.set_attr(nd, nd.mode & ~(abi.S_ISUID | abi.S_ISGID), nd.uid, nd.gid);
     }
     if ((h.flags & abi.O_APPEND) != 0) { h.offset = nd.size; }
     val k: u64 = vfs.write(nd, h.offset, buf, n);
