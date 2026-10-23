@@ -12,6 +12,7 @@ QEMU stops and fails if it finds problems.
 
 steps run in order:
   wait:REGEX     wait until the serial output (since the last wait) matches
+  login:USER:PW  log in, setting the required password on a fresh image
   send:TEXT      type TEXT on the serial port (\\n is Enter, \\x03 is ^C)
   keys:TEXT      type TEXT on the PS/2 keyboard (via the QEMU monitor);
                  <up>, <left>, <tab>, ... press named keys,
@@ -145,15 +146,18 @@ def main():
         m.settimeout(0.2)
 
         def reader():
-            while True:
-                try:
-                    d = s.recv(4096)
-                except OSError:
-                    return
-                if not d:
-                    return
-                with lock:
-                    log.extend(d)
+            # Retain guest diagnostics even when a login step raises or is interrupted.
+            with open(os.path.join(out, "serial-live.log"), "wb", buffering=0) as live:
+                while True:
+                    try:
+                        d = s.recv(4096)
+                    except OSError:
+                        return
+                    if not d:
+                        return
+                    live.write(d)
+                    with lock:
+                        log.extend(d)
         threading.Thread(target=reader, daemon=True).start()
 
         def monitor(cmd):
@@ -166,6 +170,28 @@ def main():
                 pass
 
         mark = 0
+
+        def wait_for(pattern):
+            nonlocal mark
+            rx = re.compile(pattern.encode())
+            end = time.time() + a.timeout
+            while time.time() <= end:
+                with lock:
+                    hit = rx.search(log, mark)
+                    bad = re.search(rb"panic:|\*\*\* exception", log)
+                if hit:
+                    mark = hit.end()
+                    return hit
+                if bad:
+                    raise RuntimeError("kernel failure during login")
+                time.sleep(0.05)
+            raise RuntimeError("timed out waiting for " + pattern)
+
+        def type_line(value):
+            for ch in value + "\n":
+                s.sendall(b"\r" if ch == "\n" else ch.encode())
+                time.sleep(0.01)
+
         for step in a.steps:
             kind, _, arg = step.partition(":")
             progress(step if len(step) < 100 else step[:97] + "...")
@@ -189,6 +215,19 @@ def main():
                     time.sleep(0.05)
                 if status:
                     break
+            elif kind == "login":
+                user, password = arg.split(":", 1)
+                wait_for("login: ")
+                type_line(user)
+                prompt = wait_for("New password: |Password: ")
+                type_line(password)
+                if prompt.group() == b"New password: ":
+                    wait_for("Again: ")
+                    type_line(password)
+                result = wait_for(r"Login incorrect|[^\r\n ]+@[^\r\n :]+:[^\r\n]*[$#] ")
+                if result.group() == b"Login incorrect":
+                    raise RuntimeError("login failed for " + user)
+                mark = result.start()  # leave the shell prompt for the next wait step
             elif kind == "send":
                 for ch in arg.encode().decode("unicode_escape"):
                     s.sendall(b"\r" if ch == "\n" else ch.encode())

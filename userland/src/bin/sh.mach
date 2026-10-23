@@ -1,3 +1,4 @@
+use settings: sdk.settings;
 # sh: the MachOS shell.
 #   words, 'single' and "double" quotes, \escapes, # comments,
 #   $? (last status), $0-$9 and $# (script arguments), $$ (the shell's pid),
@@ -1346,7 +1347,7 @@ fun main(argc: u64, argv: **u8) u64 {
     } or {
         interactive = 1;
         # a login shell ("-sh", from login or init) greets with /etc/motd
-        if (argc > 0 && argv[0][0] == 45) { motd(); }
+        if (argc > 0 && argv[0][0] == 45 && settings.yes("sh.motd\0", 1) != 0) { motd(); }
     }
 
     var line: [1024]u8;

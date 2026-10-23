@@ -1,0 +1,375 @@
+# bounded package manifests and strict ustar inventories over immutable input
+
+use sha: crypto.hash.sha256;
+use A:   std.allocator;
+use std.allocator.arena;
+use std.allocator.page;
+use std.data.toml;
+use std.system.os;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use sem: std.types.semver;
+use std.types.size.usize;
+use std.types.string.str;
+use io: userland.lib.cli;
+
+pub val MAX_FILES: u64 = 512;
+pub val MAX_DEPS:  u64 = 32;
+
+pub rec File {
+    path:   [256]u8;
+    digest: [65]u8;
+    size:   u64;
+    mode:   u64;
+    config: u8;
+    data:   *u8;
+}
+
+pub rec Dependency { name: [64]u8; version: [128]u8; }
+
+pub rec Package {
+    name:         [64]u8;
+    version:      [128]u8;
+    archive:      [512]u8;
+    files:        *File;
+    count:        u64;
+    deps:         *Dependency;
+    dep_count:    u64;
+    manifest:     *u8;
+    manifest_len: u64;
+    protected:    u8;
+    state:        u8;
+    active:       u8;
+    payload:      ptr;
+    capacity:     u64;
+}
+
+var pages: A.Allocator;
+var ready: u8;
+
+pub fun allocator() *A.Allocator {
+    if (ready == 0) {
+        val result: err[A.Error] = page.make(?pages);
+        if (sel result.err) { ret nil; }
+        ready = 1;
+    }
+    ret ?pages;
+}
+
+pub fun name_ok(name: *u8) u8 {
+    val n: u64 = io.len(name);
+    if (n == 0 || n > 63 || name[0] < 97 || name[0] > 122) { ret 0; }
+    var i: u64 = 0;
+    for (i < n) {
+        val c: u8 = name[i];
+        if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95)) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+pub fun path_ok(path: *u8) u8 {
+    val n: u64 = io.len(path);
+    if (n < 2 || n > 240 || path[0] != 47 || path[n - 1] == 47) { ret 0; }
+    if (n >= 8 && io.eq(?path[n - 8], 8, ".mpm-new", 8) != 0)   { ret 0; }
+    var allowed: u8     = 0;
+    val roots:   [5]*u8 = [5]*u8{"/bin/", "/etc/", "/usr/", "/opt/", "/lib/"};
+    var r:       u64    = 0;
+    for (r < 5) {
+        val k: u64 = io.len(roots[r]);
+        if (n > k && io.eq(path, k, roots[r], k) != 0) { allowed = 1; }
+        r = r + 1;
+    }
+    if (allowed == 0)                                                                                                                                             { ret 0; }
+    if (io.streq(path, "/etc/passwd") != 0 || io.streq(path, "/etc/shadow") != 0 || io.streq(path, "/etc/group") != 0 || io.streq(path, "/etc/machos.conf") != 0) { ret 0; }
+    if (n >= 9 && io.eq(path, 9, "/etc/mpm/", 9) != 0)                                                                                                            { ret 0; }
+    var start: u64 = 1;
+    var i:     u64 = 1;
+    for (i <= n) {
+        if (i == n || path[i] == 47) {
+            val length: u64 = i - start;
+            if (length == 0 || (length == 1 && path[start] == 46) || (length == 2 && path[start] == 46 && path[start + 1] == 46)) { ret 0; }
+            start = i + 1;
+        }
+        or (path[i] < 32 || path[i] > 126 || path[i] == 92 || path[i] == 34) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+fun text(table: *toml.Table, key: str, out: *u8, cap: u64) u8 {
+    val value: opt[str] = toml.get_str(table, key);
+    if (sel value.none) { ret 0; }
+    val n: u64 = io.len(value.some::*u8);
+    if (n >= cap) { ret 0; }
+    io.copy(out, value.some::*u8, n + 1);
+    ret 1;
+}
+
+fun integer(table: *toml.Table, key: str, out: *u64) u8 {
+    val value: opt[i64] = toml.get_int(table, key);
+    if (sel value.none) { ret 0; }
+    if (value.some < 0) { ret 0; }
+    @out = value.some::u64;
+    ret 1;
+}
+
+pub fun compare(left: *u8, right: *u8) i64 {
+    val a: *A.Allocator = allocator();
+    if (a == nil) { ret -2; }
+    var storage:     arena.Arena;
+    val initialized: err[A.Error] = arena.init(?storage, a, 4096);
+    if (sel initialized.err) { ret -2; }
+    fin { arena.dnit(?storage); }
+    var scratch: A.Allocator;
+    val made:    err[A.Error] = arena.make(?scratch, ?storage);
+    if (sel made.err) { ret -2; }
+    val x: res[sem.Semver, sem.SemverError] = sem.semver_parse(left::str, ?scratch);
+    val y: res[sem.Semver, sem.SemverError] = sem.semver_parse(right::str, ?scratch);
+    if (sel x.err) { ret -2; }
+    if (sel y.err) { ret -2; }
+    var one: sem.Semver = x.ok;
+    var two: sem.Semver = y.ok;
+    ret sem.semver_compare(?one, ?two);
+}
+
+pub fun satisfies(version: *u8, constraint: *u8) u8 {
+    if (constraint[0] == 62 && constraint[1] == 61) { ret (compare(version, ?constraint[2]) >= 0)::u8; }
+    ret (compare(version, constraint) == 0)::u8;
+}
+
+pub fun parse(p: *Package, data: *u8, len: u64) u8 {
+    if (len == 0 || len > 65536 || allocator() == nil) { ret 0; }
+    var source: [65537]u8;
+    var i:      u64 = 0;
+    for (i < len) {
+        # a small ASCII schema needs no escaped strings or embedded NULs
+        if (data[i] == 0 || data[i] == 92 || data[i] > 126 || (data[i] < 32 && data[i] != 9 && data[i] != 10 && data[i] != 13)) { ret 0; }
+        source[i] = data[i];
+        i         = i + 1;
+    }
+    source[len] = 0;
+    # release temporary parse trees after copying the bounded package inventory
+    var storage:     arena.Arena;
+    val initialized: err[A.Error] = arena.init(?storage, allocator(), 65536);
+    if (sel initialized.err) { ret 0; }
+    fin { arena.dnit(?storage); }
+    var scratch: A.Allocator;
+    val made:    err[A.Error] = arena.make(?scratch, ?storage);
+    if (sel made.err) { ret 0; }
+    val parsed: res[toml.Table, toml.TomlError] = toml.parse(?scratch, (?source[0])::str);
+    if (sel parsed.err) { ret 0; }
+    var table: toml.Table = parsed.ok;
+    val keys:  *str       = table.keys::*str;
+    i = 0;
+    for (i < table.len::u64) {
+        if (io.streq(keys[i]::*u8, "format") == 0 && io.streq(keys[i]::*u8, "name") == 0 && io.streq(keys[i]::*u8, "version") == 0 && io.streq(keys[i]::*u8, "arch") == 0 && io.streq(keys[i]::*u8, "protected") == 0 && io.streq(keys[i]::*u8, "files") == 0 && io.streq(keys[i]::*u8, "dependencies") == 0) { ret 0; }
+        i = i + 1;
+    }
+    var format: u64 = 0;
+    var arch:   [32]u8;
+    if (integer(?table, "format", ?format) == 0 || format != 1 || text(?table, "name", ?p.name[0], 64) == 0 || name_ok(?p.name[0]) == 0 || text(?table, "version", ?p.version[0], 128) == 0 || compare(?p.version[0], ?p.version[0]) != 0 || text(?table, "arch", ?arch[0], 32) == 0 || io.streq(?arch[0], "x86_64") == 0) { ret 0; }
+    val protection:       opt[u8]          = toml.get_bool(?table, "protected");
+    val protection_value: opt[*toml.Value] = toml.get(?table, "protected");
+    if (sel protection_value.some) {
+        if (protection_value.some.tag != toml.TYPE_BOOL) { ret 0; }
+    }
+    p.protected = 0;
+    if (sel protection.some) { p.protected = protection.some; }
+    val files: opt[*toml.Array] = toml.get_array(?table, "files");
+    if (sel files.none)                                           { ret 0; }
+    if (files.some.len == 0 || files.some.len > MAX_FILES::usize) { ret 0; }
+    p.files = os.allocate((MAX_FILES * $size_of(File)::u64)::usize)::*File;
+    if (p.files == nil) { ret 0; }
+    p.count = files.some.len::u64;
+    i       = 0;
+    for (i < p.count) {
+        val value: opt[*toml.Value] = toml.array_get(files.some, i::usize);
+        if (sel value.none)                    { ret 0; }
+        if (value.some.tag != toml.TYPE_TABLE) { ret 0; }
+        val f: *File       = ?p.files[i];
+        val t: *toml.Table = ?value.some.data.table;
+        if (t.len < 4 || t.len > 5 || text(t, "path", ?f.path[0], 256) == 0 || path_ok(?f.path[0]) == 0 || text(t, "sha256", ?f.digest[0], 65) == 0 || io.len(?f.digest[0]) != 64 || integer(t, "size", ?f.size) == 0 || integer(t, "mode", ?f.mode) == 0 || f.mode > 0o7777) { ret 0; }
+        var j: u64 = 0;
+        for (j < 64) {
+            if (!((f.digest[j] >= 48 && f.digest[j] <= 57) || (f.digest[j] >= 97 && f.digest[j] <= 102))) { ret 0; }
+            j = j + 1;
+        }
+        val file_keys:   *str  = t.keys::*str;
+        var field_index: usize = 0;
+        for (field_index < t.len) {
+            val key: *u8 = file_keys[field_index]::*u8;
+            if (io.streq(key, "path") == 0 && io.streq(key, "sha256") == 0 && io.streq(key, "size") == 0 && io.streq(key, "mode") == 0 && io.streq(key, "config") == 0) { ret 0; }
+            field_index = field_index + 1;
+        }
+        val cfg_value: opt[*toml.Value] = toml.get(t, "config");
+        if (sel cfg_value.some) {
+            if (cfg_value.some.tag != toml.TYPE_BOOL) { ret 0; }
+        }
+        val cfg: opt[u8] = toml.get_bool(t, "config");
+        if (sel cfg.some)                                                                       { f.config = cfg.some; }
+        if (f.config != 0 && (io.len(?f.path[0]) < 6 || io.eq(?f.path[0], 5, "/etc/", 5) == 0)) { ret 0; }
+        j = 0;
+        for (j < i) {
+            if (io.streq(?f.path[0], ?p.files[j].path[0]) != 0) { ret 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    p.dep_count = 0;
+    val deps_value: opt[*toml.Value] = toml.get(?table, "dependencies");
+    if (sel deps_value.some) {
+        if (deps_value.some.tag != toml.TYPE_ARRAY) { ret 0; }
+    }
+    val deps: opt[*toml.Array] = toml.get_array(?table, "dependencies");
+    if (sel deps.some) {
+        if (deps.some.len > MAX_DEPS::usize) { ret 0; }
+        p.deps = os.allocate((MAX_DEPS * $size_of(Dependency)::u64)::usize)::*Dependency;
+        if (p.deps == nil) { ret 0; }
+        p.dep_count = deps.some.len::u64;
+        i           = 0;
+        for (i < p.dep_count) {
+            val value: opt[*toml.Value] = toml.array_get(deps.some, i::usize);
+            if (sel value.none)                                                      { ret 0; }
+            if (value.some.tag != toml.TYPE_TABLE || value.some.data.table.len != 2) { ret 0; }
+            val t: *toml.Table = ?value.some.data.table;
+            val d: *Dependency = ?p.deps[i];
+            if (text(t, "name", ?d.name[0], 64) == 0 || name_ok(?d.name[0]) == 0 || text(t, "version", ?d.version[0], 128) == 0) { ret 0; }
+            var version: *u8 = ?d.version[0];
+            if (version[0] == 62 && version[1] == 61) { version = ?version[2]; }
+            if (compare(version, version) != 0)       { ret 0; }
+            i = i + 1;
+        }
+    }
+    p.manifest = os.allocate((len + 1)::usize)::*u8;
+    if (p.manifest == nil) { ret 0; }
+    io.copy(p.manifest, data, len);
+    p.manifest[len] = 0;
+    p.manifest_len  = len;
+    ret 1;
+}
+
+pub fun digest(data: *u8, len: u64, out: *u8) {
+    var c: sha.State = sha.init();
+    sha.update(?c, data, len::usize);
+    var bytes: [32]u8;
+    sha.final(?c, ?bytes[0]);
+    val hex: *u8 = "0123456789abcdef";
+    var i:   u64 = 0;
+    for (i < 32) {
+        out[i * 2]     = hex[bytes[i] >> 4];
+        out[i * 2 + 1] = hex[bytes[i] & 15];
+        i              = i + 1;
+    }
+    out[64] = 0;
+}
+
+fun octal(data: *u8, len: u64, out: *u64) u8 {
+    var i: u64 = 0;
+    var x: u64 = 0;
+    for (i < len && data[i] == 32) { i = i + 1; }
+    var digits: u8 = 0;
+    for (i < len && data[i] >= 48 && data[i] <= 55) {
+        digits = 1;
+        if (x > 0x1fffffffffffffffu64) { ret 0; }
+        x = x * 8 + (data[i] - 48)::u64;
+        i = i + 1;
+    }
+    for (i < len) {
+        if (data[i] != 0 && data[i] != 32) { ret 0; }
+        i = i + 1;
+    }
+    @out = x;
+    ret digits;
+}
+
+# no links, directories, extensions or undeclared payload entries are accepted
+pub fun inventory(p: *Package, data: *u8, len: u64) u8 {
+    if (len < 1024 || len % 512 != 0) { ret 0; }
+    var at:       u64 = 0;
+    var manifest: u8  = 0;
+    var seen:     u64 = 0;
+    for (at + 512 <= len) {
+        val h:       *u8 = ?data[at];
+        var sum:     u64 = 0;
+        var nonzero: u8  = 0;
+        var i:       u64 = 0;
+        for (i < 512) {
+            if (h[i] != 0)           { nonzero = 1; }
+            if (i >= 148 && i < 156) { sum = sum + 32; }
+            or                       { sum = sum + h[i]::u64; }
+            i = i + 1;
+        }
+        if (nonzero == 0) {
+            if (len - at < 1024 || seen != p.count || manifest == 0) { ret 0; }
+            i = at;
+            for (i < len) {
+                if (data[i] != 0) { ret 0; }
+                i = i + 1;
+            }
+            ret 1;
+        }
+        var expected: u64 = 0;
+        var size:     u64 = 0;
+        if (octal(?h[148], 8, ?expected) == 0 || expected != sum || octal(?h[124], 12, ?size) == 0 || (h[156] != 0 && h[156] != 48) || io.eq(?h[257], 6, "ustar", 6) == 0 || h[345] != 0 || h[157] != 0) { ret 0; }
+        if (size > len - at - 512 || size > 0x7ffffffffffffe00u64)                                                                                                                                       { ret 0; }
+        var name: [101]u8;
+        i = 0;
+        for (i < 100 && h[i] != 0) {
+            name[i] = h[i];
+            i       = i + 1;
+        }
+        name[i] = 0;
+        if (i == 100) { ret 0; }
+        val payload: *u8 = ?data[at + 512];
+        if (io.streq(?name[0], "manifest.toml") != 0) {
+            if (manifest != 0 || at != 0 || parse(p, payload, size) == 0) { ret 0; }
+            manifest = 1;
+        }
+        or {
+            if (manifest == 0 || i < 7 || io.eq(?name[0], 6, "files/", 6) == 0) { ret 0; }
+            var target: [256]u8;
+            target[0] = 47;
+            io.copy(?target[1], ?name[6], i - 6 + 1);
+            var found: u8  = 0;
+            var f:     u64 = 0;
+            for (f < p.count) {
+                if (io.streq(?target[0], ?p.files[f].path[0]) != 0) {
+                    if (p.files[f].data != nil || p.files[f].size != size) { ret 0; }
+                    var hex: [65]u8;
+                    digest(payload, size, ?hex[0]);
+                    if (io.streq(?hex[0], ?p.files[f].digest[0]) == 0) { ret 0; }
+                    var mode: u64 = 0;
+                    if (octal(?h[100], 8, ?mode) == 0 || mode != p.files[f].mode) { ret 0; }
+                    p.files[f].data = payload;
+                    seen            = seen + 1;
+                    found           = 1;
+                }
+                f = f + 1;
+            }
+            if (found == 0) { ret 0; }
+        }
+        at = at + 512 + ((size + 511) / 512) * 512;
+    }
+    ret 0;
+}
+
+pub fun release(p: *Package) {
+    if (p.files != nil) {
+        os.deallocate(p.files::ptr, (MAX_FILES * $size_of(File)::u64)::usize);
+        p.files = nil;
+    }
+    if (p.deps != nil) {
+        os.deallocate(p.deps::ptr, (MAX_DEPS * $size_of(Dependency)::u64)::usize);
+        p.deps = nil;
+    }
+    if (p.manifest != nil) {
+        os.deallocate(p.manifest::ptr, (p.manifest_len + 1)::usize);
+        p.manifest = nil;
+    }
+    if (p.payload != nil) {
+        os.deallocate(p.payload, p.capacity::usize);
+        p.payload = nil;
+    }
+}

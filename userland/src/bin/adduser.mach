@@ -1,5 +1,5 @@
 # adduser NAME: add a user with a group of the same name, a home in
-# /home/NAME and /bin/sh; then set a password with `passwd NAME`. root only
+# /home/NAME and /bin/sh, with a required password. root only
 
 use abi:   sdk.abi;
 use sys:   sdk.sys;
@@ -9,16 +9,47 @@ use rt:    sdk.rt;
 
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
-    if (argc != 2) {
-        io.err("usage: adduser NAME\n\0");
-        ret 2;
+    if (argc == 2 && io.streq(argv[1], "--help\0") != 0) { io.out("usage: adduser [--admin|--optional-admin] [-R DIR] [NAME]\n  A nonempty password is required. Root only.\n\0"); ret 0; }
+    if (sys.getuid() != 0 || sys.geteuid() != 0) {
+        io.err("adduser: only root may add users\n\0"); ret 1;
     }
-    if (sys.geteuid() != 0) {
-        io.err("adduser: only root may add users\n\0");
-        ret 1;
+    var prefix: *u8 = "\0";
+    var admin: u8 = 0;
+    var optional: u8 = 0;
+    var name: *u8 = nil;
+    var arg: u64 = 1;
+    for (arg < argc) {
+        if (io.streq(argv[arg], "--optional-admin\0") != 0) { admin = 1; optional = 1; }
+        or (io.streq(argv[arg], "--admin\0") != 0) { admin = 1; }
+        or (io.streq(argv[arg], "-R\0") != 0 && arg + 1 < argc) { arg = arg + 1; prefix = argv[arg]; }
+        or (name == nil) { name = argv[arg]; }
+        or { io.err("usage: adduser [--admin|--optional-admin] [-R DIR] [NAME]\n\0"); ret 2; }
+        arg = arg + 1;
     }
-    val name: *u8 = argv[1];
+    if (optional != 0) {
+        for {
+            io.out("Create an administrator account? Type yes or no: \0");
+            var reply: [16]u8;
+            val n: u64 = users.read_line(?reply[0], 15);
+            if (n == abi.NO_ID) { ret 1; }
+            if (io.eq(?reply[0], n, "no\0", 2) != 0) { ret 0; }
+            if (io.eq(?reply[0], n, "yes\0", 3) != 0) { brk; }
+        }
+    }
+    var entered: [32]u8;
+    if (name == nil) {
+        io.out("User name: \0");
+        val count: u64 = users.read_line(?entered[0], 31);
+        if (count == abi.NO_ID) { ret 1; }
+        entered[count] = 0; name = ?entered[0];
+    }
     val n: u64 = io.len(name);
+    val pl: u64 = io.len(prefix);
+    if (pl > 180) { ret 2; }
+    var passwd: [256]u8; var group: [256]u8; var shadow: [256]u8;
+    io.copy(?passwd[0], prefix, pl); io.copy(?passwd[pl], "/etc/passwd\0", 12);
+    io.copy(?group[0], prefix, pl); io.copy(?group[pl], "/etc/group\0", 11);
+    io.copy(?shadow[0], prefix, pl); io.copy(?shadow[pl], "/etc/shadow\0", 12);
     var i: u64 = 0;
     for (i < n) {
         val c: u8 = name[i];
@@ -33,34 +64,39 @@ fun main(argc: u64, argv: **u8) u64 {
         ret 1;
     }
     var u: users.User;
-    if (users.by_name(name, n, ?u) != 0) {
+    if (users.by_name_in(?passwd[0], name, n, ?u) != 0) {
         io.err("adduser: that user exists\n\0");
         ret 1;
     }
-    val uid: u64 = users.next_uid();
+    val uid: u64 = users.next_uid_in(?passwd[0]);
+    if (uid == abi.NO_ID) { io.err("adduser: cannot allocate a user ID\n\0"); ret 1; }
+    var password: [128]u8;
+    val password_len: u64 = users.new_password(?password[0]);
+    if (password_len == abi.NO_ID) { ret 1; }
     var home: [64]u8;
     io.copy(?home[0], "/home/\0", 6);
     io.copy(?home[6], name, n);
     home[6 + n] = 0;
-    sys.mkdir_mode("/home\0", 5, 0x1ED);
-    val m: u64 = sys.mkdir_mode(?home[0], 6 + n, 0x1ED);
-    if (abi.is_err(m) != 0 && abi.err_code(m) != abi.E_EXIST) {
+    var target: [256]u8;
+    io.copy(?target[0], prefix, pl); io.copy(?target[pl], "/home\0", 6);
+    sys.mkdir_mode(?target[0], pl + 5, 0x1ED);
+    io.copy(?target[pl], ?home[0], 7 + n);
+    val m: u64 = sys.mkdir_mode(?target[0], pl + 6 + n, 0x1C0);
+    if (abi.is_err(m) != 0) {
         io.fail("adduser\0", ?home[0], m);
         ret 1;
     }
-    sys.chown(?home[0], 6 + n, uid, uid);
-    if (users.add(name, n, uid, ?home[0], "/bin/sh\0") == 0) {
+    sys.chown(?target[0], pl + 6 + n, uid, uid);
+    if (users.add_in(?passwd[0], ?group[0], ?shadow[0], name, n, uid, ?home[0], "/bin/sh\0") == 0) {
         io.err("adduser: cannot write the account files\n\0");
         ret 1;
     }
-    io.out("adduser: added \0");
-    io.out(name);
-    io.out(" (uid \0");
-    io.dec(uid);
-    io.out(", home \0");
-    io.out(?home[0]);
-    io.out("); set a password with `passwd \0");
-    io.out(name);
-    io.out("`\n\0");
+    if (users.set_password_in(?shadow[0], name, n, ?password[0], password_len) == 0) {
+        io.err("adduser: password setup failed; account remains locked\n\0"); ret 1;
+    }
+    if (admin != 0 && users.add_admin(?group[0], name, n) == 0) {
+        io.err("adduser: cannot grant administrator membership\n\0"); ret 1;
+    }
+    io.out("adduser: added \0"); io.out(name); io.putc(10);
     ret 0;
 }

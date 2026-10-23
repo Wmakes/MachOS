@@ -1,71 +1,19 @@
-# /etc/machos.conf: the system's settings, one "key value" per line ('#'
-# starts a comment). what each key does is described in the file itself
+# runtime settings shared by standard-library programs and SDK utilities
 
-use io:     userland.lib.cli;
-use system: userland.lib.system;
+use sdk.settings;
 
-pub val PATH: *u8 = "/etc/machos.conf";
-
-var text: [8192]u8;
-var text_len: u64 = 0;
-var loaded: u8 = 0;
-
-fun load() {
-    if (loaded != 0) { ret; }
-    loaded = 1;
-    text_len = system.read_file(PATH, ?text[0], 8192);
-}
-
-fun blank(c: u8) u8 { ret (c == 32 || c == 9)::u8; }
-
-# the value of `key` into out (NUL-terminated, at most cap - 1 bytes); its
-# length, 0 when the key is not set. when a key is there twice, the last
-# one counts
 pub fun get(key: *u8, out: *u8, cap: u64) u64 {
-    if (cap == 0) { ret 0; }
-    load();
-    out[0] = 0;
-    val kl: u64 = io.len(key);
-    var found: u64 = 0;
-    var s: u64 = 0;
-    for (s < text_len) {
-        var e: u64 = s;
-        for (e < text_len && text[e] != 10) { e = e + 1; }
-        var i: u64 = s;
-        for (i < e && blank(text[i]) != 0) { i = i + 1; }
-        if (i + kl < e && io.eq(?text[i], kl, key, kl) != 0 && blank(text[i + kl]) != 0) {
-            i = i + kl;
-            for (i < e && blank(text[i]) != 0) { i = i + 1; }
-            var end: u64 = e;
-            for (end > i && (blank(text[end - 1]) != 0 || text[end - 1] == 13)) { end = end - 1; }
-            var k: u64 = 0;
-            for (i < end && k + 1 < cap) {
-                out[k] = text[i];
-                k = k + 1;
-                i = i + 1;
-            }
-            out[k] = 0;
-            found = k;
-        }
-        s = e + 1;
-    }
-    ret found;
+    ret settings.get(key, out, cap);
 }
 
-# whether `key` is set to yes (or no; `fallback` when it is not set)
 pub fun yes(key: *u8, fallback: u8) u8 {
-    var v: [16]u8;
-    if (get(key, ?v[0], 16) == 0) { ret fallback; }
-    if (io.streq(?v[0], "yes") != 0 || io.streq(?v[0], "on") != 0 || io.streq(?v[0], "true") != 0) { ret 1; }
-    ret 0;
+    ret settings.yes(key, fallback);
 }
 
-# a number setting, `fallback` when it is not set or not a number
 pub fun number(key: *u8, fallback: u64) u64 {
-    var v: [24]u8;
-    val n: u64 = get(key, ?v[0], 24);
-    var ok: u8 = 0;
-    val x: u64 = io.parse_dec(?v[0], n, ?ok);
-    if (ok == 0) { ret fallback; }
-    ret x;
+    ret settings.number(key, fallback);
+}
+
+pub fun path(key: *u8) *u8 {
+    ret settings.path(key);
 }

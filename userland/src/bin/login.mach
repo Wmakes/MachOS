@@ -10,6 +10,8 @@ use io:    sdk.io;
 use env:   sdk.env;
 use users: sdk.users;
 use rt:    sdk.rt;
+use auth: sdk.auth;
+use settings: sdk.settings;
 use logo:  userland.lib.logo;
 
 # the machine's name (/proc/sys/kernel/hostname) into out (64 bytes)
@@ -27,6 +29,16 @@ fun hostname(out: *u8) {
 
 # become user u and run their shell; returns only when that fails
 fun session(u: *users.User) u64 {
+    auth.invalidate(u.uid);
+    var hash: [128]u8;
+    val hn: u64 = users.stored(?u.name[0], u.name_len, ?hash[0]);
+    if (hn == abi.NO_ID || users.locked(?hash[0], hn) != 0) { ret 1; }
+    if (hn == 0) {
+        io.out("A password is required before starting this session.\n\0");
+        var password: [128]u8;
+        val n: u64 = users.new_password(?password[0]);
+        if (n == abi.NO_ID || users.set_password(?u.name[0], u.name_len, ?password[0], n) == 0) { ret 1; }
+    }
     if (users.become(u) == 0) {
         io.out("login: cannot switch to that user\n\0");
         ret 1;
@@ -69,11 +81,13 @@ fun main(argc: u64, argv: **u8) u64 {
     var host: [64]u8;
     hostname(?host[0]);
     var tries: u64 = 0;
-    for (tries < 3) {
+    var limit: u64 = settings.number("login.tries\0", 3);
+    if (limit < 1 || limit > 10) { limit = 3; }
+    for (tries < limit) {
         var un: abi.Uname;
         sys.uname(?un);
         io.putc(10);
-        logo.show(2);
+        if (settings.yes("login.banner\0", 1) != 0) { logo.show(2); }
         io.out("\n  \x1b[1mMachOS \0");
         io.out(?un.release[0]);
         io.out("\x1b[0m\0");

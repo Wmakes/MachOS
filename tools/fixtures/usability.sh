@@ -115,7 +115,7 @@ test "$(sha256sum visible | head -c64)" = "$(sha256sum expected | head -c64)" ||
 env -i PATH=/nope cat && exit 115
 env -i PATH=/bin cat expected > visible || exit 116
 test "$(sha256sum visible | head -c64)" = "$(sha256sum expected | head -c64)" || exit 117
-test "$(uname -srm)" = 'MachOS 0.9.2 x86_64' || exit 118
+test "$(uname -srm)" = 'MachOS 0.9.3 x86_64' || exit 118
 uname --bogus && exit 119
 free -h > visible || exit 120
 grep -q total visible || exit 121
@@ -132,7 +132,10 @@ grep -q .hidden visible || exit 131
 ls --color=invalid && exit 132
 config get hostname > visible || exit 133
 test "$(cat visible)" = machos || exit 134
-cp /etc/machos.conf original || exit 135
+cp /etc/system.conf original || exit 135
+cp /etc/time.conf original-time || exit 135
+cp /etc/login.conf original-login || exit 135
+cp /etc/network.conf original-network || exit 135
 config set hostname testing || exit 136
 config get hostname > visible || exit 137
 test "$(cat visible)" = testing || exit 138
@@ -148,8 +151,11 @@ config set autologin '' || exit 147
 config set network '192.168.1.20/24 192.168.1.1 1.1.1.1' || exit 148
 config get network > visible || exit 149
 test "$(cat visible)" = '192.168.1.20/24 192.168.1.1 1.1.1.1' || exit 150
-config list | grep -q '# the machine' || exit 151
-cp original /etc/machos.conf || exit 152
+config list | grep -q 'hostname testing' || exit 151
+cp original /etc/system.conf || exit 152
+cp original-time /etc/time.conf || exit 152
+cp original-login /etc/login.conf || exit 152
+cp original-network /etc/network.conf || exit 152
 printf ' beta\nAlpha\nalpha\n' > sortable || exit 153
 sort -fbu --output=sorted sortable || exit 154
 printf 'Alpha\n beta\n' > expected || exit 155
@@ -168,110 +174,110 @@ printf '\a\b\r' | wc -c > visible || exit 167
 test "$(cat visible)" = '       3' || exit 168
 printf x | head -v -c1 > visible || exit 169
 grep -q 'standard input' visible || exit 170
-printf old > /etc/machos.conf.new || exit 171
+printf old > /etc/system.conf.new || exit 171
 config set hostname unsafe && exit 172
-test "$(cat /etc/machos.conf.new)" = old || exit 173
-rm /etc/machos.conf.new || exit 174
+test "$(cat /etc/system.conf.new)" = old || exit 173
+rm /etc/system.conf.new || exit 174
 config get hostname > visible || exit 175
 test "$(cat visible)" = machos || exit 176
-printf 'hostname duplicate\n' >> /etc/machos.conf || exit 177
+printf 'hostname duplicate\n' >> /etc/system.conf || exit 177
 config set hostname final || exit 178
-grep -c hostname /etc/machos.conf > visible || exit 179
+grep -c hostname /etc/system.conf > visible || exit 179
 test "$(cat visible)" = 1 || exit 180
-cp original /etc/machos.conf || exit 181
+cp original /etc/system.conf || exit 181
 # Help/version must succeed without performing command side effects.
 mkdir --help > visible || exit 183
 grep -q usage: visible || exit 184
 mkdir --version > visible || exit 185
-grep -q 0.9.2 visible || exit 186
+grep -q 0.9.3 visible || exit 186
 mv --help > visible || exit 187
 grep -q usage: visible || exit 188
 mv --version > visible || exit 189
-grep -q 0.9.2 visible || exit 190
+grep -q 0.9.3 visible || exit 190
 rm --help > visible || exit 191
 grep -q usage: visible || exit 192
 rm --version > visible || exit 193
-grep -q 0.9.2 visible || exit 194
+grep -q 0.9.3 visible || exit 194
 cp --help > visible || exit 195
 grep -q usage: visible || exit 196
 cp --version > visible || exit 197
-grep -q 0.9.2 visible || exit 198
+grep -q 0.9.3 visible || exit 198
 cat --help > visible || exit 199
 grep -q usage: visible || exit 200
 cat --version > visible || exit 201
-grep -q 0.9.2 visible || exit 202
+grep -q 0.9.3 visible || exit 202
 head --help > visible || exit 203
 grep -q usage: visible || exit 204
 head --version > visible || exit 205
-grep -q 0.9.2 visible || exit 206
+grep -q 0.9.3 visible || exit 206
 tail --help > visible || exit 207
 grep -q usage: visible || exit 208
 tail --version > visible || exit 209
-grep -q 0.9.2 visible || exit 210
+grep -q 0.9.3 visible || exit 210
 grep --help > visible || exit 211
 grep -q usage: visible || exit 212
 grep --version > visible || exit 213
-grep -q 0.9.2 visible || exit 214
+grep -q 0.9.3 visible || exit 214
 wc --help > visible || exit 215
 grep -q usage: visible || exit 216
 wc --version > visible || exit 217
-grep -q 0.9.2 visible || exit 218
+grep -q 0.9.3 visible || exit 218
 tee --help > visible || exit 219
 grep -q usage: visible || exit 220
 tee --version > visible || exit 221
-grep -q 0.9.2 visible || exit 222
+grep -q 0.9.3 visible || exit 222
 basename --help > visible || exit 223
 grep -q usage: visible || exit 224
 basename --version > visible || exit 225
-grep -q 0.9.2 visible || exit 226
+grep -q 0.9.3 visible || exit 226
 dirname --help > visible || exit 227
 grep -q usage: visible || exit 228
 dirname --version > visible || exit 229
-grep -q 0.9.2 visible || exit 230
+grep -q 0.9.3 visible || exit 230
 seq --help > visible || exit 231
 grep -q usage: visible || exit 232
 seq --version > visible || exit 233
-grep -q 0.9.2 visible || exit 234
+grep -q 0.9.3 visible || exit 234
 sleep --help > visible || exit 235
 grep -q usage: visible || exit 236
 sleep --version > visible || exit 237
-grep -q 0.9.2 visible || exit 238
+grep -q 0.9.3 visible || exit 238
 env --help > visible || exit 239
 grep -q usage: visible || exit 240
 env --version > visible || exit 241
-grep -q 0.9.2 visible || exit 242
+grep -q 0.9.3 visible || exit 242
 free --help > visible || exit 243
 grep -q usage: visible || exit 244
 free --version > visible || exit 245
-grep -q 0.9.2 visible || exit 246
+grep -q 0.9.3 visible || exit 246
 df --help > visible || exit 247
 grep -q usage: visible || exit 248
 df --version > visible || exit 249
-grep -q 0.9.2 visible || exit 250
+grep -q 0.9.3 visible || exit 250
 du --help > visible || exit 251
 grep -q usage: visible || exit 252
 du --version > visible || exit 253
-grep -q 0.9.2 visible || exit 254
+grep -q 0.9.3 visible || exit 254
 ls --help > visible || exit 1
 grep -q usage: visible || exit 2
 ls --version > visible || exit 3
-grep -q 0.9.2 visible || exit 4
+grep -q 0.9.3 visible || exit 4
 uname --help > visible || exit 5
 grep -q usage: visible || exit 6
 uname --version > visible || exit 7
-grep -q 0.9.2 visible || exit 8
+grep -q 0.9.3 visible || exit 8
 config --help > visible || exit 9
 grep -q usage: visible || exit 10
 config --version > visible || exit 11
-grep -q 0.9.2 visible || exit 12
+grep -q 0.9.3 visible || exit 12
 sort --help > visible || exit 13
 grep -q usage: visible || exit 14
 sort --version > visible || exit 15
-grep -q 0.9.2 visible || exit 16
+grep -q 0.9.3 visible || exit 16
 printf --help > visible || exit 17
 grep -q usage: visible || exit 18
 printf --version > visible || exit 19
-grep -q 0.9.2 visible || exit 20
+grep -q 0.9.3 visible || exit 20
 env -i PATH=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:/bin cat expected > visible || exit 21
 test "$(sha256sum visible | head -c64)" = "$(sha256sum expected | head -c64)" || exit 22
 head -c1536 /dev/zero > block || exit 23

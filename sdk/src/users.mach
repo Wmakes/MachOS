@@ -117,8 +117,10 @@ fun fill(u: *User, s: u64, e: u64) {
     u.shell[u.shell_len] = 0;
 }
 
-pub fun by_name(name: *u8, n: u64, out: *User) u8 {
-    if (load("/etc/passwd\0") == 0) { ret 0; }
+pub fun by_name(name: *u8, n: u64, out: *User) u8 { ret by_name_in("/etc/passwd\0", name, n, out); }
+
+pub fun by_name_in(path: *u8, name: *u8, n: u64, out: *User) u8 {
+    if (load(path) == 0) { ret 0; }
     var s: u64 = 0;
     var e: u64 = 0;
     if (find_line(0, name, n, ?s, ?e) == 0) { ret 0; }
@@ -351,7 +353,7 @@ pub fun set_password(name: *u8, n: u64, pw: *u8, pn: u64) u8 { ret set_password_
 # the same in another system's shadow file (`install` sets up a new disk)
 pub fun set_password_in(shadow: *u8, name: *u8, n: u64, pw: *u8, pn: u64) u8 {
     var line: [256]u8;
-    if (n > 31) { ret 0; }
+    if (n > 31 || pn == 0 || pn > 127) { ret 0; }
     io.copy(?line[0], name, n);
     line[n] = 58;
     var l: u64 = n + 1;
@@ -367,6 +369,10 @@ pub fun set_password_in(shadow: *u8, name: *u8, n: u64, pw: *u8, pn: u64) u8 {
 
 # add a user (and its own group of the same name and number)
 pub fun add(name: *u8, n: u64, uid: u64, home: *u8, shell: *u8) u8 {
+    ret add_in("/etc/passwd\0", "/etc/group\0", "/etc/shadow\0", name, n, uid, home, shell);
+}
+
+pub fun add_in(passwd: *u8, group: *u8, shadow: *u8, name: *u8, n: u64, uid: u64, home: *u8, shell: *u8) u8 {
     var line: [256]u8;
     var l: u64 = 0;
     var d: [20]u8;
@@ -390,7 +396,7 @@ pub fun add(name: *u8, n: u64, uid: u64, home: *u8, shell: *u8) u8 {
     l = l + 1;
     io.copy(?line[l], shell, io.len(shell));
     l = l + io.len(shell);
-    if (put_line("/etc/passwd\0", 0, name, n, ?line[0], l, 0x1A4) == 0) { ret 0; }
+    if (put_line(passwd, 0, name, n, ?line[0], l, 0x1A4) == 0) { ret 0; }
     # name:x:gid:
     l = n;
     io.copy(?line[l], ":x:\0", 3);
@@ -399,64 +405,54 @@ pub fun add(name: *u8, n: u64, uid: u64, home: *u8, shell: *u8) u8 {
     l = l + dn;
     line[l] = 58;
     l = l + 1;
-    if (put_line("/etc/group\0", 0, name, n, ?line[0], l, 0x1A4) == 0) { ret 0; }
+    if (put_line(group, 0, name, n, ?line[0], l, 0x1A4) == 0) { ret 0; }
     io.copy(?line[0], name, n);
     line[n] = 58; line[n + 1] = 33; line[n + 2] = 58;
-    ret put_line("/etc/shadow\0", 0, name, n, ?line[0], n + 3, 0x180);
+    ret put_line(shadow, 0, name, n, ?line[0], n + 3, 0x180);
 }
 
 # a free uid from 1000 up
-pub fun next_uid() u64 {
+pub fun next_uid() u64 { ret next_uid_in("/etc/passwd\0"); }
+
+pub fun next_uid_in(path: *u8) u64 {
+    if (load(path) == 0) { ret abi.NO_ID; }
     var uid: u64 = 1000;
-    var u: User;
-    for (by_uid(uid, ?u) != 0) { uid = uid + 1; }
-    ret uid;
+    for (uid < 0xffffffff) {
+        var digits: [24]u8; var start: u64 = 0; var end: u64 = 0;
+        val n: u64 = io.fmt_dec(uid, ?digits[0]);
+        if (find_line(2, ?digits[0], n, ?start, ?end) == 0) { ret uid; }
+        uid = uid + 1;
+    }
+    ret abi.NO_ID;
 }
 
 # print `prompt` and read a line without echoing it (a password) into out;
 # its length (without the newline), or NO_ID at end of input
 pub fun read_secret(prompt: *u8, out: *u8, cap: u64) u64 {
     io.out(prompt);
-    var t: abi.Termios;
-    val tty: u8 = (abi.is_err(sys.tcgetattr(abi.STDIN, ?t)) == 0)::u8;
+    var original: abi.Termios;
+    val tty: u8 = (abi.is_err(sys.tcgetattr(abi.STDIN, ?original)) == 0)::u8;
     if (tty != 0) {
-        t.lflag = abi.ISIG | abi.ICANON;
-        sys.tcsetattr(abi.STDIN, ?t);
+        var hidden: abi.Termios = original; hidden.lflag = hidden.lflag & ~abi.ECHO;
+        if (abi.is_err(sys.tcsetattr(abi.STDIN, ?hidden)) != 0) { ret abi.NO_ID; }
     }
-    var n: u64 = 0;
-    var got_any: u8 = 0;
-    for (n < cap) {
-        var c: u8 = 0;
-        val r: u64 = sys.read(abi.STDIN, ?c, 1);
-        if (abi.is_err(r) != 0 || r == 0) { brk; }
-        got_any = 1;
-        if (c == 10) { brk; }
-        out[n] = c;
-        n = n + 1;
-    }
-    if (tty != 0) {
-        t.lflag = abi.ISIG | abi.ICANON | abi.ECHO;
-        sys.tcsetattr(abi.STDIN, ?t);
-        io.putc(10);
-    }
-    if (got_any == 0) { ret abi.NO_ID; }
+    val n: u64 = read_line(out, cap);
+    if (tty != 0) { sys.tcsetattr(abi.STDIN, ?original); io.putc(10); }
     ret n;
 }
 
-# read a visible line into out; its length, or NO_ID at end of input
+# drain an overlong line rather than leaving its tail for a later prompt
 pub fun read_line(out: *u8, cap: u64) u64 {
-    var n: u64 = 0;
-    var got_any: u8 = 0;
-    for (n < cap) {
+    var n: u64 = 0; var any: u8 = 0; var overflow: u8 = 0;
+    for {
         var c: u8 = 0;
         val r: u64 = sys.read(abi.STDIN, ?c, 1);
         if (abi.is_err(r) != 0 || r == 0) { brk; }
-        got_any = 1;
+        any = 1;
         if (c == 10) { brk; }
-        out[n] = c;
-        n = n + 1;
+        if (n < cap) { out[n] = c; n = n + 1; } or { overflow = 1; }
     }
-    if (got_any == 0) { ret abi.NO_ID; }
+    if (any == 0 || overflow != 0) { ret abi.NO_ID; }
     ret n;
 }
 
@@ -465,4 +461,71 @@ pub fun become(u: *User) u8 {
     if (abi.is_err(sys.setgid(u.gid)) != 0) { ret 0; }
     if (abi.is_err(sys.setuid(u.uid)) != 0) { ret 0; }
     ret 1;
+}
+
+# require a matching, nonempty password before changing account files
+pub fun new_password(out: *u8) u64 {
+    for {
+        val n: u64 = read_secret("New password: \0", out, 127);
+        if (n == abi.NO_ID) { ret abi.NO_ID; }
+        if (n == 0) { io.err("Password cannot be empty.\n\0"); cnt; }
+        var again: [128]u8;
+        val m: u64 = read_secret("Again: \0", ?again[0], 127);
+        val same: u8 = io.eq(out, n, ?again[0], m);
+        var i: u64 = 0;
+        for (i < 128) { again[i] = 0; i = i + 1; }
+        if (m == abi.NO_ID) { ret abi.NO_ID; }
+        if (same != 0) { ret n; }
+        io.err("Passwords do not match.\n\0");
+    }
+    ret abi.NO_ID;
+}
+
+# membership is read afresh for each privileged operation
+pub fun in_group(user: *User, group: *u8) u8 {
+    if (load("/etc/group\0") == 0) { ret 0; }
+    var s: u64 = 0; var e: u64 = 0;
+    if (find_line(0, group, io.len(group), ?s, ?e) == 0) { ret 0; }
+    var at: u64 = 0; var n: u64 = 0;
+    if (field(s, e, 2, ?at, ?n) == 0) { ret 0; }
+    if (num(at, n) == user.gid) { ret 1; }
+    if (field(s, e, 3, ?at, ?n) == 0) { ret 0; }
+    val end: u64 = at + n;
+    for (at < end) {
+        var stop: u64 = at;
+        for (stop < end && file[stop] != 44) { stop = stop + 1; }
+        if (io.eq(?file[at], stop - at, ?user.name[0], user.name_len) != 0) { ret 1; }
+        at = stop + 1;
+    }
+    ret 0;
+}
+
+# add an administrator to the named system; preserve existing members
+pub fun add_admin(group_path: *u8, name: *u8, n: u64) u8 { ret set_admin(group_path, name, n, 1); }
+
+pub fun set_admin(group_path: *u8, name: *u8, n: u64, enabled: u8) u8 {
+    if (load(group_path) == 0 || n == 0 || n > 31) { ret 0; }
+    var s: u64 = 0; var e: u64 = 0;
+    var line: [16384]u8; var len: u64 = 0;
+    if (find_line(0, "admin\0", 5, ?s, ?e) != 0) {
+        var at: u64 = 0; var count: u64 = 0;
+        if (field(s, e, 3, ?at, ?count) == 0) { ret 0; }
+        len = at - s; io.copy(?line[0], ?file[s], len);
+        val prefix: u64 = len; val end: u64 = at + count;
+        for (at < end) {
+            var stop: u64 = at; for (stop < end && file[stop] != 44) { stop = stop + 1; }
+            if (stop > at && io.eq(?file[at], stop - at, name, n) == 0) {
+                if (len + stop - at + 1 >= 16384) { ret 0; }
+                if (len > prefix) { line[len] = 44; len = len + 1; }
+                io.copy(?line[len], ?file[at], stop - at); len = len + stop - at;
+            }
+            at = stop + 1;
+        }
+    } or { io.copy(?line[0], "admin:x:101:\0", 12); len = 12; }
+    if (enabled != 0) {
+        if (len + n + 1 >= 16384) { ret 0; }
+        if (line[len - 1] != 58) { line[len] = 44; len = len + 1; }
+        io.copy(?line[len], name, n); len = len + n;
+    }
+    ret put_line(group_path, 0, "admin\0", 5, ?line[0], len, 0x1A4);
 }

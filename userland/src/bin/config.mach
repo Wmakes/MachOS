@@ -1,38 +1,52 @@
 # Inspect and edit persistent boot settings without replacing comments or unrelated keys.
 
-use io: userland.lib.cli;
-use opt: userland.lib.options;
-use conf: userland.lib.conf;
-use time: userland.lib.time;
-use os: std.system.os;
+use sdk.abi;
+use sdk.settings;
+use io_error: std.io.error;
 use std.runtime;
+use std.system.os;
+use io: userland.lib.cli;
+use userland.lib.conf;
+use opt: userland.lib.options;
+use userland.lib.time;
 
-var source: [8192]u8;
-var result: [8192]u8;
-var length: u64 = 0;
-var used: u64 = 0;
+val KEYS:      [15]*u8 = [15]*u8{"hostname", "timezone", "rtc", "ttys", "autologin", "network", "login.tries", "login.banner", "se.timeout", "sh.motd", "wget.timeout", "wget.redirects", "wget.quiet", "mpm.max_archive_mb", "mpm.max_unpacked_mb"};
+var path:      *u8;
+var temporary: [256]u8;
+var source:    [8192]u8;
+var result:    [8192]u8;
+var length:    u64     = 0;
+var used:      u64     = 0;
 
 fun valid_ip(value: *u8, n: u64) u8 {
-    var at: u64 = 0; var part: u64 = 0;
+    var at:   u64 = 0;
+    var part: u64 = 0;
     for (part < 4) {
-        val start: u64 = at; for (at < n && value[at] != 46) { at = at + 1; }
-        var ok: u8 = 0; val x: u64 = io.parse_dec(?value[start], at - start, ?ok);
+        val start: u64 = at;
+        for (at < n && value[at] != 46) { at = at + 1; }
+        var ok: u8  = 0;
+        val x:  u64 = io.parse_dec(?value[start], at - start, ?ok);
         if (ok == 0 || x > 255 || (part < 3 && at == n)) { ret 0; }
-        if (part == 3) { ret (at == n)::u8; }
-        at = at + 1; part = part + 1;
+        if (part == 3)                                   { ret (at == n)::u8; }
+        at   = at + 1;
+        part = part + 1;
     }
     ret 0;
 }
 
 fun valid_network(value: *u8) u8 {
     if (io.streq(value, "dhcp") != 0 || io.streq(value, "off") != 0) { ret 1; }
-    val n: u64 = io.len(value); var slash: u64 = 0;
+    val n:     u64 = io.len(value);
+    var slash: u64 = 0;
     for (slash < n && value[slash] != 47) { slash = slash + 1; }
     if (slash == n || valid_ip(value, slash) == 0) { ret 0; }
-    var end: u64 = slash + 1; for (end < n && value[end] != 32) { end = end + 1; }
-    var ok: u8 = 0; val prefix: u64 = io.parse_dec(?value[slash + 1], end - slash - 1, ?ok);
+    var end: u64 = slash + 1;
+    for (end < n && value[end] != 32) { end = end + 1; }
+    var ok:     u8  = 0;
+    val prefix: u64 = io.parse_dec(?value[slash + 1], end - slash - 1, ?ok);
     if (ok == 0 || prefix > 32 || end == n) { ret 0; }
-    var start: u64 = end + 1; end = start;
+    var start: u64 = end + 1;
+    end = start;
     for (end < n && value[end] != 32) { end = end + 1; }
     if (end == n || valid_ip(?value[start], end - start) == 0) { ret 0; }
     start = end + 1;
@@ -40,15 +54,40 @@ fun valid_network(value: *u8) u8 {
 }
 
 fun valid(key: *u8, value: *u8) u8 {
-    val n: u64 = io.len(value);
+    val n:        u64 = io.len(value);
     var position: u64 = 0;
-    for (position < n) { if (value[position] < 32 || value[position] == 127) { ret 0; } position = position + 1; }
-    if (io.streq(key, "timezone") != 0) { var z: time.Zone; ret time.parse(value, ?z); }
+    for (position < n) {
+        if (value[position] < 32 || value[position] == 127) { ret 0; }
+        position = position + 1;
+    }
+    if (io.streq(key, "login.banner") != 0 || io.streq(key, "sh.motd") != 0 || io.streq(key, "wget.quiet") != 0) { ret (io.streq(value, "yes") != 0 || io.streq(value, "no") != 0)::u8; }
+    if (io.streq(key, "se.timeout") != 0 || io.streq(key, "wget.timeout") != 0 || io.streq(key, "wget.redirects") != 0 || io.streq(key, "login.tries") != 0 || io.streq(key, "mpm.max_archive_mb") != 0 || io.streq(key, "mpm.max_unpacked_mb") != 0) {
+        var ok: u8  = 0;
+        val x:  u64 = io.parse_dec(value, n, ?ok);
+        if (ok == 0)                              { ret 0; }
+        if (io.streq(key, "se.timeout") != 0)     { ret (x <= 300)::u8; }
+        if (io.streq(key, "wget.timeout") != 0)   { ret (x >= 100 && x <= 600000)::u8; }
+        if (io.streq(key, "wget.redirects") != 0) { ret (x <= 20)::u8; }
+        if (io.streq(key, "login.tries") != 0)    { ret (x >= 1 && x <= 10)::u8; }
+        ret (x >= 1 && x <= 512)::u8;
+    }
+    if (io.streq(key, "timezone") != 0) {
+        var z: time.Zone;
+        ret time.parse(value, ?z);
+    }
     if (io.streq(key, "rtc") != 0) { ret (io.streq(value, "utc") != 0 || io.streq(value, "local") != 0)::u8; }
-    if (io.streq(key, "ttys") != 0) { var ok: u8 = 0; val x: u64 = io.parse_dec(value, n, ?ok); ret (ok != 0 && x >= 1 && x <= 6)::u8; }
+    if (io.streq(key, "ttys") != 0) {
+        var ok: u8  = 0;
+        val x:  u64 = io.parse_dec(value, n, ?ok);
+        ret (ok != 0 && x >= 1 && x <= 6)::u8;
+    }
     if (io.streq(key, "network") != 0) { ret valid_network(value); }
     if (io.streq(key, "hostname") != 0 || io.streq(key, "autologin") != 0) {
-        var limit: u64 = 63; if (io.streq(key, "autologin") != 0) { limit = 31; } or { if (n == 0) { ret 0; } }
+        var limit: u64 = 63;
+        if (io.streq(key, "autologin") != 0) { limit = 31; }
+        or {
+            if (n == 0) { ret 0; }
+        }
         if (n > limit) { ret 0; }
         var i: u64 = 0;
         for (i < n) {
@@ -63,56 +102,142 @@ fun valid(key: *u8, value: *u8) u8 {
 
 fun append(data: *u8, n: u64) u8 {
     if (n > 8192 - used) { ret 0; }
-    io.copy(?result[used], data, n); used = used + n; ret 1;
+    io.copy(?result[used], data, n);
+    used = used + n;
+    ret 1;
 }
 
 fun replace(key: *u8, value: *u8) u64 {
-    val kl: u64 = io.len(key); var at: u64 = 0;
+    val kl: u64 = io.len(key);
+    var at: u64 = 0;
     for (at < length) {
-        var end: u64 = at; for (end < length && source[end] != 10) { end = end + 1; }
-        var start: u64 = at; for (start < end && (source[start] == 32 || source[start] == 9)) { start = start + 1; }
-        var word: u64 = start; for (word < end && source[word] != 32 && source[word] != 9 && source[word] != 13) { word = word + 1; }
+        var end: u64 = at;
+        for (end < length && source[end] != 10) { end = end + 1; }
+        var start: u64 = at;
+        for (start < end && (source[start] == 32 || source[start] == 9)) { start = start + 1; }
+        var word: u64 = start;
+        for (word < end && source[word] != 32 && source[word] != 9 && source[word] != 13) { word = word + 1; }
         if (io.eq(?source[start], word - start, key, kl) == 0) {
             val count: u64 = end - at + (end < length)::u64;
-            if (append(?source[at], count) == 0) { io.err("config: file too large\n"); ret 1; }
+            if (append(?source[at], count) == 0) {
+                io.err("config: file too large\n");
+                ret 1;
+            }
         }
         at = end + 1;
     }
     if (used > 0 && result[used - 1] != 10 && append("\n", 1) == 0) { ret 1; }
-    if (append(key, kl) == 0 || append(" ", 1) == 0 || append(value, io.len(value)) == 0 || append("\n", 1) == 0) { io.err("config: file too large\n"); ret 1; }
+    if (append(key, kl) == 0 || append(" ", 1) == 0 || append(value, io.len(value)) == 0 || append("\n", 1) == 0) {
+        io.err("config: file too large\n");
+        ret 1;
+    }
     # Exclusive creation prevents following a pre-existing temporary-file link.
-    var st: os.stat_t;
-    if (io.stat(conf.PATH, ?st) < 0) { io.err("config: cannot stat settings file\n"); ret 1; }
-    val h: i64 = io.open_mode("/etc/machos.conf.new", os.O_WRONLY | os.O_CREAT | os.O_EXCL, io.perms(?st) & 0o777);
-    if (h < 0) { io.fail("config", "/etc/machos.conf.new", h); ret 1; }
-    val ok: u8 = io.write_all(h, ?result[0], used); io.close(h);
-    if (ok == 0) { io.remove("/etc/machos.conf.new"); io.err("config: write failed\n"); ret 1; }
-    val r: i64 = io.rename("/etc/machos.conf.new", conf.PATH);
-    if (r < 0) { io.remove("/etc/machos.conf.new"); io.fail("config", conf.PATH, r); ret 1; }
-    io.out("config: saved; boot settings take effect after reboot\n"); ret 0;
+    var st:   os.stat_t;
+    var mode: u64 = 0o644;
+    if (io.lstat(path, ?st) >= 0) {
+        if ((st.st_mode & os.S_IFMT) != os.S_IFREG) {
+            io.err("config: settings path is not a regular file\n");
+            ret 1;
+        }
+        mode = io.perms(?st) & 0o777;
+    }
+    val pn: u64 = io.len(path);
+    io.copy(?temporary[0], path, pn);
+    io.copy(?temporary[pn], ".new", 5);
+    val h: i64 = io.open_mode(?temporary[0], os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode);
+    if (h < 0) {
+        io.fail("config", ?temporary[0], h);
+        ret 1;
+    }
+    val ok: u8 = io.write_all(h, ?result[0], used);
+    io.close(h);
+    if (ok == 0) {
+        io.remove(?temporary[0]);
+        io.err("config: write failed\n");
+        ret 1;
+    }
+    val r: i64 = io.rename(?temporary[0], path);
+    if (r < 0) {
+        io.remove(?temporary[0]);
+        io.fail("config", path, r);
+        ret 1;
+    }
+    io.out("config: saved; boot settings take effect after reboot\n");
+    ret 0;
+}
+
+fun read_source(key: *u8) u8 {
+    path   = conf.path(key);
+    length = 0;
+    used   = 0;
+    if (path == nil) { ret 0; }
+    val h: i64 = io.open_mode(path, os.O_RDONLY | abi.O_NOFOLLOW::i32, 0);
+    if (h < 0) { ret (os.error_kind(h) == io_error.NOT_FOUND)::u8; }
+    for (length < 8192) {
+        val r: i64 = io.read(h, ?source[length], 8192 - length);
+        if (r < 0) {
+            io.close(h);
+            ret 0;
+        }
+        if (r == 0) { brk; }
+        length = length + r::u64;
+    }
+    io.close(h);
+    ret (length < 8192)::u8;
+}
+
+fun migrate() i64 {
+    var i: u64 = 0;
+    for (i < 15) {
+        var value:   [8192]u8;
+        var found:   u8 = 0;
+        var present: u8 = 0;
+        settings.from_file("/etc/machos.conf", KEYS[i], ?value[0], 8192, ?found);
+        if (found != 0) {
+            var existing: [8192]u8;
+            settings.from_file(conf.path(KEYS[i]), KEYS[i], ?existing[0], 8192, ?present);
+            if (present == 0) {
+                if (valid(KEYS[i], ?value[0]) == 0 || read_source(KEYS[i]) == 0 || replace(KEYS[i], ?value[0]) != 0) { ret 1; }
+            }
+        }
+        i = i + 1;
+    }
+    ret 0;
 }
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    if (opt.standard(argc::u64, argv, "config", "usage: config [list | get KEY | set KEY VALUE]\n  Keys: hostname, timezone, rtc, ttys, autologin, network\n  Quote values containing spaces; use '' for empty autologin.\n  Settings are saved in /etc/machos.conf and applied at boot.") != 0) { ret 0; }
-    val h: i64 = io.open_read(conf.PATH);
-    if (h < 0) { io.fail("config", conf.PATH, h); ret 1; }
-    for (length < 8192) {
-        val r: i64 = io.read(h, ?source[length], 8192 - length);
-        if (r < 0) { io.close(h); io.fail("config", conf.PATH, r); ret 1; }
-        if (r == 0) { brk; } length = length + r::u64;
+    if (opt.standard(argc::u64, argv, "config", "usage: config [list | get KEY | set KEY VALUE | migrate]\n  Settings live in /etc/system.conf, time.conf, login.conf, network.conf,\n  se.conf, sh.conf, wget.conf and mpm.conf. List shows every supported key.\n  Boot settings apply after reboot; program settings apply at next launch.\n  migrate copies legacy machos.conf values without overwriting focused settings.") != 0) { ret 0; }
+    if (argc == 1 || (argc == 2 && io.streq(argv[1], "list") != 0)) {
+        var i: u64 = 0;
+        for (i < 15) {
+            var value: [8192]u8;
+            conf.get(KEYS[i], ?value[0], 8192);
+            io.out(KEYS[i]);
+            io.putc(32);
+            io.out(?value[0]);
+            io.putc(10);
+            i = i + 1;
+        }
+        ret 0;
     }
-    io.close(h);
-    if (length == 8192) { io.err("config: file too large\n"); ret 1; }
-    if (argc == 1 || (argc == 2 && io.streq(argv[1], "list") != 0)) { ret (io.write_all(io.STDOUT, ?source[0], length) == 0)::i64; }
-    if (argc == 3 && io.streq(argv[1], "get") != 0) {
-        var value: [8192]u8; conf.get(argv[2], ?value[0], 8192);
-        # Validate the key independently, including settings whose value may be empty.
-        if (io.streq(argv[2], "hostname") == 0 && io.streq(argv[2], "timezone") == 0 && io.streq(argv[2], "rtc") == 0 && io.streq(argv[2], "ttys") == 0 && io.streq(argv[2], "autologin") == 0 && io.streq(argv[2], "network") == 0) { ret opt.error("config")::i64; }
-        io.out(?value[0]); io.putc(10); ret 0;
+    if (argc == 2 && io.streq(argv[1], "migrate") != 0) { ret migrate(); }
+    if (argc == 3 && io.streq(argv[1], "get") != 0 && conf.path(argv[2]) != nil) {
+        var value: [8192]u8;
+        conf.get(argv[2], ?value[0], 8192);
+        io.out(?value[0]);
+        io.putc(10);
+        ret 0;
     }
     if (argc == 4 && io.streq(argv[1], "set") != 0) {
-        if (valid(argv[2], argv[3]) == 0) { io.err("config: unknown setting or invalid value\n"); ret 2; }
+        if (valid(argv[2], argv[3]) == 0) {
+            io.err("config: unknown setting or invalid value\n");
+            ret 2;
+        }
+        if (read_source(argv[2]) == 0) {
+            io.err("config: cannot read settings file\n");
+            ret 1;
+        }
         ret replace(argv[2], argv[3])::i64;
     }
     ret opt.error("config")::i64;

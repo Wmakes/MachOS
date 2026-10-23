@@ -1,0 +1,77 @@
+# se (superuser exec) [-k | -v | COMMAND [ARG...]]: administrators authenticate as themselves
+
+use sdk.abi;
+use sdk.auth;
+use sdk.env;
+use sdk.io;
+use sdk.rt;
+use sdk.settings;
+use sdk.sys;
+use sdk.users;
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    if (argc < 2 || io.streq(argv[1], "--help\0") != 0) {
+        io.out("se: superuser exec\nusage: se [-k | -v | COMMAND [ARG...]]\n  -k forget authentication; -v authenticate without running a command\n\0");
+        ret 0;
+    }
+    if (sys.geteuid() != 0) {
+        io.err("se: not installed set-user-id root\n\0");
+        ret 1;
+    }
+    val uid:  u64 = sys.getuid();
+    var user: users.User;
+    if (users.by_uid(uid, ?user) == 0) { ret 1; }
+    if (io.streq(argv[1], "-k\0") != 0 && argc == 2) {
+        auth.invalidate(uid);
+        ret 0;
+    }
+    if (uid != 0) {
+        if (users.in_group(?user, "admin\0") == 0) {
+            io.err("se: user is not an administrator\n\0");
+            ret 1;
+        }
+        var timeout: u64 = settings.number("se.timeout\0", 300);
+        if (timeout > 300) { timeout = 300; }
+        if (auth.approve(?user, timeout, (io.streq(argv[1], "-v\0") != 0)::u8) == 0) {
+            io.err("se: authentication failed\n\0");
+            ret 1;
+        }
+    }
+    if (argc == 2 && io.streq(argv[1], "-v\0") != 0) { ret 0; }
+    var path: [512]u8;
+    val name: u64 = io.len(argv[1]);
+    if (name > 500)       { ret 2; }
+    if (argv[1][0] == 47) { io.copy(?path[0], argv[1], name + 1); }
+    or {
+        var i: u64 = 0;
+        for (i < name) {
+            if (argv[1][i] == 47 || argv[1][i] == 46 || argv[1][i] == 0) { ret 2; }
+            i = i + 1;
+        }
+        io.copy(?path[0], "/bin/\0", 5);
+        io.copy(?path[5], argv[1], name + 1);
+    }
+    var args: [8192]u8;
+    var used: u64 = 0;
+    var i:    u64 = 1;
+    for (i < argc) {
+        val n: u64 = io.len(argv[i]) + 1;
+        if (n > 8192 - used) { ret 2; }
+        io.copy(?args[used], argv[i], n);
+        used = used + n;
+        i    = i + 1;
+    }
+    # discard caller-controlled environment before entering a root program
+    env.clear();
+    env.set("PATH\0", "/bin\0");
+    env.set("HOME\0", "/root\0");
+    env.set("USER\0", "root\0");
+    env.set("LOGNAME\0", "root\0");
+    env.set("SHELL\0", "/bin/sh\0");
+    env.set("SE_USER\0", ?user.name[0]);
+    if (abi.is_err(sys.setgid(0)) != 0 || abi.is_err(sys.setuid(0)) != 0) { ret 1; }
+    val r: u64 = sys.execve(?path[0], io.len(?path[0]), ?args[0], used);
+    io.fail("se\0", ?path[0], r);
+    ret 1;
+}

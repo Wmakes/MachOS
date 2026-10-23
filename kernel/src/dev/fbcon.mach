@@ -7,15 +7,14 @@
 # ring that shift+pgup/pgdn page back through (view_up / view_down); any
 # output jumps back to the live screen
 
-use info: machos.boot.info;
+use machos.boot.info;
 
 #[embed("font8x16.bin")]
 val FONT: [4096]u8; # 256 glyphs, 16 rows each, msb = leftmost pixel
 
-val GW: u64 = 8;
-val GH: u64 = 16;
+val GW:        u64 = 8;
+val GH:        u64 = 16;
 val MAX_CELLS: u64 = 32768; # 240x135 cells is 1920x2160, plenty
-val DEFAULT: u8 = 0x07;     # light grey on black: bg in the high nibble
 
 # the 16 colours, in ANSI order: black red green yellow blue magenta cyan
 # white, then their bright versions
@@ -25,42 +24,45 @@ pub val SCREENS: u64 = 6;
 # and history. only the screen shown is painted
 rec Screen {
     cells:     [32768]u8;
-    attrs:     [32768]u8;
-    hist_c:    [98304]u8;  # lines that scrolled off, a ring of hist_max lines
-    hist_a:    [98304]u8;
-    hist_head: u64;        # where the next line goes
-    hist_n:    u64;        # lines kept
-    view:      u64;        # lines scrolled back, 0 = live
+    attrs:     [32768]u64; # packed framebuffer pixels: foreground low, background high
+    hist_c:    [98304]u8; # lines that scrolled off, a ring of hist_max lines
+    hist_a:    [98304]u64;
+    hist_head: u64; # where the next line goes
+    hist_n:    u64; # lines kept
+    view:      u64; # lines scrolled back, 0 = live
     cx:        u64;
     cy:        u64;
-    attr:      u8;
+    fg:        u32;
+    bg:        u32;
+    fg_index:  u64; # basic ANSI index, or 256 for an explicit colour
     bold:      u8;
     reverse:   u8;
-    esc:       u8;         # 0 normal, 1 after ESC, 2 inside ESC[
-    params:    [8]u64;
+    esc:       u8; # 0 normal, 1 after ESC, 2 inside ESC[
+    params:    [32]u64;
     nparams:   u64;
+    invalid:   u8; # discard overlong or overflowing CSI sequences
 }
 
 var screens: [6]Screen;
-var s: *Screen = nil;      # the screen being written
-var shown: u64 = 0;        # the screen on display
+var s:       *Screen = nil; # the screen being written
+var shown:   u64     = 0; # the screen on display
 
 # bright magenta (13) is the mach colour, #fe01ff
 val PAL_R: [16]u8 = [16]u8{0x00, 0xAA, 0x00, 0xAA, 0x00, 0xAA, 0x00, 0xAA, 0x55, 0xFF, 0x55, 0xFF, 0x55, 0xFE, 0x55, 0xFF};
 val PAL_G: [16]u8 = [16]u8{0x00, 0x00, 0xAA, 0x55, 0x00, 0x00, 0xAA, 0xAA, 0x55, 0x55, 0xFF, 0xFF, 0x55, 0x01, 0xFF, 0xFF};
 val PAL_B: [16]u8 = [16]u8{0x00, 0x00, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0x55, 0x55, 0x55, 0x55, 0xFF, 0xFF, 0xFF, 0xFF};
 
-var base: u64 = 0; # virtual address of pixel (0,0), 0 = no console
-var pitch: u64 = 0;
-var width_px: u64 = 0;
+var base:      u64 = 0; # virtual address of pixel (0,0), 0 = no console
+var pitch:     u64 = 0;
+var width_px:  u64 = 0;
 var height_px: u64 = 0;
-var cols: u64 = 0;
-var rows: u64 = 0;
-var palette: [16]u32;
+var cols:      u64 = 0;
+var rows:      u64 = 0;
+var palette:   [16]u32;
+var format:    info.Framebuffer;
 
 val HIST_CELLS: u64 = 98304;
-var hist_max: u64 = 0;
-
+var hist_max:   u64 = 0;
 
 fun channel(v: u32, size: u8, shift: u8) u32 {
     # scale an 8-bit channel down to `size` bits, then place it
@@ -69,37 +71,43 @@ fun channel(v: u32, size: u8, shift: u8) u32 {
 
 fun rgb(f: *info.Framebuffer, r: u32, g: u32, b: u32) u32 {
     ret channel(r, f.r_size, f.r_shift)
-      | channel(g, f.g_size, f.g_shift)
-      | channel(b, f.b_size, f.b_shift);
+        | channel(g, f.g_size, f.g_shift)
+        | channel(b, f.b_size, f.b_shift);
 }
 
-fun paint(i: u64, a: u8) { paint_char(i, s.cells[i], a); }
+fun paint(i: u64, a: u64) {
+    paint_char(i, s.cells[i], a);
+}
 
-fun paint_char(i: u64, ch: u8, a: u8) {
-    val c: u64 = ch::u64;
-    val fg: u32 = palette[a & 15];
-    val bg: u32 = palette[a >> 4];
+fun paint_char(i: u64, ch: u8, a: u64) {
+    val c:  u64 = ch::u64;
+    val fg: u32 = a::u32;
+    val bg: u32 = (a >> 32)::u32;
     val px: u64 = base + (i / cols) * GH * pitch + (i % cols) * GW * 4;
-    var y: u64 = 0;
+    var y:  u64 = 0;
     for (y < GH) {
-        val bits: u8 = FONT[c * GH + y];
-        val row: *u32 = (px + y * pitch)::*u32;
-        var x: u64 = 0;
+        val bits: u8   = FONT[c * GH + y];
+        val row:  *u32 = (px + y * pitch)::*u32;
+        var x:    u64  = 0;
         for (x < GW) {
             if (((bits << x::u8) & 0x80) != 0) { row[x] = fg; }
-            or                                  { row[x] = bg; }
+            or                                 { row[x] = bg; }
             x = x + 1;
         }
         y = y + 1;
     }
 }
 
-fun draw(i: u64) { paint(i, s.attrs[i]); }
+fun draw(i: u64) {
+    paint(i, s.attrs[i]);
+}
 
 # whether what is written now should reach the pixels
-fun visible() u8 { ret (s == ?screens[shown] && s.view == 0)::u8; }
+fun visible() u8 {
+    ret (s == ?screens[shown] && s.view == 0)::u8;
+}
 
-fun set(i: u64, c: u8, a: u8) {
+fun set(i: u64, c: u8, a: u64) {
     if (s.cells[i] != c || s.attrs[i] != a) {
         s.cells[i] = c;
         s.attrs[i] = a;
@@ -114,27 +122,38 @@ fun cursor_cell() u64 {
     ret s.cy * cols + x;
 }
 
-fun hide() { if (visible() != 0) { draw(cursor_cell()); } }
+fun hide() {
+    if (visible() != 0) { draw(cursor_cell()); }
+}
 
 fun show() {
     if (visible() == 0) { ret; }
     val i: u64 = cursor_cell();
-    val a: u8 = s.attrs[i];
-    paint(i, (a << 4) | (a >> 4));
+    val a: u64 = s.attrs[i];
+    paint(i, (a << 32) | (a >> 32));
 }
 
 # an empty cell: the current background, a visible foreground for the cursor
-fun blank() u8 { ret (s.attr & 0xF0) | 0x07; }
+fun colours() u64 {
+    var fg: u32 = s.fg;
+    if (s.bold != 0 && s.fg_index < 8) { fg = palette[s.fg_index + 8]; }
+    if (s.reverse != 0)                { ret s.bg::u64 | (fg::u64 << 32); }
+    ret fg::u64 | (s.bg::u64 << 32);
+}
+
+fun blank() u64 {
+    ret (colours() & 0xFFFFFFFF00000000) | palette[7]::u64;
+}
 
 # keep the top line before it scrolls away
 fun remember() {
     if (hist_max == 0) { ret; }
     val at: u64 = s.hist_head * cols;
-    var k: u64 = 0;
+    var k:  u64 = 0;
     for (k < cols) {
         s.hist_c[at + k] = s.cells[k];
         s.hist_a[at + k] = s.attrs[k];
-        k = k + 1;
+        k                = k + 1;
     }
     s.hist_head = (s.hist_head + 1) % hist_max;
     if (s.hist_n < hist_max) { s.hist_n = s.hist_n + 1; }
@@ -157,7 +176,7 @@ fun scroll() {
 fun newline() {
     s.cx = 0;
     if (s.cy + 1 < rows) { s.cy = s.cy + 1; }
-    or                 { scroll(); }
+    or                   { scroll(); }
 }
 
 fun clear_from(i: u64, end: u64) {
@@ -168,114 +187,163 @@ fun clear_from(i: u64, end: u64) {
     }
 }
 
+# indexed colours use the ANSI palette, 6x6x6 cube and 24 grey levels
+fun indexed(n: u64) u32 {
+    if (n < 16) { ret palette[n]; }
+    if (n >= 232) {
+        val v: u32 = (8 + (n - 232) * 10)::u32;
+        ret rgb(?format, v, v, v);
+    }
+    val k:     u64    = n - 16;
+    val level: [6]u32 = [6]u32{0, 95, 135, 175, 215, 255};
+    ret rgb(?format, level[k / 36], level[(k / 6) % 6], level[k % 6]);
+}
+
+fun foreground(n: u64) {
+    s.fg_index = n;
+    s.fg       = palette[n];
+}
+
 fun sgr(p: u64) {
     if (p == 0) {
-        s.attr = DEFAULT;
-        s.bold = 0;
+        foreground(7);
+        s.bg      = palette[0];
+        s.bold    = 0;
         s.reverse = 0;
-    } or (p == 1) {
-        s.bold = 1;
-        s.attr = s.attr | 0x08;
-    } or (p == 7) { # reverse video
-        if (s.reverse == 0) {
-            s.reverse = 1;
-            s.attr = (s.attr << 4) | (s.attr >> 4);
+    }
+    or (p == 1)               { s.bold = 1; }
+    or (p == 22)              { s.bold = 0; }
+    or (p == 7)               { s.reverse = 1; }
+    or (p == 27)              { s.reverse = 0; }
+    or (p >= 30 && p <= 37)   { foreground(p - 30); }
+    or (p >= 90 && p <= 97)   { foreground(p - 90 + 8); }
+    or (p == 39)              { foreground(7); }
+    or (p >= 40 && p <= 47)   { s.bg = palette[p - 40]; }
+    or (p >= 100 && p <= 107) { s.bg = palette[p - 100 + 8]; }
+    or (p == 49)              { s.bg = palette[0]; }
+}
+
+fun sgr_all() {
+    if (s.nparams == 0) { sgr(0); }
+    var i: u64 = 0;
+    for (i < s.nparams) {
+        val p: u64 = s.params[i];
+        if (p == 38 || p == 48) {
+            # consume the whole colour operand, even when its channels are invalid
+            if (i + 1 >= s.nparams) { brk; }
+            val mode:   u64 = s.params[i + 1];
+            var colour: u32 = 0;
+            var valid:  u8  = 0;
+            if (mode == 2) {
+                if (i + 4 >= s.nparams) { brk; }
+                val r: u64 = s.params[i + 2];
+                val g: u64 = s.params[i + 3];
+                val b: u64 = s.params[i + 4];
+                if (r <= 255 && g <= 255 && b <= 255) {
+                    colour = rgb(?format, r::u32, g::u32, b::u32);
+                    valid  = 1;
+                }
+                i = i + 5;
+            }
+            or (mode == 5) {
+                if (i + 2 >= s.nparams) { brk; }
+                if (s.params[i + 2] <= 255) {
+                    colour = indexed(s.params[i + 2]);
+                    valid  = 1;
+                }
+                i = i + 3;
+            }
+            or { brk; }
+            if (valid != 0) {
+                if (p == 38) {
+                    s.fg       = colour;
+                    s.fg_index = 256;
+                }
+                or { s.bg = colour; }
+            }
         }
-    } or (p == 27) {
-        if (s.reverse != 0) {
-            s.reverse = 0;
-            s.attr = (s.attr << 4) | (s.attr >> 4);
+        or {
+            sgr(p);
+            i = i + 1;
         }
-    } or (p == 22) {
-        s.bold = 0;
-        s.attr = s.attr & 0xF7;
-    } or (p >= 30 && p <= 37) {
-        s.attr = (s.attr & 0xF0) | (p - 30)::u8;
-        if (s.bold != 0) { s.attr = s.attr | 0x08; }
-    } or (p == 39) {
-        s.attr = (s.attr & 0xF0) | 0x07;
-        if (s.bold != 0) { s.attr = s.attr | 0x08; }
-    } or (p >= 40 && p <= 47) {
-        s.attr = (s.attr & 0x0F) | ((p - 40)::u8 << 4);
-    } or (p == 49) {
-        s.attr = s.attr & 0x0F;
-    } or (p >= 100 && p <= 107) { # bright backgrounds
-        s.attr = (s.attr & 0x0F) | (((p - 100)::u8 | 0x08) << 4);
-    } or (p >= 90 && p <= 97) {
-        s.attr = (s.attr & 0xF0) | (p - 90)::u8 | 0x08;
     }
 }
 
 fun csi(final: u8) {
     if (final == 109) { # m
-        if (s.nparams == 0) { sgr(0); }
-        var i: u64 = 0;
-        for (i < s.nparams) {
-            sgr(s.params[i]);
-            i = i + 1;
-        }
-    } or (final == 74) { # J: 2 = whole screen
+        sgr_all();
+    }
+    or (final == 74) { # J: 2 = whole screen
         if (s.nparams > 0 && s.params[0] == 2) {
             clear_from(0, rows * cols);
             s.cx = 0;
             s.cy = 0;
-        } or {
+        }
+        or {
             clear_from(cursor_cell(), rows * cols);
         }
-    } or (final == 72) { # H: row;col, 1-based
+    }
+    or (final == 72) { # H: row;col, 1-based
         var r: u64 = 1;
         var c: u64 = 1;
         if (s.nparams > 0 && s.params[0] > 0) { r = s.params[0]; }
         if (s.nparams > 1 && s.params[1] > 0) { c = s.params[1]; }
-        if (r > rows) { r = rows; }
-        if (c > cols) { c = cols; }
+        if (r > rows)                         { r = rows; }
+        if (c > cols)                         { c = cols; }
         s.cy = r - 1;
         s.cx = c - 1;
-    } or (final == 67 || final == 68) { # C / D: n columns right / left
+    }
+    or (final == 67 || final == 68) { # C / D: n columns right / left
         var k: u64 = 1;
         if (s.nparams > 0 && s.params[0] > 0) { k = s.params[0]; }
         if (final == 67) {
             s.cx = s.cx + k;
             if (s.cx >= cols) { s.cx = cols - 1; }
-        } or {
-            if (k > s.cx) { s.cx = 0; }
-            or          { s.cx = s.cx - k; }
         }
-    } or (final == 71) { # G: column n, 1-based
+        or {
+            if (k > s.cx) { s.cx = 0; }
+            or            { s.cx = s.cx - k; }
+        }
+    }
+    or (final == 71) { # G: column n, 1-based
         var k: u64 = 1;
         if (s.nparams > 0 && s.params[0] > 0) { k = s.params[0]; }
-        if (k > cols) { k = cols; }
+        if (k > cols)                         { k = cols; }
         s.cx = k - 1;
-    } or (final == 75) { # K: to the end of the line
+    }
+    or (final == 75) { # K: to the end of the line
         clear_from(cursor_cell(), (s.cy + 1) * cols);
     }
 }
 
 # take over the framebuffer; returns 0 when it is missing or not 32 bpp
 pub fun init(f: *info.Framebuffer) u8 {
-    if (f.addr == 0 || f.bpp != 32) { ret 0; }
-    if (f.r_size > 8 || f.g_size > 8 || f.b_size > 8) { ret 0; }
-    width_px = f.width;
+    if (f.addr == 0 || f.bpp != 32)                                                                                        { ret 0; }
+    if (f.r_size == 0 || f.g_size == 0 || f.b_size == 0 || f.r_size > 8 || f.g_size > 8 || f.b_size > 8)                   { ret 0; }
+    if (f.r_shift::u64 + f.r_size::u64 > 32 || f.g_shift::u64 + f.g_size::u64 > 32 || f.b_shift::u64 + f.b_size::u64 > 32) { ret 0; }
+    if (f.width < GW || f.height < GH || f.pitch < f.width * 4)                                                            { ret 0; }
+    format    = @f;
+    width_px  = f.width;
     height_px = f.height;
-    base  = f.addr;
-    pitch = f.pitch;
-    cols  = f.width / GW;
-    rows  = f.height / GH;
+    base      = f.addr;
+    pitch     = f.pitch;
+    cols      = f.width / GW;
+    rows      = f.height / GH;
     if (cols * rows > MAX_CELLS) { rows = MAX_CELLS / cols; }
     var k: u64 = 0;
     for (k < 16) {
         palette[k] = rgb(f, PAL_R[k]::u32, PAL_G[k]::u32, PAL_B[k]::u32);
-        k = k + 1;
+        k          = k + 1;
     }
 
     # paint every pixel, including the strip right of the last column
     var y: u64 = 0;
     for (y < f.height) {
         val row: *u32 = (base + y * pitch)::*u32;
-        var x: u64 = 0;
+        var x:   u64  = 0;
         for (x < f.width) {
             row[x] = palette[0];
-            x = x + 1;
+            x      = x + 1;
         }
         y = y + 1;
     }
@@ -285,14 +353,23 @@ pub fun init(f: *info.Framebuffer) u8 {
         var i: u64 = 0;
         for (i < rows * cols) {
             s.cells[i] = 32;
-            s.attrs[i] = DEFAULT;
-            i = i + 1;
+            s.attrs[i] = palette[7]::u64 | (palette[0]::u64 << 32);
+            i          = i + 1;
         }
-        s.attr = DEFAULT;
-        n = n + 1;
+        sgr(0);
+        s.cx        = 0;
+        s.cy        = 0;
+        s.hist_head = 0;
+        s.hist_n    = 0;
+        s.view      = 0;
+        s.esc       = 0;
+        s.nparams   = 0;
+        s.invalid   = 0;
+        n           = n + 1;
     }
     hist_max = HIST_CELLS / cols;
-    s = ?screens[0];
+    shown    = 0;
+    s        = ?screens[0];
     show();
     ret 1;
 }
@@ -309,7 +386,8 @@ fun repaint() {
                 paint_char(r * cols + k, s.hist_c[line * cols + k], s.hist_a[line * cols + k]);
                 k = k + 1;
             }
-        } or {
+        }
+        or {
             val src: u64 = (r - s.view) * cols;
             for (k < cols) {
                 paint_char(r * cols + k, s.cells[src + k], s.attrs[src + k]);
@@ -325,7 +403,7 @@ fun repaint() {
 pub fun show_screen(n: u64) {
     if (base == 0 || n >= SCREENS) { ret; }
     shown = n;
-    s = ?screens[n];
+    s     = ?screens[n];
     repaint();
 }
 
@@ -337,7 +415,7 @@ pub fun view_up() {
     if (s.hist_n == 0) { ret; }
     var v: u64 = s.view + rows / 2;
     if (v > s.hist_n) { v = s.hist_n; }
-    if (v == s.view) { ret; }
+    if (v == s.view)  { ret; }
     s.view = v;
     repaint();
 }
@@ -345,49 +423,76 @@ pub fun view_up() {
 pub fun view_down() {
     if (base == 0) { ret; }
     s = ?screens[shown];
-    if (s.view == 0) { ret; }
+    if (s.view == 0)       { ret; }
     if (s.view > rows / 2) { s.view = s.view - rows / 2; }
-    or                   { s.view = 0; }
+    or                     { s.view = 0; }
     repaint();
 }
 
-pub fun cols_of() u64 { ret cols; }
-pub fun width_of() u64 { ret width_px; }
-pub fun height_of() u64 { ret height_px; }
-pub fun rows_of() u64 { ret rows; }
+pub fun cols_of() u64 {
+    ret cols;
+}
+
+pub fun width_of() u64 {
+    ret width_px;
+}
+
+pub fun height_of() u64 {
+    ret height_px;
+}
+
+pub fun rows_of() u64 {
+    ret rows;
+}
 
 fun put(c: u8) {
     if (s.esc == 1) {
         if (c == 91) { # [
-            s.esc = 2;
-            s.nparams = 0;
+            s.esc       = 2;
+            s.nparams   = 0;
             s.params[0] = 0;
-        } or {
+            s.invalid   = 0;
+        }
+        or {
             s.esc = 0;
         }
         ret;
     }
     if (s.esc == 2) {
         if (c >= 48 && c <= 57) {
+            if (s.nparams == 0)                    { s.nparams = 1; }
+            if (s.params[s.nparams - 1] > 1000000) { s.invalid = 1; }
+            if (s.invalid == 0)                    { s.params[s.nparams - 1] = s.params[s.nparams - 1] * 10 + (c - 48)::u64; }
+        }
+        or (c == 59) { # ;
             if (s.nparams == 0) { s.nparams = 1; }
-            s.params[s.nparams - 1] = s.params[s.nparams - 1] * 10 + (c - 48)::u64;
-        } or (c == 59) { # ;
-            if (s.nparams == 0) { s.nparams = 1; }
-            if (s.nparams < 8) {
+            if (s.nparams < 32) {
                 s.params[s.nparams] = 0;
-                s.nparams = s.nparams + 1;
+                s.nparams           = s.nparams + 1;
             }
-        } or (c >= 64 && c <= 126) {
+            or { s.invalid = 1; }
+        }
+        or (c >= 64 && c <= 126) {
             s.esc = 0;
-            csi(c);
-        } or (c != 63) { # tolerate '?' in private modes, give up on the rest
+            if (s.invalid == 0) { csi(c); }
+        }
+        or (c != 63) { # tolerate '?' in private modes, give up on the rest
             s.esc = 0;
         }
         ret;
     }
-    if (c == 27) { s.esc = 1; ret; }
-    if (c == 10) { newline(); ret; }
-    if (c == 13) { s.cx = 0; ret; }
+    if (c == 27) {
+        s.esc = 1;
+        ret;
+    }
+    if (c == 10) {
+        newline();
+        ret;
+    }
+    if (c == 13) {
+        s.cx = 0;
+        ret;
+    }
     if (c == 12) { # form feed clears the screen
         clear_from(0, rows * cols);
         s.cx = 0;
@@ -403,9 +508,9 @@ fun put(c: u8) {
         for ((s.cx % 8) != 0 && s.cx < cols) { put(32); }
         ret;
     }
-    if (c < 32) { ret; }
+    if (c < 32)       { ret; }
     if (s.cx >= cols) { newline(); }
-    set(s.cy * cols + s.cx, c, s.attr);
+    set(s.cy * cols + s.cx, c, colours());
     s.cx = s.cx + 1;
 }
 

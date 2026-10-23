@@ -5,18 +5,20 @@
 # "MachOS (previous)" that boots them, in case the new one does not start.
 # the programs in /bin are replaced, machboot too (on the EFI partition as
 # well when it is mounted on /boot/efi); your settings in /etc stay
-# (/etc/machos.conf is only added when there is none).
+# (legacy settings are migrated; focused settings are only added when missing).
 # reboot afterwards to start the new system
 
 use abi: sdk.abi;
 use sys: sdk.sys;
 use io:  sdk.io;
 use rt:  sdk.rt;
+use package_tx: userland.mpm.transaction;
 
 val STAGE: *u8 = "/root/.machos-update\0";
 var buf: [65536]u8;
 var failures: u64 = 0;
 var stage_owned: u8 = 0;
+var package_lock: u8;
 
 fun fail(what: *u8) u64 {
     cleanup();
@@ -124,11 +126,12 @@ fun install(src_rel: *u8, dst: *u8) {
 }
 
 fun cleanup() {
-    if (stage_owned == 0) { ret; }
-    stage_owned = 0;
-    an = 0;
-    arg("rm\0"); arg("-r\0"); arg(STAGE);
-    run("/bin/rm\0", ?a[0], an);
+    if (stage_owned != 0) {
+        stage_owned = 0;
+        an = 0; arg("rm\0"); arg("-r\0"); arg(STAGE);
+        run("/bin/rm\0", ?a[0], an);
+    }
+    if (package_lock != 0) { package_lock = 0; package_tx.abort(); }
 }
 
 fun start_stream(prog: *u8, args: *u8, length: u64, input: u64, output: u64) u64 {
@@ -178,7 +181,10 @@ fun main(argc: u64, argv: **u8) u64 {
     val pkg: *u8 = argv[1];
     if (exists(pkg) == 0) { ret fail("no such file\0"); }
 
-    # A private, exclusively created directory also excludes concurrent updates.
+    # Share the package manager's exclusive transaction lock.
+    if (package_tx.begin() == 0) { ret fail("package manager is busy or needs recovery"); }
+    package_lock = 1;
+    # a private, exclusively created directory also excludes concurrent updates.
     if (abi.is_err(sys.mkdir_mode(STAGE, io.len(STAGE), 0x1C0)) != 0) {
         ret fail("cannot create private staging directory (remove a stale /root/.machos-update first)\0");
     }
@@ -237,11 +243,6 @@ fun main(argc: u64, argv: **u8) u64 {
     if (exists("/root/.machos-update/etc/services\0") != 0 && exists("/etc/services\0") == 0) {
         install("etc/services\0", "/etc/services\0");
     }
-    # the settings file only when there is none yet: the one there is yours
-    if (exists("/root/.machos-update/etc/machos.conf\0") != 0 && exists("/etc/machos.conf\0") == 0) {
-        install("etc/machos.conf\0", "/etc/machos.conf\0");
-    }
-
     # New packages carry notices; older packages without them remain installable.
     if (exists("/root/.machos-update/usr/share/licenses") != 0) {
         sys.mkdir("/usr", 4);
@@ -281,6 +282,29 @@ fun main(argc: u64, argv: **u8) u64 {
     }
     io.dec(programs);
     say(" programs\n\0");
+
+    # Migrate legacy settings using the newly installed configuration tool.
+    an = 0; arg("config"); arg("migrate");
+    if (run("/bin/config", ?a[0], an) != 0) { failures = failures + 1; }
+    val configs: [8]*u8 = [8]*u8{"system.conf", "time.conf", "login.conf", "network.conf", "se.conf", "sh.conf", "wget.conf", "mpm.conf"};
+    var ci: u64 = 0;
+    for (ci < 8) {
+        var rel: [96]u8; var dst: [96]u8;
+        io.copy(?rel[0], "etc/", 4); io.copy(?rel[4], configs[ci], io.len(configs[ci]) + 1);
+        io.copy(?dst[0], "/etc/", 5); io.copy(?dst[5], configs[ci], io.len(configs[ci]) + 1);
+        if (exists(?dst[0]) == 0) { install(?rel[0], ?dst[0]); }
+        ci = ci + 1;
+    }
+
+    # Refresh only stock ownership records; third-party package records remain.
+    sys.mkdir_mode("/var", 4, 0x1ED); sys.mkdir_mode("/var/lib", 8, 0x1ED);
+    sys.mkdir_mode("/var/lib/mpm", 12, 0x1ED); sys.mkdir_mode("/var/lib/mpm/configs", 20, 0x1ED);
+    an = 0; arg("cp"); arg("-r"); arg("/root/.machos-update/var/lib/mpm/packages"); arg("/var/lib/mpm");
+    if (exists("/root/.machos-update/var/lib/mpm/packages") != 0 && run("/bin/cp", ?a[0], an) != 0) { failures = failures + 1; }
+    if (exists("/etc/mpm") == 0 && exists("/root/.machos-update/etc/mpm") != 0) {
+        an = 0; arg("cp"); arg("-r"); arg("/root/.machos-update/etc/mpm"); arg("/etc");
+        if (run("/bin/cp", ?a[0], an) != 0) { failures = failures + 1; }
+    }
 
     # machboot's way back
     an = 0;

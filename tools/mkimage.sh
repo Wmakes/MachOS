@@ -69,7 +69,9 @@ chmod 0644 "$ROOTFS/boot/"*.*
 chmod 0755 "$ROOTFS/boot/efi"
 chmod 0600 "$ROOTFS/etc/shadow"
 chmod 0755 "$ROOTFS/bin/"*
-chmod 4755 "$ROOTFS/bin/su" "$ROOTFS/bin/passwd"
+chmod 4755 "$ROOTFS/bin/su" "$ROOTFS/bin/passwd" "$ROOTFS/bin/se"
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' kernel/mach.toml | head -1)
+python3 tools/mpm.py stock --root "$ROOTFS" --version "$VERSION" --output "$OUT/packages"
 tar --format=ustar --owner=0 --group=0 -cf "$OUT/initrd.tar" -C "$ROOTFS" .
 # the disk root also carries the initrd, for `install` to give new disks a
 # rescue entry (the initrd itself cannot contain itself)
@@ -121,7 +123,8 @@ else
         KEEP_CONF=1
     fi
     # Add resolver defaults to older dev images without replacing local policy.
-    for n in hosts services; do
+    for n in hosts services system.conf time.conf login.conf network.conf se.conf sh.conf wget.conf mpm.conf; do
+        case "$n" in *.conf) if ! debugfs -R "stat /etc/machos.conf" "$ROOTIMG" 2>&1 | grep -q "File not found"; then continue; fi ;; esac
         if debugfs -R "stat /etc/$n" "$ROOTIMG" 2>&1 | grep -q "File not found"; then
             echo "write $ROOTFS/etc/$n /etc/$n" >> "$CMDS"
         fi

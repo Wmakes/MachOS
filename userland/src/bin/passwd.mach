@@ -80,7 +80,8 @@ fun main(argc: u64, argv: **u8) u64 {
         }
         var h: [128]u8;
         val hn: u64 = users.stored(target, tn, ?h[0]);
-        if (hn != abi.NO_ID && hn > 0) {
+        if (hn == abi.NO_ID || users.locked(?h[0], hn) != 0) { io.err("passwd: account is locked or unavailable\n\0"); ret 1; }
+        if (hn > 0) {
             var old: [128]u8;
             val on: u64 = users.read_secret("Current password: \0", ?old[0], 127);
             if (on == abi.NO_ID || users.matches(?h[0], hn, ?old[0], on) == 0) {
@@ -91,21 +92,12 @@ fun main(argc: u64, argv: **u8) u64 {
         }
     }
     var a: [128]u8;
-    var b: [128]u8;
-    io.out("Changing the password of \0");
-    io.outn(target, tn);
-    io.putc(10);
-    val an: u64 = users.read_secret("New password: \0", ?a[0], 127);
-    val bn: u64 = users.read_secret("Again: \0", ?b[0], 127);
-    if (an == abi.NO_ID || bn == abi.NO_ID || io.eq(?a[0], an, ?b[0], bn) == 0) {
-        io.err("passwd: the passwords do not match\n\0");
-        ret 1;
-    }
+    val an: u64 = users.new_password(?a[0]);
+    if (an == abi.NO_ID) { ret 1; }
     if (users.set_password(target, tn, ?a[0], an) == 0) {
         io.err("passwd: cannot write /etc/shadow\n\0");
         ret 1;
     }
-    if (an == 0) { io.out("passwd: the password is now empty (no password)\n\0"); }
-    or           { io.out("passwd: password changed\n\0"); }
+    io.out("passwd: password changed\n\0");
     ret 0;
 }

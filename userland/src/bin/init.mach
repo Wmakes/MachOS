@@ -10,6 +10,7 @@
 # off, or a fixed "IP/PREFIX GATEWAY DNS")
 
 use std.runtime;
+use auth: sdk.auth;
 use os:   std.system.os;
 use io:   userland.lib.cli;
 use conf: userland.lib.conf;
@@ -133,6 +134,7 @@ fun main(argc: i64, argv: **u8) i64 {
         rescue_shell();
         ret 0;
     }
+    auth.boot();
     configure();
     fds[0] = io.STDIN;
     var name: [10]u8;

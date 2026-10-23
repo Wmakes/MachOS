@@ -1,0 +1,8 @@
+# MPM: install and inspect local signed package archives
+use std.runtime;
+use userland.mpm.manager;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    ret manager.run(argc::u64, argv)::i64;
+}

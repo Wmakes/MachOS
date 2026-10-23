@@ -41,6 +41,15 @@ fun main(argc: u64, argv: **u8) u64 {
             }
         }
     }
+    var existing: [128]u8;
+    val stored: u64 = users.stored(target, tn, ?existing[0]);
+    if (stored == abi.NO_ID || users.locked(?existing[0], stored) != 0) { ret 1; }
+    if (stored == 0) {
+        io.out("A password is required for this account.\n\0");
+        var password: [128]u8;
+        val n: u64 = users.new_password(?password[0]);
+        if (n == abi.NO_ID || users.set_password(target, tn, ?password[0], n) == 0) { ret 1; }
+    }
     if (users.become(?u) == 0) {
         io.err("su: cannot switch user\n\0");
         ret 1;

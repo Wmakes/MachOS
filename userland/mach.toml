@@ -414,6 +414,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.mpm]
+kind = "bin"
+entry = "bin/mpm.mach"
+out = "bin/mpm"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.mv]
 kind = "bin"
 entry = "bin/mv.mach"
@@ -506,6 +514,14 @@ need = []
 kind = "bin"
 entry = "bin/rm.mach"
 out = "bin/rm"
+targets = ["machos"]
+link = []
+need = []
+
+[artifact.se]
+kind = "bin"
+entry = "bin/se.mach"
+out = "bin/se"
 targets = ["machos"]
 link = []
 need = []
@@ -682,6 +698,14 @@ need = []
 kind = "bin"
 entry = "bin/uptime.mach"
 out = "bin/uptime"
+targets = ["machos"]
+link = []
+need = []
+
+[artifact.usermod]
+kind = "bin"
+entry = "bin/usermod.mach"
+out = "bin/usermod"
 targets = ["machos"]
 link = []
 need = []

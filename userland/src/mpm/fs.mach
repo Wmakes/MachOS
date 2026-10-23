@@ -1,0 +1,125 @@
+# bounded file I/O and symlink-free, root-owned package destinations
+
+use sha: crypto.hash.sha256;
+use sdk.abi;
+use std.system.os;
+use std.types.size.usize;
+use io:  userland.lib.cli;
+use pkg: userland.mpm.package;
+
+pub rec Blob { data: *u8; len: u64; cap: u64; }
+
+pub fun read(path: *u8, cap: u64, out: *Blob) u8 {
+    val h: i64 = io.open_mode(path, os.O_RDONLY | abi.O_NOFOLLOW::i32, 0);
+    if (h < 0) { ret 0; }
+    var st: os.stat_t;
+    if (io.fstat(h, ?st) < 0 || io.is_file(?st) == 0 || st.st_size < 0 || st.st_size::u64 > cap) {
+        io.close(h);
+        ret 0;
+    }
+    out.cap  = st.st_size::u64 + 1;
+    out.len  = 0;
+    out.data = os.allocate(out.cap::usize)::*u8;
+    if (out.data == nil) {
+        io.close(h);
+        ret 0;
+    }
+    for (out.len + 1 < out.cap) {
+        val n: i64 = io.read(h, ?out.data[out.len], out.cap - 1 - out.len);
+        if (n <= 0) {
+            io.close(h);
+            release(out);
+            ret 0;
+        }
+        out.len = out.len + n::u64;
+    }
+    var extra: u8  = 0;
+    val end:   i64 = io.read(h, ?extra, 1);
+    io.close(h);
+    if (end != 0) {
+        release(out);
+        ret 0;
+    }
+    out.data[out.len] = 0;
+    ret 1;
+}
+
+pub fun release(blob: *Blob) {
+    if (blob.data != nil) {
+        os.deallocate(blob.data::ptr, blob.cap::usize);
+        blob.data = nil;
+    }
+}
+
+pub fun exists(path: *u8) u8 {
+    var st: os.stat_t;
+    ret (io.lstat(path, ?st) >= 0)::u8;
+}
+
+pub fun directory(path: *u8, mode: u64, create: u8) u8 {
+    var st: os.stat_t;
+    if (io.lstat(path, ?st) < 0 && create != 0) {
+        if (io.mkdir(path, mode) < 0) { ret 0; }
+    }
+    if (io.lstat(path, ?st) < 0 || io.is_dir(?st) == 0 || st.st_uid != 0 || (io.perms(?st) & 0o022) != 0) { ret 0; }
+    if (mode == 0o700 && (io.perms(?st) & 0o077) != 0)                                                    { ret 0; }
+    ret 1;
+}
+
+pub fun parents(path: *u8, create: u8) u8 {
+    var prefix: [256]u8;
+    val n:      u64 = io.len(path);
+    if (n > 255 || path[0] != 47) { ret 0; }
+    var i: u64 = 0;
+    for (i < n) {
+        prefix[i] = path[i];
+        if (i > 0 && path[i] == 47) {
+            prefix[i] = 0;
+            if (directory(?prefix[0], 0o755, create) == 0) { ret 0; }
+            prefix[i] = 47;
+        }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+pub fun write(path: *u8, data: *u8, len: u64, mode: u64) u8 {
+    val h: i64 = io.open_mode(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600);
+    if (h < 0) { ret 0; }
+    var good: u8 = io.write_all(h, data, len);
+    if (good != 0 && os.set_mode(h::usize, mode::i32) < 0) { good = 0; }
+    io.close(h);
+    if (good == 0) { io.remove(path); }
+    ret good;
+}
+
+pub fun matches(path: *u8, file: *pkg.File) u8 {
+    val h: i64 = io.open_mode(path, os.O_RDONLY | abi.O_NOFOLLOW::i32, 0);
+    if (h < 0) { ret 0; }
+    var st: os.stat_t;
+    if (io.fstat(h, ?st) < 0 || io.is_file(?st) == 0 || st.st_size::u64 != file.size || st.st_uid != 0 || st.st_gid != 0 || io.perms(?st) != file.mode) {
+        io.close(h);
+        ret 0;
+    }
+    var c:     sha.State = sha.init();
+    var block: [8192]u8;
+    for {
+        val n: i64 = io.read(h, ?block[0], 8192);
+        if (n < 0) {
+            io.close(h);
+            ret 0;
+        }
+        if (n == 0) { brk; }
+        sha.update(?c, ?block[0], n::usize);
+    }
+    io.close(h);
+    var digest: [32]u8;
+    sha.final(?c, ?digest[0]);
+    val hex: *u8 = "0123456789abcdef";
+    var i:   u64 = 0;
+    for (i < 32) {
+        if (file.digest[i * 2] != hex[digest[i] >> 4] || file.digest[i * 2 + 1] != hex[digest[i] & 15]) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}

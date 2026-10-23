@@ -1,0 +1,73 @@
+# modern Minisign detached signatures; verify both the prehash and trusted comment
+# format: https://jedisct1.github.io/minisign/
+
+use crypto.contracts;
+use crypto.hash;
+use blake: crypto.hash.blake2b;
+use crypto.signature;
+use std.encoding.base64;
+use std.types.size.usize;
+use io: userland.lib.cli;
+
+pub rec Signature {
+    packet:      [74]u8;
+    global:      [64]u8;
+    comment:     [1024]u8;
+    comment_len: u64;
+}
+
+fun line(data: *u8, len: u64, at: *u64, out: *u64) u64 {
+    val start: u64 = @at;
+    for (@at < len && data[@at] != 10) { @at = @at + 1; }
+    var end: u64 = @at;
+    if (@at < len)                          { @at = @at + 1; }
+    if (end > start && data[end - 1] == 13) { end = end - 1; }
+    @out = start;
+    ret end - start;
+}
+
+fun decode(data: *u8, len: u64, out: *u8, size: u64) u8 {
+    if (len != ((size + 2) / 3) * 4)                                      { ret 0; }
+    if (base64.decode(data, len::usize, out, size::usize) != size::usize) { ret 0; }
+    var canonical: [128]u8;
+    val encoded:   usize = base64.encode(out, size::usize, ?canonical[0], 128);
+    ret (encoded == len::usize && io.eq(data, len, ?canonical[0], len) != 0)::u8;
+}
+
+pub fun parse(data: *u8, len: u64, out: *Signature) u8 {
+    if (len > 1536) { ret 0; }
+    var at:    u64 = 0;
+    var start: u64 = 0;
+    var n:     u64 = line(data, len, ?at, ?start);
+    if (n < 19 || io.eq(?data[start], 19, "untrusted comment: ", 19) == 0) { ret 0; }
+    n = line(data, len, ?at, ?start);
+    if (decode(?data[start], n, ?out.packet[0], 74) == 0 || out.packet[0] != 69 || out.packet[1] != 68) { ret 0; }
+    n = line(data, len, ?at, ?start);
+    if (n < 17 || n - 17 > 1024 || io.eq(?data[start], 17, "trusted comment: ", 17) == 0) { ret 0; }
+    out.comment_len = n - 17;
+    io.copy(?out.comment[0], ?data[start + 17], out.comment_len);
+    n = line(data, len, ?at, ?start);
+    ret (decode(?data[start], n, ?out.global[0], 64) != 0 && at == len)::u8;
+}
+
+pub fun verify(data: *u8, len: u64, signed: *Signature, key: *u8, key_len: u64) u8 {
+    if (key_len > 512) { ret 0; }
+    var at:    u64 = 0;
+    var start: u64 = 0;
+    val first: u64 = line(key, key_len, ?at, ?start);
+    if (first < 19 || io.eq(?key[start], 19, "untrusted comment: ", 19) == 0) { ret 0; }
+    val n:      u64 = line(key, key_len, ?at, ?start);
+    var public: [42]u8;
+    if (at != key_len || decode(?key[start], n, ?public[0], 42) == 0 || public[0] != 69 || public[1] != 100) { ret 0; }
+    if (io.eq(?public[2], 8, ?signed.packet[2], 8) == 0)                                                     { ret 0; }
+    var digest: [64]u8;
+    val result: contracts.Operation = hash.digest_blake2b(blake.params(64),
+        contracts.Bytes{data: data, len: len::usize}, contracts.Buffer{data: ?digest[0], capacity: 64});
+    if (result.error != contracts.OK) { ret 0; }
+    val pk: contracts.Bytes = contracts.Bytes{data: ?public[10], len: 32};
+    if (signature.verify_ed25519(pk, contracts.Bytes{data: ?digest[0], len: 64}, contracts.Bytes{data: ?signed.packet[10], len: 64}) != contracts.OK) { ret 0; }
+    var comment: [1088]u8;
+    io.copy(?comment[0], ?signed.packet[10], 64);
+    io.copy(?comment[64], ?signed.comment[0], signed.comment_len);
+    ret (signature.verify_ed25519(pk, contracts.Bytes{data: ?comment[0], len: (64 + signed.comment_len)::usize}, contracts.Bytes{data: ?signed.global[0], len: 64}) == contracts.OK)::u8;
+}

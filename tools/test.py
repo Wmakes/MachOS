@@ -9,6 +9,7 @@ every expected string, in order. Tests marked `fsck` also run e2fsck on the
 root partition afterwards.
 """
 import argparse, os, re, subprocess, sys, threading, time
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 P = r"[^\r\n ]+@[^\r\n :]+:[^\r\n]*[$#] "  # shell prompt, not a printed comment
@@ -92,6 +93,130 @@ def with_securitytest():
     for path in (archive, short):
         subprocess.run(["tools/put.sh", path, "/bin/" + os.path.basename(path), disk()],
                        cwd=ROOT, check=True, stdout=subprocess.PIPE)
+
+
+def with_mpm():
+    """Signed local archives, dependency graphs and hostile inputs for MPM."""
+    import gzip
+    import hashlib
+    import io
+    import shutil
+    import tarfile
+    import mpm as builder
+    subprocess.run(["tools/mkimage.sh", PROFILE[0], "--fresh"], cwd=ROOT, check=True,
+                   stdout=subprocess.PIPE)
+    target = Path(ROOT) / "out/headless/mpm-fixtures"
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    payload = target / "root"
+    (payload / "opt/mpm/mounted").mkdir(parents=True)
+    (payload / "etc").mkdir()
+    key, public = target / "test.key", target / "test.pub"
+    subprocess.run(["minisign", "-G", "-W", "-s", str(key), "-p", str(public)],
+                   check=True, stdout=subprocess.PIPE)
+
+    def sign(path):
+        subprocess.run(["minisign", "-S", "-W", "-s", str(key), "-m", str(path),
+                        "-x", str(path) + ".sig", "-t", "mpm test archive"],
+                       check=True, stdout=subprocess.PIPE)
+
+    def make(filename, name, version="1.0.0", deps=(), files=None, signed=True):
+        if files is None:
+            files = {"/opt/mpm/" + name: (name + "\n").encode()}
+        specs = []
+        for namepath, contents in files.items():
+            source = payload / namepath[1:]
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(contents)
+            specs.append(dict(path=namepath, mode=0o644, config=namepath.startswith("/etc/")))
+        definition = dict(name=name, version=version,
+                          dependencies=[dict(name=d, version=v) for d, v in deps], files=specs)
+        manifest, entries = builder.build_manifest(definition, payload)
+        path = target / filename
+        builder.archive(path, manifest, entries)
+        if signed:
+            sign(path)
+        return path
+
+    make("helper.mpa", "mpm-helper")
+    make("demo.mpa", "mpm-demo", deps=[("mpm-helper", ">=1.0.0")],
+         files={"/opt/mpm/demo": bytes(range(256)) * 4096,
+                "/etc/mpm-demo.conf": b"setting default\n"})
+    make("upgrade.mpa", "mpm-demo", "1.1.0", deps=[("mpm-helper", ">=1.0.0")],
+         files={"/opt/mpm/demo": b"upgraded\n", "/etc/mpm-demo.conf": b"setting upgraded\n"})
+    make("unsigned.mpa", "mpm-unsigned", signed=False)
+    make("conflict.mpa", "mpm-conflict", files={"/opt/mpm/conflict": b"replacement\n"})
+    make("ownership.mpa", "mpm-ownership", files={"/opt/mpm/demo": b"takeover\n"})
+    make("cycle-a.mpa", "mpm-cycle-a", deps=[("mpm-cycle-b", ">=1.0.0")])
+    make("cycle-b.mpa", "mpm-cycle-b", deps=[("mpm-cycle-a", ">=1.0.0")])
+    make("missing.mpa", "mpm-missing", deps=[("mpm-does-not-exist", ">=1.0.0")])
+    make("rollback.mpa", "mpm-rollback", files={"/opt/mpm/rollback": b"after\n",
+         "/opt/mpm/mounted/second": b"cannot cross filesystems\n"})
+    good = (target / "helper.mpa").read_bytes()
+    bad = target / "truncated.mpa"
+    bad.write_bytes(good[:-8]); sign(bad)
+    tampered = target / "tampered.mpa"
+    changed = bytearray(good); changed[len(changed) // 2] ^= 1
+    tampered.write_bytes(changed)
+    (target / "tampered.mpa.sig").write_bytes((target / "helper.mpa.sig").read_bytes())
+    comment = target / "comment.mpa"
+    comment.write_bytes(good)
+    (target / "comment.mpa.sig").write_bytes((target / "helper.mpa.sig").read_bytes().replace(b"mpm test archive", b"mpm fake archive"))
+    # The signer is trusted, but these tar inventories must still be rejected.
+    plain = gzip.decompress(good)
+    source_entries = []
+    with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as tar:
+        for member in tar:
+            source_entries.append((member, tar.extractfile(member).read()))
+    for filename, kind in (("traversal.mpa", "traversal"), ("duplicate.mpa", "duplicate"), ("link.mpa", "link")):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+            for member, contents in source_entries:
+                cloned = tarfile.TarInfo(member.name)
+                cloned.mode = member.mode
+                if kind == "traversal" and member.name != "manifest.toml":
+                    cloned.name = "files/../../etc/evil"
+                if kind == "link" and member.name != "manifest.toml":
+                    cloned.type, cloned.linkname = tarfile.SYMTYPE, "/etc/shadow"
+                    cloned.size = 0
+                    tar.addfile(cloned)
+                else:
+                    cloned.size = len(contents)
+                    tar.addfile(cloned, io.BytesIO(contents))
+                    if kind == "duplicate" and member.name != "manifest.toml":
+                        tar.addfile(cloned, io.BytesIO(contents))
+        bad = target / filename
+        bad.write_bytes(gzip.compress(raw.getvalue(), mtime=0)); sign(bad)
+    # A valid signature from a key that is not in the guest's trust store.
+    other = target / "other.key"
+    subprocess.run(["minisign", "-G", "-W", "-s", str(other), "-p", str(target / "other.pub")],
+                   check=True, stdout=subprocess.PIPE)
+    unknown = target / "unknown.mpa"; unknown.write_bytes(good)
+    subprocess.run(["minisign", "-S", "-W", "-s", str(other), "-m", str(unknown), "-x", str(unknown) + ".sig"],
+                   check=True, stdout=subprocess.PIPE)
+    key.unlink(); other.unlink()
+    (target / "recover.journal").write_bytes(b"10\t/opt/mpm/rollback\n")
+    bundle = target / "mpm-fixtures.tar"
+    with tarfile.open(bundle, "w", format=tarfile.USTAR_FORMAT) as tar:
+        for path in sorted(target.iterdir()):
+            if path.suffix in (".mpa", ".sig") or path.name in ("test.pub", "recover.journal"):
+                tar.add(path, arcname=path.name, recursive=False)
+    subprocess.run(["tools/put.sh", str(bundle), "/bin/mpm-fixtures.tar", disk()],
+                   cwd=ROOT, check=True, stdout=subprocess.PIPE)
+
+
+def check_truecolor():
+    from PIL import Image
+    with Image.open(os.path.join(ROOT, "out/headless/truecolor.png")) as image:
+        image = image.convert("RGB")
+        ink = set(image.crop((0, 0, 24, 16)).getdata())
+        if ink != {(18, 52, 86), (101, 67, 33)}:
+            return "RGB glyph foreground/background differ from requested colours"
+        for x, colour in ((0, (17, 34, 51)), (32, (255, 0, 0)), (64, (128, 128, 128))):
+            if set(image.crop((x, 32, x + 32, 48)).getdata()) != {colour}:
+                return "RGB/indexed background pixels differ from requested colours"
+    return ""
 
 
 def with_usability():
@@ -284,7 +409,7 @@ def tlssuite_steps():
 
 def stdsuite_steps():
     # Permission regressions must run as an ordinary owner, not uid 0.
-    steps = ["wait:" + P, "send:adduser stdtest\\n", "wait:" + P,
+    steps = ["wait:" + P, "send:adduser stdtest\\n", "wait:New password: ", "send:stdtest\\n", "wait:Again: ", "send:stdtest\\n", "wait:" + P,
              "send:su stdtest\\n", r"wait:stdtest@[^\r\n :]+:[^\r\n]*[$] ",
              f"send:cd /home/stdtest; runtests /bin/stdsuite 0 {len(STD_SUITE) - 1}\\n"]
     for i in range(len(STD_SUITE)):
@@ -679,7 +804,7 @@ TESTS = [
     ("usability-reboot", True, True,
      ["wait:" + P,
       "send:uname -n; config get ttys; test \"$(uname -n)\" = configured; echo boot-config-status $?\\n", "wait:" + P],
-     ["MachOS 0.9.2", "configured", "1", "boot-config-status 0"]),
+     ["MachOS 0.9.3", "configured", "1", "boot-config-status 0"]),
 
     ("boot", False, False,
      ["wait:" + P, "send:uname -a; ls /\\n", "wait:" + P],
@@ -780,8 +905,8 @@ TESTS = [
     # the live ISO, as a USB stick would boot it: runs from memory
     ("live-iso", False, False,
      ["--prep", lambda: sh("tools/iso.sh out/headless/live.iso"), "--boot", os.path.join(ROOT, "out/headless/live.iso"),
-      "wait:" + P, "send:dmesg | grep -E 'live system|loaded by'; ls /bin | wc -l\\n", "wait:" + P],
-     ["loaded by machboot", "live system: running from memory"]),
+      "wait:" + P, "send:dmesg | grep -E 'live system|loaded by'; ls /bin | wc -l; mpm list; mpm info coreutils\\n", "wait:" + P],
+     ["loaded by machboot", "live system: running from memory", "machos-base 0.9.3", "mpm: installed files verified"]),
 
     # FAT32 on a USB stick: read the host's files, write, rename, remove;
     # the host's fsck.fat checks it after
@@ -814,8 +939,8 @@ TESTS = [
     # itself standing in for Windows' boot manager)
     ("dualboot", False, False,
      ["--prep", fake_windows, "--boot", DUAL, "--nologin", "sleep:2.5", "keys:<down><down><down>", "sleep:0.5",
-      "keys:<ret>", "wait:booting Windows", "wait:login: ", "send:root\\n", "wait:" + P],
-     ["Windows", "machboot: booting Windows", "machboot 0.9.2"]),
+      "keys:<ret>", "wait:booting Windows", "login:root:machos", "wait:" + P],
+     ["Windows", "machboot: booting Windows", "machboot 0.9.3"]),
 
     # machboot hide: no menu, straight into MachOS
     ("hidden-menu", False, True,
@@ -828,17 +953,17 @@ TESTS = [
     # an update from a package on a USB stick, then a reboot into it
     ("update", False, True,
      ["--prep", update_stick] + usb_stick() + [
-      "wait:" + P, "send:mkdir /mnt; mount /dev/sdb /mnt; rm -r /usr/share/licenses; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update /bin/install; mv /mnt/update.tgz '/mnt/update name;literal.tgz'; mount /dev/sda1 /boot/efi; cd /mnt; update 'update name;literal.tgz'; cd /root; umount /boot/efi; umount /mnt; machboot\\n",
+      "wait:" + P, "send:cat /etc/system.conf /etc/time.conf /etc/login.conf /etc/network.conf > /etc/machos.conf; rm /etc/system.conf /etc/time.conf /etc/login.conf /etc/network.conf; echo kept > /var/lib/mpm/custom-marker; mkdir /mnt; mount /dev/sdb /mnt; rm -r /usr/share/licenses; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update /bin/install; mv /mnt/update.tgz '/mnt/update name;literal.tgz'; mount /dev/sda1 /boot/efi; cd /mnt; update 'update name;literal.tgz'; cd /root; umount /boot/efi; umount /mnt; config get hostname; mpm info coreutils; cat /var/lib/mpm/custom-marker; machboot\\n",
       "wait:" + P],
-     ["updating MachOS", "installing the programs", "MachOS is updated to 0.9.2", "MachOS (previous)"]),
+     ["updating MachOS", "installing the programs", "MachOS is updated to 0.9.3", "machos", "mpm: installed files verified", "kept", "MachOS (previous)"]),
     ("update-reboot", True, True,
      ["wait:" + P, "send:ls /boot; uname -a\\n", "wait:" + P],
-     ["kernel.old.elf", "MachOS 0.9.2"]),
+     ["kernel.old.elf", "MachOS 0.9.3"]),
 
     # MachOS installed on a USB stick, then booted from the stick alone
     ("usb-install", False, False,
      ["--prep", lambda: sh(f"rm -f {USB_STICK}; dd if=/dev/zero of={USB_STICK} bs=1M count=512 status=none")]
-     + usb_stick() + ["wait:" + P, "send:install /dev/sdb\\n", "wait:continue: ", "send:yes\\n", "wait:New password: ", "send:machos\\n", "wait:Again: ", "send:machos\\n",
+     + usb_stick() + ["wait:" + P, "send:install /dev/sdb\\n", "wait:continue: ", "send:yes\\n", "wait:New password: ", "send:machos\\n", "wait:Again: ", "send:machos\\n", "wait:Create an administrator", "send:no\\n",
       "wait:installed on", "wait:" + P],
      ["mass storage", "installed on /dev/sdb"]),
     ("usb-installed-boot", False, False,
@@ -847,7 +972,7 @@ TESTS = [
       "--qemu=-device", "--qemu=qemu-xhci,id=xhci", "--qemu=-drive",
       f"--qemu=if=none,id=stick,format=raw,file={USB_STICK}",
       "--qemu=-device", "--qemu=usb-storage,bus=xhci.0,drive=stick,bootindex=0",
-      "wait:Password: ", "send:machos\\n", "wait:" + P, "send:df\\n", "wait:" + P],
+      "wait:" + P, "send:df\\n", "wait:" + P],
      ["root: ext2 on /dev/sdb2", "/dev/sdb2"]),
 
     ("tools", False, False,
@@ -858,7 +983,7 @@ TESTS = [
       "wait:diff=", "wait:" + P,
       "send:find / -name '*.conf'; ls /etc | xargs echo got; seq 1 50 | tail -2 | tee /tmp/t | wc -l; basename /a/b.txt .txt; df\\n",
       "wait:" + P],
-     ["APPLE", "FIG", "PEAR", "20", "19", "-3", "+X", "diff=1", "/boot/machboot.conf", "got group hosts machos.conf motd passwd services shadow ssl/",
+     ["APPLE", "FIG", "PEAR", "20", "19", "-3", "+X", "diff=1", "/boot/machboot.conf", "group hosts login.conf motd mpm/ mpm.conf network.conf passwd se.conf services sh.conf shadow ssl/ system.conf time.conf wget.conf",
       "      2", "b", "/dev/sda2", "%"]),
 
     ("jobs-and-ctrl-c", False, False,
@@ -940,8 +1065,8 @@ TESTS = [
      ["wait:" + P, "send:cat /proc/version; head -2 /proc/meminfo; cat /proc/self/status; ls /proc/sys/kernel; cat /proc/stat\\n",
       "wait:" + P,
       "send:uname -a; free; uptime; ps; df; id; whoami; tty; neofetch | grep -c Memory\\n", "wait:" + P],
-     ["MachOS version 0.9.2", "MemTotal:", "Name:", "cat", "Uid:", "hostname", "cpu0",
-      "MachOS 0.9.2 x86_64 on machos", "total", "processes", "PID", "init", "Filesystem", "/dev/sda2",
+     ["MachOS version 0.9.3", "MemTotal:", "Name:", "cat", "Uid:", "hostname", "cpu0",
+      "MachOS 0.9.3 x86_64 on machos", "total", "processes", "PID", "init", "Filesystem", "/dev/sda2",
       "uid=0(root)", "root", "/dev/tty1", "1"]),
 
     ("events", False, False,
@@ -951,17 +1076,17 @@ TESTS = [
 
     ("clock", False, False,
      ["wait:" + P, "send:date -s '2030-01-02 03:04:05'; date +%s\\n", "wait:" + P,
-      "send:echo 'timezone CET-1CEST,M3.5.0,M10.5.0/3' >> /etc/machos.conf; date; date -u; env TZ=JST-9 date\\n",
+      "send:echo 'timezone CET-1CEST,M3.5.0,M10.5.0/3' >> /etc/time.conf; date; date -u; env TZ=JST-9 date\\n",
       "wait:" + P,
       "send:date -s '2030-07-01 12:00'; date -u; echo box > /proc/sys/kernel/hostname; uname -n\\n", "wait:" + P],
      ["2030-01-02 03:04:05 UTC", "18935534", "2030-01-02 04:04", "CET", "2030-01-02 03:04", "UTC",
       "2030-01-02 12:04", "JST", "2030-07-01 12:00:00 CEST", "2030-07-01 10:00", "UTC", "box"]),
 
     ("config-write", False, False,
-     ["wait:" + P, "send:echo 'hostname testbox' > /etc/machos.conf; echo 'ttys 2' >> /etc/machos.conf\\n",
+     ["wait:" + P, "send:echo 'hostname testbox' > /etc/system.conf; echo 'ttys 2' >> /etc/login.conf\\n",
       "wait:" + P,
-      "send:echo 'autologin root' >> /etc/machos.conf; echo 'timezone CET-1CEST,M3.5.0,M10.5.0/3' >> /etc/machos.conf\\n",
-      "wait:" + P, "send:echo 'rtc local' >> /etc/machos.conf; sync\\n", "wait:" + P, "sleep:1"],
+      "send:echo 'autologin root' >> /etc/login.conf; echo 'timezone CET-1CEST,M3.5.0,M10.5.0/3' >> /etc/time.conf\\n",
+      "wait:" + P, "send:echo 'rtc local' >> /etc/time.conf; sync\\n", "wait:" + P, "sleep:1"],
      []),
 
     ("config-boot", True, False,
@@ -1036,11 +1161,12 @@ TESTS = [
       "wait:" + P, "send:cd /tmp; wget http://10.0.2.2:8080/hello.txt; cat hello.txt\\n", "wait:" + P,
       "send:wget -q -O big http://10.0.2.2:8080/big.txt; wc -l big; sha256sum big\\n", "wait:" + P,
       "send:wget -O - http://10.0.2.2:8080/sub; wget http://10.0.2.2:8080/nope; echo status $?\\n", "wait:" + P,
-      "send:wget http://10.0.2.2:1/\\n", "wait:" + P],
+      "send:wget http://10.0.2.2:1/\\n", "wait:" + P,
+      "send:config set wget.quiet yes; wget -O /tmp/quiet http://10.0.2.2:8080/hello.txt > /tmp/wget-log 2>&1; grep saved /tmp/wget-log; echo quiet-progress $?; config set wget.redirects 0; wget -q -O /tmp/limit http://10.0.2.2:8080/sub; echo redirect-limit $?; config set wget.timeout 1; echo timeout-range $?\\n", "wait:" + P],
      ["hello.txt saved, 15 bytes", "hello over tcp", "150000",
       "771c3995129ed087c7336651f32a510b009e3c9d2190f13bda69d91dd91a257e",
       "redirected to http://10.0.2.2:8080/sub/", "behind a redirect", "404", "status 1",
-      "connection refused"]),
+      "connection refused", "quiet-progress 1", "too many redirects", "redirect-limit 1", "timeout-range 2"]),
 
     ("net-config", False, False,
      ["wait:" + P, "send:ip set 10.0.2.50/24 10.0.2.2 10.0.2.3; ip; ping -c 1 10.0.2.2\\n", "wait:packet loss",
@@ -1075,7 +1201,7 @@ TESTS = [
       "^C", "status=130", "1", "no such process"]),
 
     ("users", False, True,
-     ["wait:" + P, "send:id; adduser alice; ls -l /home\\n", "wait:" + P,
+     ["wait:" + P, "send:id; adduser alice\\n", "wait:New password: ", "send:first\\n", "wait:Again: ", "send:first\\n", "wait:" + P, "send:ls -l /home\\n", "wait:" + P,
       "send:passwd alice\\n", "wait:New password: ", "send:secret\\n", "wait:Again: ", "send:secret\\n",
       "wait:" + P,
       "send:su alice\\n", "wait:" + P,
@@ -1083,7 +1209,7 @@ TESTS = [
       "send:exit\\n", "wait:login: ", "send:alice\\n", "wait:Password: ", "send:wrong\\n",
       "wait:incorrect", "wait:login: ", "send:alice\\n", "wait:Password: ", "send:secret\\n",
       "wait:" + P, "send:pwd; ls -l /bin/su\\n", "wait:" + P],
-     ["uid=0(root)", "added alice (uid 1000", "alice    alice", "password changed",
+     ["uid=0(root)", "added alice", "alice    alice", "password changed",
       "uid=1000(alice)", "shadow: permission denied", "/x: permission denied", "hi",
       "operation not permitted", "Login incorrect", "alice@machos", "/home/alice", "-rwsr-xr-x root"]),
 
@@ -1134,10 +1260,10 @@ TESTS = [
     ("install", False, False,
      ["--disk2", "blank:" + TARGET,
       "wait:" + P, "send:ls /dev; install /dev/sda\\n", "wait:continue: ", "send:no\\n", "wait:" + P,
-      "send:install /dev/sdb\\n", "wait:continue: ", "send:yes\\n", "wait:New password: ", "send:machos\\n", "wait:Again: ", "send:machos\\n", "wait:" + P,
-      "send:ls /dev; mount /dev/sdb2 /mnt; ls /mnt; umount /dev/sdb2; ls /mnt; echo unmounted\\n", "wait:" + P],
+      "send:install /dev/sdb\\n", "wait:continue: ", "send:yes\\n", "wait:New password: ", "send:\\n", "wait:It cannot be empty.", "wait:New password: ", "send:machos\\n", "wait:Again: ", "send:machos\\n", "wait:Create an administrator", "send:yes\\n", "wait:User name: ", "send:installer\\n", "wait:New password: ", "send:testing\\n", "wait:Again: ", "send:testing\\n", "wait:" + P,
+      "send:ls /dev; mount /dev/sdb2 /mnt; ls /mnt; cat /mnt/etc/group; ls /mnt/var/lib/mpm/packages; umount /dev/sdb2; ls /mnt; echo unmounted\\n", "wait:" + P],
      ["sdb", "/dev/sdb2 MachOS root 446 MiB", "mkfat: FAT32", "mkext2:", "copying the system",
-      "is installed on /dev/sdb", "sdb1", "sdb2", "bin/", "unmounted"]),
+      "It cannot be empty.", "adduser: added installer", "is installed on /dev/sdb", "sdb1", "sdb2", "bin/", "admin:x:101:installer", "machos-base.toml", "unmounted"]),
 
     ("nvme-boot", False, False,
      ["--nvme", "wait:" + P, "send:df; ls /dev; echo \"[$(partname /dev/nvme0n1 2)]\"\\n", "wait:" + P],
@@ -1146,16 +1272,16 @@ TESTS = [
 
     ("nvme-install", False, False,
      ["--disk2", "blank:" + NVME_TARGET, "--disk2", "nvme:" + NVME_TARGET,
-      "wait:" + P, "send:install /dev/nvme0n1\\n", "wait:continue: ", "send:yes\\n", "wait:New password: ", "send:machos\\n", "wait:Again: ", "send:machos\\n", "wait:installed on",
+      "wait:" + P, "send:install /dev/nvme0n1\\n", "wait:continue: ", "send:yes\\n", "wait:New password: ", "send:machos\\n", "wait:Again: ", "send:machos\\n", "wait:Create an administrator", "send:no\\n", "wait:installed on",
       "wait:" + P],
      ["/dev/nvme0n1p1 EFI system", "mkfat: FAT32", "copying the system", "installed on /dev/nvme0n1"]),
 
     ("nvme-installed-boot", False, True,
-     ["--boot", NVME_TARGET, "--nvme", "wait:Password: ", "send:machos\\n", "wait:" + P, "send:df\\n", "wait:" + P, "sleep:1"],
+     ["--boot", NVME_TARGET, "--nvme", "wait:" + P, "send:df\\n", "wait:" + P, "sleep:1"],
      ["root: ext2 on /dev/nvme0n1p2", "/dev/nvme0n1p2"]),
 
     ("installed-boot", False, True,
-     ["--boot", TARGET, "wait:Password: ", "send:machos\\n", "wait:" + P,
+     ["--boot", TARGET, "wait:" + P,
       "send:uname; ls /boot; echo on-installed > /home/x; cat /home/x; mkdir /mnt; mount /dev/sda2 /mnt\\n", "wait:" + P,
       "sleep:1"],
      ["root: ext2 on /dev/sda2", "MachOS", "kernel.elf", "on-installed", "busy"]),
@@ -1220,6 +1346,77 @@ TESTS.append(("security", False, True,
                "ok invalid syscall stack ends only its process",
                "ok invalid signal return ends only its process",
                "ok signal return masks unsupported MXCSR bits", "0 security failures", "security-status 0"]))
+
+
+TESTS.append(("password-migration", False, True,
+              ["wait:" + P, "send:adduser legacy\\n", "wait:New password: ", "send:initial\\n", "wait:Again: ", "send:initial\\n", "wait:" + P,
+               "send:grep 'root:' /etc/shadow > /tmp/root-shadow; cp /tmp/root-shadow /etc/shadow; echo 'legacy::' >> /etc/shadow; exit\\n",
+               "login:legacy:changed", "wait:legacy@.*[$] ", "send:id; exit\\n", "login:root:machos", "wait:" + P,
+               "send:echo 'legacy:!:' > /tmp/locked; grep 'root:' /etc/shadow >> /tmp/locked; cp /tmp/locked /etc/shadow; exit\\n",
+               "wait:login: ", "send:legacy\\n", "wait:Password: ", "send:changed\\n", "wait:Login incorrect",
+               "login:root:machos", "wait:" + P, "send:sync\\n", "wait:" + P],
+              ["adduser: added legacy", "A password is required", "uid=1000(legacy)", "Login incorrect"]))
+
+
+TESTS.append(("mpm", False, True,
+              ["--prep", with_mpm, "--boot", disk, "wait:" + P,
+               "send:cd /bin; tar -xf /bin/mpm-fixtures.tar; cp /bin/test.pub /etc/mpm/keys/test.pub; cd /root\\n", "wait:" + P,
+               "send:mpm list; mpm info machos-base; mpm info /bin/demo.mpa; mpm install /bin/demo.mpa; echo install-status $?\\n", "wait:" + P,
+               "send:sha256sum /opt/mpm/demo; mpm info mpm-demo; mpm remove mpm-helper; echo dependency-status $?\\n", "wait:" + P,
+               "send:echo edited > /etc/mpm-demo.conf; mpm install /bin/upgrade.mpa; cat /etc/mpm-demo.conf; cat /etc/mpm-demo.conf.mpm-new; mpm install /bin/demo.mpa; echo downgrade-status $?\\n", "wait:" + P,
+               "send:mpm install --force /bin/ownership.mpa; echo ownership-status $?; mpm remove machos-base; echo base-status $?\\n", "wait:" + P,
+               "send:mpm remove mpm-demo; cat /etc/mpm-demo.conf; test -e /opt/mpm/demo; echo removed-file $?; mpm remove --purge mpm-demo; test -e /etc/mpm-demo.conf; echo purged-config $?; test -e /etc/mpm-demo.conf.mpm-new; echo purged-pending $?; mpm remove mpm-helper; sync\\n", "wait:" + P],
+              ["machos-base 0.9.3", "mpm: installed files verified", "mpm: archive verified",
+               "mpm: installed mpm-helper 1.0.0", "mpm: installed mpm-demo 1.0.0", "install-status 0",
+               "fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83", "mpm: installed files verified", "dependency-status 1",
+               "mpm: keeping edited configuration", "mpm: installed mpm-demo 1.1.0", "edited", "setting upgraded", "downgrade-status 1",
+               "ownership-status 1", "base-status 1", "configuration preserved", "edited", "removed-file 1", "purged-config 1", "purged-pending 1"]))
+
+TESTS.append(("mpm-reject", False, True,
+              ["--prep", with_mpm, "--boot", disk, "wait:" + P,
+               "send:cd /bin; tar -xf /bin/mpm-fixtures.tar; cp /bin/test.pub /etc/mpm/keys/test.pub; cd /root\\n", "wait:" + P,
+               "send:mpm install /bin/unsigned.mpa; echo unsigned-status $?; mpm install /bin/tampered.mpa; echo tampered-status $?; mpm install --allow-unsigned /bin/comment.mpa; echo comment-status $?; mpm install /bin/unknown.mpa; echo unknown-status $?\\n", "wait:" + P,
+               "send:mpm install /bin/truncated.mpa; echo truncated-status $?; mpm install /bin/traversal.mpa; echo traversal-status $?; mpm install /bin/duplicate.mpa; echo duplicate-status $?; mpm install /bin/link.mpa; echo link-status $?\\n", "wait:" + P,
+               "send:mpm install /bin/cycle-a.mpa; echo cycle-status $?; mpm install /bin/missing.mpa; echo missing-status $?\\n", "wait:" + P,
+               "send:mpm install --allow-unsigned /bin/unsigned.mpa\\n", "wait:Password: ", "send:wrong\\n", "wait:" + P,
+               "send:mpm install --allow-unsigned /bin/unsigned.mpa\\n", "wait:Password: ", "send:machos\\n", "wait:" + P,
+               "send:echo old > /opt/mpm/conflict; mpm install /bin/conflict.mpa; echo conflict-status $?; cat /opt/mpm/conflict; mpm install --force /bin/conflict.mpa; cat /opt/mpm/conflict; test -e /var/lib/mpm/transaction; echo clean-status $?; sync\\n", "wait:" + P],
+              ["unsigned-status 1", "tampered-status 1", "comment-status 1", "unknown-status 1", "truncated-status 1", "traversal-status 1", "duplicate-status 1", "link-status 1", "cycle-status 1", "missing-status 1", "authentication failed", "mpm: installed mpm-unsigned 1.0.0", "conflict-status 1", "old", "mpm: installed mpm-conflict 1.0.0", "replacement", "clean-status 1"]))
+
+TESTS.append(("mpm-rollback", False, True,
+              ["--prep", with_mpm, "--boot", disk, "--disk2", "blank:" + TARGET,
+               "wait:" + P, "send:cd /bin; tar -xf /bin/mpm-fixtures.tar; cp /bin/test.pub /etc/mpm/keys/test.pub; cd /root\\n", "wait:" + P,
+               "send:mkdir -p /opt/mpm/mounted; echo before > /opt/mpm/rollback; mkext2 /dev/sdb; mount /dev/sdb /opt/mpm/mounted; mpm install --force /bin/rollback.mpa; echo rollback-status $?; cat /opt/mpm/rollback; test -e /var/lib/mpm/packages/mpm-rollback.toml; echo record-status $?; umount /opt/mpm/mounted\\n", "wait:" + P,
+               "send:mkdir /var/lib/mpm/transaction; chmod 700 /var/lib/mpm/transaction; cp /bin/recover.journal /var/lib/mpm/transaction/journal; echo original > /var/lib/mpm/transaction/old-0; echo interrupted > /opt/mpm/rollback; mpm recover; echo recovery-status $?; cat /opt/mpm/rollback; sync\\n", "wait:" + P],
+              ["transaction rolled back", "rollback-status 1", "before", "record-status 1", "recovery-status 0", "original"]))
+
+
+TESTS.append(("truecolor", False, True,
+              ["--post", check_truecolor, "wait:" + P,
+               "send:printf '\\\\e[2J\\\\e[H\\\\e[38;2;18;52;86;48;2;101;67;33mRGB\\\\e[0m\\\\e[3;1H\\\\e[48;2;17;34;51m    \\\\e[48;5;196m    \\\\e[48;5;244m    \\\\e[0m\\\\n'\\n",
+               "wait:" + P, "shot:out/headless/truecolor.png"], ["RGB"]))
+
+
+TESTS.append(("admin", False, True,
+              ["--prep", with_mpm, "--boot", disk, "wait:" + P,
+               "send:cd /bin; tar -xf /bin/mpm-fixtures.tar; cp /bin/test.pub /etc/mpm/keys/test.pub; cd /root\\n", "wait:" + P,
+               "send:adduser --admin tester\\n", "wait:New password: ",
+               "send:\\n", "wait:Password cannot be empty.", "wait:New password: ",
+               "send:testing\\n", "wait:Again: ", "send:testing\\n", "wait:" + P,
+               "send:su tester\\n", "wait:tester@.*[$] ",
+               "send:se id\\n", "wait:Password: ", "send:wrong\\n", "wait:authentication failed", "wait:" + P,
+               "send:se id\\n", "wait:Password: ", "send:testing\\n", "wait:uid=0", "wait:" + P,
+               "send:se id; se -k\\n", "wait:uid=0", "wait:" + P,
+               "send:se id\\n", "wait:Password: ", "send:testing\\n", "wait:uid=0", "wait:" + P,
+               "send:se mpm install --allow-unsigned /bin/unsigned.mpa\\n", "wait:Password: ", "send:testing\\n", "wait:mpm: installed mpm-unsigned", "wait:" + P,
+               "send:export MPM_UNSAFE=yes; se env | grep MPM_UNSAFE; echo leaked-env $?\\n", "wait:" + P,
+               "send:se usermod --no-admin tester; se id; echo revoked-status $?; mpm remove mpm-unsigned; echo direct-status $?\\n", "wait:" + P,
+               "send:exit\\n", "wait:root@.*# ",
+               "send:usermod --admin tester; usermod --admin tester; config set se.timeout 0; config get se.timeout; config set wget.redirects 2; config get wget.redirects; config set se.timeout 1; su tester\\n", "wait:tester@.*[$] ",
+               "send:se id\\n", "wait:Password: ", "send:testing\\n", "wait:uid=0", "wait:" + P,
+               "sleep:2", "send:se id\\n", "wait:Password: ", "send:testing\\n", "wait:uid=0", "wait:" + P,
+               "send:exit\\n", "wait:root@.*# ", "send:sync\\n", "wait:" + P],
+              ["Password cannot be empty.", "adduser: added tester", "se: authentication failed", "uid=0(root)", "uid=0(root)", "uid=0(root)", "mpm: installed mpm-unsigned", "leaked-env 1", "user is not an administrator", "revoked-status 1", "direct-status 1", "config: saved", "0", "config: saved", "2", "uid=0(root)", "uid=0(root)"]))
 
 
 for cores in (2, 4):
@@ -1292,7 +1489,7 @@ for index, (name, keep, fsck, steps, expect) in enumerate(TESTS):
 
 
 def run(name, keep, fsck, steps, expect, profile):
-    cmd = [os.path.join(ROOT, "tools/headless.py"), "-p", profile, "-t", "240"]
+    cmd = [os.path.join(ROOT, "tools/headless.py"), "-p", profile, "-t", "60" if name.startswith("mpm") or name in ("admin", "password-migration", "install") else "240"]
     if keep:
         cmd.append("--keep")
     if fsck:
@@ -1340,7 +1537,7 @@ def run(name, keep, fsck, steps, expect, profile):
     steps = [part for step in steps for part in (step() if callable(step) else [step])]
     # every boot but rescue mode starts at a login prompt: log in as root
     if "--rescue" not in cmd and not nologin:
-        steps = ["wait:login: ", "send:root\\n"] + steps
+        steps = ["login:root:machos"] + steps
     # headless.py's progress (stderr) is shown live, so a stuck step is seen
     # as it happens; its stdout (the serial log) is kept for the checks
     proc = subprocess.Popen(cmd + steps, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

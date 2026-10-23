@@ -1,3 +1,4 @@
+use conf: userland.lib.conf;
 # wget fetches HTTP and verified HTTPS URLs, following at most five redirects.
 
 use std.runtime;
@@ -273,7 +274,9 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
         ret 1;
     }
     var s: tcp.Stream = c.ok;
-    tcp.stream_set_read_timeout(?s, 30000);
+    var timeout: u64 = conf.number("wget.timeout", 30000);
+    if (timeout < 100 || timeout > 600000) { timeout = 30000; }
+    tcp.stream_set_read_timeout(?s, timeout);
     if (encrypted != 0) {
         val trust: *cert.TrustStore = roots.load(quiet == 0);
         if (trust == nil) {
@@ -468,7 +471,7 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    var quiet: u8 = 0;
+    var quiet: u8 = conf.yes("wget.quiet", 0);
     var output: *u8 = nil;
     var i: i64 = 1;
     for (i < argc && argv[i][0] == 45 && argv[i][1] != 0) {
@@ -490,6 +493,8 @@ fun main(argc: i64, argv: **u8) i64 {
     target[ulen] = 0;
 
     var hops: u64 = 0;
+    var max_hops: u64 = conf.number("wget.redirects", 5);
+    if (max_hops > 20) { max_hops = 5; }
     for {
         val parsed: u8 = parse_url();
         if (parsed == 0) {
@@ -512,7 +517,7 @@ fun main(argc: i64, argv: **u8) i64 {
         val r: i64 = get(ip4, quiet, output);
         if (r != 2) { ret r; }
         hops = hops + 1;
-        if (hops > 5) {
+        if (hops > max_hops) {
             io.err("wget: too many redirects\n");
             ret 1;
         }

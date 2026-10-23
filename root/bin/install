@@ -22,12 +22,13 @@ mkext2 $ROOT || exit 1
 test -d /mnt || mkdir /mnt
 mount $ROOT /mnt || exit 1
 echo "copying the system..."
-cp -r /bin /etc /boot /usr /mnt || exit 1
-chmod 4755 /mnt/bin/su /mnt/bin/passwd || exit 1
+cp -r /bin /etc /boot /usr /var /mnt || exit 1
+chmod 4755 /mnt/bin/su /mnt/bin/passwd /mnt/bin/se || exit 1
 mkdir /mnt/home
 mkdir /mnt/root
 chmod 700 /mnt/root
 passwd -R /mnt root || exit 1
+adduser --optional-admin -R /mnt || exit 1
 umount /mnt || exit 1
 sync
 echo "MachOS is installed on $1. Boot from that disk."

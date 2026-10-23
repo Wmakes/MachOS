@@ -1,0 +1,146 @@
+# Exercise the console parser, cell colours and redraws using a RAM framebuffer.
+
+use machos.boot.info;
+use fb: machos.dev.fbcon;
+
+var pixels:  [8192]u32;
+var display: info.Framebuffer;
+
+fun setup(swapped: u8) u8 {
+    display.addr    = (?pixels[0])::u64;
+    display.width   = 128;
+    display.height  = 64;
+    display.pitch   = 512;
+    display.bpp     = 32;
+    display.r_size  = 8;
+    display.g_size  = 8;
+    display.b_size  = 8;
+    display.r_shift = 16;
+    display.g_shift = 8;
+    display.b_shift = 0;
+    if (swapped != 0) {
+        display.r_shift = 0;
+        display.b_shift = 16;
+    }
+    ret fb.init(?display);
+}
+
+fun write(screen: u64, text: *u8) {
+    var i: u64 = 0;
+    for (text[i] != 0) {
+        fb.putc_on(screen, text[i]);
+        i = i + 1;
+    }
+}
+
+fun glyph(x: u64, y: u64, fg: u32, bg: u32) u8 {
+    var ink:   u64 = 0;
+    var paper: u64 = 0;
+    var row:   u64 = 0;
+    for (row < 16) {
+        var col: u64 = 0;
+        for (col < 8) {
+            val pixel: u32 = pixels[(y * 16 + row) * 128 + x * 8 + col];
+            if (pixel == fg) { ink = ink + 1; }
+            or (pixel == bg) { paper = paper + 1; }
+            or               { ret 0; }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    ret (ink != 0 && paper != 0)::u8;
+}
+
+fun solid(x: u64, y: u64, colour: u32) u8 {
+    var row: u64 = 0;
+    for (row < 16) {
+        var col: u64 = 0;
+        for (col < 8) {
+            if (pixels[(y * 16 + row) * 128 + x * 8 + col] != colour) { ret 0; }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    ret 1;
+}
+
+test console__rgb_foreground_background_and_pixel_layout {
+    if (setup(0) == 0) { ret 1; }
+    write(0, "\x1b[38;2;18;52;86;48;2;101;67;33mX\0");
+    if (glyph(0, 0, 0x123456, 0x654321) == 0) { ret 2; }
+    if (setup(1) == 0)                        { ret 3; }
+    write(0, "\x1b[38;2;18;52;86;48;2;101;67;33mX\0");
+    if (glyph(0, 0, 0x563412, 0x214365) == 0) { ret 4; }
+    display.width = 0;
+    if (fb.init(?display) != 0) { ret 5; }
+    ret 0;
+}
+
+test console__indexed_cube_greys_and_ansi_palette {
+    setup(0);
+    write(0, "\x1b[38;5;196;48;5;244mX\x1b[38;5;13;48;5;16mX\x1b[38;5;231;48;5;232mX\0");
+    if (glyph(0, 0, 0xFF0000, 0x808080) == 0) { ret 1; }
+    if (glyph(1, 0, 0xFE01FF, 0) == 0)        { ret 2; }
+    if (glyph(2, 0, 0xFFFFFF, 0x080808) == 0) { ret 3; }
+    ret 0;
+}
+
+test console__bold_reverse_and_resets_preserve_explicit_rgb {
+    setup(0);
+    write(0, "\x1b[31mX\x1b[1mX\x1b[22mX\x1b[91;22mX\x1b[38;2;18;52;86;48;2;101;67;33;1;7mX\x1b[27;22mX\x1b[39;49mX\x1b[0mX\0");
+    if (glyph(0, 0, 0xAA0000, 0) == 0 || glyph(1, 0, 0xFF5555, 0) == 0)               { ret 1; }
+    if (glyph(2, 0, 0xAA0000, 0) == 0 || glyph(3, 0, 0xFF5555, 0) == 0)               { ret 2; }
+    if (glyph(4, 0, 0x654321, 0x123456) == 0 || glyph(5, 0, 0x123456, 0x654321) == 0) { ret 3; }
+    if (glyph(6, 0, 0xAAAAAA, 0) == 0 || glyph(7, 0, 0xAAAAAA, 0) == 0)               { ret 4; }
+    ret 0;
+}
+
+test console__malformed_colour_operands_cannot_become_other_attributes {
+    setup(0);
+    write(0, "\x1b[38;2;18;52;86m\x1b[38;2;256;0;0mX\x1b[38;5;999mX\x1b[38;2;0mX\x1b[999999999999999999999999999999999999999999999999mX\0");
+    var i: u64 = 0;
+    for (i < 4) {
+        if (glyph(i, 0, 0x123456, 0) == 0) { ret 1; }
+        i = i + 1;
+    }
+    write(0, "\x1b[0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0mX\x1b[38;2;1;2;3mX\0");
+    if (glyph(4, 0, 0x123456, 0) == 0 || glyph(5, 0, 0x010203, 0) == 0) { ret 2; }
+    ret 0;
+}
+
+test console__rgb_survives_scroll_history_and_terminal_switches {
+    setup(0);
+    write(0, "\x1b[38;2;18;52;86;48;2;101;67;33mA\n\x1b[38;2;1;2;3mB\nC\nD\n\0");
+    if (glyph(0, 0, 0x010203, 0x654321) == 0) { ret 1; }
+    fb.view_up();
+    if (glyph(0, 0, 0x123456, 0x654321) == 0) { ret 2; }
+    fb.show_screen(1);
+    write(1, "X\0");
+    if (glyph(0, 0, 0xAAAAAA, 0) == 0) { ret 3; }
+    fb.show_screen(0);
+    if (glyph(0, 0, 0x123456, 0x654321) == 0) { ret 4; }
+    fb.view_down();
+    if (glyph(0, 0, 0x010203, 0x654321) == 0) { ret 5; }
+    write(0, "\x1b[48;2;17;34;51m\x1b[2J\0");
+    if (solid(1, 0, 0x112233) == 0 || solid(15, 3, 0x112233) == 0) { ret 6; }
+    ret 0;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    ret 0;
+}
+
+#[naked]
+#[symbol("_start")]
+fun start() {
+    asm x86_64 {
+        mov rdi, [rsp]
+        lea rsi, [rsp + 8]
+        and rsp, -16
+        call main
+        mov rdi, rax
+        mov rax, 60
+        syscall
+    }
+}

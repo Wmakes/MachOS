@@ -1,0 +1,90 @@
+# focused runtime configuration, with read-only fallback for legacy installations
+
+use sdk.abi;
+use sdk.io;
+use sdk.sys;
+
+pub fun path(key: *u8) *u8 {
+    if (io.streq(key, "hostname\0") != 0)                                                                                                                 { ret "/etc/system.conf\0"; }
+    if (io.streq(key, "timezone\0") != 0 || io.streq(key, "rtc\0") != 0)                                                                                  { ret "/etc/time.conf\0"; }
+    if (io.streq(key, "ttys\0") != 0 || io.streq(key, "autologin\0") != 0 || io.streq(key, "login.tries\0") != 0 || io.streq(key, "login.banner\0") != 0) { ret "/etc/login.conf\0"; }
+    if (io.streq(key, "network\0") != 0)                                                                                                                  { ret "/etc/network.conf\0"; }
+    if (io.streq(key, "se.timeout\0") != 0)                                                                                                               { ret "/etc/se.conf\0"; }
+    if (io.streq(key, "sh.motd\0") != 0)                                                                                                                  { ret "/etc/sh.conf\0"; }
+    if (io.streq(key, "wget.timeout\0") != 0 || io.streq(key, "wget.redirects\0") != 0 || io.streq(key, "wget.quiet\0") != 0)                             { ret "/etc/wget.conf\0"; }
+    if (io.streq(key, "mpm.max_archive_mb\0") != 0 || io.streq(key, "mpm.max_unpacked_mb\0") != 0)                                                        { ret "/etc/mpm.conf\0"; }
+    ret nil;
+}
+
+# found distinguishes an explicitly empty value from an absent key
+pub fun from_file(file: *u8, key: *u8, out: *u8, cap: u64, found: *u8) u64 {
+    @found = 0;
+    if (cap == 0) { ret 0; }
+    out[0] = 0;
+    val h: u64 = sys.open(file, io.len(file), abi.O_READ | abi.O_NOFOLLOW);
+    if (abi.is_err(h) != 0) { ret 0; }
+    var text:   [8193]u8;
+    var length: u64 = 0;
+    for (length < 8193) {
+        val n: u64 = sys.read(h, ?text[length], 8193 - length);
+        if (abi.is_err(n) != 0) {
+            sys.close(h);
+            ret 0;
+        }
+        if (n == 0) { brk; }
+        length = length + n;
+    }
+    sys.close(h);
+    if (length > 8192) { ret 0; }
+    val kl:    u64 = io.len(key);
+    var at:    u64 = 0;
+    var count: u64 = 0;
+    for (at < length) {
+        var end: u64 = at;
+        for (end < length && text[end] != 10) { end = end + 1; }
+        for (at < end && (text[at] == 32 || text[at] == 9)) { at = at + 1; }
+        if (at + kl < end && io.eq(?text[at], kl, key, kl) != 0 && (text[at + kl] == 32 || text[at + kl] == 9)) {
+            var start: u64 = at + kl;
+            for (start < end && (text[start] == 32 || text[start] == 9)) { start = start + 1; }
+            var stop: u64 = end;
+            for (stop > start && (text[stop - 1] == 32 || text[stop - 1] == 9 || text[stop - 1] == 13)) { stop = stop - 1; }
+            if (stop - start >= cap) {
+                @found = 0;
+                out[0] = 0;
+                ret 0;
+            }
+            count = stop - start;
+            io.copy(out, ?text[start], count);
+            out[count] = 0;
+            @found     = 1;
+        }
+        at = end + 1;
+    }
+    ret count;
+}
+
+pub fun get(key: *u8, out: *u8, cap: u64) u64 {
+    if (cap == 0) { ret 0; }
+    out[0] = 0;
+    val file: *u8 = path(key);
+    if (file == nil) { ret 0; }
+    var found: u8  = 0;
+    val count: u64 = from_file(file, key, out, cap, ?found);
+    if (found != 0) { ret count; }
+    ret from_file("/etc/machos.conf\0", key, out, cap, ?found);
+}
+
+pub fun number(key: *u8, fallback: u64) u64 {
+    var text:  [32]u8;
+    val n:     u64 = get(key, ?text[0], 32);
+    var good:  u8  = 0;
+    val value: u64 = io.parse_dec(?text[0], n, ?good);
+    if (good == 0) { ret fallback; }
+    ret value;
+}
+
+pub fun yes(key: *u8, fallback: u8) u8 {
+    var text: [16]u8;
+    if (get(key, ?text[0], 16) == 0) { ret fallback; }
+    ret (io.streq(?text[0], "yes\0") != 0 || io.streq(?text[0], "on\0") != 0 || io.streq(?text[0], "true\0") != 0)::u8;
+}

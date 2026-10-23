@@ -1,0 +1,612 @@
+# local package selection, ownership, dependencies and transaction planning
+
+use sdk.abi;
+use sdk.auth;
+use sdk.sys;
+use sdk.users;
+use std.compress.gzip;
+use std.compress.inflate;
+use io_error: std.io.error;
+use std.process.env;
+use std.system.os;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use io: userland.lib.cli;
+use userland.lib.conf;
+use userland.mpm.fs;
+use pkg:    userland.mpm.package;
+use signed: userland.mpm.signature;
+use tx:     userland.mpm.transaction;
+
+var installed:         [128]pkg.Package;
+var installed_count:   u64;
+var selected:          [32]pkg.Package;
+var selected_count:    u64;
+var order:             [32]u64;
+var order_count:       u64;
+var unsigned_allowed:  u8;
+var unsigned_approved: u8;
+var overwrite:         u8;
+var purge:             u8;
+var max_archive:       u64;
+var max_unpacked:      u64;
+var removing:          [128]u8;
+
+fun fail(message: *u8) u8 {
+    io.err("mpm: ");
+    io.err(message);
+    io.putc(10);
+    ret 0;
+}
+
+fun record_path(out: *u8, name: *u8, active: u8) {
+    var base: *u8 = "/var/lib/mpm/packages/";
+    if (active == 0) { base = "/var/lib/mpm/configs/"; }
+    val n: u64 = io.len(base);
+    val k: u64 = io.len(name);
+    io.copy(out, base, n);
+    io.copy(?out[n], name, k);
+    io.copy(?out[n + k], ".toml", 6);
+}
+
+fun load_records(dirpath: *u8, active: u8) u8 {
+    if (fs.directory(dirpath, 0o755, 0) == 0) { ret fail("installed package database is missing or unsafe"); }
+    var dir: io.Dir;
+    if (io.dir_open(?dir, dirpath) < 0) { ret 0; }
+    var good: u8 = 1;
+    for {
+        val next: i64 = io.dir_next(?dir);
+        if (next < 0) {
+            good = 0;
+            brk;
+        }
+        if (next == 0) { brk; }
+        if (installed_count == 128 || dir.len <= 5 || dir.len > 68 || io.eq(?dir.name[dir.len - 5], 5, ".toml", 5) == 0) {
+            good = 0;
+            brk;
+        }
+        var path: [256]u8;
+        val n:    u64 = io.len(dirpath);
+        io.copy(?path[0], dirpath, n);
+        path[n] = 47;
+        io.copy(?path[n + 1], dir.name, dir.len);
+        path[n + 1 + dir.len] = 0;
+        var metadata: os.stat_t;
+        if (io.lstat(?path[0], ?metadata) < 0 || metadata.st_uid != 0 || (io.perms(?metadata) & 0o022) != 0) {
+            good = 0;
+            brk;
+        }
+        var blob: fs.Blob;
+        if (fs.read(?path[0], 65536, ?blob) == 0) {
+            good = 0;
+            brk;
+        }
+        val p:      *pkg.Package = ?installed[installed_count];
+        val parsed: u8           = pkg.parse(p, blob.data, blob.len);
+        fs.release(?blob);
+        if (parsed == 0 || io.eq(?p.name[0], io.len(?p.name[0]), dir.name, dir.len - 5) == 0) {
+            good = 0;
+            brk;
+        }
+        var i: u64 = 0;
+        for (i < installed_count) {
+            if (io.streq(?p.name[0], ?installed[i].name[0]) != 0) { good = 0; }
+            i = i + 1;
+        }
+        if (good == 0) { brk; }
+        p.active        = active;
+        installed_count = installed_count + 1;
+    }
+    io.dir_close(?dir);
+    if (good == 0) { ret fail("corrupt installed package database"); }
+    ret 1;
+}
+
+fun find_installed(name: *u8) i64 {
+    var i: u64 = 0;
+    for (i < installed_count) {
+        if (io.streq(name, ?installed[i].name[0]) != 0) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun owner(path: *u8) i64 {
+    var i: u64 = 0;
+    for (i < installed_count) {
+        var f: u64 = 0;
+        for (f < installed[i].count) {
+            if ((installed[i].active != 0 || installed[i].files[f].config != 0) && io.streq(path, ?installed[i].files[f].path[0]) != 0) { ret i::i64; }
+            if (installed[i].files[f].config != 0) {
+                var pending: [256]u8;
+                val n:       u64 = io.len(?installed[i].files[f].path[0]);
+                io.copy(?pending[0], ?installed[i].files[f].path[0], n);
+                io.copy(?pending[n], ".mpm-new", 9);
+                if (io.streq(path, ?pending[0]) != 0) { ret i::i64; }
+            }
+            f = f + 1;
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun find_file(p: *pkg.Package, path: *u8) *pkg.File {
+    var i: u64 = 0;
+    for (i < p.count) {
+        if (io.streq(path, ?p.files[i].path[0]) != 0) { ret ?p.files[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun approve_unsigned(path: *u8) u8 {
+    io.err("mpm: WARNING: unsigned package: ");
+    io.err(path);
+    io.err("\n");
+    if (unsigned_allowed == 0) { ret fail("refusing unsigned archive; explicit --allow-unsigned is required"); }
+    if (unsigned_approved == 0) {
+        var user: users.User;
+        if (users.by_uid(sys.getuid(), ?user) == 0) { ret 0; }
+        # se supplies the invoking name in its otherwise clean environment
+        var who:   [32]u8;
+        val named: res[opt[usize], env.EnvError] = env.get("SE_USER", ?who[0], 32);
+        if (sel named.err) { ret 0; }
+        if (sel named.ok.some) {
+            if (named.ok.some == 0 || named.ok.some >= 32 || users.by_name(?who[0], named.ok.some::u64, ?user) == 0) { ret 0; }
+        }
+        var hash: [128]u8;
+        val n:    u64 = users.stored(?user.name[0], user.name_len, ?hash[0]);
+        if (n == abi.NO_ID || users.locked(?hash[0], n) != 0) { ret fail("account cannot approve an unsigned package"); }
+        if (n > 0 && auth.password(?user) == 0)               { ret fail("unsigned installation authentication failed"); }
+        unsigned_approved = 1;
+    }
+    ret 1;
+}
+
+fun trusted(data: *u8, len: u64, path: *u8) u8 {
+    var sigpath: [520]u8;
+    val pn:      u64 = io.len(path);
+    if (pn > 511) { ret 0; }
+    io.copy(?sigpath[0], path, pn);
+    io.copy(?sigpath[pn], ".sig", 5);
+    var st:     os.stat_t;
+    val status: i64 = io.lstat(?sigpath[0], ?st);
+    if (status < 0) {
+        if (os.error_kind(status) == io_error.NOT_FOUND) { ret approve_unsigned(path); }
+        ret fail("cannot inspect detached signature");
+    }
+    var text:      fs.Blob;
+    var signature: signed.Signature;
+    if (fs.read(?sigpath[0], 1536, ?text) == 0) { ret fail("cannot read signature"); }
+    val parsed: u8 = signed.parse(text.data, text.len, ?signature);
+    fs.release(?text);
+    if (parsed == 0)                             { ret fail("invalid signature format"); }
+    if (fs.parents("/etc/mpm/keys/key", 0) == 0) { ret fail("unsafe or missing trusted-key directory"); }
+    var dir: io.Dir;
+    if (io.dir_open(?dir, "/etc/mpm/keys") < 0) { ret fail("cannot read trusted keys"); }
+    var valid: u8  = 0;
+    var count: u64 = 0;
+    for {
+        val next: i64 = io.dir_next(?dir);
+        if (next <= 0) { brk; }
+        count = count + 1;
+        if (count > 64)                                                                       { brk; }
+        if (dir.len < 5 || dir.len > 240 || io.eq(?dir.name[dir.len - 4], 4, ".pub", 4) == 0) { cnt; }
+        var keypath: [256]u8;
+        io.copy(?keypath[0], "/etc/mpm/keys/", 14);
+        io.copy(?keypath[14], dir.name, dir.len);
+        keypath[14 + dir.len] = 0;
+        if (io.lstat(?keypath[0], ?st) < 0 || st.st_uid != 0 || (io.perms(?st) & 0o022) != 0 || io.is_file(?st) == 0) { cnt; }
+        var key: fs.Blob;
+        if (fs.read(?keypath[0], 512, ?key) != 0) {
+            valid = signed.verify(data, len, ?signature, key.data, key.len);
+            fs.release(?key);
+            if (valid != 0) { brk; }
+        }
+    }
+    io.dir_close(?dir);
+    if (valid == 0) { ret fail("signature is invalid or its key is not trusted"); }
+    ret 1;
+}
+
+fun archive(path: *u8, p: *pkg.Package) u8 {
+    if (io.len(path) > 511) { ret 0; }
+    var compressed: fs.Blob;
+    if (fs.read(path, max_archive, ?compressed) == 0) { ret fail("cannot read archive or archive exceeds configured limit"); }
+    if (trusted(compressed.data, compressed.len, path) == 0) {
+        fs.release(?compressed);
+        ret 0;
+    }
+    p.capacity = max_unpacked;
+    p.payload  = os.allocate(max_unpacked::usize);
+    if (p.payload == nil || pkg.allocator() == nil) {
+        fs.release(?compressed);
+        ret fail("out of memory");
+    }
+    val unpacked: res[usize, inflate.InflateError] = gzip.decompress_into(pkg.allocator(), compressed.data, compressed.len::usize, p.payload::*u8, max_unpacked::usize);
+    fs.release(?compressed);
+    if (sel unpacked.err)                                        { ret fail("invalid, truncated or oversized gzip stream"); }
+    if (pkg.inventory(p, p.payload::*u8, unpacked.ok::u64) == 0) { ret fail("invalid package manifest or archive inventory"); }
+    io.copy(?p.archive[0], path, io.len(path) + 1);
+    ret 1;
+}
+
+fun find_selected(name: *u8) i64 {
+    var i: u64 = 0;
+    for (i < selected_count) {
+        if (io.streq(name, ?selected[i].name[0]) != 0) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun dependency(parent: *pkg.Package, dep: *pkg.Dependency) i64 {
+    val supplied: i64 = find_selected(?dep.name[0]);
+    if (supplied >= 0) {
+        if (pkg.satisfies(?selected[supplied::u64].version[0], ?dep.version[0]) == 0) { ret -1; }
+        ret supplied;
+    }
+    val existing: i64 = find_installed(?dep.name[0]);
+    if (existing >= 0 && installed[existing::u64].active != 0 && pkg.satisfies(?installed[existing::u64].version[0], ?dep.version[0]) != 0) { ret -2; }
+    if (selected_count == 32)                                                                                                               { ret -1; }
+    var directory: [512]u8;
+    var slash:     u64 = 0;
+    var i:         u64 = 0;
+    for (parent.archive[i] != 0) {
+        if (parent.archive[i] == 47) { slash = i + 1; }
+        i = i + 1;
+    }
+    if (slash == 0) { io.copy(?directory[0], ".", 2); }
+    or {
+        io.copy(?directory[0], ?parent.archive[0], slash);
+        directory[slash] = 0;
+    }
+    var dir: io.Dir;
+    if (io.dir_open(?dir, ?directory[0]) < 0) { ret -1; }
+    var result:  i64 = -1;
+    var scanned: u64 = 0;
+    for {
+        val next: i64 = io.dir_next(?dir);
+        if (next <= 0) { brk; }
+        scanned = scanned + 1;
+        if (scanned > 256)                                                   { brk; }
+        if (dir.len < 5 || io.eq(?dir.name[dir.len - 4], 4, ".mpa", 4) == 0) { cnt; }
+        var path: [512]u8;
+        val n:    u64 = io.len(?directory[0]);
+        if (n + dir.len + 2 > 512) { cnt; }
+        io.copy(?path[0], ?directory[0], n);
+        path[n] = 47;
+        io.copy(?path[n + 1], dir.name, dir.len);
+        path[n + 1 + dir.len] = 0;
+        val candidate: *pkg.Package = ?selected[selected_count];
+        if (archive(?path[0], candidate) != 0 && io.streq(?candidate.name[0], ?dep.name[0]) != 0 && pkg.satisfies(?candidate.version[0], ?dep.version[0]) != 0) {
+            result         = selected_count::i64;
+            selected_count = selected_count + 1;
+            brk;
+        }
+        pkg.release(candidate);
+    }
+    io.dir_close(?dir);
+    ret result;
+}
+
+fun visit(index: u64) u8 {
+    val p: *pkg.Package = ?selected[index];
+    if (p.state == 1) { ret fail("dependency cycle"); }
+    if (p.state == 2) { ret 1; }
+    p.state = 1;
+    var i: u64 = 0;
+    for (i < p.dep_count) {
+        val child: i64 = dependency(p, ?p.deps[i]);
+        if (child == -1) {
+            io.err("mpm: missing or incompatible dependency: ");
+            io.err(?p.deps[i].name[0]);
+            io.err("\n");
+            ret 0;
+        }
+        if (child >= 0 && visit(child::u64) == 0) { ret 0; }
+        i = i + 1;
+    }
+    p.state            = 2;
+    order[order_count] = index;
+    order_count        = order_count + 1;
+    ret 1;
+}
+
+fun plan_package(p: *pkg.Package) u8 {
+    val old_index: i64          = find_installed(?p.name[0]);
+    var old:       *pkg.Package = nil;
+    if (old_index >= 0) {
+        old = ?installed[old_index::u64];
+        if (old.active != 0 && pkg.compare(?p.version[0], ?old.version[0]) <= 0) { ret fail("upgrade must have a newer version of the same package"); }
+        if (old.protected != 0 && p.protected == 0)                              { ret fail("an upgrade cannot remove base protection"); }
+    }
+    var i: u64 = 0;
+    for (i < p.count) {
+        val f:     *pkg.File = ?p.files[i];
+        val owned: i64       = owner(?f.path[0]);
+        if (owned >= 0 && owned != old_index) {
+            io.err("mpm: file belongs to another package: ");
+            io.err(?f.path[0]);
+            io.err("\n");
+            ret 0;
+        }
+        if (fs.exists(?f.path[0]) != 0 && owned < 0) {
+            io.err("mpm: WARNING: existing unowned file: ");
+            io.err(?f.path[0]);
+            io.err("\n");
+            if (overwrite == 0) { ret fail("refusing overwrite; explicit --force is required"); }
+        }
+        if (old != nil) {
+            val prior: *pkg.File = find_file(old, ?f.path[0]);
+            if (prior != nil && prior.config != 0 && f.config == 0) { ret fail("upgrade cannot discard configuration tracking"); }
+        }
+        var destination: [256]u8;
+        io.copy(?destination[0], ?f.path[0], io.len(?f.path[0]) + 1);
+        if (old != nil && f.config != 0 && fs.exists(?f.path[0]) != 0) {
+            val prior: *pkg.File = find_file(old, ?f.path[0]);
+            if (prior != nil && fs.matches(?f.path[0], prior) == 0) {
+                val n: u64 = io.len(?f.path[0]);
+                io.copy(?destination[n], ".mpm-new", 9);
+                if (fs.exists(?destination[0]) != 0) { ret fail("configuration replacement already exists; review its .mpm-new file first"); }
+                io.out("mpm: keeping edited configuration; new version: ");
+                io.out(?destination[0]);
+                io.putc(10);
+            }
+        }
+        if (tx.add(?destination[0], f.data, f.size, f.mode, 0) == 0) { ret 0; }
+        i = i + 1;
+    }
+    if (old != nil) {
+        i = 0;
+        for (i < old.count) {
+            val f: *pkg.File = ?old.files[i];
+            if (find_file(p, ?f.path[0]) == nil && (old.active != 0 || f.config != 0) && fs.exists(?f.path[0]) != 0) {
+                if (f.config != 0)                         { ret fail("upgrade drops a configuration file; retain it in the manifest"); }
+                if (tx.add(?f.path[0], nil, 0, 0, 1) == 0) { ret 0; }
+            }
+            i = i + 1;
+        }
+        if (old.active == 0) {
+            var retained: [256]u8;
+            record_path(?retained[0], ?p.name[0], 0);
+            if (tx.add(?retained[0], nil, 0, 0, 1) == 0) { ret 0; }
+        }
+    }
+    var record: [256]u8;
+    record_path(?record[0], ?p.name[0], 1);
+    ret tx.add(?record[0], p.manifest, p.manifest_len, 0o644, 0);
+}
+
+fun install(argc: u64, argv: **u8, start: u64) u8 {
+    var i: u64 = start;
+    for (i < argc) {
+        if (io.streq(argv[i], "--allow-unsigned") != 0) { unsigned_allowed = 1; }
+        or (io.streq(argv[i], "--force") != 0)          { overwrite = 1; }
+        i = i + 1;
+    }
+    i = start;
+    for (i < argc) {
+        if (argv[i][0] == 45) {
+            if (io.streq(argv[i], "--allow-unsigned") == 0 && io.streq(argv[i], "--force") == 0) { ret fail("unknown install option"); }
+        }
+        or {
+            if (selected_count == 32) { ret fail("too many packages"); }
+            val p: *pkg.Package = ?selected[selected_count];
+            if (archive(argv[i], p) == 0)       { ret 0; }
+            if (find_selected(?p.name[0]) >= 0) { ret fail("multiple archives for the same package"); }
+            selected_count = selected_count + 1;
+        }
+        i = i + 1;
+    }
+    if (selected_count == 0) { ret fail("no archives supplied"); }
+    i = 0;
+    for (i < selected_count) {
+        if (visit(i) == 0) { ret 0; }
+        i = i + 1;
+    }
+    # An upgrade must also preserve constraints of installed dependants.
+    i = 0;
+    for (i < installed_count) {
+        if (installed[i].active != 0 && find_selected(?installed[i].name[0]) < 0) {
+            var d: u64 = 0;
+            for (d < installed[i].dep_count) {
+                val s: i64 = find_selected(?installed[i].deps[d].name[0]);
+                if (s >= 0 && pkg.satisfies(?selected[s::u64].version[0], ?installed[i].deps[d].version[0]) == 0) { ret fail("upgrade would break an installed dependency"); }
+                d = d + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < order_count) {
+        if (plan_package(?selected[order[i]]) == 0) { ret 0; }
+        i = i + 1;
+    }
+    if (tx.commit() == 0) { ret 0; }
+    i = 0;
+    for (i < order_count) {
+        io.out("mpm: installed ");
+        io.out(?selected[order[i]].name[0]);
+        io.putc(32);
+        io.out(?selected[order[i]].version[0]);
+        io.putc(10);
+        i = i + 1;
+    }
+    ret 1;
+}
+
+fun remove(argc: u64, argv: **u8, start: u64) u8 {
+    var i: u64 = start;
+    for (i < argc) {
+        if (io.streq(argv[i], "--purge") != 0) { purge = 1; }
+        or {
+            val index: i64 = find_installed(argv[i]);
+            if (index < 0)                            { ret fail("package is not installed"); }
+            if (installed[index::u64].protected != 0) { ret fail("protected base package cannot be removed"); }
+            removing[index::u64] = 1;
+        }
+        i = i + 1;
+    }
+    var total: u64 = 0;
+    i = 0;
+    for (i < installed_count) {
+        if (removing[i] != 0) { total = total + 1; }
+        or (installed[i].active != 0) {
+            var d: u64 = 0;
+            for (d < installed[i].dep_count) {
+                val index: i64 = find_installed(?installed[i].deps[d].name[0]);
+                if (index >= 0 && removing[index::u64] != 0) { ret fail("package is required by an installed package"); }
+                d = d + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (total == 0) { ret fail("no packages supplied"); }
+    i = 0;
+    for (i < installed_count) {
+        if (removing[i] != 0) {
+            val p:    *pkg.Package = ?installed[i];
+            var keep: u8           = 0;
+            var f:    u64          = 0;
+            for (f < p.count) {
+                if (p.files[f].config != 0 && purge == 0) { keep = 1; }
+                or ((p.active != 0 || p.files[f].config != 0) && fs.exists(?p.files[f].path[0]) != 0) {
+                    if (tx.add(?p.files[f].path[0], nil, 0, 0, 1) == 0) { ret 0; }
+                }
+                if (p.files[f].config != 0 && purge != 0) {
+                    var pending: [256]u8;
+                    val n:       u64 = io.len(?p.files[f].path[0]);
+                    io.copy(?pending[0], ?p.files[f].path[0], n);
+                    io.copy(?pending[n], ".mpm-new", 9);
+                    if (fs.exists(?pending[0]) != 0 && tx.add(?pending[0], nil, 0, 0, 1) == 0) { ret 0; }
+                }
+                f = f + 1;
+            }
+            var path: [256]u8;
+            record_path(?path[0], ?p.name[0], p.active);
+            if (p.active != 0 || keep == 0) {
+                if (tx.add(?path[0], nil, 0, 0, 1) == 0) { ret 0; }
+            }
+            if (keep != 0 && p.active != 0) {
+                record_path(?path[0], ?p.name[0], 0);
+                if (tx.add(?path[0], p.manifest, p.manifest_len, 0o644, 0) == 0) { ret 0; }
+            }
+        }
+        i = i + 1;
+    }
+    if (tx.commit() == 0) { ret 0; }
+    io.out("mpm: removed packages");
+    if (purge == 0) { io.out("; configuration preserved"); }
+    io.putc(10);
+    ret 1;
+}
+
+fun info(p: *pkg.Package) {
+    io.out(?p.name[0]);
+    io.putc(32);
+    io.out(?p.version[0]);
+    if (p.protected != 0) { io.out(" [protected]"); }
+    io.putc(10);
+    var i: u64 = 0;
+    for (i < p.dep_count) {
+        io.out("  requires ");
+        io.out(?p.deps[i].name[0]);
+        io.putc(32);
+        io.out(?p.deps[i].version[0]);
+        io.putc(10);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < p.count) {
+        io.out("  ");
+        io.out(?p.files[i].path[0]);
+        if (p.files[i].config != 0) { io.out(" [config]"); }
+        io.putc(10);
+        i = i + 1;
+    }
+}
+
+pub fun run(argc: u64, argv: **u8) u64 {
+    if (argc < 2 || io.streq(argv[1], "--help") != 0) {
+        io.out("MachOS Package Manager\nusage: mpm install [--allow-unsigned] [--force] FILE.mpa...\n       mpm remove [--purge] NAME...\n       mpm list | info NAME|FILE.mpa | recover\n  --force overwrites unowned files; other packages retain their ownership.\n  Local archives only. Signatures are FILE.mpa.sig; trusted keys: /etc/mpm/keys.\n");
+        ret 0;
+    }
+    var mutate: u8 = (io.streq(argv[1], "install") != 0 || io.streq(argv[1], "remove") != 0)::u8;
+    if (mutate != 0 || io.streq(argv[1], "recover") != 0) {
+        if (sys.getuid() != 0 || sys.geteuid() != 0) {
+            fail("root is required; administrators can use se");
+            ret 1;
+        }
+        if (io.streq(argv[1], "recover") != 0 && argc == 2) { ret (tx.recover() == 0)::u64; }
+        if (tx.begin() == 0)                                { ret 1; }
+    }
+    if (load_records("/var/lib/mpm/packages", 1) == 0 || load_records("/var/lib/mpm/configs", 0) == 0) {
+        if (mutate != 0) { tx.abort(); }
+        ret 1;
+    }
+    max_archive  = conf.number("mpm.max_archive_mb", 64);
+    max_unpacked = conf.number("mpm.max_unpacked_mb", 128);
+    if (max_archive < 1 || max_archive > 512 || max_unpacked < 1 || max_unpacked > 512) {
+        if (mutate != 0) { tx.abort(); }
+        fail("invalid archive limits");
+        ret 1;
+    }
+    max_archive  = max_archive * 1048576;
+    max_unpacked = max_unpacked * 1048576;
+    if (mutate != 0) {
+        var good: u8 = 0;
+        if (io.streq(argv[1], "install") != 0)                                 { good = install(argc, argv, 2); }
+        or                                                                     { good = remove(argc, argv, 2); }
+        if (good == 0 && fs.exists("/var/lib/mpm/transaction/COMMITTED") == 0) { tx.abort(); }
+        ret (good == 0)::u64;
+    }
+    if (argc == 2 && io.streq(argv[1], "list") != 0) {
+        var i: u64 = 0;
+        for (i < installed_count) {
+            io.out(?installed[i].name[0]);
+            io.putc(32);
+            io.out(?installed[i].version[0]);
+            if (installed[i].active == 0) { io.out(" [config only]"); }
+            io.putc(10);
+            i = i + 1;
+        }
+        ret 0;
+    }
+    if (argc == 3 && io.streq(argv[1], "info") != 0) {
+        val n: u64 = io.len(argv[2]);
+        if (n > 4 && io.eq(?argv[2][n - 4], 4, ".mpa", 4) != 0) {
+            if (archive(argv[2], ?selected[0]) == 0) { ret 1; }
+            info(?selected[0]);
+            io.out("mpm: archive verified\n");
+            ret 0;
+        }
+        val index: i64 = find_installed(argv[2]);
+        if (index < 0) {
+            fail("package is not installed");
+            ret 1;
+        }
+        val p: *pkg.Package = ?installed[index::u64];
+        info(p);
+        var failed: u64 = 0;
+        var i:      u64 = 0;
+        for (i < p.count) {
+            if (p.active != 0 || p.files[i].config != 0) {
+                var st: os.stat_t;
+                if (fs.matches(?p.files[i].path[0], ?p.files[i]) == 0 || io.lstat(?p.files[i].path[0], ?st) < 0 || io.perms(?st) != p.files[i].mode) {
+                    io.err("mpm: changed or missing: ");
+                    io.err(?p.files[i].path[0]);
+                    io.err("\n");
+                    failed = failed + 1;
+                }
+            }
+            i = i + 1;
+        }
+        if (failed == 0) { io.out("mpm: installed files verified\n"); }
+        ret (failed != 0)::u64;
+    }
+    fail("unknown command or invalid arguments; see mpm --help");
+    ret 2;
+}

@@ -1,0 +1,28 @@
+[package.machos-base]
+protected = true
+licenses = true
+tools = ["init", "login", "sh", "se", "su", "passwd", "mpm", "machboot"]
+configs = ["system.conf", "time.conf", "login.conf", "se.conf", "sh.conf", "mpm.conf"]
+
+[package.coreutils]
+tools = ["basename", "cat", "chmod", "chown", "clear", "confirm", "cp", "df", "diff", "dirname", "du", "echo", "env", "false", "find", "grep", "gunzip", "gzip", "hd", "head", "ls", "mkdir", "mv", "printf", "rm", "seq", "sha256sum", "sleep", "sort", "stat", "tail", "tar", "tee", "test", "touch", "tr", "true", "wc", "which", "xargs"]
+
+[package.netutils]
+tools = ["ca-update", "host", "ip", "nc", "ping", "wget"]
+configs = ["network.conf", "wget.conf"]
+
+[package.diskutils]
+tools = ["fsck", "gpt", "mkext2", "mkfat", "mount", "partname", "sync", "umount"]
+
+[package.sysutils]
+tools = ["calc", "config", "date", "dmesg", "events", "free", "hello", "kill", "neofetch", "poweroff", "ps", "reboot", "shutdown", "top", "tty", "uname", "uptime"]
+
+[package.accounts]
+tools = ["adduser", "usermod", "id", "whoami"]
+
+[package.editors]
+tools = ["edit", "less", "nano"]
+
+[package.installer]
+tools = ["install", "update"]
+dependencies = ["coreutils", "diskutils", "accounts"]

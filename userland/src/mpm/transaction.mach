@@ -1,0 +1,279 @@
+# durable undo journal: stage data, record intent, then publish by atomic rename
+# a committed marker distinguishes successful publication from interrupted cleanup
+
+use sdk.abi;
+use sdk.sys;
+use std.system.os;
+use io: userland.lib.cli;
+use userland.mpm.fs;
+use pkg: userland.mpm.package;
+
+pub val STAGE: *u8 = "/var/lib/mpm/transaction";
+
+pub rec Operation {
+    path:  [256]u8;
+    data:  *u8;
+    len:   u64;
+    mode:  u64;
+    had:   u8;
+    erase: u8;
+}
+
+var operations: [4096]Operation;
+var count:      u64;
+var journal:    i64 = -1;
+var started:    u8;
+
+fun numbered(out: *u8, prefix: *u8, index: u64) {
+    val n: u64 = io.len(STAGE);
+    io.copy(out, STAGE, n);
+    out[n] = 47;
+    io.copy(?out[n + 1], prefix, io.len(prefix));
+    val used: u64 = n + 1 + io.len(prefix);
+    val end:  u64 = used + io.fmt_dec(index, ?out[used]);
+    out[end] = 0;
+}
+
+pub fun initialize() u8 {
+    if (fs.directory("/var", 0o755, 1) == 0 || fs.directory("/var/lib", 0o755, 1) == 0 || fs.directory("/var/lib/mpm", 0o755, 1) == 0 || fs.directory("/var/lib/mpm/packages", 0o755, 1) == 0 || fs.directory("/var/lib/mpm/configs", 0o755, 1) == 0) { ret 0; }
+    ret 1;
+}
+
+pub fun begin() u8 {
+    if (fs.exists("/root/.machos-update") != 0) { ret 0; }
+    if (initialize() == 0 || io.mkdir(STAGE, 0o700) < 0) {
+        io.err("mpm: cannot acquire transaction; use mpm recover after an interrupted operation\n");
+        ret 0;
+    }
+    count   = 0;
+    started = 0;
+    journal = io.open_mode("/var/lib/mpm/transaction/journal", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600);
+    if (journal < 0) {
+        io.remove(STAGE);
+        ret 0;
+    }
+    var pid: [24]u8;
+    val pn:  u64 = io.fmt_dec(sys.getpid(), ?pid[0]);
+    if (fs.write("/var/lib/mpm/transaction/pid", ?pid[0], pn, 0o600) == 0) {
+        io.close(journal);
+        journal = -1;
+        io.remove("/var/lib/mpm/transaction/journal");
+        io.remove(STAGE);
+        ret 0;
+    }
+    ret 1;
+}
+
+pub fun add(path: *u8, data: *u8, len: u64, mode: u64, erase: u8) u8 {
+    if (count == 4096 || io.len(path) > 255) { ret 0; }
+    var i: u64 = 0;
+    for (i < count) {
+        if (io.streq(path, ?operations[i].path[0]) != 0) {
+            io.err("mpm: duplicate transaction destination\n");
+            ret 0;
+        }
+        i = i + 1;
+    }
+    val op: *Operation = ?operations[count];
+    io.copy(?op.path[0], path, io.len(path) + 1);
+    op.data  = data;
+    op.len   = len;
+    op.mode  = mode;
+    op.erase = erase;
+    op.had   = fs.exists(path);
+    var st: os.stat_t;
+    if (op.had != 0 && (io.lstat(path, ?st) < 0 || io.is_file(?st) == 0)) {
+        io.err("mpm: refusing a non-regular destination\n");
+        ret 0;
+    }
+    count = count + 1;
+    ret 1;
+}
+
+fun cleanup() u8 {
+    if (journal >= 0) {
+        io.close(journal);
+        journal = -1;
+    }
+    for {
+        var dir: io.Dir;
+        if (io.dir_open(?dir, STAGE) < 0) { ret 0; }
+        var next: i64 = io.dir_next(?dir);
+        for (next > 0 && (io.streq(dir.name, "COMMITTED") != 0 || io.streq(dir.name, "journal") != 0)) { next = io.dir_next(?dir); }
+        var path: [512]u8;
+        if (next > 0) {
+            val n: u64 = io.len(STAGE);
+            io.copy(?path[0], STAGE, n);
+            path[n] = 47;
+            io.copy(?path[n + 1], dir.name, dir.len);
+            path[n + 1 + dir.len] = 0;
+        }
+        io.dir_close(?dir);
+        if (next < 0)                { ret 0; }
+        if (next == 0)               { brk; }
+        if (io.remove(?path[0]) < 0) { ret 0; }
+    }
+    io.remove("/var/lib/mpm/transaction/journal");
+    io.remove("/var/lib/mpm/transaction/COMMITTED");
+    ret (io.remove(STAGE) >= 0)::u8;
+}
+
+fun undo() u8 {
+    var i:    u64 = count;
+    var good: u8  = 1;
+    for (i > 0) {
+        i = i - 1;
+        val op:       *Operation = ?operations[i];
+        var old:      [96]u8;
+        var incoming: [96]u8;
+        numbered(?old[0], "old-", i);
+        numbered(?incoming[0], "new-", i);
+        if (fs.parents(?op.path[0], 0) == 0) {
+            good = 0;
+            cnt;
+        }
+        if (fs.exists(?old[0]) != 0) {
+            if (fs.exists(?op.path[0]) != 0 && io.remove(?op.path[0]) < 0) {
+                good = 0;
+                cnt;
+            }
+            if (io.rename(?old[0], ?op.path[0]) < 0) { good = 0; }
+        }
+        or (op.had == 0 && op.erase == 0 && fs.exists(?incoming[0]) == 0 && fs.exists(?op.path[0]) != 0) {
+            if (io.remove(?op.path[0]) < 0) { good = 0; }
+        }
+    }
+    sys.sync();
+    if (good != 0) { ret cleanup(); }
+    io.err("mpm: rollback incomplete; keep the transaction directory and run mpm recover\n");
+    ret 0;
+}
+
+pub fun abort() u8 {
+    if (started != 0) { ret 0; }
+    ret cleanup();
+}
+
+pub fun commit() u8 {
+    started = 1;
+    var i:        u64 = 0;
+    var recorded: u64 = 0;
+    for (i < count) {
+        val op:       *Operation = ?operations[i];
+        var old:      [96]u8;
+        var incoming: [96]u8;
+        numbered(?old[0], "old-", i);
+        numbered(?incoming[0], "new-", i);
+        if (fs.parents(?op.path[0], 1) == 0)                                        { brk; }
+        if (op.erase == 0 && fs.write(?incoming[0], op.data, op.len, op.mode) == 0) { brk; }
+        var line: [260]u8;
+        line[0] = 48 + op.had;
+        line[1] = 48 + op.erase;
+        line[2] = 9;
+        val n: u64 = io.len(?op.path[0]);
+        io.copy(?line[3], ?op.path[0], n);
+        line[3 + n] = 10;
+        if (io.write_all(journal, ?line[0], n + 4) == 0) { brk; }
+        sys.sync();
+        recorded = i + 1;
+        if (op.had != 0 && io.rename(?op.path[0], ?old[0]) < 0)        { brk; }
+        if (op.erase == 0 && io.rename(?incoming[0], ?op.path[0]) < 0) { brk; }
+        i = i + 1;
+    }
+    if (i != count) {
+        count = recorded;
+        undo();
+        io.err("mpm: installation failed; transaction rolled back\n");
+        ret 0;
+    }
+    sys.sync();
+    if (fs.write("/var/lib/mpm/transaction/COMMITTED", "done\n", 5, 0o600) == 0) {
+        undo();
+        ret 0;
+    }
+    sys.sync();
+    if (cleanup() == 0) { io.err("mpm: committed; run mpm recover to finish cleanup\n"); }
+    ret 1;
+}
+
+pub fun recover() u8 {
+    if (fs.parents(STAGE, 0) == 0 || fs.directory(STAGE, 0o700, 0) == 0) {
+        io.err("mpm: no safe transaction to recover\n");
+        ret 0;
+    }
+    var owner: fs.Blob;
+    if (fs.read("/var/lib/mpm/transaction/pid", 24, ?owner) != 0) {
+        var good: u8  = 0;
+        val pid:  u64 = io.parse_dec(owner.data, owner.len, ?good);
+        fs.release(?owner);
+        if (good == 0) { ret 0; }
+        var procpath: [48]u8;
+        io.copy(?procpath[0], "/proc/", 6);
+        val end: u64 = 6 + io.fmt_dec(pid, ?procpath[6]);
+        procpath[end] = 0;
+        if (fs.exists(?procpath[0]) != 0) {
+            io.err("mpm: transaction owner is still running\n");
+            ret 0;
+        }
+    }
+    if (fs.exists("/var/lib/mpm/transaction/COMMITTED") != 0) { ret cleanup(); }
+    var blob: fs.Blob;
+    if (fs.read("/var/lib/mpm/transaction/journal", 1064960, ?blob) == 0) { ret (io.remove(STAGE) >= 0)::u8; }
+    count = 0;
+    var at: u64 = 0;
+    for (at < blob.len) {
+        var end: u64 = at;
+        for (end < blob.len && blob.data[end] != 10) { end = end + 1; }
+        if (end == blob.len) { brk; } # a partial last intent was never applied
+        if (end - at < 5 || end - at > 258 || count == 4096 || blob.data[at] < 48 || blob.data[at] > 49 || blob.data[at + 1] < 48 || blob.data[at + 1] > 49 || blob.data[at + 2] != 9) {
+            fs.release(?blob);
+            ret 0;
+        }
+        val op: *Operation = ?operations[count];
+        io.copy(?op.path[0], ?blob.data[at + 3], end - at - 3);
+        op.path[end - at - 3] = 0;
+        var internal: u8     = 0;
+        val roots:    [2]*u8 = [2]*u8{"/var/lib/mpm/packages/", "/var/lib/mpm/configs/"};
+        var r:        u64    = 0;
+        for (r < 2) {
+            val prefix: u64 = io.len(roots[r]);
+            val length: u64 = end - at - 3;
+            if (length > prefix + 5 && io.eq(?op.path[0], prefix, roots[r], prefix) != 0 && io.eq(?op.path[length - 5], 5, ".toml", 5) != 0) {
+                var name: [64]u8;
+                val n:    u64 = length - prefix - 5;
+                if (n < 64) {
+                    io.copy(?name[0], ?op.path[prefix], n);
+                    name[n]  = 0;
+                    internal = pkg.name_ok(?name[0]);
+                }
+            }
+            r = r + 1;
+        }
+        var pending: u8  = 0;
+        val length:  u64 = io.len(?op.path[0]);
+        if (length > 8 && io.eq(?op.path[length - 8], 8, ".mpm-new", 8) != 0) {
+            var original: [256]u8;
+            io.copy(?original[0], ?op.path[0], length - 8);
+            original[length - 8] = 0;
+            pending              = pkg.path_ok(?original[0]);
+        }
+        if (pkg.path_ok(?op.path[0]) == 0 && internal == 0 && pending == 0) {
+            fs.release(?blob);
+            ret 0;
+        }
+        var j: u64 = 0;
+        for (j < end - at - 3) {
+            if (op.path[j] < 32 || op.path[j] > 126) {
+                fs.release(?blob);
+                ret 0;
+            }
+            j = j + 1;
+        }
+        op.had   = blob.data[at] - 48;
+        op.erase = blob.data[at + 1] - 48;
+        count    = count + 1;
+        at       = end + 1;
+    }
+    fs.release(?blob);
+    ret undo();
+}

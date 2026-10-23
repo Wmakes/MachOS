@@ -1,0 +1,121 @@
+# password approval and root-owned se timestamps, scoped to uid and session
+
+use sdk.abi;
+use sdk.io;
+use sdk.sys;
+use sdk.users;
+
+pub fun password(user: *users.User) u8 {
+    var hash: [128]u8;
+    val n:    u64 = users.stored(?user.name[0], user.name_len, ?hash[0]);
+    if (n == abi.NO_ID || n == 0 || users.locked(?hash[0], n) != 0 || sys.isatty(abi.STDIN) == 0) { ret 0; }
+    var secret: [128]u8;
+    val len:    u64 = users.read_secret("Password: \0", ?secret[0], 127);
+    var good:   u8  = 0;
+    if (len != abi.NO_ID && len != 0) { good = users.matches(?hash[0], n, ?secret[0], len); }
+    var i: u64 = 0;
+    for (i < 128) {
+        secret[i] = 0;
+        i         = i + 1;
+    }
+    if (good == 0) { sys.sleep(1000); }
+    ret good;
+}
+
+fun directory(path: *u8, mode: u64) u8 {
+    sys.mkdir_mode(path, io.len(path), mode);
+    val h: u64 = sys.open(path, io.len(path), abi.O_READ | abi.O_DIRECTORY | abi.O_NOFOLLOW);
+    if (abi.is_err(h) != 0) { ret 0; }
+    var st:   abi.Stat;
+    val good: u8 = (abi.is_err(sys.fstat(h, ?st)) == 0 && st.uid == 0 && (st.mode & 0x3F) == (mode & 0x3F))::u8;
+    sys.close(h);
+    ret good;
+}
+
+fun cache_path(uid: u64, out: *u8) u64 {
+    val sid: u64 = sys.getsid(0);
+    if (abi.is_err(sid) != 0 || sid == 0 || sys.tty_number(abi.STDIN) == 0)    { ret 0; }
+    if (directory("/run\0", 0x1ED) == 0 || directory("/run/se\0", 0x1C0) == 0) { ret 0; }
+    io.copy(out, "/run/se/\0", 8);
+    var n: u64 = 8 + io.fmt_dec(uid, ?out[8]);
+    out[n] = 45;
+    n      = n + 1;
+    n      = n + io.fmt_dec(sid, ?out[n]);
+    out[n] = 0;
+    ret n;
+}
+
+pub fun invalidate(uid: u64) {
+    var path: [80]u8;
+    val n:    u64 = cache_path(uid, ?path[0]);
+    if (n != 0) { sys.remove(?path[0], n); }
+}
+
+# a changed password or locked account invalidates a previous approval
+pub fun approve(user: *users.User, seconds: u64, force: u8) u8 {
+    var path: [80]u8;
+    val n:    u64 = cache_path(user.uid, ?path[0]);
+    var hash: [128]u8;
+    val hn:   u64 = users.stored(?user.name[0], user.name_len, ?hash[0]);
+    if (hn == abi.NO_ID || hn == 0 || users.locked(?hash[0], hn) != 0) { ret 0; }
+    var now: abi.Timespec;
+    if (abi.is_err(sys.raw(abi.CLOCK, abi.CLOCK_MONOTONIC, (?now)::u64, 0, 0, 0)) != 0) { ret 0; }
+    var record: [136]u8;
+    if (n != 0 && force == 0 && seconds > 0) {
+        val h: u64 = sys.open(?path[0], n, abi.O_READ | abi.O_NOFOLLOW);
+        if (abi.is_err(h) == 0) {
+            var st:   abi.Stat;
+            val safe: u8  = (abi.is_err(sys.fstat(h, ?st)) == 0 && st.kind == abi.KIND_FILE && st.uid == 0 && st.mode == 0x180 && st.size == hn + 8)::u8;
+            val got:  u64 = sys.read(h, ?record[0], 136);
+            sys.close(h);
+            if (safe != 0 && got == hn + 8) {
+                var then: u64 = 0;
+                var i:    u64 = 0;
+                for (i < 8) {
+                    then = then | (record[i]::u64 << (i * 8));
+                    i    = i + 1;
+                }
+                if (then <= now.sec && now.sec - then < seconds && io.eq(?record[8], hn, ?hash[0], hn) != 0) { ret 1; }
+            }
+        }
+    }
+    if (password(user) == 0) { ret 0; }
+    if (n != 0 && seconds > 0) {
+        var i: u64 = 0;
+        for (i < 8) {
+            record[i] = (now.sec >> (i * 8))::u8;
+            i         = i + 1;
+        }
+        io.copy(?record[8], ?hash[0], hn);
+        sys.remove(?path[0], n);
+        val h: u64 = sys.open_mode(?path[0], n, abi.O_WRITE | abi.O_CREATE | abi.O_EXCL, 0x180);
+        if (abi.is_err(h) == 0) {
+            if (io.write_all(h, ?record[0], hn + 8) == 0) { sys.remove(?path[0], n); }
+            sys.close(h);
+        }
+    }
+    ret 1;
+}
+
+# timestamps never survive a reboot, even if a PID/session number is reused
+pub fun boot() {
+    if (directory("/run\0", 0x1ED) == 0 || directory("/run/se\0", 0x1C0) == 0) { ret; }
+    val h: u64 = sys.open("/run/se\0", 7, abi.O_READ | abi.O_DIRECTORY | abi.O_NOFOLLOW);
+    if (abi.is_err(h) != 0) { ret; }
+    var index: u64 = 0;
+    for {
+        var entry: abi.Entry;
+        val next:  u64 = sys.readdir(h, index, ?entry);
+        if (abi.is_err(next) != 0 || next == 0) { brk; }
+        if (entry.name_len == 0 || entry.name_len > 59 || entry.name[0] == 46) {
+            index = index + 1;
+            cnt;
+        }
+        var path: [112]u8;
+        io.copy(?path[0], "/run/se/\0", 8);
+        io.copy(?path[8], ?entry.name[0], entry.name_len);
+        path[8 + entry.name_len] = 0;
+        if (abi.is_err(sys.remove(?path[0], 8 + entry.name_len)) != 0) { index = index + 1; }
+    }
+    sys.close(h);
+}

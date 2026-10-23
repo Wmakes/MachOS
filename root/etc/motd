@@ -11,8 +11,10 @@
     `ls /bin` lists commands; `ls --help` explains listing options.
     `config --help` shows how to change persistent system settings.
     `nano FILE` edits text; `less FILE` reads it; `shutdown` powers off.
-    `passwd` sets your password; `adduser NAME` creates another account.
+    `passwd` changes your password; `adduser NAME` creates another account.
+    `adduser --admin NAME` creates an administrator; use `se COMMAND`.
+    `mpm --help` explains local package installation and verification.
 
   Arrows recall commands; Tab completes names; Alt+F1..F6 switch terminals.
-  Shift+PgUp/PgDn scroll back. Root has no password on the live image.
+  Shift+PgUp/PgDn scroll back. First login requires setting a password.
 
