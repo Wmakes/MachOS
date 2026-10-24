@@ -638,7 +638,7 @@ fun info(p: *pkg.Package) {
 
 pub fun run(argc: u64, argv: **u8) u64 {
     if (argc < 2 || io.streq(argv[1], "--help") != 0) {
-        io.out("MachOS Package Manager\nusage: mpm install [--allow-unsigned] [--force] NAME|FILE.mpa...\n       mpm remove [--purge] NAME...\n       mpm refresh | search [TEXT] | upgrade\n       mpm list | info NAME|FILE.mpa | recover\n  --force overwrites unowned files; other packages retain their ownership.\n  Signed stable repository and local archives. Signatures are FILE.mpa.sig; trusted keys: /etc/mpm/keys.\n");
+        io.out("MachOS Package Manager\nusage: mpm install [--allow-unsigned] [--force] NAME|FILE.mpa...\n       mpm remove [--purge] NAME...\n       mpm refresh | search [TEXT] | upgrade\n       mpm list [--available] | info NAME|FILE.mpa | recover\n  --force overwrites unowned files; other packages retain their ownership.\n  Signed stable repository and local archives. Signatures are FILE.mpa.sig; trusted keys: /etc/mpm/keys.\n");
         ret 0;
     }
     var mutate: u8 = (io.streq(argv[1], "install") != 0 || io.streq(argv[1], "remove") != 0 || io.streq(argv[1], "refresh") != 0 || io.streq(argv[1], "upgrade") != 0)::u8;
@@ -681,6 +681,10 @@ pub fun run(argc: u64, argv: **u8) u64 {
         var query: *u8 = nil;
         if (argc == 3) { query = argv[2]; }
         ret (repo.search(query) == 0)::u64;
+    }
+    if (argc == 3 && io.streq(argv[1], "list") != 0 && io.streq(argv[2], "--available") != 0) {
+        if (repo.load(0) == 0) { ret 1; }
+        ret (repo.search(nil) == 0)::u64;
     }
     if (argc == 2 && io.streq(argv[1], "list") != 0) {
         var i: u64 = 0;

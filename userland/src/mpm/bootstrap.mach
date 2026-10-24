@@ -122,7 +122,7 @@ fun parse(blob: *fs.Blob) u8 {
         val prefix_len: u64 = io.len(RECORDS);
         if (io.eq(?m.path[0], prefix_len, RECORDS, prefix_len) != 0) {
             var p: pkg.Package;
-            if (pkg.parse(?p, m.data, m.len) == 0 || io.streq(?p.version[0], "0.9.3") == 0) {
+            if (pkg.parse(?p, m.data, m.len) == 0) {
                 io.err("mpm: invalid migration package record: ");
                 io.err(?m.path[0]);
                 io.putc(10);

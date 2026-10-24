@@ -19,7 +19,7 @@ use roots:  userland.lib.tls_roots;
 use secure: userland.lib.tls_socket;
 
 var response:          parser.Parser;
-var response_line:     [8192]u8;
+var response_line:     [16384]u8;
 var response_storage:  [32768]u8;
 var response_fields:   [128]field.Field;
 var response_trailers: [32]field.Field;
@@ -47,7 +47,7 @@ fun body_feed(fd: i64, data: *u8, length: usize) u8 {
     ret 1;
 }
 
-var head:       [8192]u8; # the reply's header, and what came after it
+var head:       [32768]u8; # the reply's header, and what came after it
 var chunk:      [4096]u8;
 var host:       [256]u8; # of the URL being fetched
 var path:       [8192]u8; # its path (with the query), always starting with /
@@ -309,12 +309,12 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
     var have: u64 = 0;
     var hlen: u64 = 0;
     for (hlen == 0) {
-        if (have >= 8192) {
+        if (have >= 32768) {
             io.err("wget: the reply's header is too long\n");
             disconnect(?s);
             ret 1;
         }
-        val r: res[usize, io_error.Error] = receive(?s, ?head[have], (8192 - have)::usize);
+        val r: res[usize, io_error.Error] = receive(?s, ?head[have], (32768 - have)::usize);
         if (sel r.err) {
             io.err("wget: no reply\n");
             disconnect(?s);
@@ -409,8 +409,9 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
 
     var limits: parser.Limits = parser.limits_default();
     # Downloads stream to disk and retain no body in memory.
-    limits.max_body_bytes = max_body;
-    if (!parser.init_response(?response, method.GET, ?response_line[0], 8192,
+    limits.max_body_bytes  = max_body;
+    limits.max_header_line = 16384;
+    if (!parser.init_response(?response, method.GET, ?response_line[0], 16384,
         ?response_storage[0], 32768, ?response_fields[0], 128,
         ?response_trailers[0], 32, limits)) {
         disconnect(?s);

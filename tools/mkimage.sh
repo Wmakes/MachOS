@@ -95,7 +95,9 @@ owned_by_root() {
     rm -f "$CMDS"
 }
 
-IMG="$OUT/disk.img"
+# Test guests have disposable disks separate from the interactive dev image.
+IMG="${MACHOS_IMAGE_ROOT:-out}/$PROFILE/disk.img"
+mkdir -p "$(dirname "$IMG")"
 ROOTIMG="$OUT/root.img"
 if [ "$FRESH" = 1 ] || [ ! -f "$IMG" ] || ! sgdisk -p "$IMG" 2>/dev/null | grep -q 'MachOS root' \
    || ! sgdisk -i 2 "$IMG" 2>/dev/null | grep -q "First sector: $ROOT_START "; then

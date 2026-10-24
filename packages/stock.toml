@@ -1,4 +1,5 @@
 [package.machos-base]
+version = "0.9.4"
 protected = true
 licenses = true
 tools = ["init", "login", "sh", "se", "su", "passwd", "mpm", "wget"]
@@ -28,6 +29,7 @@ tools = ["install"]
 dependencies = ["coreutils", "diskutils", "accounts"]
 
 [package.machos-kernel]
+version = "0.9.4"
 protected = true
 tools = []
 boot = ["/boot/kernel.elf", "/boot/initrd.tar"]

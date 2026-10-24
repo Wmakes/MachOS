@@ -118,7 +118,8 @@ def stock(root, version, output, definitions):
         (root / suffix).chmod(0o755)
     for name, group in groups.items():
         deps = group.get("dependencies", []) + ([] if name == "machos-base" else ["machos-base"])
-        definition = dict(name=name, version=version, protected=group.get("protected", False),
+        package_version = group.get("version", version)
+        definition = dict(name=name, version=package_version, protected=group.get("protected", False),
                           dependencies=[dict(name=d, version=">=" + version) for d in deps],
                           files=[dict(path="/bin/" + tool, config=False) for tool in group["tools"]]
                           + [dict(path="/etc/" + cfg, config=True) for cfg in group.get("configs", [])]
@@ -130,7 +131,7 @@ def stock(root, version, output, definitions):
         record = database / (name + ".toml")
         record.write_bytes(manifest)
         record.chmod(0o644)
-        archive(output / (name + "-" + version + "-x86_64.mpa"), manifest, entries)
+        archive(output / (name + "-" + package_version + "-x86_64.mpa"), manifest, entries)
         (output / (name + "-" + version + ".mpa")).unlink(missing_ok=True)
 
 

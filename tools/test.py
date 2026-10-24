@@ -38,7 +38,7 @@ PROFILE = ["debug"]
 
 
 def disk():
-    return os.path.join(ROOT, "out", PROFILE[0], "disk.img")
+    return os.path.join(ROOT, "out", "headless", "images", PROFILE[0], "disk.img")
 
 
 def with_posixtest():
@@ -820,6 +820,8 @@ def https_server():
                 filename = self.path.removeprefix("/mpm/redirect/")
                 self.send_response(302)
                 self.send_header("Location", "https://tls.test:9443/mpm/assets/" + filename + "?token=" + "x" * 2048)
+                # Release redirects carry large security-policy headers.
+                self.send_header("Content-Security-Policy", "x" * 9216)
                 self.send_header("Content-Length", "0")
                 self.send_header("Connection", "close")
                 self.end_headers()
@@ -1162,7 +1164,7 @@ TESTS = [
     ("live-iso", False, False,
      ["--prep", lambda: sh("tools/iso.sh out/headless/live.iso"), "--boot", os.path.join(ROOT, "out/headless/live.iso"),
       "wait:" + P, "send:dmesg | grep -E 'live system|loaded by'; ls /bin | wc -l; mpm list; mpm info coreutils\\n", "wait:" + P],
-     ["loaded by machboot", "live system: running from memory", "machos-base 0.9.3", "mpm: installed files verified"]),
+     ["loaded by machboot", "live system: running from memory", "machos-base 0.9.4", "mpm: installed files verified"]),
 
     # FAT32 on a USB stick: read the host's files, write, rename, remove;
     # the host's fsck.fat checks it after
@@ -1622,7 +1624,7 @@ TESTS.append(("mpm", False, True,
                "send:echo edited > /etc/mpm-demo.conf; mpm install /bin/upgrade.mpa; cat /etc/mpm-demo.conf; cat /etc/mpm-demo.conf.mpm-new; mpm install /bin/demo.mpa; echo downgrade-status $?\\n", "wait:" + P,
                "send:mpm install --force /bin/ownership.mpa; echo ownership-status $?; mpm remove machos-base; echo base-status $?\\n", "wait:" + P,
                "send:mpm remove mpm-demo; cat /etc/mpm-demo.conf; test -e /opt/mpm/demo; echo removed-file $?; mpm remove --purge mpm-demo; test -e /etc/mpm-demo.conf; echo purged-config $?; test -e /etc/mpm-demo.conf.mpm-new; echo purged-pending $?; mpm remove mpm-helper; sync\\n", "wait:" + P],
-              ["machos-base 0.9.3", "mpm: installed files verified", "mpm: archive verified",
+              ["machos-base 0.9.4", "mpm: installed files verified", "mpm: archive verified",
                "mpm: installed mpm-helper 1.0.0", "mpm: installed mpm-demo 1.0.0", "install-status 0",
                "fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83", "mpm: installed files verified", "dependency-status 1",
                "mpm: keeping edited configuration", "mpm: installed mpm-demo 1.1.0", "edited", "setting upgraded", "downgrade-status 1",
@@ -1667,9 +1669,9 @@ TESTS.append(("live-installed-boot", True, True,
 TESTS.append(("mpm-network", False, True,
               ["--prep", with_mpm_repository, "--boot", disk, "wait:" + P,
                "send:echo '10.0.2.2 tls.test' >> /etc/hosts; export SSL_CERT_FILE=/root/test-ca.pem; cp /root/repository.pub /etc/mpm/keys/machos.pub; config set mpm.repository https://tls.test:9443/mpm/stable.toml; mpm refresh; echo refresh-status $?\\n", "wait:" + P,
-               "send:mpm search demo; mpm info mpm-demo; mpm install mpm-demo; echo network-install-status $?; cat /opt/mpm/demo /opt/mpm/mpm-helper; mpm info mpm-demo\\n", "wait:" + P,
+               "send:mpm list --available; echo available-status $?; mpm list --invalid; echo invalid-list-status $?; mpm search demo; mpm info mpm-demo; mpm install mpm-demo; echo network-install-status $?; cat /opt/mpm/demo /opt/mpm/mpm-helper; mpm info mpm-demo\\n", "wait:" + P,
                "send:echo edited > /etc/mpm-demo.conf; wget -q -O - https://tls.test:9443/mpm/control/upgrade; mpm refresh; mpm upgrade; echo network-upgrade-status $?; cat /opt/mpm/demo /etc/mpm-demo.conf /etc/mpm-demo.conf.mpm-new; sync\\n", "wait:" + P],
-              ["refreshed verified stable repository", "refresh-status 0", "mpm-demo 1.0.0 -", "installed bytes:", "mpm: installed mpm-demo 1.0.0", "network-install-status 0", "network install", "dependency fetched", "installed files verified", "refreshed verified stable repository", "mpm: installed mpm-demo 1.1.0", "network-upgrade-status 0", "network upgrade", "edited", "setting upgraded"]))
+              ["refreshed verified stable repository", "refresh-status 0", "mpm-helper 1.0.0 -", "mpm-demo 1.0.0 -", "available-status 0", "invalid-list-status 2", "mpm-demo 1.0.0 -", "installed bytes:", "mpm: installed mpm-demo 1.0.0", "network-install-status 0", "network install", "dependency fetched", "installed files verified", "refreshed verified stable repository", "mpm: installed mpm-demo 1.1.0", "network-upgrade-status 0", "network upgrade", "edited", "setting upgraded"]))
 
 
 TESTS.append(("mpm-network-reject", False, True,
@@ -1947,6 +1949,8 @@ def main():
         ap.error("unknown tests: " + ", ".join(sorted(unknown)))
     chosen = [test for test in TESTS if not a.names or test[0] in a.names]
     PROFILE[0] = a.profile
+    # Fixture keys and settings must never leak into the interactive dev disk.
+    os.environ["MACHOS_IMAGE_ROOT"] = os.path.join(ROOT, "out", "headless", "images")
     subprocess.run(["tools/build.sh", a.profile], cwd=ROOT, check=True)
     os.environ["MACHOS_PREBUILT_PROFILE"] = a.profile
     failed = 0
