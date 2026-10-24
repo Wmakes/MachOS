@@ -9,20 +9,20 @@
 # does: the time zone's offset is handed to the kernel) and network (dhcp,
 # off, or a fixed "IP/PREFIX GATEWAY DNS")
 
+use sdk.auth;
 use std.runtime;
-use auth: sdk.auth;
-use os:   std.system.os;
-use io:   userland.lib.cli;
-use conf: userland.lib.conf;
-use time: userland.lib.time;
+use std.system.os;
+use std.system.os.machos; # a shell leading its own process group
 use std.types.size.usize;
-use machos: std.system.os.machos; # a shell leading its own process group
+use io: userland.lib.cli;
+use userland.lib.conf;
+use userland.lib.time;
 
 val TTYS: u64 = 6;
 
-var fds: [6]i64;   # each terminal, open (tty1 is the console init was given)
-var pids: [6]i64;  # the session running on it, 0 = none
-var ttys: u64 = 6;
+var fds:       [6]i64; # each terminal, open (tty1 is the console init was given)
+var pids:      [6]i64; # the session running on it, 0 = none
+var ttys:      u64 = 6;
 var autologin: [32]u8;
 
 # start login on terminal `t`
@@ -35,7 +35,7 @@ fun start(t: u64) {
         argv[2] = ?autologin[0];
         argv[3] = nil;
     }
-    val h: i32 = fds[t]::i32;
+    val h:   i32 = fds[t]::i32;
     val pid: i64 = os.spawn_redirected("/bin/login", ?argv[0], os.environ(), h::usize, h::usize, h::usize);
     if (pid < 0) {
         pids[t] = 0;
@@ -48,7 +48,7 @@ fun start(t: u64) {
 # wait for any child; its pid, or a negative native code
 fun reap() i64 {
     var st: os.ProcessStatus;
-    val w: os.WaitResult = os.wait_pid(-1, ?st, 0);
+    val w:  os.WaitResult = os.wait_pid(-1, ?st, 0);
     if (w.pid > 0) { ret w.pid; }
     ret w.error.code;
 }
@@ -107,10 +107,10 @@ fun signed(v: i64, out: *u8) {
     var x: u64 = v::u64;
     if (v < 0) {
         out[0] = 45;
-        n = 1;
-        x = (0 - v)::u64;
+        n      = 1;
+        x      = (0 - v)::u64;
     }
-    n = n + io.fmt_dec(x, ?out[n]);
+    n      = n + io.fmt_dec(x, ?out[n]);
     out[n] = 0;
 }
 
@@ -122,8 +122,8 @@ fun rtc_local() {
     var ts: os.Timespec;
     os.realtime(?ts);
     var zname: *u8 = nil;
-    val off: i64 = time.offset(?z, ts.sec - z.std_off, ?zname);
-    var b: [24]u8;
+    val off:   i64 = time.offset(?z, ts.sec - z.std_off, ?zname);
+    var b:     [24]u8;
     signed(off, ?b[0]);
     tell("/proc/sys/kernel/rtc_offset", ?b[0]);
 }
@@ -134,6 +134,13 @@ fun main(argc: i64, argv: **u8) i64 {
         rescue_shell();
         ret 0;
     }
+    if (io.exists("/bin/mpm-bootstrap.tar")) {
+        var args: [3]*u8 = [3]*u8{"mpm", "--bootstrap", nil};
+        if (io.run_program("/bin/mpm", ?args[0], nil) != 0) {
+            io.err("init: legacy migration failed; boot rescue to repair the system\n");
+            for { io.sleep_ms(1000); }
+        }
+    }
     auth.boot();
     configure();
     fds[0] = io.STDIN;
@@ -143,7 +150,7 @@ fun main(argc: i64, argv: **u8) i64 {
     var t: u64 = 1;
     for (t < TTYS) {
         name[8] = 49 + t::u8;
-        fds[t] = -1;
+        fds[t]  = -1;
         if (t < ttys) { fds[t] = io.open_mode(?name[0], os.O_RDWR, 0); }
         t = t + 1;
     }

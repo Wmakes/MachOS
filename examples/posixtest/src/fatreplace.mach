@@ -1,0 +1,64 @@
+# FAT rename replacement must preserve existing handles without reusing their entry.
+
+use sdk.abi;
+use sdk.io;
+use sdk.rt;
+use sdk.sys;
+
+val TARGET: *u8 = "/boot/efi/MPMOLD.TST";
+val SOURCE: *u8 = "/boot/efi/MPMNEW.TST";
+
+fun create(path: *u8, text: *u8) u64 {
+    val fd: u64 = sys.open(path, io.len(path), abi.O_READ | abi.O_WRITE | abi.O_CREATE | abi.O_TRUNC);
+    if (abi.is_err(fd) != 0) { ret fd; }
+    if (sys.write(fd, text, io.len(text)) != io.len(text)) {
+        sys.close(fd);
+        ret abi.err(abi.E_IO);
+    }
+    ret fd;
+}
+
+fun matches(path: *u8, text: *u8) u8 {
+    val fd: u64 = sys.open(path, io.len(path), abi.O_READ);
+    if (abi.is_err(fd) != 0) { ret 0; }
+    var data: [64]u8;
+    val n:    u64 = sys.read(fd, ?data[0], 64);
+    sys.close(fd);
+    ret io.eq(?data[0], n, text, io.len(text));
+}
+
+fun exercise() u64 {
+    val old: u64 = create(TARGET, "old");
+    val new: u64 = create(SOURCE, "new");
+    if (abi.is_err(old) != 0 || abi.is_err(new) != 0) { ret 1; }
+    sys.close(new);
+    if (abi.is_err(sys.rename(SOURCE, io.len(SOURCE), TARGET, io.len(TARGET))) != 0) { ret 2; }
+    sys.seek(old, 0);
+    var data: [64]u8;
+    val n:    u64 = sys.read(old, ?data[0], 64);
+    if (io.eq(?data[0], n, "old", 3) == 0 || matches(TARGET, "new") == 0) { ret 3; }
+    sys.seek(old, 0);
+    if (sys.write(old, "detached replacement", 20) != 20 || matches(TARGET, "new") == 0) { ret 4; }
+    sys.close(old);
+    if (matches(TARGET, "new") == 0) { ret 5; }
+    val orphan: u64 = sys.open(TARGET, io.len(TARGET), abi.O_READ | abi.O_WRITE);
+    if (abi.is_err(orphan) != 0 || abi.is_err(sys.remove(TARGET, io.len(TARGET))) != 0) { ret 6; }
+    val replacement: u64 = create(TARGET, "last");
+    if (abi.is_err(replacement) != 0) { ret 7; }
+    sys.close(replacement);
+    sys.seek(orphan, 0);
+    if (sys.write(orphan, "detached unlink", 15) != 15 || matches(TARGET, "last") == 0) { ret 8; }
+    sys.close(orphan);
+    if (matches(TARGET, "last") == 0)                        { ret 9; }
+    if (abi.is_err(sys.remove(TARGET, io.len(TARGET))) != 0) { ret 10; }
+    sys.sync();
+    ret 0;
+}
+
+#[symbol("umain")]
+fun main(argc: u64, argv: **u8) u64 {
+    val status: u64 = exercise();
+    if (status == 0) { io.out("FAT replacement and detached handles passed\n\0"); }
+    or               { io.err("FAT replacement regression failed\n\0"); }
+    ret status;
+}

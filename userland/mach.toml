@@ -686,14 +686,6 @@ targets = ["machos"]
 link = []
 need = []
 
-[artifact.update]
-kind = "bin"
-entry = "bin/update.mach"
-out = "bin/update"
-targets = ["machos"]
-link = []
-need = []
-
 [artifact.uptime]
 kind = "bin"
 entry = "bin/uptime.mach"

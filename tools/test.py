@@ -169,12 +169,17 @@ def with_mpm():
     with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as tar:
         for member in tar:
             source_entries.append((member, tar.extractfile(member).read()))
-    for filename, kind in (("traversal.mpa", "traversal"), ("duplicate.mpa", "duplicate"), ("link.mpa", "link")):
+    for filename, kind in (("bootstrap.mpa", "bootstrap"), ("traversal.mpa", "traversal"), ("duplicate.mpa", "duplicate"), ("link.mpa", "link")):
         raw = io.BytesIO()
         with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as tar:
             for member, contents in source_entries:
                 cloned = tarfile.TarInfo(member.name)
                 cloned.mode = member.mode
+                if kind == "bootstrap":
+                    if member.name == "manifest.toml":
+                        contents = contents.replace(b"/opt/mpm/mpm-helper", b"/bin/mpm-bootstrap.tar")
+                    else:
+                        cloned.name = "files/bin/mpm-bootstrap.tar"
                 if kind == "traversal" and member.name != "manifest.toml":
                     cloned.name = "files/../../etc/evil"
                 if kind == "link" and member.name != "manifest.toml":
@@ -204,6 +209,145 @@ def with_mpm():
                 tar.add(path, arcname=path.name, recursive=False)
     subprocess.run(["tools/put.sh", str(bundle), "/bin/mpm-fixtures.tar", disk()],
                    cwd=ROOT, check=True, stdout=subprocess.PIPE)
+
+
+def with_mpm_repository(system=False):
+    """A private HTTPS repository with signed snapshots and real .mpa archives."""
+    import datetime, hashlib, json, shutil
+    import mpm as builder
+    with_mpm()
+    https_server()
+    base = Path(ROOT) / "out/headless/https/mpm"
+    shutil.rmtree(base, ignore_errors=True)
+    assets = base / "assets"
+    assets.mkdir(parents=True)
+    payload = base / "payload"
+    payload.mkdir()
+    key, public = base / "test.key", base / "test.pub"
+    subprocess.run(["minisign", "-G", "-W", "-s", str(key), "-p", str(public)], check=True, stdout=subprocess.DEVNULL)
+    def sign(path):
+        subprocess.run(["minisign", "-S", "-W", "-s", str(key), "-m", str(path), "-x", str(path) + ".sig", "-t", "temporary repository fixture"], check=True, stdout=subprocess.DEVNULL)
+    records = []
+    def package(name, version, files, deps=(), protected=False):
+        specs = []
+        for path, data in files.items():
+            source = payload / path[1:]
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(data)
+            specs.append(dict(path=path, mode=0o644, config=path.startswith("/etc/")))
+        definition = dict(name=name, version=version, protected=protected, files=specs, dependencies=[dict(name=n, version=v) for n,v in deps])
+        manifest, entries = builder.build_manifest(definition, payload)
+        filename = name + "-" + version + "-x86_64.mpa"
+        path = assets / filename
+        builder.archive(path, manifest, entries)
+        sign(path)
+        record = dict(name=name, version=version, arch="x86_64", description="Repository fixture " + name, filename=filename,
+                      size=path.stat().st_size, installed_size=sum(len(d) for d in files.values()), sha256=hashlib.sha256(path.read_bytes()).hexdigest(), protected=protected,
+                      url="https://tls.test:9443/mpm/redirect/" + filename, signature_url="https://tls.test:9443/mpm/assets/" + filename + ".sig", dependencies=[n + " " + v for n,v in deps])
+        records.append(record)
+        return path
+    import tarfile, tomllib
+    def stock(path, target_version=None, kernel=None):
+        with tarfile.open(path, "r:gz") as tar:
+            meta = tomllib.loads(tar.extractfile("manifest.toml").read().decode())
+            entries = [(item["path"], item["mode"], tar.extractfile("files/" + item["path"][1:]).read(), item.get("config", False)) for item in meta["files"]]
+        if target_version:
+            meta["version"] = target_version
+            for dep in meta.get("dependencies", []):
+                dep["version"] = ">=" + target_version
+            for dest, mode, data, config_file in entries:
+                source = payload / dest[1:]
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(kernel if dest == "/boot/kernel.elf" else data)
+            definition = dict(name=meta["name"], version=target_version, protected=meta["protected"], dependencies=meta.get("dependencies", []),
+                              files=[dict(path=dest, mode=mode, config=configuration) for dest,mode,_,configuration in entries])
+            manifest, members = builder.build_manifest(definition, payload)
+            filename = meta["name"] + "-" + target_version + "-x86_64.mpa"
+            target = assets / filename
+            builder.archive(target, manifest, members)
+        else:
+            filename = path.name
+            target = assets / filename
+            shutil.copyfile(path, target)
+        sign(target)
+        records.append(dict(name=meta["name"], version=meta["version"], arch="x86_64", description="Stock package " + meta["name"], filename=filename,
+                            size=target.stat().st_size, installed_size=sum(len(data) if dest != "/boot/kernel.elf" or kernel is None else len(kernel) for dest,_,data,_ in entries),
+                            sha256=hashlib.sha256(target.read_bytes()).hexdigest(), protected=meta["protected"], url="https://tls.test:9443/mpm/redirect/" + filename,
+                            signature_url="https://tls.test:9443/mpm/assets/" + filename + ".sig", dependencies=[dep["name"] + " " + dep["version"] for dep in meta.get("dependencies", [])]))
+    stock_paths = sorted((Path(ROOT) / "out" / PROFILE[0] / "packages").glob("*-x86_64.mpa"))
+    for path in stock_paths:
+        stock(path)
+    package("mpm-helper", "1.0.0", {"/opt/mpm/mpm-helper": b"dependency fetched\n"})
+    package("mpm-demo", "1.0.0", {"/opt/mpm/demo": b"network install\n", "/etc/mpm-demo.conf": b"setting first\n"}, [("mpm-helper", ">=1.0.0")])
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    def encoded(lines):
+        return ("\n".join(lines) + "\n").encode()
+    def fields(values):
+        return [k + " = " + (str(v).lower() if isinstance(v, bool) else str(v) if isinstance(v, int) else json.dumps(v)) for k,v in values.items()]
+    previous = "0" * 64
+    def snapshot(name, revision, expired=False, bad_index=False):
+        nonlocal previous
+        start = now - datetime.timedelta(days=32) if expired else now
+        end = now - datetime.timedelta(days=2) if expired else now + datetime.timedelta(days=30)
+        header = dict(format=1, channel="stable", published=start.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        index = fields(dict(**header, os_version="0.9.3", arch="x86_64", revision=revision, system=["machos-base", "machos-kernel", "machos-boot"]))
+        for record in records:
+            index += ["", "[[packages]]"] + fields(record)
+        index_path = assets / ("index-r" + str(revision) + ".toml")
+        index_path.write_bytes(encoded(index));sign(index_path)
+        if bad_index:
+            sig = Path(str(index_path) + ".sig")
+            sig.write_text(sig.read_text().replace("temporary repository fixture", "tampered trusted comment"))
+        stable = fields(dict(**header, expires=end.strftime("%Y-%m-%dT%H:%M:%SZ"), revision=revision, previous_sha256=previous, latest_os="0.9.3"))
+        stable += ["", "[[releases]]"] + fields(dict(os_version="0.9.3", revision=revision, size=index_path.stat().st_size, sha256=hashlib.sha256(index_path.read_bytes()).hexdigest(),
+                                                    url="https://tls.test:9443/mpm/assets/" + index_path.name, signature_url="https://tls.test:9443/mpm/assets/" + index_path.name + ".sig"))
+        dest = base / "snapshots" / name
+        dest.mkdir(parents=True)
+        (dest / "stable.toml").write_bytes(encoded(stable));sign(dest / "stable.toml")
+        if name in ("initial", "upgrade"):
+            previous = hashlib.sha256((dest / "stable.toml").read_bytes()).hexdigest()
+    snapshot("initial", 1)
+    package("mpm-demo", "1.1.0", {"/opt/mpm/demo": b"network upgrade\n", "/etc/mpm-demo.conf": b"setting upgraded\n"}, [("mpm-helper", ">=1.0.0")])
+    snapshot("upgrade", 2)
+    snapshot("bad-index", 3, bad_index=True)
+    snapshot("expired", 4, expired=True)
+    bad = package("mpm-demo", "2.0.0", {"/opt/mpm/demo": b"signed before tampering\n", "/etc/mpm-demo.conf": b"setting malicious\n"}, [("mpm-helper", ">=1.0.0")])
+    snapshot("bad-package", 5)
+    bad.write_bytes(bad.read_bytes() + b"tampered")
+    if system:
+        project = Path(ROOT) / "out/headless/system-kernel"
+        project.mkdir(parents=True, exist_ok=True)
+        manifest = (Path(ROOT) / "kernel/mach.toml").read_text().replace('version = "0.9.3"', 'version = "0.9.4"', 1)
+        shutil.copytree(Path(ROOT) / "kernel/src", project / "src", dirs_exist_ok=True)
+        manifest = manifest.replace('path = "../sdk"', 'path = ' + json.dumps(str(Path(ROOT) / "sdk")))
+        (project / "mach.toml").write_text(manifest)
+        subprocess.run(["mach", "dep", "pull", str(project)], cwd=ROOT, check=True, stdout=subprocess.PIPE)
+        subprocess.run(["mach", "build", str(project), "-a", "kernel", "-t", "kernel", "-p", PROFILE[0]], cwd=ROOT, check=True)
+        kernel = (project / "out/kernel" / PROFILE[0] / "kernel.elf").read_bytes()
+        # A different kernel version is confined to this ignored test project.
+        old_records = records[:]
+        records.clear()
+        for path in stock_paths:
+            stock(path, "0.9.4", kernel)
+        header = dict(format=1, channel="stable", published=now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        index = fields(dict(**header, os_version="0.9.4", arch="x86_64", revision=1, system=["machos-base", "machos-kernel", "machos-boot"]))
+        for record in records:
+            index += ["", "[[packages]]"] + fields(record)
+        path = assets / "index-system-r1.toml"
+        path.write_bytes(encoded(index));sign(path)
+        current = __import__("tomllib").loads((base / "snapshots/upgrade/stable.toml").read_text())["releases"][0]
+        latest = dict(os_version="0.9.4", revision=1, size=path.stat().st_size, sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                      url="https://tls.test:9443/mpm/assets/" + path.name, signature_url="https://tls.test:9443/mpm/assets/" + path.name + ".sig")
+        stable = fields(dict(**header, expires=(now + datetime.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ"), revision=3, previous_sha256=previous, latest_os="0.9.4"))
+        for record in (current, latest):
+            stable += ["", "[[releases]]"] + fields(record)
+        target = base / "snapshots/system"
+        target.mkdir()
+        (target / "stable.toml").write_bytes(encoded(stable));sign(target / "stable.toml")
+        records[:] = old_records
+    key.unlink()
+    (base / "active").write_text("initial")
+    subprocess.run(["tools/put.sh", str(public), "/root/repository.pub", disk()], cwd=ROOT, check=True, stdout=subprocess.PIPE)
 
 
 def check_truecolor():
@@ -628,6 +772,9 @@ def https_server():
 
         def do_GET(self):
             body = b"hello over verified TLS\n"
+            if self.path.startswith("/mpm/"):
+                self.serve_mpm()
+                return
             if self.path == "/bundle":
                 body = provider_bundle
             if self.path == "/big":
@@ -659,6 +806,49 @@ def https_server():
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
+            self.wfile.flush()
+            self.close_connection = True
+            try:
+                self.connection.settimeout(5)
+                self.connection.unwrap()
+            except (OSError, ssl.SSLError):
+                pass
+
+        def serve_mpm(self):
+            base = Path(directory) / "mpm"
+            if self.path.startswith("/mpm/redirect/"):
+                filename = self.path.removeprefix("/mpm/redirect/")
+                self.send_response(302)
+                self.send_header("Location", "https://tls.test:9443/mpm/assets/" + filename + "?token=" + "x" * 2048)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.flush()
+                self.close_connection = True
+                try:
+                    self.connection.settimeout(5)
+                    self.connection.unwrap()
+                except (OSError, ssl.SSLError):
+                    pass
+                return
+            control = self.path.removeprefix("/mpm/control/")
+            if self.path.startswith("/mpm/control/") and control in ("initial", "upgrade", "bad-index", "expired", "bad-package", "system"):
+                (base / "active").write_text(control)
+                data = b"repository snapshot selected\n"
+            else:
+                relative = self.path.removeprefix("/mpm/").split("?", 1)[0]
+                if relative in ("stable.toml", "stable.toml.sig"):
+                    relative = "snapshots/" + (base / "active").read_text() + "/" + relative
+                path = base / relative
+                if ".." in relative.split("/") or not path.is_file():
+                    self.send_error(404)
+                    return
+                data = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
             self.wfile.flush()
             self.close_connection = True
             try:
@@ -764,13 +954,79 @@ def fsck_stick(kind):
     return "" if "status=0" in out else "host fsck found problems: " + out.strip()[-300:]
 
 
+def legacy_update(output):
+    """Generate only the final 0.9.3 migration artifact; not a future update format."""
+    import shutil, tarfile, tempfile
+    version = re.search(r'^version = "([^"]+)"', (Path(ROOT) / "kernel/mach.toml").read_text(), re.M)[1]
+    if version != "0.9.3":
+        raise RuntimeError("legacy migration packages end at 0.9.3")
+    subprocess.run(["tools/mkimage.sh", "release", "--fresh"], cwd=ROOT, check=True, stdout=subprocess.PIPE)
+    root = Path(ROOT) / "out/release/rootfs"
+    def owner(info):
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        info.mtime = 0
+        return info
+    with tempfile.TemporaryDirectory(dir=Path(ROOT) / "out") as temporary:
+        stage = Path(temporary)
+        for name in ("bin", "boot", "etc", "usr/share/licenses"):
+            shutil.copytree(root / name, stage / name, dirs_exist_ok=True)
+        (stage / "VERSION").write_text("0.9.3\n")
+        data = stage / "bin/mpm-bootstrap.tar"
+        with tarfile.open(data, "w", format=tarfile.USTAR_FORMAT) as tar:
+            defaults = [*sorted((root / "etc").glob("*.conf")), root / "etc/hosts", root / "etc/services", root / "etc/mpm/keys/machos.pub", root / "etc/mpm/os-version"]
+            for path in defaults + sorted((root / "var/lib/mpm/packages").glob("*.toml")):
+                tar.add(path, arcname=str(path.relative_to(root)), recursive=False, filter=owner)
+        with tarfile.open(output, "w:gz", format=tarfile.USTAR_FORMAT) as tar:
+            for path in sorted(stage.rglob("*")):
+                tar.add(path, arcname=str(path.relative_to(stage)), recursive=False, filter=owner)
+
+
 def update_stick():
-    """a FAT stick carrying an update package"""
-    sh("rm -f out/headless/update.tgz")  # a package that fails to build must not be an old one
-    pkg = sh("tools/mkupdate.sh out/headless/update.tgz").strip().splitlines()[-1]
+    """Exercise the real 0.9.2 updater against the last migration archive."""
+    import shutil
+    archive = Path(ROOT) / "out/headless/update.tgz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    archive.unlink(missing_ok=True)
+    legacy_update(archive)
+    project = Path(ROOT) / "out/headless/legacy-update"
+    (project / "src").mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(Path(ROOT) / "tools/fixtures/legacy-update-0.9.2.mach", project / "src/update.mach")
+    (project / "mach.toml").write_text('''[project]
+id = "legacy"
+version = "0.9.2"
+mach = "^6.10"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+[target.machos]
+isa = "x86_64"
+os = "freestanding"
+abi = "sysv64"
+of = "elf"
+base = 0x400000
+platform = "machos"
+[artifact.update]
+kind = "bin"
+entry = "update.mach"
+out = "update"
+targets = ["machos"]
+link = []
+need = []
+[dep.sdk]
+path = "''' + str(Path(ROOT) / "sdk") + '''"
+''')
+    subprocess.run(["mach", "dep", "pull", str(project)], cwd=ROOT, check=True, stdout=subprocess.PIPE)
+    subprocess.run(["mach", "build", str(project), "-a", "update", "-t", "machos", "-p", "release"], cwd=ROOT, check=True)
+    subprocess.run(["tools/put.sh", str(project / "out/machos/release/update"), "/bin/update", disk()], cwd=ROOT, check=True, stdout=subprocess.PIPE)
     sh(f"rm -f {USB_STICK}; dd if=/dev/zero of={USB_STICK} bs=1M count=64 status=none")
     sh(f"mkfs.fat -F 32 {USB_STICK}")
-    sh(f"mcopy -i {USB_STICK} out/headless/update.tgz ::/update.tgz")
+    subprocess.run(["mcopy", "-i", USB_STICK, str(archive), "::/update.tgz"], cwd=ROOT, check=True)
 
 
 DUAL = os.path.join(ROOT, "out", "headless", "dual.img")
@@ -952,13 +1208,13 @@ TESTS = [
 
     # an update from a package on a USB stick, then a reboot into it
     ("update", False, True,
-     ["--prep", update_stick] + usb_stick() + [
-      "wait:" + P, "send:cat /etc/system.conf /etc/time.conf /etc/login.conf /etc/network.conf > /etc/machos.conf; rm /etc/system.conf /etc/time.conf /etc/login.conf /etc/network.conf; echo kept > /var/lib/mpm/custom-marker; mkdir /mnt; mount /dev/sdb /mnt; rm -r /usr/share/licenses; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update /bin/install; mv /mnt/update.tgz '/mnt/update name;literal.tgz'; mount /dev/sda1 /boot/efi; cd /mnt; update 'update name;literal.tgz'; cd /root; umount /boot/efi; umount /mnt; config get hostname; mpm info coreutils; cat /var/lib/mpm/custom-marker; machboot\\n",
+     ["--prep", update_stick, "--boot", disk] + usb_stick() + [
+      "wait:" + P, "send:cat /etc/system.conf /etc/time.conf /etc/login.conf /etc/network.conf > /etc/machos.conf; rm /etc/system.conf /etc/time.conf /etc/login.conf /etc/network.conf /etc/se.conf /etc/sh.conf /etc/mpm.conf /etc/wget.conf; rm -r /etc/mpm /var/lib/mpm; mkdir /mnt; mount /dev/sdb /mnt; rm -r /usr/share/licenses; rm /etc/ssl/certs/ca-certificates.crt /bin/ca-update /bin/install; mv /mnt/update.tgz '/mnt/update name;literal.tgz'; mount /dev/sda1 /boot/efi; cd /mnt; update 'update name;literal.tgz'; cd /root; umount /boot/efi; umount /mnt; config get hostname; machboot\\n",
       "wait:" + P],
-     ["updating MachOS", "installing the programs", "MachOS is updated to 0.9.3", "machos", "mpm: installed files verified", "kept", "MachOS (previous)"]),
+     ["updating MachOS", "installing the programs", "MachOS is updated to 0.9.3", "machos", "MachOS (previous)"]),
     ("update-reboot", True, True,
-     ["wait:" + P, "send:ls /boot; uname -a\\n", "wait:" + P],
-     ["kernel.old.elf", "MachOS 0.9.3"]),
+     ["--boot", disk, "wait:" + P, "send:ls /boot; uname -a; mpm info coreutils; test -e /bin/update; echo legacy-updater-status $?; test -e /bin/mpm-bootstrap.tar; echo migration-data-status $?; cat /etc/mpm/os-version\\n", "wait:" + P],
+     ["kernel.old.elf", "MachOS 0.9.3", "mpm: installed files verified", "legacy-updater-status 1", "migration-data-status 1", "0.9.3"]),
 
     # MachOS installed on a USB stick, then booted from the stick alone
     ("usb-install", False, False,
@@ -1376,12 +1632,12 @@ TESTS.append(("mpm-reject", False, True,
               ["--prep", with_mpm, "--boot", disk, "wait:" + P,
                "send:cd /bin; tar -xf /bin/mpm-fixtures.tar; cp /bin/test.pub /etc/mpm/keys/test.pub; cd /root\\n", "wait:" + P,
                "send:mpm install /bin/unsigned.mpa; echo unsigned-status $?; mpm install /bin/tampered.mpa; echo tampered-status $?; mpm install --allow-unsigned /bin/comment.mpa; echo comment-status $?; mpm install /bin/unknown.mpa; echo unknown-status $?\\n", "wait:" + P,
-               "send:mpm install /bin/truncated.mpa; echo truncated-status $?; mpm install /bin/traversal.mpa; echo traversal-status $?; mpm install /bin/duplicate.mpa; echo duplicate-status $?; mpm install /bin/link.mpa; echo link-status $?\\n", "wait:" + P,
+               "send:mpm install --force /bin/bootstrap.mpa; echo bootstrap-status $?; test -e /bin/mpm-bootstrap.tar; echo bootstrap-file-status $?; mpm install /bin/truncated.mpa; echo truncated-status $?; mpm install /bin/traversal.mpa; echo traversal-status $?; mpm install /bin/duplicate.mpa; echo duplicate-status $?; mpm install /bin/link.mpa; echo link-status $?\\n", "wait:" + P,
                "send:mpm install /bin/cycle-a.mpa; echo cycle-status $?; mpm install /bin/missing.mpa; echo missing-status $?\\n", "wait:" + P,
                "send:mpm install --allow-unsigned /bin/unsigned.mpa\\n", "wait:Password: ", "send:wrong\\n", "wait:" + P,
                "send:mpm install --allow-unsigned /bin/unsigned.mpa\\n", "wait:Password: ", "send:machos\\n", "wait:" + P,
                "send:echo old > /opt/mpm/conflict; mpm install /bin/conflict.mpa; echo conflict-status $?; cat /opt/mpm/conflict; mpm install --force /bin/conflict.mpa; cat /opt/mpm/conflict; test -e /var/lib/mpm/transaction; echo clean-status $?; sync\\n", "wait:" + P],
-              ["unsigned-status 1", "tampered-status 1", "comment-status 1", "unknown-status 1", "truncated-status 1", "traversal-status 1", "duplicate-status 1", "link-status 1", "cycle-status 1", "missing-status 1", "authentication failed", "mpm: installed mpm-unsigned 1.0.0", "conflict-status 1", "old", "mpm: installed mpm-conflict 1.0.0", "replacement", "clean-status 1"]))
+              ["unsigned-status 1", "tampered-status 1", "comment-status 1", "unknown-status 1", "bootstrap-status 1", "bootstrap-file-status 1", "truncated-status 1", "traversal-status 1", "duplicate-status 1", "link-status 1", "cycle-status 1", "missing-status 1", "authentication failed", "mpm: installed mpm-unsigned 1.0.0", "conflict-status 1", "old", "mpm: installed mpm-conflict 1.0.0", "replacement", "clean-status 1"]))
 
 TESTS.append(("mpm-rollback", False, True,
               ["--prep", with_mpm, "--boot", disk, "--disk2", "blank:" + TARGET,
@@ -1389,6 +1645,59 @@ TESTS.append(("mpm-rollback", False, True,
                "send:mkdir -p /opt/mpm/mounted; echo before > /opt/mpm/rollback; mkext2 /dev/sdb; mount /dev/sdb /opt/mpm/mounted; mpm install --force /bin/rollback.mpa; echo rollback-status $?; cat /opt/mpm/rollback; test -e /var/lib/mpm/packages/mpm-rollback.toml; echo record-status $?; umount /opt/mpm/mounted\\n", "wait:" + P,
                "send:mkdir /var/lib/mpm/transaction; chmod 700 /var/lib/mpm/transaction; cp /bin/recover.journal /var/lib/mpm/transaction/journal; echo original > /var/lib/mpm/transaction/old-0; echo interrupted > /opt/mpm/rollback; mpm recover; echo recovery-status $?; cat /opt/mpm/rollback; sync\\n", "wait:" + P],
               ["transaction rolled back", "rollback-status 1", "before", "record-status 1", "recovery-status 0", "original"]))
+
+
+TESTS.append(("fat-replace", False, True,
+              ["--prep", lambda: with_posix_artifact("fatreplace"), "--boot", disk, "wait:" + P,
+               "send:fatreplace; echo fat-replace-status $?; sync\\n", "wait:" + P],
+              ["FAT replacement and detached handles passed", "fat-replace-status 0"]))
+
+
+TESTS.append(("live-install", False, True,
+              ["--prep", lambda: sh("tools/iso.sh out/headless/live-install.iso"), "--boot", os.path.join(ROOT, "out/headless/live-install.iso"), "--disk2", "blank:" + TARGET,
+               "wait:" + P, "send:install /dev/sdb\\n", "wait:Type yes to continue:", "send:yes\\n", "wait:New password:", "send:machos\\n", "wait:Again:", "send:machos\\n", "wait:Create an administrator account?", "send:no\\n", "wait:" + P,
+               "send:mkdir -p /mnt; mount /dev/sdb2 /mnt; test -f /mnt/boot/initrd.tar; echo live-rescue-status $?; test -e /mnt/bin/update; echo live-update-status $?; umount /mnt; sync\\n", "wait:" + P],
+              ["MachOS is installed", "live-rescue-status 0", "live-update-status 1"]))
+
+TESTS.append(("live-installed-boot", True, True,
+              ["--boot", TARGET, "wait:" + P, "send:uname -r; mpm info coreutils; test -f /boot/initrd.tar; echo installed-rescue-status $?; sync\\n", "wait:" + P],
+              ["0.9.3", "installed files verified", "installed-rescue-status 0"]))
+
+
+TESTS.append(("mpm-network", False, True,
+              ["--prep", with_mpm_repository, "--boot", disk, "wait:" + P,
+               "send:echo '10.0.2.2 tls.test' >> /etc/hosts; export SSL_CERT_FILE=/root/test-ca.pem; cp /root/repository.pub /etc/mpm/keys/machos.pub; config set mpm.repository https://tls.test:9443/mpm/stable.toml; mpm refresh; echo refresh-status $?\\n", "wait:" + P,
+               "send:mpm search demo; mpm info mpm-demo; mpm install mpm-demo; echo network-install-status $?; cat /opt/mpm/demo /opt/mpm/mpm-helper; mpm info mpm-demo\\n", "wait:" + P,
+               "send:echo edited > /etc/mpm-demo.conf; wget -q -O - https://tls.test:9443/mpm/control/upgrade; mpm refresh; mpm upgrade; echo network-upgrade-status $?; cat /opt/mpm/demo /etc/mpm-demo.conf /etc/mpm-demo.conf.mpm-new; sync\\n", "wait:" + P],
+              ["refreshed verified stable repository", "refresh-status 0", "mpm-demo 1.0.0 -", "installed bytes:", "mpm: installed mpm-demo 1.0.0", "network-install-status 0", "network install", "dependency fetched", "installed files verified", "refreshed verified stable repository", "mpm: installed mpm-demo 1.1.0", "network-upgrade-status 0", "network upgrade", "edited", "setting upgraded"]))
+
+
+TESTS.append(("mpm-network-reject", False, True,
+              ["--prep", with_mpm_repository, "--boot", disk, "wait:" + P,
+               "send:echo '10.0.2.2 tls.test' >> /etc/hosts; export SSL_CERT_FILE=/root/test-ca.pem; cp /etc/mpm/keys/machos.pub /root/original.pub; cp /root/repository.pub /etc/mpm/keys/machos.pub; cp /root/repository.pub /etc/mpm/keys/test.pub; config set mpm.repository https://tls.test:9443/mpm/stable.toml; mpm refresh; mpm install mpm-demo; wget -q -O - https://tls.test:9443/mpm/control/upgrade; mpm refresh; cp /var/lib/mpm/repository/stable.toml /tmp/catalogue-before\\n", "wait:" + P,
+               "send:wget -q -O - https://tls.test:9443/mpm/control/bad-index; mpm refresh; echo bad-index-status $?; test \"$(sha256sum < /tmp/catalogue-before)\" = \"$(sha256sum < /var/lib/mpm/repository/stable.toml)\"; echo index-cache-kept $?\\n", "wait:" + P,
+               "send:wget -q -O - https://tls.test:9443/mpm/control/expired; mpm refresh; echo expired-index-status $?; wget -q -O - https://tls.test:9443/mpm/control/initial; mpm refresh; echo replay-status $?; test \"$(sha256sum < /tmp/catalogue-before)\" = \"$(sha256sum < /var/lib/mpm/repository/stable.toml)\"; echo replay-cache-kept $?\\n", "wait:" + P,
+               "send:wget -q -O - https://tls.test:9443/mpm/control/upgrade; cp /root/original.pub /etc/mpm/keys/machos.pub; mpm refresh; echo wrong-official-key-status $?; cp /root/repository.pub /etc/mpm/keys/machos.pub; wget -q --max-size 10 -O /tmp/limited https://tls.test:9443/big; echo download-limit-status $?\\n", "wait:" + P,
+               "send:wget -q -O - https://tls.test:9443/mpm/control/bad-package; mpm refresh; mpm install --allow-unsigned mpm-demo; echo bad-network-package-status $?; cat /opt/mpm/demo; mpm info mpm-demo; test -e /var/lib/mpm/transaction; echo network-lock-status $?; sync\\n", "wait:" + P],
+              ["bad-index-status 1", "index-cache-kept 0", "expired-index-status 1", "replay-status 1", "replay-cache-kept 0", "wrong-official-key-status 1", "download-limit-status 1", "bad-network-package-status 1", "network install", "mpm-demo 1.0.0", "installed files verified", "network-lock-status 1"]))
+
+
+TESTS.append(("mpm-system-rollback", False, True,
+              ["--prep", lambda: with_mpm_repository(True), "--boot", disk, "wait:" + P,
+               "send:echo '10.0.2.2 tls.test' >> /etc/hosts; export SSL_CERT_FILE=/root/test-ca.pem; cp /root/repository.pub /etc/mpm/keys/machos.pub; config set mpm.repository https://tls.test:9443/mpm/stable.toml; wget -q -O - https://tls.test:9443/mpm/control/system; mpm refresh; cp /boot/kernel.elf /tmp/kernel-before; cp /boot/efi/EFI/BOOT/BOOTX64.EFI /tmp/efi-before; mkdir /boot/efi/EFI/BOOT/MPMNEW.EFI; echo block > /boot/efi/EFI/BOOT/MPMNEW.EFI/block; mpm upgrade; echo failed-system-status $?; cat /etc/mpm/os-version\\n", "wait:" + P,
+               "send:rm -r /boot/efi/EFI/BOOT/MPMNEW.EFI; mpm recover; echo system-recover-status $?; test \"$(sha256sum < /boot/kernel.elf)\" = \"$(sha256sum < /tmp/kernel-before)\"; echo kernel-restored $?; test \"$(sha256sum < /boot/efi/EFI/BOOT/BOOTX64.EFI)\" = \"$(sha256sum < /tmp/efi-before)\"; echo efi-restored $?; mpm info machos-kernel; test -e /var/lib/mpm/transaction; echo recovered-lock-status $?; sync\\n", "wait:" + P],
+              ["rollback incomplete", "failed-system-status 1", "0.9.3", "system-recover-status 0", "kernel-restored 0", "efi-restored 0", "installed files verified", "recovered-lock-status 1"]))
+
+
+TESTS.append(("mpm-system", False, True,
+              ["--prep", lambda: with_mpm_repository(True), "--boot", disk, "wait:" + P,
+               "send:echo '10.0.2.2 tls.test' >> /etc/hosts; export SSL_CERT_FILE=/root/test-ca.pem; cp /root/repository.pub /etc/mpm/keys/machos.pub; config set mpm.repository https://tls.test:9443/mpm/stable.toml; mpm refresh; wget -q -O - https://tls.test:9443/mpm/control/system; mpm refresh; echo system-refresh-status $?\\n", "wait:" + P,
+               "send:sha256sum /boot/kernel.elf; mpm upgrade; echo system-upgrade-status $?; cat /etc/mpm/os-version; mpm info machos-kernel; grep 'MachOS (previous)' /boot/machboot.conf; sync\\n", "wait:" + P],
+              ["system-refresh-status 0", "system upgrade committed; reboot to start 0.9.4", "system-upgrade-status 0", "0.9.4", "installed files verified", "entry MachOS (previous)"]))
+
+TESTS.append(("mpm-system-boot", True, True,
+              ["--boot", disk, "wait:" + P, "send:uname -r; cat /etc/mpm/os-version; mpm info machos-kernel; mpm search coreutils; sync\\n", "wait:" + P],
+              ["0.9.4", "0.9.4", "installed files verified", "coreutils 0.9.4 -"]))
 
 
 TESTS.append(("truecolor", False, True,

@@ -1,4 +1,4 @@
-# local package selection, ownership, dependencies and transaction planning
+# local and repository package selection, ownership, dependencies and transaction planning
 
 use sdk.abi;
 use sdk.auth;
@@ -16,8 +16,15 @@ use io: userland.lib.cli;
 use userland.lib.conf;
 use userland.mpm.fs;
 use pkg:    userland.mpm.package;
+use repo:   userland.mpm.repository;
 use signed: userland.mpm.signature;
-use tx:     userland.mpm.transaction;
+use userland.mpm.system;
+use tx: userland.mpm.transaction;
+
+var system_mode: u8;
+var changing_os: u8;
+
+var network_mode: u8;
 
 var installed:         [128]pkg.Package;
 var installed_count:   u64;
@@ -242,6 +249,25 @@ fun find_selected(name: *u8) i64 {
     ret -1;
 }
 
+fun from_repository(name: *u8, constraint: *u8, out: *pkg.Package) u8 {
+    if (network_mode == 0) {
+        if (repo.load(0) == 0) { ret 0; }
+        network_mode = 1;
+    }
+    val n: i64 = repo.find(name, constraint);
+    if (n < 0) { ret fail("package or required version is not in the repository"); }
+    var path: [512]u8;
+    if (repo.download(n::u64, ?path[0], max_archive) == 0 || archive(?path[0], out) == 0) { ret 0; }
+    val entry: *repo.Entry = repo.get(n::u64);
+    if (io.streq(?out.name[0], ?entry.name[0]) == 0 || io.streq(?out.version[0], ?entry.version[0]) == 0 || out.protected != entry.protected || out.dep_count != entry.dep_count) { ret fail("package manifest differs from repository index"); }
+    var d: u64 = 0;
+    for (d < out.dep_count) {
+        if (io.streq(?out.deps[d].name[0], ?entry.deps[d].name[0]) == 0 || io.streq(?out.deps[d].version[0], ?entry.deps[d].version[0]) == 0) { ret fail("package dependencies differ from repository index"); }
+        d = d + 1;
+    }
+    ret 1;
+}
+
 fun dependency(parent: *pkg.Package, dep: *pkg.Dependency) i64 {
     val supplied: i64 = find_selected(?dep.name[0]);
     if (supplied >= 0) {
@@ -251,6 +277,12 @@ fun dependency(parent: *pkg.Package, dep: *pkg.Dependency) i64 {
     val existing: i64 = find_installed(?dep.name[0]);
     if (existing >= 0 && installed[existing::u64].active != 0 && pkg.satisfies(?installed[existing::u64].version[0], ?dep.version[0]) != 0) { ret -2; }
     if (selected_count == 32)                                                                                                               { ret -1; }
+    if (network_mode != 0) {
+        val slot: u64 = selected_count;
+        if (from_repository(?dep.name[0], ?dep.version[0], ?selected[slot]) == 0) { ret -1; }
+        selected_count = selected_count + 1;
+        ret slot::i64;
+    }
     var directory: [512]u8;
     var slash:     u64 = 0;
     var i:         u64 = 0;
@@ -320,8 +352,9 @@ fun plan_package(p: *pkg.Package) u8 {
     var old:       *pkg.Package = nil;
     if (old_index >= 0) {
         old = ?installed[old_index::u64];
-        if (old.active != 0 && pkg.compare(?p.version[0], ?old.version[0]) <= 0) { ret fail("upgrade must have a newer version of the same package"); }
-        if (old.protected != 0 && p.protected == 0)                              { ret fail("an upgrade cannot remove base protection"); }
+        val comparison: i64 = pkg.compare(?p.version[0], ?old.version[0]);
+        if (old.active != 0 && (comparison < 0 || (comparison == 0 && changing_os == 0 && system_mode == 0))) { ret fail("upgrade must have a newer version of the same package"); }
+        if (old.protected != 0 && p.protected == 0)                                                           { ret fail("an upgrade cannot remove base protection"); }
     }
     var i: u64 = 0;
     for (i < p.count) {
@@ -337,7 +370,7 @@ fun plan_package(p: *pkg.Package) u8 {
             io.err("mpm: WARNING: existing unowned file: ");
             io.err(?f.path[0]);
             io.err("\n");
-            if (overwrite == 0) { ret fail("refusing overwrite; explicit --force is required"); }
+            if (overwrite == 0 && !(system_mode != 0 && pkg.boot_file(?p.name[0], ?f.path[0]) != 0)) { ret fail("refusing overwrite; explicit --force is required"); }
         }
         if (old != nil) {
             val prior: *pkg.File = find_file(old, ?f.path[0]);
@@ -394,15 +427,26 @@ fun install(argc: u64, argv: **u8, start: u64) u8 {
         }
         or {
             if (selected_count == 32) { ret fail("too many packages"); }
-            val p: *pkg.Package = ?selected[selected_count];
-            if (archive(argv[i], p) == 0)       { ret 0; }
+            val p:      *pkg.Package = ?selected[selected_count];
+            val length: u64          = io.len(argv[i]);
+            if (length > 4 && io.eq(?argv[i][length - 4], 4, ".mpa", 4) != 0) {
+                if (archive(argv[i], p) == 0) { ret 0; }
+            }
+            or {
+                if (pkg.name_ok(argv[i]) == 0 || from_repository(argv[i], nil, p) == 0) { ret 0; }
+            }
             if (find_selected(?p.name[0]) >= 0) { ret fail("multiple archives for the same package"); }
             selected_count = selected_count + 1;
         }
         i = i + 1;
     }
-    if (selected_count == 0) { ret fail("no archives supplied"); }
-    i = 0;
+    ret install_selected();
+}
+
+fun install_selected() u8 {
+    if (system_mode == 0 && (find_selected("machos-kernel") >= 0 || find_selected("machos-boot") >= 0)) { ret fail("upgrade protected boot packages together using mpm upgrade"); }
+    if (selected_count == 0)                                                                            { ret fail("no packages selected"); }
+    var i: u64 = 0;
     for (i < selected_count) {
         if (visit(i) == 0) { ret 0; }
         i = i + 1;
@@ -420,12 +464,27 @@ fun install(argc: u64, argv: **u8, start: u64) u8 {
         }
         i = i + 1;
     }
+    # Persist a bootable previous-system entry before changing executable files.
+    if (system_mode != 0) {
+        val kernel: i64 = find_selected("machos-kernel");
+        val boot:   i64 = find_selected("machos-boot");
+        if (kernel < 0 || boot < 0 || system.plan(?selected[kernel::u64], ?selected[boot::u64], ?repo.target_version[0]) == 0) { ret 0; }
+    }
     i = 0;
     for (i < order_count) {
         if (plan_package(?selected[order[i]]) == 0) { ret 0; }
         i = i + 1;
     }
+    if (system_mode != 0) {
+        val boot: i64 = find_selected("machos-boot");
+        if (boot < 0 || system.finish(?selected[boot::u64], ?repo.target_version[0]) == 0) { ret 0; }
+    }
     if (tx.commit() == 0) { ret 0; }
+    if (system_mode != 0) {
+        io.out("mpm: system upgrade committed; reboot to start ");
+        io.out(?repo.target_version[0]);
+        io.putc(10);
+    }
     i = 0;
     for (i < order_count) {
         io.out("mpm: installed ");
@@ -436,6 +495,54 @@ fun install(argc: u64, argv: **u8, start: u64) u8 {
         i = i + 1;
     }
     ret 1;
+}
+
+fun upgrade() u8 {
+    if (repo.load(1) == 0) { ret 0; }
+    network_mode = 1;
+    var local: [128]u8;
+    if (repo.version(?local[0]) == 0 || pkg.compare(?repo.target_version[0], ?local[0]) < 0) { ret fail("refusing an OS downgrade"); }
+    changing_os = (io.streq(?local[0], ?repo.target_version[0]) == 0)::u8;
+    system_mode = changing_os;
+    var i: u64 = 0;
+    for (i < installed_count) {
+        if (installed[i].active != 0) {
+            val candidate: i64 = repo.find(?installed[i].name[0], nil);
+            if (candidate < 0 && changing_os != 0) { ret fail("an installed package has no compatible version in the target OS release"); }
+            if (candidate >= 0) {
+                val entry:      *repo.Entry = repo.get(candidate::u64);
+                val comparison: i64         = pkg.compare(?entry.version[0], ?installed[i].version[0]);
+                if (comparison < 0 && changing_os != 0) { ret fail("target OS would downgrade an installed package"); }
+                if (comparison > 0 || changing_os != 0) {
+                    if (selected_count == 32 || from_repository(?entry.name[0], nil, ?selected[selected_count]) == 0) { ret 0; }
+                    selected_count = selected_count + 1;
+                    var role: u64 = 0;
+                    for (role < repo.system_count) {
+                        if (io.streq(?entry.name[0], repo.system(role)) != 0) { system_mode = 1; }
+                        role = role + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (system_mode != 0) {
+        var role: u64 = 0;
+        for (role < repo.system_count) {
+            val name: *u8 = repo.system(role);
+            if (find_selected(name) < 0) {
+                if (selected_count == 32 || from_repository(name, nil, ?selected[selected_count]) == 0) { ret 0; }
+                selected_count = selected_count + 1;
+            }
+            role = role + 1;
+        }
+    }
+    if (selected_count == 0) {
+        tx.abort();
+        io.out("mpm: installed packages are up to date\n");
+        ret 1;
+    }
+    ret install_selected();
 }
 
 fun remove(argc: u64, argv: **u8, start: u64) u8 {
@@ -531,17 +638,21 @@ fun info(p: *pkg.Package) {
 
 pub fun run(argc: u64, argv: **u8) u64 {
     if (argc < 2 || io.streq(argv[1], "--help") != 0) {
-        io.out("MachOS Package Manager\nusage: mpm install [--allow-unsigned] [--force] FILE.mpa...\n       mpm remove [--purge] NAME...\n       mpm list | info NAME|FILE.mpa | recover\n  --force overwrites unowned files; other packages retain their ownership.\n  Local archives only. Signatures are FILE.mpa.sig; trusted keys: /etc/mpm/keys.\n");
+        io.out("MachOS Package Manager\nusage: mpm install [--allow-unsigned] [--force] NAME|FILE.mpa...\n       mpm remove [--purge] NAME...\n       mpm refresh | search [TEXT] | upgrade\n       mpm list | info NAME|FILE.mpa | recover\n  --force overwrites unowned files; other packages retain their ownership.\n  Signed stable repository and local archives. Signatures are FILE.mpa.sig; trusted keys: /etc/mpm/keys.\n");
         ret 0;
     }
-    var mutate: u8 = (io.streq(argv[1], "install") != 0 || io.streq(argv[1], "remove") != 0)::u8;
+    var mutate: u8 = (io.streq(argv[1], "install") != 0 || io.streq(argv[1], "remove") != 0 || io.streq(argv[1], "refresh") != 0 || io.streq(argv[1], "upgrade") != 0)::u8;
     if (mutate != 0 || io.streq(argv[1], "recover") != 0) {
         if (sys.getuid() != 0 || sys.geteuid() != 0) {
             fail("root is required; administrators can use se");
             ret 1;
         }
-        if (io.streq(argv[1], "recover") != 0 && argc == 2) { ret (tx.recover() == 0)::u64; }
-        if (tx.begin() == 0)                                { ret 1; }
+        if (io.streq(argv[1], "recover") != 0 && argc == 2) {
+            # Recovery may need the separate EFI filesystem after a reboot.
+            if (fs.exists("/var/lib/mpm/transaction/journal") != 0) { system.mount_efi(); }
+            ret (tx.recover() == 0)::u64;
+        }
+        if (tx.begin() == 0) { ret 1; }
     }
     if (load_records("/var/lib/mpm/packages", 1) == 0 || load_records("/var/lib/mpm/configs", 0) == 0) {
         if (mutate != 0) { tx.abort(); }
@@ -559,9 +670,17 @@ pub fun run(argc: u64, argv: **u8) u64 {
     if (mutate != 0) {
         var good: u8 = 0;
         if (io.streq(argv[1], "install") != 0)                                 { good = install(argc, argv, 2); }
-        or                                                                     { good = remove(argc, argv, 2); }
+        or (io.streq(argv[1], "remove") != 0)                                  { good = remove(argc, argv, 2); }
+        or (io.streq(argv[1], "refresh") != 0 && argc == 2)                    { good = repo.refresh(); }
+        or (io.streq(argv[1], "upgrade") != 0 && argc == 2)                    { good = upgrade(); }
         if (good == 0 && fs.exists("/var/lib/mpm/transaction/COMMITTED") == 0) { tx.abort(); }
         ret (good == 0)::u64;
+    }
+    if (io.streq(argv[1], "search") != 0 && (argc == 2 || argc == 3)) {
+        if (repo.load(0) == 0) { ret 1; }
+        var query: *u8 = nil;
+        if (argc == 3) { query = argv[2]; }
+        ret (repo.search(query) == 0)::u64;
     }
     if (argc == 2 && io.streq(argv[1], "list") != 0) {
         var i: u64 = 0;
@@ -585,8 +704,26 @@ pub fun run(argc: u64, argv: **u8) u64 {
         }
         val index: i64 = find_installed(argv[2]);
         if (index < 0) {
-            fail("package is not installed");
-            ret 1;
+            if (repo.load(0) == 0) { ret 1; }
+            val remote: i64 = repo.find(argv[2], nil);
+            if (remote < 0) {
+                fail("package is not installed or available");
+                ret 1;
+            }
+            val entry: *repo.Entry = repo.get(remote::u64);
+            io.out(?entry.name[0]);
+            io.putc(32);
+            io.out(?entry.version[0]);
+            io.putc(10);
+            io.out(?entry.description[0]);
+            io.putc(10);
+            io.out("download bytes: ");
+            io.dec(entry.size);
+            io.putc(10);
+            io.out("installed bytes: ");
+            io.dec(entry.installed_size);
+            io.putc(10);
+            ret 0;
         }
         val p: *pkg.Package = ?installed[index::u64];
         info(p);

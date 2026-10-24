@@ -24,6 +24,27 @@ var count:      u64;
 var journal:    i64 = -1;
 var started:    u8;
 
+val EFI:     *u8 = "/boot/efi/EFI/BOOT/BOOTX64.EFI";
+val EFI_NEW: *u8 = "/boot/efi/EFI/BOOT/MPMNEW.EFI";
+
+fun copy(from: *u8, to: *u8, mode: u64) u8 {
+    var blob: fs.Blob;
+    if (fs.read(from, 16777216, ?blob) == 0) { ret 0; }
+    val good: u8 = fs.write(to, blob.data, blob.len, mode);
+    fs.release(?blob);
+    ret good;
+}
+
+fun efi_replace(source: *u8) u8 {
+    if (fs.parents(EFI, 0) == 0)                           { ret 0; }
+    if (fs.exists(EFI_NEW) != 0 && io.remove(EFI_NEW) < 0) { ret 0; }
+    if (copy(source, EFI_NEW, 0o755) == 0)                 { ret 0; }
+    sys.sync();
+    if (io.rename(EFI_NEW, EFI) < 0) { ret 0; }
+    sys.sync();
+    ret 1;
+}
+
 fun numbered(out: *u8, prefix: *u8, index: u64) {
     val n: u64 = io.len(STAGE);
     io.copy(out, STAGE, n);
@@ -132,6 +153,14 @@ fun undo() u8 {
             good = 0;
             cnt;
         }
+        if (io.streq(?op.path[0], EFI) != 0) {
+            if (fs.exists(?old[0]) != 0) {
+                if (efi_replace(?old[0]) == 0) { good = 0; }
+            }
+            or (op.had == 0 && fs.exists(EFI) != 0 && io.remove(EFI) < 0) { good = 0; }
+            if (fs.exists(EFI_NEW) != 0 && io.remove(EFI_NEW) < 0)        { good = 0; }
+            cnt;
+        }
         if (fs.exists(?old[0]) != 0) {
             if (fs.exists(?op.path[0]) != 0 && io.remove(?op.path[0]) < 0) {
                 good = 0;
@@ -166,6 +195,8 @@ pub fun commit() u8 {
         numbered(?incoming[0], "new-", i);
         if (fs.parents(?op.path[0], 1) == 0)                                        { brk; }
         if (op.erase == 0 && fs.write(?incoming[0], op.data, op.len, op.mode) == 0) { brk; }
+        val efi: u8 = (io.streq(?op.path[0], EFI) != 0)::u8;
+        if (efi != 0 && (op.erase != 0 || (op.had != 0 && copy(EFI, ?old[0], 0o755) == 0))) { brk; }
         var line: [260]u8;
         line[0] = 48 + op.had;
         line[1] = 48 + op.erase;
@@ -176,6 +207,11 @@ pub fun commit() u8 {
         if (io.write_all(journal, ?line[0], n + 4) == 0) { brk; }
         sys.sync();
         recorded = i + 1;
+        if (efi != 0) {
+            if (efi_replace(?incoming[0]) == 0) { brk; }
+            i = i + 1;
+            cnt;
+        }
         if (op.had != 0 && io.rename(?op.path[0], ?old[0]) < 0)        { brk; }
         if (op.erase == 0 && io.rename(?incoming[0], ?op.path[0]) < 0) { brk; }
         i = i + 1;
@@ -248,6 +284,12 @@ pub fun recover() u8 {
                 }
             }
             r = r + 1;
+        }
+        val metadata: [11]*u8 = [11]*u8{"/var/lib/mpm/repository/stable.toml", "/var/lib/mpm/repository/stable.toml.sig", "/var/lib/mpm/repository/current.toml", "/var/lib/mpm/repository/current.toml.sig", "/var/lib/mpm/repository/latest.toml", "/var/lib/mpm/repository/latest.toml.sig", "/etc/mpm/os-version", "/boot/kernel.old.elf", "/boot/initrd.old.tar", "/boot/machboot.conf", "/boot/efi/EFI/BOOT/BOOTX64.EFI"};
+        var m:        u64     = 0;
+        for (m < 11) {
+            if (io.streq(?op.path[0], metadata[m]) != 0) { internal = 1; }
+            m = m + 1;
         }
         var pending: u8  = 0;
         val length:  u64 = io.len(?op.path[0]);

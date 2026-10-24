@@ -1,8 +1,11 @@
-# MPM: install and inspect local signed package archives
+# MPM: manage local archives and the signed package repository
 use std.runtime;
+use io: userland.lib.cli;
+use userland.mpm.bootstrap;
 use userland.mpm.manager;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
+    if (argc == 2 && io.streq(argv[1], "--bootstrap") != 0) { ret (bootstrap.run() == 0)::i64; }
     ret manager.run(argc::u64, argv)::i64;
 }

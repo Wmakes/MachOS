@@ -10,7 +10,7 @@ use userland.lib.conf;
 use opt: userland.lib.options;
 use userland.lib.time;
 
-val KEYS:      [15]*u8 = [15]*u8{"hostname", "timezone", "rtc", "ttys", "autologin", "network", "login.tries", "login.banner", "se.timeout", "sh.motd", "wget.timeout", "wget.redirects", "wget.quiet", "mpm.max_archive_mb", "mpm.max_unpacked_mb"};
+val KEYS:      [16]*u8 = [16]*u8{"hostname", "timezone", "rtc", "ttys", "autologin", "network", "login.tries", "login.banner", "se.timeout", "sh.motd", "wget.timeout", "wget.redirects", "wget.quiet", "mpm.max_archive_mb", "mpm.max_unpacked_mb", "mpm.repository"};
 var path:      *u8;
 var temporary: [256]u8;
 var source:    [8192]u8;
@@ -54,6 +54,16 @@ fun valid_network(value: *u8) u8 {
 }
 
 fun valid(key: *u8, value: *u8) u8 {
+    if (io.streq(key, "mpm.repository") != 0) {
+        val n: u64 = io.len(value);
+        if (n < 9 || n > 480 || io.eq(value, 8, "https://", 8) == 0) { ret 0; }
+        var i: u64 = 0;
+        for (i < n) {
+            if (value[i] <= 32 || value[i] >= 127) { ret 0; }
+            i = i + 1;
+        }
+        ret 1;
+    }
     val n:        u64 = io.len(value);
     var position: u64 = 0;
     for (position < n) {
@@ -188,7 +198,7 @@ fun read_source(key: *u8) u8 {
 
 fun migrate() i64 {
     var i: u64 = 0;
-    for (i < 15) {
+    for (i < 16) {
         var value:   [8192]u8;
         var found:   u8 = 0;
         var present: u8 = 0;
@@ -210,7 +220,7 @@ fun main(argc: i64, argv: **u8) i64 {
     if (opt.standard(argc::u64, argv, "config", "usage: config [list | get KEY | set KEY VALUE | migrate]\n  Settings live in /etc/system.conf, time.conf, login.conf, network.conf,\n  se.conf, sh.conf, wget.conf and mpm.conf. List shows every supported key.\n  Boot settings apply after reboot; program settings apply at next launch.\n  migrate copies legacy machos.conf values without overwriting focused settings.") != 0) { ret 0; }
     if (argc == 1 || (argc == 2 && io.streq(argv[1], "list") != 0)) {
         var i: u64 = 0;
-        for (i < 15) {
+        for (i < 16) {
             var value: [8192]u8;
             conf.get(KEYS[i], ?value[0], 8192);
             io.out(KEYS[i]);

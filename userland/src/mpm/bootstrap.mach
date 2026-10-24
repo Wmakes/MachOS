@@ -1,0 +1,191 @@
+# One-time 0.9.2 -> 0.9.3 migration data carried by the final legacy update.
+# The old updater copies /bin files but cannot seed MPM's database or trust store.
+
+use sdk.abi;
+use sdk.sys;
+use std.system.os;
+use io: userland.lib.cli;
+use userland.mpm.fs;
+use pkg: userland.mpm.package;
+
+val BUNDLE:  *u8 = "/bin/mpm-bootstrap.tar";
+val RECORDS: *u8 = "/var/lib/mpm/packages/";
+
+rec Member { path: [256]u8; data: *u8; len: u64; record: u8; }
+var members: [64]Member;
+var count:   u64;
+
+fun octal(data: *u8, len: u64, out: *u64) u8 {
+    @out = 0;
+    var i: u64 = 0;
+    for (i < len && data[i] == 32) { i = i + 1; }
+    var digits: u64 = 0;
+    for (i < len && data[i] >= 48 && data[i] <= 55) {
+        @out   = @out * 8 + (data[i] - 48)::u64;
+        i      = i + 1;
+        digits = digits + 1;
+    }
+    for (i < len) {
+        if (data[i] != 0 && data[i] != 32) { ret 0; }
+        i = i + 1;
+    }
+    ret (digits != 0)::u8;
+}
+
+fun permitted(path: *u8) u8 {
+    val files: [12]*u8 = [12]*u8{"/etc/system.conf", "/etc/time.conf", "/etc/login.conf", "/etc/network.conf", "/etc/se.conf", "/etc/sh.conf", "/etc/wget.conf", "/etc/mpm.conf", "/etc/mpm/keys/machos.pub", "/etc/mpm/os-version", "/etc/hosts", "/etc/services"};
+    var i:     u64     = 0;
+    for (i < 12) {
+        if (io.streq(path, files[i]) != 0) { ret 1; }
+        i = i + 1;
+    }
+    val prefix: *u8 = "/var/lib/mpm/packages/";
+    val n:      u64 = io.len(path);
+    val k:      u64 = io.len(prefix);
+    if (n <= k + 5 || n - k - 5 >= 64 || io.eq(path, k, prefix, k) == 0 || io.eq(?path[n - 5], 5, ".toml", 5) == 0) { ret 0; }
+    var name: [64]u8;
+    io.copy(?name[0], ?path[k], n - k - 5);
+    name[n - k - 5] = 0;
+    ret pkg.name_ok(?name[0]);
+}
+
+fun invalid(why: *u8, offset: u64) u8 {
+    io.err("mpm: ");
+    io.err(why);
+    io.err(" at migration archive offset ");
+    io.dec(offset);
+    io.putc(10);
+    ret 0;
+}
+
+fun parse(blob: *fs.Blob) u8 {
+    if (blob.len < 1024 || blob.len % 512 != 0) { ret 0; }
+    var at:        u64 = 0;
+    var essential: u64 = 0;
+    for (at + 512 <= blob.len) {
+        val h:        *u8 = ?blob.data[at];
+        var all_zero: u8  = 1;
+        var i:        u64 = 0;
+        for (i < 512) {
+            if (h[i] != 0) { all_zero = 0; }
+            i = i + 1;
+        }
+        if (all_zero != 0) {
+            if (blob.len - at < 1024) { ret 0; }
+            for (at < blob.len) {
+                if (blob.data[at] != 0) { ret 0; }
+                at = at + 1;
+            }
+            if (essential != 31 || count < 5) {
+                io.err("mpm: migration data is missing required records\n");
+                ret 0;
+            }
+            ret 1;
+        }
+        if (count == 64 || (h[156] != 0 && h[156] != 48) || io.eq(?h[257], 5, "ustar", 5) == 0) { ret invalid("invalid tar header", at); }
+        var checksum: u64 = 0;
+        var sum:      u64 = 0;
+        var size:     u64 = 0;
+        if (octal(?h[148], 8, ?checksum) == 0 || octal(?h[124], 12, ?size) == 0 || size > 65536 || at + 512 + size > blob.len) { ret invalid("invalid member bounds", at); }
+        i = 0;
+        for (i < 512) {
+            if (i >= 148 && i < 156) { sum = sum + 32; }
+            or                       { sum = sum + h[i]::u64; }
+            i = i + 1;
+        }
+        if (sum != checksum) { ret invalid("tar checksum mismatch", at); }
+        i = 345;
+        for (i < 500) {
+            if (h[i] != 0) { ret invalid("tar prefix is not supported", at); }
+            i = i + 1;
+        }
+        var n: u64 = 0;
+        for (n < 100 && h[n] != 0) { n = n + 1; }
+        if (n == 0 || n >= 100 || h[0] == 47) { ret invalid("invalid tar name", at); }
+        val m: *Member = ?members[count];
+        m.path[0] = 47;
+        io.copy(?m.path[1], h, n);
+        m.path[n + 1] = 0;
+        if (permitted(?m.path[0]) == 0) {
+            io.err("mpm: unsupported migration member: ");
+            io.err(?m.path[0]);
+            io.putc(10);
+            ret 0;
+        }
+        var j: u64 = 0;
+        for (j < count) {
+            if (io.streq(?members[j].path[0], ?m.path[0]) != 0) { ret 0; }
+            j = j + 1;
+        }
+        m.data = ?blob.data[at + 512];
+        m.len  = size;
+        val prefix_len: u64 = io.len(RECORDS);
+        if (io.eq(?m.path[0], prefix_len, RECORDS, prefix_len) != 0) {
+            var p: pkg.Package;
+            if (pkg.parse(?p, m.data, m.len) == 0 || io.streq(?p.version[0], "0.9.3") == 0) {
+                io.err("mpm: invalid migration package record: ");
+                io.err(?m.path[0]);
+                io.putc(10);
+                ret 0;
+            }
+            val path_len: u64 = io.len(?m.path[0]);
+            if (io.eq(?p.name[0], io.len(?p.name[0]), ?m.path[prefix_len], path_len - prefix_len - 5) == 0) { ret invalid("package record name mismatch", at); }
+            if (io.streq(?p.name[0], "machos-base") != 0)                                                   { essential = essential | 1; }
+            if (io.streq(?p.name[0], "machos-kernel") != 0)                                                 { essential = essential | 2; }
+            if (io.streq(?p.name[0], "machos-boot") != 0)                                                   { essential = essential | 4; }
+            m.record = 1;
+        }
+        if (io.streq(?m.path[0], "/etc/mpm/keys/machos.pub") != 0) { essential = essential | 8; }
+        if (io.streq(?m.path[0], "/etc/mpm/os-version") != 0) {
+            if (io.eq(m.data, m.len, "0.9.3\n", 6) == 0) { ret invalid("migration version mismatch", at); }
+            essential = essential | 16;
+        }
+        count = count + 1;
+        at    = at + 512 + ((size + 511) / 512) * 512;
+    }
+    ret 0;
+}
+
+fun install(m: *Member) u8 {
+    if (m.record == 0 && io.streq(?m.path[0], "/etc/mpm/os-version") == 0 && fs.exists(?m.path[0]) != 0) { ret 1; }
+    if (fs.parents(?m.path[0], 1) == 0)                                                                  { ret 0; }
+    var tmp: [256]u8;
+    val n:   u64 = io.len(?m.path[0]);
+    io.copy(?tmp[0], ?m.path[0], n);
+    io.copy(?tmp[n], ".bootstrap-new", 15);
+    if (fs.exists(?tmp[0]) != 0 && io.remove(?tmp[0]) < 0)                                  { ret 0; }
+    if (fs.write(?tmp[0], m.data, m.len, 0o644) == 0 || io.rename(?tmp[0], ?m.path[0]) < 0) { ret 0; }
+    ret 1;
+}
+
+pub fun run() u8 {
+    if (sys.getuid() != 0 || sys.geteuid() != 0 || fs.parents(BUNDLE, 0) == 0) { ret 0; }
+    var st: os.stat_t;
+    if (io.lstat(BUNDLE, ?st) < 0 || st.st_uid != 0 || (io.perms(?st) & 0o022) != 0) { ret 0; }
+    var blob: fs.Blob;
+    if (fs.read(BUNDLE, 4194304, ?blob) == 0) { ret 0; }
+    fin { fs.release(?blob); }
+    if (parse(?blob) == 0) {
+        io.err("mpm: invalid legacy migration data\n");
+        ret 0;
+    }
+    var args: [3]*u8 = [3]*u8{"config", "migrate", nil};
+    if (io.run_program("/bin/config", ?args[0], nil) != 0) { ret 0; }
+    var version: *Member = nil;
+    var i:       u64     = 0;
+    for (i < count) {
+        val m: *Member = ?members[i];
+        if (io.streq(?m.path[0], "/etc/mpm/os-version") != 0) { version = m; }
+        or {
+            if (install(m) == 0) { ret 0; }
+        }
+        i = i + 1;
+    }
+    if (fs.directory("/var/lib/mpm/configs", 0o755, 1) == 0 || version == nil || install(version) == 0) { ret 0; }
+    sys.sync();
+    if (fs.exists("/bin/update") != 0 && io.remove("/bin/update") < 0) { ret 0; }
+    if (io.remove(BUNDLE) < 0)                                         { ret 0; }
+    sys.sync();
+    io.out("mpm: legacy migration completed; future updates use mpm upgrade\n");
+    ret 1;
+}

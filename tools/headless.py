@@ -261,11 +261,15 @@ def main():
         qemu.kill()
         qemu.wait()
     if a.fsck:
+        # A live installer boots an ISO but writes the attached target disk.
+        check_img = img
+        if img.endswith(".iso") and a.disk2:
+            check_img = a.disk2.removeprefix("nvme:")
         part = os.path.join(out, "root.img")
-        info = subprocess.run(["sgdisk", "-i", "2", img], stdout=subprocess.PIPE, text=True).stdout
+        info = subprocess.run(["sgdisk", "-i", "2", check_img], stdout=subprocess.PIPE, text=True).stdout
         first = int(re.search(r"First sector: (\d+)", info).group(1))
         last = int(re.search(r"Last sector: (\d+)", info).group(1))
-        subprocess.run(["dd", f"if={img}", f"of={part}", "bs=512", f"skip={first}",
+        subprocess.run(["dd", f"if={check_img}", f"of={part}", "bs=512", f"skip={first}",
                         f"count={last - first + 1}", "status=none"], check=True)
         fsck = subprocess.run(["e2fsck", "-fn", part], stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True)

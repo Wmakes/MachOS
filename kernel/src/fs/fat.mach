@@ -427,6 +427,8 @@ pub fun read(fs: *Fs, first: u64, size: u64, off: u64, dst: u64, n: u64) u64 {
 
 # the short entry of a file: first cluster, size and change time
 fun update_entry(fs: *Fs, dir: u64, idx: u64, first: u64, size: u64) {
+    # Unlinked open files retain their clusters but no longer own a directory entry.
+    if (idx == 0xFFFFFFFFFFFFFFFF) { ret; }
     val off: u64 = entry_off(fs, dir, idx);
     if (off == 0) { ret; }
     var ent: [32]u8;
@@ -436,6 +438,22 @@ fun update_entry(fs: *Fs, dir: u64, idx: u64, first: u64, size: u64) {
     @((?ent[28])::*u32) = size::u32;
     stamp((?ent[24])::*u16, (?ent[22])::*u16);
     wr(fs, off, 32, (?ent[0])::u64);
+}
+
+# Replace a file's data reference while retaining its existing directory name.
+# The VFS keeps the displaced chain alive until its last open handle closes.
+pub fun replace(fs: *Fs, dir: u64, idx: u64, first: u64, size: u64) u64 {
+    val off: u64 = entry_off(fs, dir, idx);
+    if (off == 0 || size > 0xFFFFFFFF) { ret e(abi.E_INVAL); }
+    var ent: [32]u8;
+    if (rd(fs, off, 32, (?ent[0])::u64) == 0) { ret e(abi.E_IO); }
+    if (ent[0] == 0 || ent[0] == 0xE5 || (ent[11] & 0x18) != 0) { ret e(abi.E_INVAL); }
+    @((?ent[26])::*u16) = (first & 0xFFFF)::u16;
+    @((?ent[20])::*u16) = ((first >> 16) & 0xFFFF)::u16;
+    @((?ent[28])::*u32) = size::u32;
+    stamp((?ent[24])::*u16, (?ent[22])::*u16);
+    if (wr(fs, off, 32, (?ent[0])::u64) == 0) { ret e(abi.E_IO); }
+    ret 0;
 }
 
 # write at `off`, growing the chain; *first and *size are updated (and the

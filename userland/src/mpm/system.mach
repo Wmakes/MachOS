@@ -1,0 +1,129 @@
+# boot artifacts, EFI mounting and version state for an official system upgrade
+
+use sdk.abi;
+use sdk.sys;
+use std.system.os;
+use std.types.size.usize;
+use io: userland.lib.cli;
+use userland.mpm.fs;
+use pkg:  userland.mpm.package;
+use repo: userland.mpm.repository;
+use tx:   userland.mpm.transaction;
+
+pub val EFI: *u8 = "/boot/efi/EFI/BOOT/BOOTX64.EFI";
+
+fun fail(why: *u8) u8 {
+    io.err("mpm: ");
+    io.err(why);
+    io.putc(10);
+    ret 0;
+}
+
+pub fun mount_efi() u8 {
+    if (fs.parents("/boot/efi/file", 1) == 0) { ret 0; }
+    var root:    [16]u8;
+    var mounted: u8  = 0;
+    var i:       u64 = 0;
+    for {
+        var m:      abi.MountInfo;
+        val result: u64 = sys.mounts(i, ?m);
+        if (abi.is_err(result) != 0)               { ret 0; }
+        if (result == 0)                           { brk; }
+        if (io.streq(?m.dir[0], "/boot/efi") != 0) { mounted = 1; }
+        if (io.streq(?m.dir[0], "/") != 0)         { io.copy(?root[0], ?m.dev[0], io.len(?m.dev[0]) + 1); }
+        i = i + 1;
+    }
+    if (mounted == 0) {
+        val n: u64 = io.len(?root[0]);
+        # MachOS's installer uses partition 1 for EFI and partition 2 for root.
+        if (n < 7 || n > 15 || root[n - 1] != 50 || (root[n - 2] >= 48 && root[n - 2] <= 57)) { ret fail("cannot locate the installed EFI partition"); }
+        root[n - 1] = 49;
+        if (abi.is_err(sys.mount(?root[0], n, "/boot/efi", 9)) != 0) { ret fail("cannot mount the EFI partition"); }
+    }
+    if (fs.parents(EFI, 0) == 0 || fs.exists(EFI) == 0) { ret fail("the installed EFI fallback loader is missing or unsafe"); }
+    ret 1;
+}
+
+fun file(p: *pkg.Package, path: *u8) *pkg.File {
+    var i: u64 = 0;
+    for (i < p.count) {
+        if (io.streq(?p.files[i].path[0], path) != 0) { ret ?p.files[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun keep(source: *u8, destination: *u8, limit: u64) u8 {
+    var data: fs.Blob;
+    if (fs.read(source, limit, ?data) == 0) { ret 0; }
+    # Buffers remain owned by this short-lived process until transaction commit.
+    ret tx.add(destination, data.data, data.len, 0o644, 0);
+}
+
+pub fun plan(kernel: *pkg.Package, boot: *pkg.Package, target: *u8) u8 {
+    if (kernel == nil || boot == nil || kernel.protected == 0 || boot.protected == 0 || mount_efi() == 0) { ret fail("system upgrades require the protected kernel and boot packages together"); }
+    val image:  *pkg.File = file(kernel, "/boot/kernel.elf");
+    val rescue: *pkg.File = file(kernel, "/boot/initrd.tar");
+    val loader: *pkg.File = file(boot, "/boot/BOOTX64.EFI");
+    if (image == nil || rescue == nil || loader == nil)                                                                                                                                                                                     { ret fail("system upgrade is missing a boot artifact"); }
+    if (image.size < 64 || image.data[0] != 0x7F || image.data[1] != 69 || image.data[2] != 76 || image.data[3] != 70 || loader.size < 512 || loader.data[0] != 77 || loader.data[1] != 90 || rescue.size < 1024 || rescue.size % 512 != 0) { ret fail("system upgrade contains an invalid boot artifact"); }
+    if (keep("/boot/kernel.elf", "/boot/kernel.old.elf", 134217728) == 0 || keep("/boot/initrd.tar", "/boot/initrd.old.tar", 134217728) == 0)                                                                                               { ret 0; }
+    var config: fs.Blob;
+    if (fs.read("/boot/machboot.conf", 16384, ?config) == 0) { ret 0; }
+    val marker:     *u8 = "entry MachOS (previous)";
+    val marker_len: u64 = io.len(marker);
+    val entry:      *u8 = "\nentry MachOS (previous)\n    kernel /boot/kernel.old.elf\n    initrd /boot/initrd.old.tar\n    cmdline rescue\n";
+    val n:          u64 = io.len(entry);
+    val data:       *u8 = os.allocate((config.len + n)::usize)::*u8;
+    if (data == nil) { ret 0; }
+    var at:       u64 = 0;
+    var used:     u64 = 0;
+    var replaced: u8  = 0;
+    var skip:     u8  = 0;
+    for (at < config.len) {
+        var end: u64 = at;
+        for (end < config.len && config.data[end] != 10) { end = end + 1; }
+        val length: u64 = end - at;
+        if (length >= 6 && io.eq(?config.data[at], 6, "entry ", 6) != 0) {
+            skip = 0;
+            var trimmed: u64 = length;
+            if (trimmed > 0 && config.data[at + trimmed - 1] == 13) { trimmed = trimmed - 1; }
+            if (trimmed == marker_len && io.eq(?config.data[at], trimmed, marker, marker_len) != 0) {
+                skip = 1;
+                if (replaced == 0) {
+                    io.copy(?data[used], entry, n);
+                    used     = used + n;
+                    replaced = 1;
+                }
+            }
+        }
+        if (end < config.len) { end = end + 1; }
+        if (skip == 0) {
+            io.copy(?data[used], ?config.data[at], end - at);
+            used = used + end - at;
+        }
+        at = end;
+    }
+    if (replaced == 0) {
+        io.copy(?data[used], entry, n);
+        used = used + n;
+    }
+    if (tx.add("/boot/machboot.conf", data, used, 0o644, 0) == 0) { ret 0; }
+    ret 1;
+}
+
+pub fun finish(boot: *pkg.Package, target: *u8) u8 {
+    val loader: *pkg.File = file(boot, "/boot/BOOTX64.EFI");
+    if (loader == nil || tx.add(EFI, loader.data, loader.size, 0o755, 0) == 0) { ret 0; }
+    var local: [128]u8;
+    if (repo.version(?local[0]) == 0) { ret 0; }
+    if (io.streq(?local[0], target) == 0) {
+        val n:    u64 = io.len(target);
+        val data: *u8 = os.allocate((n + 1)::usize)::*u8;
+        if (data == nil) { ret 0; }
+        io.copy(data, target, n);
+        data[n] = 10;
+        if (tx.add("/etc/mpm/os-version", data, n + 1, 0o644, 0) == 0 || keep("/var/lib/mpm/repository/latest.toml", "/var/lib/mpm/repository/current.toml", 1048576) == 0 || keep("/var/lib/mpm/repository/latest.toml.sig", "/var/lib/mpm/repository/current.toml.sig", 1536) == 0) { ret 0; }
+    }
+    ret 1;
+}

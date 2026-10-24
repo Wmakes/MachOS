@@ -583,6 +583,7 @@ pub fun unlink(nd: *Node) u64 {
     # FAT and exFAT: the entry goes now, the clusters with the last close
     if (nd.fs == FS_FAT) {
         fat.remove(nd.fatfs, nd.parent.ino, nd.fidx, nd.fcount, nd.ino, 1);
+        nd.fidx = 0xFFFFFFFFFFFFFFFF;
         nd.dead = 1;
     }
     if (nd.fs == FS_EXFAT) {
@@ -678,7 +679,7 @@ pub fun replace(nd: *Node, old: *Node) u64 {
     if (nd == old) { ret 0; }
     if ((nd.kind != abi.KIND_FILE && nd.kind != abi.KIND_LINK) || (old.kind != abi.KIND_FILE && old.kind != abi.KIND_LINK)) { ret e(abi.E_NOTSUP); }
     if (nd.fs != old.fs || nd.fsi != old.fsi) { ret e(abi.E_XDEV); }
-    if (nd.fs != FS_RAM && nd.fs != FS_EXT2) { ret e(abi.E_NOTSUP); }
+    if (nd.fs != FS_RAM && nd.fs != FS_EXT2 && nd.fs != FS_FAT) { ret e(abi.E_NOTSUP); }
     if (nd.mount_of != nil || old.mount_of != nil || nd.mounted != nil || old.mounted != nil) {
         ret e(abi.E_BUSY);
     }
@@ -687,6 +688,16 @@ pub fun replace(nd: *Node, old: *Node) u64 {
             old.parent.ino, ?old.name[0], old.name_len, nd.ino, old.ino);
         if (abi.is_err(left) != 0) { ret left; }
         if (left == 0) { old.dead = 1; }
+    }
+    if (nd.fs == FS_FAT) {
+        if (nd.fatfs != old.fatfs) { ret e(abi.E_XDEV); }
+        val changed: u64 = fat.replace(old.fatfs, old.parent.ino, old.fidx, nd.ino, nd.size);
+        if (abi.is_err(changed) != 0) { ret changed; }
+        fat.remove(nd.fatfs, nd.parent.ino, nd.fidx, nd.fcount, nd.ino, 1);
+        nd.fidx = old.fidx;
+        nd.fcount = old.fcount;
+        old.fidx = 0xFFFFFFFFFFFFFFFF;
+        old.dead = 1;
     }
     val dir: *Node = old.parent;
     detach(nd);

@@ -69,19 +69,26 @@ pub fun name_ok(name: *u8) u8 {
     ret 1;
 }
 
+pub fun boot_file(name: *u8, path: *u8) u8 {
+    if (io.streq(name, "machos-kernel") != 0) { ret (io.streq(path, "/boot/kernel.elf") != 0 || io.streq(path, "/boot/initrd.tar") != 0)::u8; }
+    if (io.streq(name, "machos-boot") != 0)   { ret (io.streq(path, "/boot/BOOTX64.EFI") != 0)::u8; }
+    ret 0;
+}
+
 pub fun path_ok(path: *u8) u8 {
     val n: u64 = io.len(path);
     if (n < 2 || n > 240 || path[0] != 47 || path[n - 1] == 47) { ret 0; }
     if (n >= 8 && io.eq(?path[n - 8], 8, ".mpm-new", 8) != 0)   { ret 0; }
     var allowed: u8     = 0;
-    val roots:   [5]*u8 = [5]*u8{"/bin/", "/etc/", "/usr/", "/opt/", "/lib/"};
+    val roots:   [6]*u8 = [6]*u8{"/bin/", "/etc/", "/usr/", "/opt/", "/lib/", "/boot/"};
     var r:       u64    = 0;
-    for (r < 5) {
+    for (r < 6) {
         val k: u64 = io.len(roots[r]);
         if (n > k && io.eq(path, k, roots[r], k) != 0) { allowed = 1; }
         r = r + 1;
     }
     if (allowed == 0)                                                                                                                                             { ret 0; }
+    if (io.streq(path, "/bin/mpm-bootstrap.tar") != 0)                                                                                                            { ret 0; }
     if (io.streq(path, "/etc/passwd") != 0 || io.streq(path, "/etc/shadow") != 0 || io.streq(path, "/etc/group") != 0 || io.streq(path, "/etc/machos.conf") != 0) { ret 0; }
     if (n >= 9 && io.eq(path, 9, "/etc/mpm/", 9) != 0)                                                                                                            { ret 0; }
     var start: u64 = 1;
@@ -191,6 +198,7 @@ pub fun parse(p: *Package, data: *u8, len: u64) u8 {
         val f: *File       = ?p.files[i];
         val t: *toml.Table = ?value.some.data.table;
         if (t.len < 4 || t.len > 5 || text(t, "path", ?f.path[0], 256) == 0 || path_ok(?f.path[0]) == 0 || text(t, "sha256", ?f.digest[0], 65) == 0 || io.len(?f.digest[0]) != 64 || integer(t, "size", ?f.size) == 0 || integer(t, "mode", ?f.mode) == 0 || f.mode > 0o7777) { ret 0; }
+        if (io.eq(?f.path[0], 6, "/boot/", 6) != 0 && (p.protected == 0 || boot_file(?p.name[0], ?f.path[0]) == 0))                                                                                                                                                           { ret 0; }
         var j: u64 = 0;
         for (j < 64) {
             if (!((f.digest[j] >= 48 && f.digest[j] <= 57) || (f.digest[j] >= 97 && f.digest[j] <= 102))) { ret 0; }

@@ -39,9 +39,9 @@ def quote(value):
 
 
 def allowed(path):
-    return (path.startswith(("/bin/", "/etc/", "/usr/", "/opt/", "/lib/"))
+    return (path.startswith(("/bin/", "/etc/", "/usr/", "/opt/", "/lib/", "/boot/"))
             and not path.startswith("/etc/mpm/") and not path.endswith(".mpm-new")
-            and path not in ("/etc/passwd", "/etc/shadow", "/etc/group", "/etc/machos.conf")
+            and path not in ("/etc/passwd", "/etc/shadow", "/etc/group", "/etc/machos.conf", "/bin/mpm-bootstrap.tar")
             and all(part not in ("", ".", "..") for part in path[1:].split("/")))
 
 
@@ -64,6 +64,10 @@ def build_manifest(definition, root):
         quote(path)
         if not allowed(path) or len("files/" + path[1:]) > 99 or path in seen:
             raise ValueError("unsupported or duplicate package path: " + path)
+        if path.startswith("/boot/"):
+            owners = {"/boot/kernel.elf": "machos-kernel", "/boot/initrd.tar": "machos-kernel", "/boot/BOOTX64.EFI": "machos-boot"}
+            if owners.get(path) != name or not definition.get("protected", False):
+                raise ValueError("reserved boot payload: " + path)
         seen.add(path)
         source = root / path[1:]
         # Reject symlinks at every component, including the final file.
@@ -118,6 +122,7 @@ def stock(root, version, output, definitions):
                           dependencies=[dict(name=d, version=">=" + version) for d in deps],
                           files=[dict(path="/bin/" + tool, config=False) for tool in group["tools"]]
                           + [dict(path="/etc/" + cfg, config=True) for cfg in group.get("configs", [])]
+                          + [dict(path=path, config=False) for path in group.get("boot", []) if (root / path[1:]).is_file()]
                           + ([dict(path="/" + str(p.relative_to(root)), config=False)
                               for p in sorted((root / "usr/share/licenses").rglob("*")) if p.is_file()]
                              if group.get("licenses", False) else []))
@@ -125,7 +130,8 @@ def stock(root, version, output, definitions):
         record = database / (name + ".toml")
         record.write_bytes(manifest)
         record.chmod(0o644)
-        archive(output / (name + "-" + version + ".mpa"), manifest, entries)
+        archive(output / (name + "-" + version + "-x86_64.mpa"), manifest, entries)
+        (output / (name + "-" + version + ".mpa")).unlink(missing_ok=True)
 
 
 def main():

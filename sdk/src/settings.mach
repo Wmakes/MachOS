@@ -12,6 +12,7 @@ pub fun path(key: *u8) *u8 {
     if (io.streq(key, "se.timeout\0") != 0)                                                                                                               { ret "/etc/se.conf\0"; }
     if (io.streq(key, "sh.motd\0") != 0)                                                                                                                  { ret "/etc/sh.conf\0"; }
     if (io.streq(key, "wget.timeout\0") != 0 || io.streq(key, "wget.redirects\0") != 0 || io.streq(key, "wget.quiet\0") != 0)                             { ret "/etc/wget.conf\0"; }
+    if (io.streq(key, "mpm.repository\0") != 0)                                                                                                           { ret "/etc/mpm.conf\0"; }
     if (io.streq(key, "mpm.max_archive_mb\0") != 0 || io.streq(key, "mpm.max_unpacked_mb\0") != 0)                                                        { ret "/etc/mpm.conf\0"; }
     ret nil;
 }

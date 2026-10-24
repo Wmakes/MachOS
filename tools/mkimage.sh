@@ -76,6 +76,9 @@ tar --format=ustar --owner=0 --group=0 -cf "$OUT/initrd.tar" -C "$ROOTFS" .
 # the disk root also carries the initrd, for `install` to give new disks a
 # rescue entry (the initrd itself cannot contain itself)
 cp "$OUT/initrd.tar" "$ROOTFS/boot/initrd.tar"
+# The rescue snapshot cannot contain its own digest. Final disk records and
+# package archives also own the completed initrd; the live snapshot owns kernel only.
+python3 tools/mpm.py stock --root "$ROOTFS" --version "$VERSION" --output "$OUT/packages"
 
 # mke2fs -d and debugfs write keep the host's user ids: give these paths
 # (newline-separated, absolute inside the filesystem) to root
@@ -129,6 +132,24 @@ else
             echo "write $ROOTFS/etc/$n /etc/$n" >> "$CMDS"
         fi
     done
+    # Development image refreshes also refresh stock ownership and bootstrap files.
+    # Preserve third-party records and existing trust keys.
+    for d in /var /var/lib /var/lib/mpm /var/lib/mpm/packages /var/lib/mpm/configs /etc/mpm /etc/mpm/keys; do
+        if debugfs -R "stat $d" "$ROOTIMG" 2>&1 | grep -q "File not found"; then
+            echo "mkdir $d" >> "$CMDS"
+        fi
+    done
+    for f in "$ROOTFS/var/lib/mpm/packages/"*.toml "$ROOTFS/etc/mpm/os-version"; do
+        rel=${f#"$ROOTFS"}
+        echo "rm $rel" >> "$CMDS"
+        echo "write $f $rel" >> "$CMDS"
+    done
+    if debugfs -R "stat /etc/mpm/keys/machos.pub" "$ROOTIMG" 2>&1 | grep -q "File not found"; then
+        echo "write $ROOTFS/etc/mpm/keys/machos.pub /etc/mpm/keys/machos.pub" >> "$CMDS"
+    fi
+    if ! debugfs -R "stat /bin/update" "$ROOTIMG" 2>&1 | grep -q "File not found"; then
+        echo "rm /bin/update" >> "$CMDS"
+    fi
     for d in /etc/ssl /etc/ssl/certs; do
         if debugfs -R "stat $d" "$ROOTIMG" 2>&1 | grep -q "File not found"; then
             echo "mkdir $d" >> "$CMDS"
@@ -145,7 +166,7 @@ else
         done
     done
     debugfs -w -f "$CMDS" "$ROOTIMG" >/dev/null 2>&1
-    owned_by_root "$ROOTIMG" "$(cd "$ROOTFS" && find bin boot etc/ssl -mindepth 1 | sed 's|^|/|')"
+    owned_by_root "$ROOTIMG" "$(cd "$ROOTFS" && find bin boot etc/ssl etc/mpm var/lib/mpm -mindepth 1 | sed 's|^|/|')"
     # a rescue build's config is undone by the next normal one
     if [ "$RESCUE" = 1 ]; then touch "$OUT/rescue-conf"; else rm -f "$OUT/rescue-conf"; fi
     dd if="$ROOTIMG" of="$IMG" bs=512 seek="$ROOT_START" conv=notrunc 2>/dev/null

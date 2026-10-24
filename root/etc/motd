@@ -13,7 +13,7 @@
     `nano FILE` edits text; `less FILE` reads it; `shutdown` powers off.
     `passwd` changes your password; `adduser NAME` creates another account.
     `adduser --admin NAME` creates an administrator; use `se COMMAND`.
-    `mpm --help` explains local package installation and verification.
+    `mpm refresh` refreshes the signed repository; `mpm upgrade` updates the system.
 
   Arrows recall commands; Tab completes names; Alt+F1..F6 switch terminals.
   Shift+PgUp/PgDn scroll back. First login requires setting a password.

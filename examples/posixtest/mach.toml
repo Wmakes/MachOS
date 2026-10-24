@@ -80,3 +80,11 @@ out = "securitytest"
 targets = ["machos"]
 link = []
 need = []
+
+[artifact.fatreplace]
+kind = "bin"
+entry = "fatreplace.mach"
+out = "fatreplace"
+targets = ["machos"]
+link = []
+need = []

@@ -1,15 +1,15 @@
 [package.machos-base]
 protected = true
 licenses = true
-tools = ["init", "login", "sh", "se", "su", "passwd", "mpm", "machboot"]
-configs = ["system.conf", "time.conf", "login.conf", "se.conf", "sh.conf", "mpm.conf"]
+tools = ["init", "login", "sh", "se", "su", "passwd", "mpm", "wget"]
+configs = ["system.conf", "time.conf", "login.conf", "se.conf", "sh.conf", "mpm.conf", "wget.conf", "ssl/certs/ca-certificates.crt", "ssl/certs/SOURCE", "ssl/certs/LICENSE.mach-tls"]
 
 [package.coreutils]
 tools = ["basename", "cat", "chmod", "chown", "clear", "confirm", "cp", "df", "diff", "dirname", "du", "echo", "env", "false", "find", "grep", "gunzip", "gzip", "hd", "head", "ls", "mkdir", "mv", "printf", "rm", "seq", "sha256sum", "sleep", "sort", "stat", "tail", "tar", "tee", "test", "touch", "tr", "true", "wc", "which", "xargs"]
 
 [package.netutils]
-tools = ["ca-update", "host", "ip", "nc", "ping", "wget"]
-configs = ["network.conf", "wget.conf"]
+tools = ["ca-update", "host", "ip", "nc", "ping"]
+configs = ["network.conf"]
 
 [package.diskutils]
 tools = ["fsck", "gpt", "mkext2", "mkfat", "mount", "partname", "sync", "umount"]
@@ -24,5 +24,15 @@ tools = ["adduser", "usermod", "id", "whoami"]
 tools = ["edit", "less", "nano"]
 
 [package.installer]
-tools = ["install", "update"]
+tools = ["install"]
 dependencies = ["coreutils", "diskutils", "accounts"]
+
+[package.machos-kernel]
+protected = true
+tools = []
+boot = ["/boot/kernel.elf", "/boot/initrd.tar"]
+
+[package.machos-boot]
+protected = true
+tools = ["machboot"]
+boot = ["/boot/BOOTX64.EFI"]

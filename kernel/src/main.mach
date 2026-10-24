@@ -601,6 +601,14 @@ fun mount_root() {
     kprint.puts("root: initrd in memory (no disk root), \0");
     kprint.dec(initrd.unpack(boot.initrd, boot.initrd_len));
     kprint.puts(" files\n\0");
+    # Keep the loaded rescue archive available to the disk installer. It cannot
+    # be a member of itself, so expose a separate RAM file after unpacking it.
+    val bootdir: *vfs.Node = vfs.child(vfs.get_root(), "boot\0", 4);
+    if (bootdir != nil) {
+        val archive: *vfs.Node = vfs.create_ram(bootdir, "initrd.tar\0", 10, abi.KIND_FILE);
+        if (archive == nil || vfs.write(archive, 0, boot.initrd, boot.initrd_len) != boot.initrd_len) { kprint.panic("cannot retain rescue archive\0"); }
+        archive.mode = 0x1A4;
+    }
 }
 
 #[naked]
