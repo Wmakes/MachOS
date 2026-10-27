@@ -1,0 +1,165 @@
+name: Release ISO
+
+# manual: Actions tab -> Release ISO -> Run workflow.
+# builds the live ISO (tools/iso.sh) and either leaves it as a downloadable
+# artifact or publishes it straight to a GitHub release (MachOS-X.Y.Z.iso).
+# the version comes from kernel/mach.toml unless you type one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version override, e.g. 0.9.5 (empty = version in kernel/mach.toml)"
+        required: false
+        type: string
+        default: ""
+      publish:
+        description: "Publish to GitHub Releases (off = only a downloadable artifact)"
+        required: true
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark the release as a pre-release"
+        required: true
+        type: boolean
+        default: false
+      quick_tests:
+        description: "Run the quick host-side tests (tools/test_deps.py, tools/test_cabundle.py) before building"
+        required: true
+        type: boolean
+        default: false
+      mach_version:
+        description: "Mach compiler version, e.g. 6.10.1 (empty = latest)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: fetch tags of the dependency submodules
+        run: |
+          # submodules are shallow clones with no tags; mach needs tags to check dependency versions
+          git submodule foreach --recursive 'git fetch --unshallow --tags --force || git fetch --tags --force'
+
+      - name: resolve version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          cur=$(sed -n 's/^version = "\(.*\)"$/\1/p' kernel/mach.toml | head -1)
+          [ -n "$cur" ] || { echo "::error::no version in kernel/mach.toml"; exit 1; }
+          ver="${INPUT_VERSION#v}"
+          ver="${ver:-$cur}"
+          [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+.][0-9A-Za-z.-]+)?$ ]] || { echo "::error::bad version '$ver' (want e.g. 0.9.5)"; exit 1; }
+          echo "kernel/mach.toml: $cur  ->  building: $ver"
+          if [ "$ver" != "$cur" ]; then
+            # the OS version lives in these four places; replace only the exact old string
+            esc=${cur//./\\.}
+            sed -i -E "0,/^version = \"$esc\"/s//version = \"$ver\"/" kernel/mach.toml machboot/mach.toml
+            sed -i "s/^version = \"$esc\"/version = \"$ver\"/" packages/stock.toml
+            echo "$ver" > root/etc/mpm/os-version
+            git --no-pager diff --stat
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: make sure this release does not exist yet
+        if: ${{ inputs.publish }}
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag v$VERSION already exists. Delete it or type another version."
+            exit 1
+          fi
+
+      - name: install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lld gdisk e2fsprogs mtools xorriso python3
+          command -v lld-link sgdisk mke2fs debugfs mcopy xorriso
+
+      - name: install mach
+        env:
+          MACH_VERSION: ${{ inputs.mach_version }}
+        run: |
+          base=https://github.com/briar-systems/mach/releases
+          if [ -n "$MACH_VERSION" ]; then
+            ver="${MACH_VERSION#v}"
+          else
+            tag=$(curl -fsSI "$base/latest" | tr -d '\r' | grep -i '^location:' | sed 's|.*/tag/||')
+            ver="${tag#v}"
+          fi
+          [ -n "$ver" ] || { echo "::error::could not resolve mach version"; exit 1; }
+          f="mach-$ver-x86_64-linux.tar.gz"
+          dest="$RUNNER_TEMP/mach-bin"; dl="$RUNNER_TEMP/mach-dl"
+          mkdir -p "$dest" "$dl"
+          curl -fsSL -o "$dl/$f" "$base/download/v$ver/$f"
+          curl -fsSL -o "$dl/SHA256SUMS" "$base/download/v$ver/SHA256SUMS"
+          (cd "$dl" && grep " $f\$" SHA256SUMS | sha256sum -c -)
+          tar -xzf "$dl/$f" -C "$dest"
+          echo "$dest" >> "$GITHUB_PATH"
+
+      - name: quick tests
+        if: ${{ inputs.quick_tests }}
+        run: |
+          mach info
+          python3 tools/test_deps.py
+          python3 tools/test_cabundle.py
+
+      - name: build ISO
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          mach info
+          mkdir -p dist
+          tools/iso.sh "dist/MachOS-$VERSION.iso"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: MachOS-${{ steps.ver.outputs.version }}-iso
+          path: dist/MachOS-*.iso
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: MachOS-*-iso
+          path: dist
+          merge-multiple: true
+
+      - run: ls -l dist
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.build.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: MachOS ${{ needs.build.outputs.version }}
+          prerelease: ${{ inputs.prerelease }}
+          # notes = GitHub's list of commits/PRs since the previous release
+          generate_release_notes: true
+          files: dist/MachOS-*.iso
