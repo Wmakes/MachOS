@@ -63,7 +63,7 @@ pub fun initialize() u8 {
 pub fun begin() u8 {
     if (fs.exists("/root/.machos-update") != 0) { ret 0; }
     if (initialize() == 0 || io.mkdir(STAGE, 0o700) < 0) {
-        io.err("mpm: cannot acquire transaction; use mpm recover after an interrupted operation\n");
+        io.emsg("mpm: cannot acquire transaction; use mpm recover after an interrupted operation\n");
         ret 0;
     }
     count   = 0;
@@ -90,7 +90,7 @@ pub fun add(path: *u8, data: *u8, len: u64, mode: u64, erase: u8) u8 {
     var i: u64 = 0;
     for (i < count) {
         if (io.streq(path, ?operations[i].path[0]) != 0) {
-            io.err("mpm: duplicate transaction destination\n");
+            io.emsg("mpm: duplicate transaction destination\n");
             ret 0;
         }
         i = i + 1;
@@ -104,7 +104,7 @@ pub fun add(path: *u8, data: *u8, len: u64, mode: u64, erase: u8) u8 {
     op.had   = fs.exists(path);
     var st: os.stat_t;
     if (op.had != 0 && (io.lstat(path, ?st) < 0 || io.is_file(?st) == 0)) {
-        io.err("mpm: refusing a non-regular destination\n");
+        io.emsg("mpm: refusing a non-regular destination\n");
         ret 0;
     }
     count = count + 1;
@@ -174,7 +174,7 @@ fun undo() u8 {
     }
     sys.sync();
     if (good != 0) { ret cleanup(); }
-    io.err("mpm: rollback incomplete; keep the transaction directory and run mpm recover\n");
+    io.emsg("mpm: rollback incomplete; keep the transaction directory and run mpm recover\n");
     ret 0;
 }
 
@@ -219,7 +219,7 @@ pub fun commit() u8 {
     if (i != count) {
         count = recorded;
         undo();
-        io.err("mpm: installation failed; transaction rolled back\n");
+        io.emsg("mpm: installation failed; transaction rolled back\n");
         ret 0;
     }
     sys.sync();
@@ -228,13 +228,13 @@ pub fun commit() u8 {
         ret 0;
     }
     sys.sync();
-    if (cleanup() == 0) { io.err("mpm: committed; run mpm recover to finish cleanup\n"); }
+    if (cleanup() == 0) { io.emsg("mpm: committed; run mpm recover to finish cleanup\n"); }
     ret 1;
 }
 
 pub fun recover() u8 {
     if (fs.parents(STAGE, 0) == 0 || fs.directory(STAGE, 0o700, 0) == 0) {
-        io.err("mpm: no safe transaction to recover\n");
+        io.emsg("mpm: no safe transaction to recover\n");
         ret 0;
     }
     var owner: fs.Blob;
@@ -248,7 +248,7 @@ pub fun recover() u8 {
         val end: u64 = 6 + io.fmt_dec(pid, ?procpath[6]);
         procpath[end] = 0;
         if (fs.exists(?procpath[0]) != 0) {
-            io.err("mpm: transaction owner is still running\n");
+            io.emsg("mpm: transaction owner is still running\n");
             ret 0;
         }
     }

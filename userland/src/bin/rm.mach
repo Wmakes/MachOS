@@ -16,12 +16,12 @@ var verbose: u8 = 0;
 fun remove(p: *u8, n: u64) u8 {
     var identity: os.stat_t; var root: os.stat_t;
     if (io.lstat(p, ?identity) >= 0 && io.stat("/", ?root) >= 0 && identity.st_dev == root.st_dev && identity.st_ino == root.st_ino) {
-        io.err("rm: refusing to remove root directory\n"); ret 0;
+        io.emsg("rm: refusing to remove root directory\n"); ret 0;
     }
     var end: u64 = n; for (end > 0 && p[end - 1] == 47) { end = end - 1; }
     var start: u64 = end; for (start > 0 && p[start - 1] != 47) { start = start - 1; }
     if ((end - start == 1 && p[start] == 46) || (end - start == 2 && p[start] == 46 && p[start + 1] == 46)) {
-        io.err("rm: refusing to remove . or ..\n"); ret 0;
+        io.emsg("rm: refusing to remove . or ..\n"); ret 0;
     }
     if (recursive != 0) {
         var st: os.stat_t;
@@ -50,14 +50,14 @@ fun remove(p: *u8, n: u64) u8 {
     val r: i64 = io.remove(p);
     if (r < 0) {
         if (force != 0 && os.error_kind(r) == error.NOT_FOUND) { ret 1; }
-        io.err("rm: \0");
+        io.emsg("rm: \0");
         io.errn(p, n);
-        io.err(": \0");
+        io.emsg(": \0");
         io.err(io.reason(r));
-        io.err("\n\0");
+        io.emsg("\n\0");
         ret 0;
     }
-    if (verbose != 0) { io.out("removed "); io.outn(p, n); io.putc(10); }
+    if (verbose != 0) { io.msg("removed "); io.outn(p, n); io.putc(10); }
     ret 1;
 }
 

@@ -66,18 +66,18 @@ pub fun argument(p: *Parser) *u8 {
 }
 
 pub fun error(name: *u8) u64 {
-    io.err(name); io.err(": invalid option or argument; try --help\n"); ret 2;
+    io.err(name); io.emsg(": invalid option or argument; try --help\n"); ret 2;
 }
 
 pub fun standard(argc: u64, argv: **u8, name: *u8, help: *u8) u8 {
     if (argc != 2) { ret 0; }
     if (io.streq(argv[1], "--help") != 0) {
-        io.out(help); io.out("\n  --help       show this help\n  --version    show the MachOS version\n"); ret 1;
+        io.out(help); io.msg("\n  --help       show this help\n  --version    show the MachOS version\n"); ret 1;
     }
     if (io.streq(argv[1], "--version") != 0) {
         var release: [64]u8;
         system.release(?release[0], 64);
-        io.out(name); io.out(" (MachOS) "); io.out(?release[0]); io.putc(10); ret 1;
+        io.out(name); io.msg(" (MachOS) "); io.out(?release[0]); io.putc(10); ret 1;
     }
     ret 0;
 }

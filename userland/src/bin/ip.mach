@@ -15,9 +15,9 @@ fun show(path: *u8) u64 {
     var b: [4096]u8;
     val n: u64 = system.read_file(path, ?b[0], 4096);
     if (n == 0) {
-        io.err("ip: ");
+        io.emsg("ip: ");
         io.err(path);
-        io.err(" cannot be read\n");
+        io.emsg(" cannot be read\n");
         ret 1;
     }
     io.outn(?b[0], n);
@@ -40,7 +40,7 @@ fun tell(text: *u8, n: u64) u64 {
 }
 
 fun usage() u64 {
-    io.err("usage: ip [stats | neigh | dhcp | off | set IP/PREFIX GATEWAY [DNS]]\n");
+    io.emsg("usage: ip [stats | neigh | dhcp | off | set IP/PREFIX GATEWAY [DNS]]\n");
     ret 2;
 }
 

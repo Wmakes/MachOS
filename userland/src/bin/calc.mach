@@ -182,7 +182,7 @@ fun show(v: u64) {
         io.dec(v);
     }
     if (abs(v) >= 16) {
-        io.out("  (0x\0");
+        io.msg("  (0x\0");
         var d: [16]u8;
         var n: u64 = 0;
         var x: u64 = v;
@@ -209,9 +209,9 @@ fun eval() u8 {
     val v: u64 = expr();
     if (peek() != 0) { fail("unexpected character\0"); }
     if (bad != nil) {
-        io.err("calc: \0");
+        io.emsg("calc: \0");
         io.err(bad);
-        io.err("\n\0");
+        io.emsg("\n\0");
         ret 0;
     }
     show(v);
@@ -239,7 +239,7 @@ fun run(argc: u64, argv: **u8) u64 {
     }
     # one expression per line
     for {
-        if (io.isatty(io.STDIN) != 0) { io.out("> \0"); }
+        if (io.isatty(io.STDIN) != 0) { io.msg("> \0"); }
         len = 0;
         for (len < 1023) {
             var c: u8 = 0;

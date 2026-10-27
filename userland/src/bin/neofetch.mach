@@ -245,7 +245,7 @@ fun run(argc: u64, argv: **u8) u64 {
     io.putc(10);
     var i: u64 = 0;
     for (i < nlines || i < logo.LINES) {
-        io.out("  \0");
+        io.msg("  \0");
         if (i < logo.LINES) {
             io.out(logo.COLOR);
             io.out(logo.line(i));

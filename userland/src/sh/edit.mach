@@ -2,14 +2,16 @@
 # raw mode (no ICANON/ECHO/ISIG) only while a line is being typed.
 #   left/right, home/end (^A ^E), backspace, delete      move and erase
 #   up/down                                              history
-#   tab                                                  complete commands (first
-#                                                        word, from /bin) and paths
+#   tab                                                  complete commands, supported
+#                                                        switches and paths
 #   ^U ^K  clear before / after the cursor   ^L  clear the screen
 #   ^C     drop the line                     ^D  end of input on an empty line
 
 use abi: sdk.abi;
 use sys: sdk.sys;
 use io:  sdk.io;
+use env: sdk.env;
+use utf8: userland.lib.utf8;
 
 pub val MAX: u64 = 1024;
 val HIST: u64 = 100;
@@ -34,20 +36,56 @@ fun raw(on: u8) {
     sys.tcsetattr(abi.STDIN, ?t);
 }
 
+var input: [64]u8;
+var input_at: u64 = 0;
+var input_len: u64 = 0;
+
 fun getc() u64 {
-    var c: u8 = 0;
-    val r: u64 = sys.read(abi.STDIN, ?c, 1);
+    if (input_at < input_len) {
+        val c: u8 = input[input_at];
+        input_at = input_at + 1;
+        ret c::u64;
+    }
+    val r: u64 = sys.read(abi.STDIN, ?input[0], 64);
     if (abi.is_err(r) != 0 || r == 0) { ret EOF; }
-    ret c::u64;
+    input_at = 1;
+    input_len = r;
+    ret input[0]::u64;
 }
 
 # move the cursor `n` columns left or right
 fun cursor_move(n: u64, right: u8) {
     if (n == 0) { ret; }
-    io.out("\x1b[\0");
+    io.msg("\x1b[\0");
     io.dec(n);
     if (right != 0) { io.putc(67); }
     or              { io.putc(68); }
+}
+
+fun continuation(c: u8) u8 { ret ((c & 0xC0) == 0x80)::u8; }
+
+fun previous(at: u64) u64 {
+    if (at == 0) { ret 0; }
+    var i: u64 = at - 1;
+    for (i > 0 && continuation(buf[i]) != 0) { i = i - 1; }
+    ret i;
+}
+
+fun next(at: u64) u64 {
+    if (at >= len) { ret len; }
+    var i: u64 = at + 1;
+    for (i < len && continuation(buf[i]) != 0) { i = i + 1; }
+    ret i;
+}
+
+fun columns(start: u64, end: u64) u64 {
+    var count: u64 = 0;
+    var i: u64 = start;
+    for (i < end) {
+        count = count + utf8.width(utf8.decode(?buf[0], i, end));
+        i = utf8.next(?buf[0], i, end);
+    }
+    ret count;
 }
 
 # redraw the whole line: prompt, text, clear the rest, put the cursor back
@@ -55,31 +93,38 @@ fun redraw() {
     io.putc(13);
     io.out(prompt_text);
     io.outn(?buf[0], len);
-    io.out("\x1b[K\0");
-    cursor_move(len - cur, 0);
+    io.msg("\x1b[K\0");
+    cursor_move(columns(cur, len), 0);
 }
 
-fun insert(c: u8) {
-    if (len + 1 >= MAX) { ret; }
+fun insert_bytes(text: *u8, n: u64) {
+    if (n == 0 || len + n >= MAX) { ret; }
     var i: u64 = len;
     for (i > cur) {
-        buf[i] = buf[i - 1];
+        buf[i + n - 1] = buf[i - 1];
         i = i - 1;
     }
-    buf[cur] = c;
-    len = len + 1;
-    cur = cur + 1;
-    if (cur == len) { io.putc(c); }     # typing at the end: no redraw needed
+    i = 0;
+    for (i < n) {
+        buf[cur + i] = text[i];
+        i = i + 1;
+    }
+    len = len + n;
+    cur = cur + n;
+    if (cur == len) { io.outn(text, n); } # typing at the end: no redraw needed
     or              { redraw(); }
 }
 
+fun insert(c: u8) { insert_bytes(?c, 1); }
+
 fun erase(at: u64) {
+    val end: u64 = next(at);
     var i: u64 = at;
-    for (i + 1 < len) {
-        buf[i] = buf[i + 1];
+    for (i + end - at < len) {
+        buf[i] = buf[i + end - at];
         i = i + 1;
     }
-    len = len - 1;
+    len = len - (end - at);
 }
 
 fun set_line(src: *u8, n: u64) {
@@ -127,9 +172,23 @@ var match_dirs: [128]u8;
 var nmatches: u64 = 0;
 var nmore: u64 = 0;     # matches that did not fit
 
-fun collect(dir: *u8, dn: u64, prefix: *u8, pn: u64, dirs_too: u8) {
-    nmatches = 0;
-    nmore = 0;
+fun reset_matches() { nmatches = 0; nmore = 0; }
+
+fun add_match(name: *u8, n: u64, kind: u8) {
+    if (n == 0 || n > 63) { ret; }
+    var i: u64 = 0;
+    for (i < nmatches) {
+        if (match_lens[i] == n && io.eq(?match_names[i][0], n, name, n) != 0) { ret; }
+        i = i + 1;
+    }
+    if (nmatches == 128) { nmore = nmore + 1; ret; }
+    io.copy(?match_names[nmatches][0], name, n);
+    match_lens[nmatches] = n;
+    match_dirs[nmatches] = kind; # 1: directory; 2: option awaits an attached value
+    nmatches = nmatches + 1;
+}
+
+fun collect(dir: *u8, dn: u64, prefix: *u8, pn: u64, kinds: u8) {
     val h: u64 = sys.open(dir, dn, abi.O_READ);
     if (abi.is_err(h) != 0) { ret; }
     var i: u64 = 0;
@@ -141,19 +200,81 @@ fun collect(dir: *u8, dn: u64, prefix: *u8, pn: u64, dirs_too: u8) {
         if (e.name_len < pn || e.name_len > 63) { cnt; }
         if (io.eq(?e.name[0], pn, prefix, pn) == 0) { cnt; }
         if (pn == 0 && e.name[0] == 46) { cnt; } # hide dotfiles unless asked
-        if (dirs_too == 0 && e.kind == abi.KIND_DIR) { cnt; }
+        if (kinds == 1 && e.kind != abi.KIND_DIR) { cnt; }
+        if (kinds == 2 && e.kind != abi.KIND_FILE) { cnt; }
         if (pn == 1 && e.name_len == 1 && e.name[0] == 46) { cnt; } # not . for .
-        if (nmatches == 128) {
-            nmore = nmore + 1;
-            cnt;
-        }
-        io.copy(?match_names[nmatches][0], ?e.name[0], e.name_len);
-        match_lens[nmatches] = e.name_len;
-        match_dirs[nmatches] = (e.kind == abi.KIND_DIR)::u8;
-        nmatches = nmatches + 1;
+        add_match(?e.name[0], e.name_len, (e.kind == abi.KIND_DIR)::u8);
     }
     sys.close(h);
-    sort();
+}
+
+fun collect_commands(prefix: *u8, pn: u64) {
+    var path: *u8 = env.get("PATH\0");
+    if (path == nil) { path = "/bin\0"; }
+    var start: u64 = 0;
+    var i: u64 = 0;
+    for {
+        if (path[i] == 58 || path[i] == 0) {
+            val n: u64 = i - start;
+            if (n == 0) { collect(".\0", 1, prefix, pn, 2); }
+            or (n < 256) { collect(?path[start], n, prefix, pn, 2); }
+            if (path[i] == 0) { brk; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun same_command(name: *u8, n: u64, expected: *u8) u8 {
+    ret io.eq(name, n, expected, io.len(expected));
+}
+
+# Only offer switches actually handled by the corresponding program. A word
+# ending in '=' leaves the cursor ready for its value.
+fun switches(name: *u8, n: u64) *u8 {
+    if (same_command(name, n, "ls") != 0) { ret "-l -a -A -h -d -F --all --almost-all --human-readable --directory --classify --color=auto --color=always --color=never --help --version"; }
+    if (same_command(name, n, "grep") != 0) { ret "-F -i -v -x -c -n -q -l -r -e -H -h --fixed-strings --ignore-case --invert-match --line-regexp --count --line-number --quiet --silent --files-with-matches --recursive --regexp= --with-filename --no-filename --help --version"; }
+    if (same_command(name, n, "find") != 0) { ret "-name -iname -path -ipath -type -maxdepth -mindepth -print --help --version"; }
+    if (same_command(name, n, "tar") != 0) { ret "-c -x -t -v -f --create --extract --list --verbose --file= --help --version"; }
+    if (same_command(name, n, "cp") != 0) { ret "-r -R -n -v -f --recursive --no-clobber --verbose --force --help --version"; }
+    if (same_command(name, n, "mv") != 0) { ret "-f -n -v --force --no-clobber --verbose --help --version"; }
+    if (same_command(name, n, "rm") != 0) { ret "-f -r -R -v --force --recursive --verbose --help --version"; }
+    if (same_command(name, n, "sort") != 0) { ret "-r -n -u -f -b -o --reverse --numeric-sort --unique --ignore-case --ignore-leading-blanks --output= --help --version"; }
+    if (same_command(name, n, "cat") != 0) { ret "-n -b -s -E -T --number --number-nonblank --squeeze-blank --show-ends --show-tabs --help --version"; }
+    if (same_command(name, n, "head") != 0 || same_command(name, n, "tail") != 0) { ret "-n -c -q -v --lines= --bytes= --quiet --verbose --help --version"; }
+    if (same_command(name, n, "wc") != 0) { ret "-l -w -c --lines --words --bytes --help --version"; }
+    if (same_command(name, n, "du") != 0) { ret "-s -h -k -m -b --summarize --human-readable --bytes --help --version"; }
+    if (same_command(name, n, "df") != 0) { ret "-h -k -m --human-readable --help --version"; }
+    if (same_command(name, n, "mkdir") != 0) { ret "-p -v -m --parents --verbose --mode= --help --version"; }
+    if (same_command(name, n, "tee") != 0) { ret "-a --append --help --version"; }
+    if (same_command(name, n, "basename") != 0) { ret "-s -z --suffix= --zero --help --version"; }
+    if (same_command(name, n, "dirname") != 0) { ret "-z --zero --help --version"; }
+    if (same_command(name, n, "seq") != 0) { ret "-s --separator= --help --version"; }
+    if (same_command(name, n, "env") != 0) { ret "-i -u -C -0 --ignore-environment --unset= --chdir= --null --help --version"; }
+    if (same_command(name, n, "ping") != 0) { ret "-c"; }
+    if (same_command(name, n, "wget") != 0) { ret "-q -O --https-only --max-size"; }
+    if (same_command(name, n, "kill") != 0) { ret "-l -TERM -KILL -INT -HUP -STOP -CONT"; }
+    if (same_command(name, n, "gzip") != 0 || same_command(name, n, "gunzip") != 0) { ret "-d -c -k"; }
+    if (same_command(name, n, "adduser") != 0) { ret "-R --admin --optional-admin --help"; }
+    if (same_command(name, n, "usermod") != 0) { ret "--admin --no-admin --help"; }
+    if (same_command(name, n, "se") != 0) { ret "-k -v --help"; }
+    if (same_command(name, n, "gpt") != 0) { ret "--check"; }
+    if (same_command(name, n, "ca-update") != 0) { ret "--provider --url"; }
+    ret "";
+}
+
+fun collect_words(words: *u8, prefix: *u8, pn: u64) {
+    var i: u64 = 0;
+    for (words[i] != 0) {
+        for (words[i] == 32) { i = i + 1; }
+        if (words[i] == 0) { brk; }
+        val start: u64 = i;
+        for (words[i] != 0 && words[i] != 32) { i = i + 1; }
+        if (i - start >= pn && io.eq(?words[start], pn, prefix, pn) != 0) {
+            val end: u8 = (words[i - 1] == 61)::u8;
+            add_match(?words[start], i - start, end * 2);
+        }
+    }
 }
 
 fun before(a: u64, b: u64) u8 {
@@ -228,51 +349,111 @@ fun list_matches() {
         r = r + 1;
     }
     if (nmore > 0) {
-        io.out("...and \0");
+        io.msg("...and \0");
         io.dec(nmore);
-        io.out(" more\n\0");
+        io.msg(" more\n\0");
     }
 }
 
-fun complete() {
-    # the word under the cursor
-    var ws: u64 = cur;
-    for (ws > 0 && buf[ws - 1] != 32 && buf[ws - 1] != 124 && buf[ws - 1] != 59 && buf[ws - 1] != 38 && buf[ws - 1] != 40) { ws = ws - 1; }
-    # a command word: the first on the line or after | ; & && || ( $(
-    var first: u8 = 1;
-    var k: u64 = ws;
-    for (k > 0) {
-        val b: u8 = buf[k - 1];
-        if (b == 32) {
-            k = k - 1;
-            cnt;
+fun context(ws: *u64, segment: *u64) u8 {
+    @ws = 0; @segment = 0;
+    var quote: u8 = 0;
+    var escape: u8 = 0;
+    var i: u64 = 0;
+    for (i < cur) {
+        val c: u8 = buf[i];
+        if (escape != 0) { escape = 0; i = i + 1; cnt; }
+        if (c == 92 && quote != 39) { escape = 1; i = i + 1; cnt; }
+        if (quote != 0) { if (c == quote) { quote = 0; } i = i + 1; cnt; }
+        if (c == 39 || c == 34) { quote = c; i = i + 1; cnt; }
+        if (c == 32 || c == 9 || c == 124 || c == 59 || c == 38 || c == 40 || c == 60 || c == 62) {
+            @ws = i + 1;
+            if (c == 124 || c == 59 || c == 38 || c == 40) { @segment = i + 1; }
         }
-        if (b != 124 && b != 59 && b != 38 && b != 40) { first = 0; }
-        brk;
+        i = i + 1;
     }
-    val word: *u8 = ?buf[ws];
-    val wn: u64 = cur - ws;
+    ret quote;
+}
+
+fun decoded_word(ws: u64, out: *u8) u64 {
+    var quote: u8 = 0;
+    var n: u64 = 0;
+    var i: u64 = ws;
+    for (i < cur) {
+        val c: u8 = buf[i];
+        if (c == 92 && quote != 39 && i + 1 < cur) {
+            i = i + 1;
+            out[n] = buf[i]; n = n + 1;
+        } or (c == 39 || c == 34) {
+            if (quote == 0) { quote = c; }
+            or (quote == c) { quote = 0; }
+            or { out[n] = c; n = n + 1; }
+        } or { out[n] = c; n = n + 1; }
+        i = i + 1;
+    }
+    out[n] = 0;
+    ret n;
+}
+
+fun insert_quoted(c: u8, quote: u8) {
+    if (quote == 39 && c == 39) { insert(39); insert(92); insert(39); insert(39); ret; }
+    if ((quote == 0 && (c == 32 || c == 9 || c == 39 || c == 34 || c == 92 || c == 124 ||
+                        c == 59 || c == 38 || c == 40 || c == 41 || c == 36 || c == 60 || c == 62)) ||
+        (quote == 34 && (c == 34 || c == 92 || c == 36 || c == 96))) { insert(92); }
+    insert(c);
+}
+
+fun complete() {
+    var ws: u64 = 0;
+    var segment: u64 = 0;
+    val quote: u8 = context(?ws, ?segment);
+    if (cur - ws >= 256) { ret; }
+    var decoded: [256]u8;
+    val full_len: u64 = decoded_word(ws, ?decoded[0]);
+    var start: u64 = segment;
+    for (start < ws && (buf[start] == 32 || buf[start] == 9)) { start = start + 1; }
+    val first: u8 = (start == ws)::u8;
+    var end: u64 = start;
+    for (end < ws && buf[end] != 32 && buf[end] != 9) { end = end + 1; }
+    var base: u64 = start;
+    var i: u64 = start;
+    for (i < end) { if (buf[i] == 47) { base = i + 1; } i = i + 1; }
+    var offset: u64 = 0;
+    var dirs_only: u8 = 0;
+    if (first == 0) {
+        if (same_command(?buf[base], end - base, "tar") != 0 && full_len >= 7 &&
+            io.eq(?decoded[0], 7, "--file=", 7) != 0) { offset = 7; }
+        if (same_command(?buf[base], end - base, "sort") != 0 && full_len >= 9 &&
+            io.eq(?decoded[0], 9, "--output=", 9) != 0) { offset = 9; }
+        if (same_command(?buf[base], end - base, "env") != 0 && full_len >= 8 &&
+            io.eq(?decoded[0], 8, "--chdir=", 8) != 0) { offset = 8; dirs_only = 1; }
+    }
+    val word: *u8 = ?decoded[offset];
+    val wn: u64 = full_len - offset;
     var slash: u64 = wn;
     for (slash > 0 && word[slash - 1] != 47) { slash = slash - 1; }
 
+    reset_matches();
     if (first != 0 && slash == 0) {
-        collect("/bin\0", 4, word, wn, 0);
+        collect_commands(word, wn);
+        collect_words("cd pwd exit jobs fg bg wait export unset set history time", word, wn);
+    } or (first == 0 && offset == 0 && wn > 0 && word[0] == 45 && slash == 0) {
+        collect_words(switches(?buf[base], end - base), word, wn);
     } or {
         var dir: [256]u8;
-        var dn: u64 = 0;
-        if (slash == 0) {
-            dir[0] = 46;
-            dn = 1;
-        } or {
-            if (slash >= 256) { ret; }
+        var dn: u64 = 1;
+        dir[0] = 46;
+        if (slash != 0) {
             io.copy(?dir[0], word, slash);
             dn = slash;
+            if (dn > 1 && dir[dn - 1] == 47) { dn = dn - 1; }
         }
-        collect(?dir[0], dn, ?word[slash], wn - slash, 1);
+        if (same_command(?buf[base], end - base, "cd") != 0) { dirs_only = 1; }
+        collect(?dir[0], dn, ?word[slash], wn - slash, dirs_only);
     }
     if (nmatches == 0) { ret; }
+    sort();
 
-    # the longest prefix every match shares
     var common: u64 = match_lens[0];
     var m: u64 = 1;
     for (m < nmatches) {
@@ -284,24 +465,43 @@ fun complete() {
     val have: u64 = wn - slash;
     if (common > have) {
         var j: u64 = have;
-        for (j < common) {
-            insert(match_names[0][j]);
-            j = j + 1;
-        }
+        for (j < common) { insert_quoted(match_names[0][j], quote); j = j + 1; }
     }
     if (nmatches == 1) {
-        if (match_dirs[0] != 0) { insert(47); }
-        or                      { insert(32); }
+        if (cur == len) {
+            if (match_dirs[0] == 1) { insert(47); }
+            or (match_dirs[0] == 0) {
+                if (quote != 0) { insert(quote); }
+                insert(32);
+            }
+        }
         ret;
     }
-    if (common == have) {
-        # nothing to add: list the choices under the line
-        list_matches();
-        redraw();
-    }
+    if (common == have) { list_matches(); redraw(); }
 }
 
 # --- the editor -------------------------------------------------------------
+
+fun read_utf8(first: u8, text: *u8) u64 {
+    var n: u64 = 0;
+    if (first >= 0xC2 && first <= 0xDF) { n = 2; }
+    or (first >= 0xE0 && first <= 0xEF) { n = 3; }
+    or (first >= 0xF0 && first <= 0xF4) { n = 4; }
+    or { ret 0; }
+    text[0] = first;
+    var i: u64 = 1;
+    for (i < n) {
+        val c: u64 = getc();
+        if (c == EOF || c < 0x80 || c >= 0xC0) { ret 0; }
+        text[i] = c::u8;
+        i = i + 1;
+    }
+    if (first == 0xE0 && text[1] < 0xA0) { ret 0; }
+    if (first == 0xED && text[1] >= 0xA0) { ret 0; }
+    if (first == 0xF0 && text[1] < 0x90) { ret 0; }
+    if (first == 0xF4 && text[1] >= 0x90) { ret 0; }
+    ret n;
+}
 
 # read one line after printing `p`; its length (without the newline) is
 # returned and the text is at text(), or EOF
@@ -337,7 +537,7 @@ pub fun read_line(p: *u8) u64 {
             cnt;
         }
         if (c == 3) { # ^C
-            io.out("^C\n\0");
+            io.msg("^C\n\0");
             len = 0;
             cur = 0;
             back = 0;
@@ -346,14 +546,14 @@ pub fun read_line(p: *u8) u64 {
         }
         if (c == 127 || c == 8) {
             if (cur > 0) {
-                cur = cur - 1;
+                cur = previous(cur);
                 erase(cur);
                 redraw();
             }
             cnt;
         }
-        if (c == 1) { cursor_move(cur, 0); cur = 0; cnt; }
-        if (c == 5) { cursor_move(len - cur, 1); cur = len; cnt; }
+        if (c == 1) { cursor_move(columns(0, cur), 0); cur = 0; cnt; }
+        if (c == 5) { cursor_move(columns(cur, len), 1); cur = len; cnt; }
         if (c == 21) { # ^U
             var i: u64 = 0;
             for (cur + i < len) {
@@ -371,7 +571,7 @@ pub fun read_line(p: *u8) u64 {
             cnt;
         }
         if (c == 12) { # ^L
-            io.out("\x1b[2J\x1b[H\0");
+            io.msg("\x1b[2J\x1b[H\0");
             redraw();
             cnt;
         }
@@ -404,19 +604,19 @@ pub fun read_line(p: *u8) u64 {
                 }
             } or (f == 67) { # right
                 if (cur < len) {
-                    cur = cur + 1;
+                    cur = next(cur);
                     cursor_move(1, 1);
                 }
             } or (f == 68) { # left
                 if (cur > 0) {
-                    cur = cur - 1;
+                    cur = previous(cur);
                     cursor_move(1, 0);
                 }
             } or (f == 72 || (f == 126 && (num == 1 || num == 7))) { # home
-                cursor_move(cur, 0);
+                cursor_move(columns(0, cur), 0);
                 cur = 0;
             } or (f == 70 || (f == 126 && (num == 4 || num == 8))) { # end
-                cursor_move(len - cur, 1);
+                cursor_move(columns(cur, len), 1);
                 cur = len;
             } or (f == 126 && num == 3) { # delete
                 if (cur < len) {
@@ -427,6 +627,11 @@ pub fun read_line(p: *u8) u64 {
             cnt;
         }
         if (c >= 32 && c < 127) { insert(c::u8); }
+        or (c >= 128) {
+            var text: [4]u8;
+            val n: u64 = read_utf8(c::u8, ?text[0]);
+            if (n != 0) { insert_bytes(?text[0], n); }
+        }
     }
     raw(0);
     ret result;

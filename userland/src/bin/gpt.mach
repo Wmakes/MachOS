@@ -95,14 +95,14 @@ fun main(argc: u64, argv: **u8) u64 {
     var check: u8 = 0; var target: *u8 = nil;
     if (argc == 3 && io.streq(argv[1], "--check") != 0) { check = 1; target = argv[2]; }
     or (argc == 2 && io.streq(argv[1], "--check") == 0) { target = argv[1]; }
-    or { io.err("usage: gpt [--check] DISK\n"); ret 2; }
+    or { io.emsg("usage: gpt [--check] DISK\n"); ret 2; }
     var st: abi.Stat;
     val stat_result: u64 = sys.stat(target, io.len(target), ?st);
     if (abi.is_err(stat_result) != 0) { io.fail("gpt", target, stat_result); ret 1; }
-    if (whole_disk(?st) == 0) { io.err("gpt: target must be a whole disk, not a partition or character device\n"); ret 1; }
+    if (whole_disk(?st) == 0) { io.emsg("gpt: target must be a whole disk, not a partition or character device\n"); ret 1; }
     if (st.sector != 0 && st.sector != 512) {
-        io.err("gpt: this disk has 4096-byte sectors; MachOS can only partition\n\0");
-        io.err("     512-byte-sector disks so far (most disks are)\n\0");
+        io.emsg("gpt: this disk has 4096-byte sectors; MachOS can only partition\n\0");
+        io.emsg("     512-byte-sector disks so far (most disks are)\n\0");
         ret 1;
     }
     val sectors: u64 = bd.disk_size(target) / bd.SECTOR;
@@ -110,7 +110,7 @@ fun main(argc: u64, argv: **u8) u64 {
     val last_usable: u64 = last - 33;
     val root_start: u64 = ESP_START + ESP_SECTORS;
     if (sectors < root_start + ROOT_MIN + 34) {
-        io.err("gpt: the disk is too small (at least 100 MiB)\n\0");
+        io.emsg("gpt: the disk is too small (at least 100 MiB)\n\0");
         ret 1;
     }
     if (check != 0) { ret 0; }
@@ -150,23 +150,23 @@ fun main(argc: u64, argv: **u8) u64 {
     if (ok != 0) { ok = bd.pwrite(h, last * bd.SECTOR, ?s[0], 512); }
     sys.close(h);
     if (ok == 0) {
-        io.err("gpt: writing the disk failed (a filesystem on it may be mounted)\n\0");
+        io.emsg("gpt: writing the disk failed (a filesystem on it may be mounted)\n\0");
         ret 1;
     }
-    io.out("gpt: \0");
+    io.msg("gpt: \0");
     io.out(target);
     # partitions are DISK1 / DISK2, or DISKp1 / DISKp2 when DISK ends in a digit
     val dn: u64 = io.len(target);
     var sep: *u8 = "\0";
     if (dn > 0 && target[dn - 1] >= 48 && target[dn - 1] <= 57) { sep = "p\0"; }
-    io.out(": \0");
+    io.msg(": \0");
     io.out(target);
     io.out(sep);
-    io.out("1 EFI system 64 MiB, \0");
+    io.msg("1 EFI system 64 MiB, \0");
     io.out(target);
     io.out(sep);
-    io.out("2 MachOS root \0");
+    io.msg("2 MachOS root \0");
     io.dec(root_count / 2048);
-    io.out(" MiB\n\0");
+    io.msg(" MiB\n\0");
     ret 0;
 }

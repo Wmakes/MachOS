@@ -22,7 +22,7 @@ var line: [1500]u8;
 var reply: [1500]u8;
 
 fun usage() i64 {
-    io.err("usage: nc [-u] [-w SECONDS] HOST PORT, or nc -l [-w SECONDS] PORT\n");
+    io.emsg("usage: nc [-u] [-w SECONDS] HOST PORT, or nc -l [-w SECONDS] PORT\n");
     ret 2;
 }
 
@@ -37,7 +37,7 @@ fun send_input(s: *tcp.Stream) u8 {
         for (at < r::u64) {
             val w: res[usize, io_error.Error] = tcp.stream_write(s, ?chunk[at], (r::u64 - at)::usize);
             if (sel w.err) {
-                io.err("nc: sending failed\n");
+                io.emsg("nc: sending failed\n");
                 ret 0;
             }
             at = at + w.ok::u64;
@@ -139,9 +139,9 @@ fun main(argc: i64, argv: **u8) i64 {
     if (argc - i != 2) { ret usage(); }
     var ip: u32 = 0;
     if (addr.lookup(argv[i], ?ip) == 0) {
-        io.err("nc: ");
+        io.emsg("nc: ");
         io.err(argv[i]);
-        io.err(": not found\n");
+        io.emsg(": not found\n");
         ret 1;
     }
     var ok: u8 = 0;

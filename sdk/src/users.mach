@@ -468,7 +468,7 @@ pub fun new_password(out: *u8) u64 {
     for {
         val n: u64 = read_secret("New password: \0", out, 127);
         if (n == abi.NO_ID) { ret abi.NO_ID; }
-        if (n == 0) { io.err("Password cannot be empty.\n\0"); cnt; }
+        if (n == 0) { io.emsg("Password cannot be empty.\n\0"); cnt; }
         var again: [128]u8;
         val m: u64 = read_secret("Again: \0", ?again[0], 127);
         val same: u8 = io.eq(out, n, ?again[0], m);
@@ -476,7 +476,7 @@ pub fun new_password(out: *u8) u64 {
         for (i < 128) { again[i] = 0; i = i + 1; }
         if (m == abi.NO_ID) { ret abi.NO_ID; }
         if (same != 0) { ret n; }
-        io.err("Passwords do not match.\n\0");
+        io.emsg("Passwords do not match.\n\0");
     }
     ret abi.NO_ID;
 }

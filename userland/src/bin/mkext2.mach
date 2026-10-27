@@ -110,7 +110,7 @@ fun dir_block(at: u64, self: u64, parent: u64, child: u64, child_name: *u8) u8 {
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     if (argc != 2) {
-        io.err("usage: mkext2 PART\n\0");
+        io.emsg("usage: mkext2 PART\n\0");
         ret 2;
     }
     disk = bd.open_disk("mkext2\0", argv[1], 1);
@@ -135,7 +135,7 @@ fun main(argc: u64, argv: **u8) u64 {
         gdt_blocks = (groups * 32 + BS - 1) / BS;
     }
     if (groups * 32 > 131072 || blocks < overhead() + 64) {
-        io.err("mkext2: the partition is too large or too small\n\0");
+        io.emsg("mkext2: the partition is too large or too small\n\0");
         ret 1;
     }
 
@@ -216,15 +216,15 @@ fun main(argc: u64, argv: **u8) u64 {
     if (ok != 0) { ok = dir_block(lf_block, 11, 2, 0, "\0"); }
     sys.close(disk);
     if (ok == 0) {
-        io.err("mkext2: writing the disk failed\n\0");
+        io.emsg("mkext2: writing the disk failed\n\0");
         ret 1;
     }
-    io.out("mkext2: \0");
+    io.msg("mkext2: \0");
     io.dec(blocks / 256);
-    io.out(" MiB in \0");
+    io.msg(" MiB in \0");
     io.dec(groups);
-    io.out(" groups, \0");
+    io.msg(" groups, \0");
     io.dec(ipg * groups);
-    io.out(" inodes\n\0");
+    io.msg(" inodes\n\0");
     ret 0;
 }

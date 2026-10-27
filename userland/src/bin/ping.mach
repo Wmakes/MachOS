@@ -39,20 +39,20 @@ fun main(argc: i64, argv: **u8) i64 {
         var ok: u8 = 0;
         count = io.parse_dec(argv[2], io.len(argv[2]), ?ok);
         if (ok == 0 || count == 0) {
-            io.err("usage: ping [-c COUNT] HOST\n");
+            io.emsg("usage: ping [-c COUNT] HOST\n");
             ret 2;
         }
         i = 3;
     } or (argc != 2) {
-        io.err("usage: ping [-c COUNT] HOST\n");
+        io.emsg("usage: ping [-c COUNT] HOST\n");
         ret 2;
     }
     val host: *u8 = argv[i];
     var ip: u32 = 0;
     if (addr.lookup(host, ?ip) == 0) {
-        io.err("ping: ");
+        io.emsg("ping: ");
         io.err(host);
-        io.err(": not found\n");
+        io.emsg(": not found\n");
         ret 2;
     }
     var shown: [16]u8;
@@ -64,11 +64,11 @@ fun main(argc: i64, argv: **u8) i64 {
         ret 2;
     }
     machos.sock_set_rcvtimeo(fd, 1000);
-    io.out("PING ");
+    io.msg("PING ");
     io.out(host);
-    io.out(" (");
+    io.msg(" (");
     io.out(?shown[0]);
-    io.out("): 56 data bytes\n");
+    io.msg("): 56 data bytes\n");
     var sa: [16]u8;
     put_addr(?sa[0], ip);
     var sent: u64 = 0;
@@ -100,7 +100,7 @@ fun main(argc: i64, argv: **u8) i64 {
             var flen: u32 = 16;
             val r: i64 = machos.sock_recvfrom(fd, ?rep[0], 128, 0, ?from[0], ?flen);
             if (r < 0) {
-                io.out("no reply for icmp_seq=");
+                io.msg("no reply for icmp_seq=");
                 io.dec(seq);
                 io.putc(10);
                 brk;
@@ -110,15 +110,15 @@ fun main(argc: i64, argv: **u8) i64 {
                 val us: u64 = us_now() - t0;
                 got = got + 1;
                 io.dec(reply_len);
-                io.out(" bytes from ");
+                io.msg(" bytes from ");
                 io.out(?shown[0]);
-                io.out(": icmp_seq=");
+                io.msg(": icmp_seq=");
                 io.dec(seq);
-                io.out(" time=");
+                io.msg(" time=");
                 io.dec(us / 1000);
                 io.putc(46);
                 io.dec((us % 1000) / 100);
-                io.out(" ms\n");
+                io.msg(" ms\n");
                 # the rest of the second before the next one
                 if (seq + 1 < count && us < 1000000) { io.sleep_ms((1000000 - us) / 1000); }
                 brk;
@@ -127,15 +127,15 @@ fun main(argc: i64, argv: **u8) i64 {
         seq = seq + 1;
     }
     machos.sock_close(fd);
-    io.out("--- ");
+    io.msg("--- ");
     io.out(host);
-    io.out(" ping statistics ---\n");
+    io.msg(" ping statistics ---\n");
     io.dec(sent);
-    io.out(" packets transmitted, ");
+    io.msg(" packets transmitted, ");
     io.dec(got);
-    io.out(" received, ");
+    io.msg(" received, ");
     io.dec((sent - got) * 100 / sent);
-    io.out("% packet loss\n");
+    io.msg("% packet loss\n");
     if (got == 0) { ret 1; }
     ret 0;
 }

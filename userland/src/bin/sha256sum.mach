@@ -23,7 +23,7 @@ fun sum(h: i64, name: *u8) {
         io.putc(HEX[d[k] & 15]);
         k = k + 1;
     }
-    io.out("  \0");
+    io.msg("  \0");
     io.out(name);
     io.putc(10);
 }

@@ -27,6 +27,15 @@ fun hostname(out: *u8) {
     out[n] = 0;
 }
 
+# Load the system locale before printing any prompt. Like Linux, individual
+# LC_* variables inherited from the environment still take precedence in the
+# message catalog lookup; LANG supplies the configured default.
+fun system_locale() {
+    if (env.get("LANG\0") != nil) { ret; }
+    var locale: [64]u8;
+    if (settings.get("locale\0", ?locale[0], 64) > 0) { env.set("LANG\0", ?locale[0]); }
+}
+
 # become user u and run their shell; returns only when that fails
 fun session(u: *users.User) u64 {
     auth.invalidate(u.uid);
@@ -34,13 +43,13 @@ fun session(u: *users.User) u64 {
     val hn: u64 = users.stored(?u.name[0], u.name_len, ?hash[0]);
     if (hn == abi.NO_ID || users.locked(?hash[0], hn) != 0) { ret 1; }
     if (hn == 0) {
-        io.out("A password is required before starting this session.\n\0");
+        io.msg("A password is required before starting this session.\n\0");
         var password: [128]u8;
         val n: u64 = users.new_password(?password[0]);
         if (n == abi.NO_ID || users.set_password(?u.name[0], u.name_len, ?password[0], n) == 0) { ret 1; }
     }
     if (users.become(u) == 0) {
-        io.out("login: cannot switch to that user\n\0");
+        io.msg("login: cannot switch to that user\n\0");
         ret 1;
     }
     var home: *u8 = ?u.home[0];
@@ -63,17 +72,18 @@ fun session(u: *users.User) u64 {
 
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
+    system_locale();
     sys.setsid();
     if (argc == 3 && io.streq(argv[1], "-f\0") != 0) {
         if (sys.geteuid() != 0) {
-            io.err("login: -f is for root\n\0");
+            io.emsg("login: -f is for root\n\0");
             ret 1;
         }
         var au: users.User;
         if (users.by_name(argv[2], io.len(argv[2]), ?au) == 0) {
-            io.err("login: no such user: \0");
+            io.emsg("login: no such user: \0");
             io.err(argv[2]);
-            io.err("\n\0");
+            io.emsg("\n\0");
         } or {
             ret session(?au);
         }
@@ -88,18 +98,18 @@ fun main(argc: u64, argv: **u8) u64 {
         sys.uname(?un);
         io.putc(10);
         if (settings.yes("login.banner\0", 1) != 0) { logo.show(2); }
-        io.out("\n  \x1b[1mMachOS \0");
+        io.msg("\n  \x1b[1mMachOS \0");
         io.out(?un.release[0]);
-        io.out("\x1b[0m\0");
+        io.msg("\x1b[0m\0");
         val t: u64 = sys.tty_number(abi.STDIN);
         if (t != 0) {
-            io.out(" (tty\0");
+            io.msg(" (tty\0");
             io.dec(t);
-            io.out(")\0");
+            io.msg(")\0");
         }
-        io.out("   alt+F1..F6 switch terminals\n\n\0");
+        io.msg("   alt+F1..F6 switch terminals\n\n\0");
         io.out(?host[0]);
-        io.out(" login: \0");
+        io.msg(" login: \0");
         var name: [32]u8;
         val n: u64 = users.read_line(?name[0], 31);
         if (n == abi.NO_ID) { ret 1; }
@@ -119,7 +129,7 @@ fun main(argc: u64, argv: **u8) u64 {
         }
         if (users.locked(?h[0], hn) != 0 || users.matches(?h[0], hn, ?pw[0], pn) == 0) {
             sys.sleep(1000);
-            io.out("Login incorrect\n\0");
+            io.msg("Login incorrect\n\0");
             cnt;
         }
         ret session(?u);

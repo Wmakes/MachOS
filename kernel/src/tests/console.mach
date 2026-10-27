@@ -76,6 +76,39 @@ test console__rgb_foreground_background_and_pixel_layout {
     ret 0;
 }
 
+test console__utf8_sequences_are_single_unicode_cells {
+    setup(0);
+    write(0, "A\xC3\xA9\xC4\x85\xE2\x82\xACZ\0"); # A, e-acute, a-ogonek, euro, Z
+    if (fb.cell_at(0, 0) != 65 || fb.cell_at(0, 1) != 0x00E9) { ret 1; }
+    if (fb.cell_at(0, 2) != 0x0105 || fb.cell_at(0, 3) != 0x20AC || fb.cell_at(0, 4) != 90) { ret 2; }
+    if (glyph(1, 0, 0xAAAAAA, 0) == 0 || glyph(2, 0, 0xAAAAAA, 0) == 0 || glyph(3, 0, 0xAAAAAA, 0) == 0) { ret 3; }
+    setup(0);
+    write(0, "\xC0\xAFX\0");
+    if (fb.cell_at(0, 0) != 0xFFFD || fb.cell_at(0, 1) != 0xFFFD || fb.cell_at(0, 2) != 88) { ret 4; }
+    ret 0;
+}
+
+test console__latin_greek_cyrillic_and_combining_glyphs {
+    setup(0);
+    # c-cedilla, r-caron, t-comma, g-breve, y-hook, w-circumflex,
+    # thorn, a-macron, c-circumflex, Greek omega, Cyrillic ya, and two
+    # Latin letters added after the source font was released.
+    write(0, "\xC3\xA7\xC5\x99\xC8\x9B\xC4\x9F\xE1\xBB\xB9\xC5\xB5\xC3\xBE\xC4\x81\xC4\x89\xCF\x89\xD1\x8F\xEA\x9F\x8E\xF0\x9D\xBD\x80\0");
+    val expected: [13]u32 = [13]u32{0x00E7, 0x0159, 0x021B, 0x011F, 0x1EF9, 0x0175,
+                                           0x00FE, 0x0101, 0x0109, 0x03C9, 0x044F, 0xA7CE, 0x1DF40};
+    var i: u64 = 0;
+    for (i < 13) {
+        if (fb.cell_at(0, i) != expected[i] || glyph(i, 0, 0xAAAAAA, 0) == 0) { ret 1; }
+        i = i + 1;
+    }
+    setup(0);
+    write(0, "e\xCC\x81a\xCC\x82\xCC\x81X\0"); # decomposed e-acute and a with two marks
+    if (fb.cell_at(0, 0) != 101 || fb.mark_at(0, 0, 0) != 0x0301) { ret 2; }
+    if (fb.cell_at(0, 1) != 97 || fb.mark_at(0, 1, 0) != 0x0302 || fb.mark_at(0, 1, 1) != 0x0301) { ret 3; }
+    if (fb.cell_at(0, 2) != 88) { ret 4; }
+    ret 0;
+}
+
 test console__indexed_cube_greys_and_ansi_palette {
     setup(0);
     write(0, "\x1b[38;5;196;48;5;244mX\x1b[38;5;13;48;5;16mX\x1b[38;5;231;48;5;232mX\0");

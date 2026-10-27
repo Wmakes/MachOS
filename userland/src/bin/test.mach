@@ -38,6 +38,6 @@ fun run(argc: u64, argv: **u8) u64 {
         if (io.streq(argv[2], "=\0") != 0) { ret yes(io.streq(argv[1], argv[3])); }
         if (io.streq(argv[2], "!=\0") != 0) { ret yes(io.streq(argv[1], argv[3]) ^ 1); }
     }
-    io.err("test: unsupported expression\n\0");
+    io.emsg("test: unsupported expression\n\0");
     ret 2;
 }

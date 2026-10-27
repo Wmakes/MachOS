@@ -7,7 +7,7 @@ use addr: userland.lib.netaddr;
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     if (argc < 2) {
-        io.err("usage: host NAME...\n");
+        io.emsg("usage: host NAME...\n");
         ret 2;
     }
     var status: i64 = 0;
@@ -18,13 +18,13 @@ fun main(argc: i64, argv: **u8) i64 {
             var b: [16]u8;
             addr.format(a, ?b[0]);
             io.out(argv[i]);
-            io.out(" has address ");
+            io.msg(" has address ");
             io.out(?b[0]);
             io.putc(10);
         } or {
-            io.err("host: ");
+            io.emsg("host: ");
             io.err(argv[i]);
-            io.err(": not found\n");
+            io.emsg(": not found\n");
             status = 1;
         }
         i = i + 1;

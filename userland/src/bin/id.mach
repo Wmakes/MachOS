@@ -22,7 +22,7 @@ fun show(label: *u8, id: u64, group: u8) {
 fun run(argc: u64, argv: **u8) u64 {
     var me: system.Proc;
     if (system.process("self", ?me) == 0) {
-        io.err("id: /proc/self cannot be read\n");
+        io.emsg("id: /proc/self cannot be read\n");
         ret 1;
     }
     show("uid=", me.uid, 0);

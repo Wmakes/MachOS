@@ -4,12 +4,13 @@ protected = true
 licenses = true
 tools = ["init", "login", "sh", "se", "su", "passwd", "mpm", "wget"]
 configs = ["system.conf", "time.conf", "login.conf", "se.conf", "sh.conf", "mpm.conf", "wget.conf", "ssl/certs/ca-certificates.crt", "ssl/certs/SOURCE", "ssl/certs/LICENSE.mach-tls"]
+trees = ["usr/share/locale"]
 
 [package.coreutils]
 tools = ["basename", "cat", "chmod", "chown", "clear", "confirm", "cp", "df", "diff", "dirname", "du", "echo", "env", "false", "find", "grep", "gunzip", "gzip", "hd", "head", "ls", "mkdir", "mv", "printf", "rm", "seq", "sha256sum", "sleep", "sort", "stat", "tail", "tar", "tee", "test", "touch", "tr", "true", "wc", "which", "xargs"]
 
 [package.netutils]
-tools = ["ca-update", "host", "ip", "nc", "ping"]
+tools = ["ca-update", "host", "ip", "nc", "ntpdate", "ping"]
 configs = ["network.conf"]
 
 [package.diskutils]

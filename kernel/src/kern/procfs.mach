@@ -55,6 +55,7 @@ use smp:     machos.arch.x86_64.smp;
 use version: machos.abi.version;
 use fbcon:   machos.dev.fbcon;
 use clock:   machos.kern.clock;
+use keymap:  machos.dev.keymap;
 use net:     machos.net.net;
 use dhcp:    machos.net.dhcp;
 use tcp:     machos.net.tcp;
@@ -75,6 +76,7 @@ val SCREEN:    u64 = 11;
 val CLOCK:     u64 = 12;
 val RTCOFF:    u64 = 13;
 val KERNEL_WORK: u64 = 14;
+val KEYMAP:    u64 = 15;
 val NETCONF:   u64 = 30;
 val NETDEV:    u64 = 31;
 val NETARP:    u64 = 32;
@@ -457,6 +459,9 @@ fun generate(nd: *vfs.Node, o: *Out) {
             dec(o, off::u64);
         }
         putc(o, 10);
+    } or (id == KEYMAP) {
+        puts(o, keymap.name());
+        putc(o, 10);
     } or (id == NETCONF) {
         net_config(o);
     } or (id == NETDEV) {
@@ -587,6 +592,16 @@ fun write(nd: *vfs.Node, buf: u64, n: u64) u64 {
         kprint.clear_log();
         ret n;
     }
+    if (nd.ino == KEYMAP) {
+        val s: *u8 = buf::*u8;
+        var k: u64 = n;
+        for (k > 0 && (s[k - 1] == 10 || s[k - 1] == 13 || s[k - 1] == 0)) { k = k - 1; }
+        if (keymap.set(s, k) == 0) { ret abi.err(abi.E_INVAL); }
+        events.begin("keymap \0");
+        events.textn(s, k);
+        events.end();
+        ret n;
+    }
     if (nd.ino == NETCONF) {
         val r: u64 = net_write(buf::*u8, n);
         if (abi.is_err(r) != 0) { ret r; }
@@ -691,4 +706,5 @@ pub fun init(root: *vfs.Node) {
     vfs.make_proc(k, "hostname\0", 8, abi.KIND_FILE, HOSTNAME, 0, 0x1A4);
     vfs.make_proc(k, "clock\0", 5, abi.KIND_FILE, CLOCK, 0, 0x1A4);
     vfs.make_proc(k, "rtc_offset\0", 10, abi.KIND_FILE, RTCOFF, 0, 0x1A4);
+    vfs.make_proc(k, "keymap\0", 6, abi.KIND_FILE, KEYMAP, 0, 0x1A4);
 }

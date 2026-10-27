@@ -23,7 +23,7 @@ fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
     if (argc != 3) {
-        io.err("usage: diff A B\n\0");
+        io.emsg("usage: diff A B\n\0");
         ret 2;
     }
     val ha: i64 = text.open_in("diff\0", argv[1]);
@@ -35,7 +35,7 @@ fun run(argc: u64, argv: **u8) u64 {
     val n: u64 = text.split_lines(?abuf[0], na, ?as[0], ?al[0], MAXL);
     val m: u64 = text.split_lines(?bbuf[0], nb, ?bs[0], ?bl[0], MAXL);
     if (n == MAXL || m == MAXL) {
-        io.err("diff: files over 1000 lines are not supported\n\0");
+        io.emsg("diff: files over 1000 lines are not supported\n\0");
         ret 2;
     }
     val w: u64 = m + 1;
@@ -68,23 +68,23 @@ fun run(argc: u64, argv: **u8) u64 {
             cnt;
         }
         if (in_hunk == 0) {
-            io.out("@@ -\0");
+            io.msg("@@ -\0");
             io.dec(a + 1);
-            io.out(" +\0");
+            io.msg(" +\0");
             io.dec(b + 1);
-            io.out(" @@\n\0");
+            io.msg(" @@\n\0");
             in_hunk = 1;
             differ = 1;
         }
         if (b >= m || (a < n && lcs[(a + 1) * w + b] >= lcs[a * w + b + 1])) {
-            io.out("\x1b[31m-\0");
+            io.msg("\x1b[31m-\0");
             io.outn(?abuf[as[a]], al[a]);
-            io.out("\x1b[0m\n\0");
+            io.msg("\x1b[0m\n\0");
             a = a + 1;
         } or {
-            io.out("\x1b[32m+\0");
+            io.msg("\x1b[32m+\0");
             io.outn(?bbuf[bs[b]], bl[b]);
-            io.out("\x1b[0m\n\0");
+            io.msg("\x1b[0m\n\0");
             b = b + 1;
         }
     }

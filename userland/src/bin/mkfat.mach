@@ -236,14 +236,14 @@ fun copy_file(src: *u8, dest: *u8) u8 {
     if (cut > 0) { dl = cut - 1; }
     val d: *Dir = dir(dest, dl);
     if (d == nil) {
-        io.err("mkfat: too many directories or entries\n\0");
+        io.emsg("mkfat: too many directories or entries\n\0");
         ret 0;
     }
     var first: u64 = 0;
     if (st.size > 0) {
         first = alloc_clusters((st.size + bd.SECTOR - 1) / bd.SECTOR);
         if (first == 0) {
-            io.err("mkfat: the partition is full\n\0");
+            io.emsg("mkfat: the partition is full\n\0");
             ret 0;
         }
         val h: u64 = sys.open(src, io.len(src), abi.O_READ);
@@ -265,7 +265,7 @@ fun copy_file(src: *u8, dest: *u8) u8 {
         sys.close(h);
     }
     if (add_entry(d, ?dest[cut], n - cut, 0x20, first, st.size) == 0) {
-        io.err("mkfat: too many entries in one directory\n\0");
+        io.emsg("mkfat: too many entries in one directory\n\0");
         ret 0;
     }
     ret 1;
@@ -298,7 +298,7 @@ fun fat_datetime() {
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     if (argc < 2) {
-        io.err("usage: mkfat PART [SRC:DEST ...]\n\0");
+        io.emsg("usage: mkfat PART [SRC:DEST ...]\n\0");
         ret 2;
     }
     disk = bd.open_disk("mkfat\0", argv[1], 1);
@@ -310,7 +310,7 @@ fun main(argc: u64, argv: **u8) u64 {
     data_start = RESERVED + 2 * fat_sectors;
     clusters = count - data_start;
     if (clusters < 65525 || clusters > MAX_CLUSTERS - 2) {
-        io.err("mkfat: the partition must be 33 to 128 MiB\n\0");
+        io.emsg("mkfat: the partition must be 33 to 128 MiB\n\0");
         ret 1;
     }
     fat_datetime();
@@ -336,9 +336,9 @@ fun main(argc: u64, argv: **u8) u64 {
         var colon: u64 = 0;
         for (colon < n && a[colon] != 58) { colon = colon + 1; }
         if (colon == n || colon == 0 || colon + 1 == n) {
-            io.err("mkfat: expected SRC:DEST, got \0");
+            io.emsg("mkfat: expected SRC:DEST, got \0");
             io.err(a);
-            io.err("\n\0");
+            io.emsg("\n\0");
             ret 2;
         }
         a[colon] = 0;
@@ -408,13 +408,13 @@ fun main(argc: u64, argv: **u8) u64 {
     }
     sys.close(disk);
     if (ok == 0) {
-        io.err("mkfat: writing the disk failed\n\0");
+        io.emsg("mkfat: writing the disk failed\n\0");
         ret 1;
     }
-    io.out("mkfat: FAT32, \0");
+    io.msg("mkfat: FAT32, \0");
     io.dec(count / 2048);
-    io.out(" MiB, \0");
+    io.msg(" MiB, \0");
     io.dec(argc - 2);
-    io.out(" files\n\0");
+    io.msg(" files\n\0");
     ret 0;
 }

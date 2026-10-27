@@ -50,8 +50,8 @@ fun run(argc: u64, argv: **u8) u64 {
         or (c == 109) { unit = 1048576; } or { p.bad = 1; }
     }
     if (p.bad != 0 || p.at != argc) { ret opt.error("df"); }
-    if (unit == 1024) { io.out("Filesystem        KiB      Used     Avail Use% Mounted on\n"); }
-    or { io.out("Filesystem Size Used Avail Use% Mounted on\n"); }
+    if (unit == 1024) { io.msg("Filesystem        KiB      Used     Avail Use% Mounted on\n"); }
+    or { io.msg("Filesystem Size Used Avail Use% Mounted on\n"); }
     var b: [8192]u8;
     val n: u64 = system.read_file("/proc/mounts", ?b[0], 8192);
     var s: u64 = 0;
@@ -75,7 +75,7 @@ fun run(argc: u64, argv: **u8) u64 {
         var pct: u64 = 0;
         if (total > 0) { pct = ((total - free) * 100 + total - 1) / total; }
         io.dec_pad(pct, 4);
-        io.out("% ");
+        io.msg("% ");
         word(?b[0], s, e, 1, ?at, ?dl);
         io.outn(?b[at], dl);
         io.putc(10);

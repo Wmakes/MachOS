@@ -41,7 +41,7 @@ var max_unpacked:      u64;
 var removing:          [128]u8;
 
 fun fail(message: *u8) u8 {
-    io.err("mpm: ");
+    io.emsg("mpm: ");
     io.err(message);
     io.putc(10);
     ret 0;
@@ -149,9 +149,9 @@ fun find_file(p: *pkg.Package, path: *u8) *pkg.File {
 }
 
 fun approve_unsigned(path: *u8) u8 {
-    io.err("mpm: WARNING: unsigned package: ");
+    io.emsg("mpm: WARNING: unsigned package: ");
     io.err(path);
-    io.err("\n");
+    io.emsg("\n");
     if (unsigned_allowed == 0) { ret fail("refusing unsigned archive; explicit --allow-unsigned is required"); }
     if (unsigned_approved == 0) {
         var user: users.User;
@@ -333,9 +333,9 @@ fun visit(index: u64) u8 {
     for (i < p.dep_count) {
         val child: i64 = dependency(p, ?p.deps[i]);
         if (child == -1) {
-            io.err("mpm: missing or incompatible dependency: ");
+            io.emsg("mpm: missing or incompatible dependency: ");
             io.err(?p.deps[i].name[0]);
-            io.err("\n");
+            io.emsg("\n");
             ret 0;
         }
         if (child >= 0 && visit(child::u64) == 0) { ret 0; }
@@ -361,15 +361,15 @@ fun plan_package(p: *pkg.Package) u8 {
         val f:     *pkg.File = ?p.files[i];
         val owned: i64       = owner(?f.path[0]);
         if (owned >= 0 && owned != old_index) {
-            io.err("mpm: file belongs to another package: ");
+            io.emsg("mpm: file belongs to another package: ");
             io.err(?f.path[0]);
-            io.err("\n");
+            io.emsg("\n");
             ret 0;
         }
         if (fs.exists(?f.path[0]) != 0 && owned < 0) {
-            io.err("mpm: WARNING: existing unowned file: ");
+            io.emsg("mpm: WARNING: existing unowned file: ");
             io.err(?f.path[0]);
-            io.err("\n");
+            io.emsg("\n");
             if (overwrite == 0 && !(system_mode != 0 && pkg.boot_file(?p.name[0], ?f.path[0]) != 0)) { ret fail("refusing overwrite; explicit --force is required"); }
         }
         if (old != nil) {
@@ -384,7 +384,7 @@ fun plan_package(p: *pkg.Package) u8 {
                 val n: u64 = io.len(?f.path[0]);
                 io.copy(?destination[n], ".mpm-new", 9);
                 if (fs.exists(?destination[0]) != 0) { ret fail("configuration replacement already exists; review its .mpm-new file first"); }
-                io.out("mpm: keeping edited configuration; new version: ");
+                io.msg("mpm: keeping edited configuration; new version: ");
                 io.out(?destination[0]);
                 io.putc(10);
             }
@@ -481,13 +481,13 @@ fun install_selected() u8 {
     }
     if (tx.commit() == 0) { ret 0; }
     if (system_mode != 0) {
-        io.out("mpm: system upgrade committed; reboot to start ");
+        io.msg("mpm: system upgrade committed; reboot to start ");
         io.out(?repo.target_version[0]);
         io.putc(10);
     }
     i = 0;
     for (i < order_count) {
-        io.out("mpm: installed ");
+        io.msg("mpm: installed ");
         io.out(?selected[order[i]].name[0]);
         io.putc(32);
         io.out(?selected[order[i]].version[0]);
@@ -539,7 +539,7 @@ fun upgrade() u8 {
     }
     if (selected_count == 0) {
         tx.abort();
-        io.out("mpm: installed packages are up to date\n");
+        io.msg("mpm: installed packages are up to date\n");
         ret 1;
     }
     ret install_selected();
@@ -605,8 +605,8 @@ fun remove(argc: u64, argv: **u8, start: u64) u8 {
         i = i + 1;
     }
     if (tx.commit() == 0) { ret 0; }
-    io.out("mpm: removed packages");
-    if (purge == 0) { io.out("; configuration preserved"); }
+    io.msg("mpm: removed packages");
+    if (purge == 0) { io.msg("; configuration preserved"); }
     io.putc(10);
     ret 1;
 }
@@ -615,11 +615,11 @@ fun info(p: *pkg.Package) {
     io.out(?p.name[0]);
     io.putc(32);
     io.out(?p.version[0]);
-    if (p.protected != 0) { io.out(" [protected]"); }
+    if (p.protected != 0) { io.msg(" [protected]"); }
     io.putc(10);
     var i: u64 = 0;
     for (i < p.dep_count) {
-        io.out("  requires ");
+        io.msg("  requires ");
         io.out(?p.deps[i].name[0]);
         io.putc(32);
         io.out(?p.deps[i].version[0]);
@@ -628,9 +628,9 @@ fun info(p: *pkg.Package) {
     }
     i = 0;
     for (i < p.count) {
-        io.out("  ");
+        io.msg("  ");
         io.out(?p.files[i].path[0]);
-        if (p.files[i].config != 0) { io.out(" [config]"); }
+        if (p.files[i].config != 0) { io.msg(" [config]"); }
         io.putc(10);
         i = i + 1;
     }
@@ -638,7 +638,7 @@ fun info(p: *pkg.Package) {
 
 pub fun run(argc: u64, argv: **u8) u64 {
     if (argc < 2 || io.streq(argv[1], "--help") != 0) {
-        io.out("MachOS Package Manager\nusage: mpm install [--allow-unsigned] [--force] NAME|FILE.mpa...\n       mpm remove [--purge] NAME...\n       mpm refresh | search [TEXT] | upgrade\n       mpm list [--available] | info NAME|FILE.mpa | recover\n  --force overwrites unowned files; other packages retain their ownership.\n  Signed stable repository and local archives. Signatures are FILE.mpa.sig; trusted keys: /etc/mpm/keys.\n");
+        io.msg("MachOS Package Manager\nusage: mpm install [--allow-unsigned] [--force] NAME|FILE.mpa...\n       mpm remove [--purge] NAME...\n       mpm refresh | search [TEXT] | upgrade\n       mpm list [--available] | info NAME|FILE.mpa | recover\n  --force overwrites unowned files; other packages retain their ownership.\n  Signed stable repository and local archives. Signatures are FILE.mpa.sig; trusted keys: /etc/mpm/keys.\n");
         ret 0;
     }
     var mutate: u8 = (io.streq(argv[1], "install") != 0 || io.streq(argv[1], "remove") != 0 || io.streq(argv[1], "refresh") != 0 || io.streq(argv[1], "upgrade") != 0)::u8;
@@ -692,7 +692,7 @@ pub fun run(argc: u64, argv: **u8) u64 {
             io.out(?installed[i].name[0]);
             io.putc(32);
             io.out(?installed[i].version[0]);
-            if (installed[i].active == 0) { io.out(" [config only]"); }
+            if (installed[i].active == 0) { io.msg(" [config only]"); }
             io.putc(10);
             i = i + 1;
         }
@@ -703,7 +703,7 @@ pub fun run(argc: u64, argv: **u8) u64 {
         if (n > 4 && io.eq(?argv[2][n - 4], 4, ".mpa", 4) != 0) {
             if (archive(argv[2], ?selected[0]) == 0) { ret 1; }
             info(?selected[0]);
-            io.out("mpm: archive verified\n");
+            io.msg("mpm: archive verified\n");
             ret 0;
         }
         val index: i64 = find_installed(argv[2]);
@@ -721,10 +721,10 @@ pub fun run(argc: u64, argv: **u8) u64 {
             io.putc(10);
             io.out(?entry.description[0]);
             io.putc(10);
-            io.out("download bytes: ");
+            io.msg("download bytes: ");
             io.dec(entry.size);
             io.putc(10);
-            io.out("installed bytes: ");
+            io.msg("installed bytes: ");
             io.dec(entry.installed_size);
             io.putc(10);
             ret 0;
@@ -737,15 +737,15 @@ pub fun run(argc: u64, argv: **u8) u64 {
             if (p.active != 0 || p.files[i].config != 0) {
                 var st: os.stat_t;
                 if (fs.matches(?p.files[i].path[0], ?p.files[i]) == 0 || io.lstat(?p.files[i].path[0], ?st) < 0 || io.perms(?st) != p.files[i].mode) {
-                    io.err("mpm: changed or missing: ");
+                    io.emsg("mpm: changed or missing: ");
                     io.err(?p.files[i].path[0]);
-                    io.err("\n");
+                    io.emsg("\n");
                     failed = failed + 1;
                 }
             }
             i = i + 1;
         }
-        if (failed == 0) { io.out("mpm: installed files verified\n"); }
+        if (failed == 0) { io.msg("mpm: installed files verified\n"); }
         ret (failed != 0)::u64;
     }
     fail("unknown command or invalid arguments; see mpm --help");

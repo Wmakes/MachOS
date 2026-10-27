@@ -11,7 +11,7 @@ fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 fun run(argc: u64, argv: **u8) u64 {
     if (opt.standard(argc, argv, "printf", "usage: printf FORMAT [ARG...]\n  Conversions: %s %d %c %%\n  Escapes: \\n \\t \\r \\a \\b \\f \\v \\e \\0 \\c \\\\; \\c stops output.") != 0) { ret 0; }
     if (argc < 2) {
-        io.err("usage: printf FORMAT [ARG...]\n\0");
+        io.emsg("usage: printf FORMAT [ARG...]\n\0");
         ret 2;
     }
     val f: *u8 = argv[1];

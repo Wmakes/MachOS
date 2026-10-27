@@ -18,18 +18,18 @@ fun run(argc: u64, argv: **u8) u64 {
             io.fail("stat\0", argv[i], r);
             status = 1;
         } or {
-            io.out("  File: \0");
+            io.msg("  File: \0");
             io.out(argv[i]);
-            io.out("\n  Type: \0");
-            if (io.kind_of(st.st_mode) == io.KIND_DIR) { io.out("directory\0"); }
-            or (io.kind_of(st.st_mode) == io.KIND_DEV) { io.out("device\0"); }
-            or                           { io.out("regular file\0"); }
-            io.out("\n  Size: \0");
+            io.msg("\n  Type: \0");
+            if (io.kind_of(st.st_mode) == io.KIND_DIR) { io.msg("directory\0"); }
+            or (io.kind_of(st.st_mode) == io.KIND_DEV) { io.msg("device\0"); }
+            or                           { io.msg("regular file\0"); }
+            io.msg("\n  Size: \0");
             io.dec(st.st_size::u64);
-            io.out("\nChange: \0");
+            io.msg("\nChange: \0");
             var t: [16]u8;
             io.outn(?t[0], text.fmt_time(st.st_mtime::u64, ?t[0]));
-            io.out(" UTC\n\0");
+            io.msg(" UTC\n\0");
         }
         i = i + 1;
     }

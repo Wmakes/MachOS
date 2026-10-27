@@ -11,18 +11,18 @@ fun show(p: *system.Proc) {
     io.dec_pad(p.pid, 5);
     io.dec_pad(p.ppid, 6);
     io.dec_pad(p.group, 7);
-    if (p.state == 82)      { io.out(" running "); }
-    or (p.state == 83)      { io.out(" waiting "); }
-    or (p.state == 84)      { io.out(" stopped "); }
-    or                      { io.out(" zombie  "); }
+    if (p.state == 82)      { io.msg(" running "); }
+    or (p.state == 83)      { io.msg(" waiting "); }
+    or (p.state == 84)      { io.msg(" stopped "); }
+    or                      { io.msg(" zombie  "); }
     io.dec_pad(p.pages * 4, 5);
-    io.out("K  ");
+    io.msg("K  ");
     io.outn(?p.name[0], p.name_len);
     io.putc(10);
 }
 
 fun run(argc: u64, argv: **u8) u64 {
-    io.out("  PID  PPID  GROUP STATE     MEM  NAME\n");
+    io.msg("  PID  PPID  GROUP STATE     MEM  NAME\n");
     system.processes(show);
     ret 0;
 }

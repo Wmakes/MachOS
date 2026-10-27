@@ -88,10 +88,10 @@ fun show(e: *Item) {
         io.putc(32);
         pad_out(?gname[0], gname_len, 8);
         if (human != 0) { io.putc(32); opt.size(e.size, 1); } or { io.dec_pad(e.size, 8); }
-        io.out("  \0");
+        io.msg("  \0");
         var t: [16]u8;
         io.outn(?t[0], text.fmt_time(e.mtime, ?t[0]));
-        io.out("  \0");
+        io.msg("  \0");
     }
     # directories blue, devices yellow, programs green
     var paint: *u8 = nil;
@@ -100,7 +100,7 @@ fun show(e: *Item) {
     or ((e.mode & 0x49) != 0)   { paint = "\x1b[1;32m\0"; }
     if (color != 0 && paint != nil) { io.out(paint); }
     io.outn(e.name, e.name_len);
-    if (color != 0 && paint != nil) { io.out("\x1b[0m\0"); }
+    if (color != 0 && paint != nil) { io.msg("\x1b[0m\0"); }
     if (e.kind == io.KIND_DIR) { io.putc(47); }
     or (classify != 0 && (e.mode & 0o111) != 0) { io.putc(42); }
     io.putc(10);
@@ -180,7 +180,7 @@ fun run(argc: u64, argv: **u8) u64 {
     for (i < argc) {
         if (many != 0) {
             io.out(argv[i]);
-            io.out(":\n\0");
+            io.msg(":\n\0");
         }
         if (list(argv[i]) == 0) { status = 1; }
         i = i + 1;

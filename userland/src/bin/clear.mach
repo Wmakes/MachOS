@@ -7,6 +7,6 @@ use std.runtime;
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
-    io.out("\x1b[2J\x1b[H\0");
+    io.msg("\x1b[2J\x1b[H\0");
     ret 0;
 }

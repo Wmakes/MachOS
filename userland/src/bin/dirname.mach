@@ -25,7 +25,7 @@ fun emit(path: *u8, end: u8) {
     for (e > 1 && p[e - 1] == 47) { e = e - 1; }
     for (e > 0 && p[e - 1] != 47) { e = e - 1; }
     for (e > 1 && p[e - 1] == 47) { e = e - 1; }
-    if (e == 0) { io.out(".\0"); }
+    if (e == 0) { io.msg(".\0"); }
     or          { io.outn(p, e); }
     io.putc(end);
 }

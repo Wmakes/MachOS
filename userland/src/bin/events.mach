@@ -18,11 +18,11 @@ fun run(argc: u64, argv: **u8) u64 {
         var ok: u8 = 0;
         count = io.parse_dec(argv[2], io.len(argv[2]), ?ok);
         if (ok == 0) {
-            io.err("usage: events [-n COUNT]\n");
+            io.emsg("usage: events [-n COUNT]\n");
             ret 2;
         }
     } or (argc != 1) {
-        io.err("usage: events [-n COUNT]\n");
+        io.emsg("usage: events [-n COUNT]\n");
         ret 2;
     }
     val h: i64 = io.open_read("/dev/events");

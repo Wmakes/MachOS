@@ -20,11 +20,11 @@ fun is_dir(p: *u8, n: u64) u8 {
 }
 
 fun complain(p: *u8, n: u64, e: i64) {
-    io.err("cp: \0");
+    io.emsg("cp: \0");
     io.errn(p, n);
-    io.err(": \0");
+    io.emsg(": \0");
     io.err(io.reason(e));
-    io.err("\n\0");
+    io.emsg("\n\0");
 }
 
 fun copy_file(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
@@ -34,11 +34,11 @@ fun copy_file(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
         ret 0;
     }
     var st: os.stat_t;
-    if (io.fstat(from, ?st) < 0) { io.close(from); io.err("cp: cannot stat source\n"); ret 0; }
+    if (io.fstat(from, ?st) < 0) { io.close(from); io.emsg("cp: cannot stat source\n"); ret 0; }
     var dstst: os.stat_t;
     if (io.stat(dst, ?dstst) >= 0) {
         if (st.st_dev == dstst.st_dev && st.st_ino == dstst.st_ino) {
-            io.close(from); io.err("cp: source and destination are the same file\n"); ret 0;
+            io.close(from); io.emsg("cp: source and destination are the same file\n"); ret 0;
         }
         if (keep != 0) { io.close(from); ret 1; }
     }
@@ -58,9 +58,9 @@ fun copy_file(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
         }
         if (r == 0) { brk; }
         if (io.write_all(to, ?buf[0], r::u64) == 0) {
-            io.err("cp: write failed: \0");
+            io.emsg("cp: write failed: \0");
             io.errn(dst, dn);
-            io.err("\n\0");
+            io.emsg("\n\0");
             ok = 0;
             brk;
         }
@@ -69,24 +69,24 @@ fun copy_file(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
     io.close(to);
     # Do not grant set-id privileges when creating a copy owned by another user.
     io.chmod(dst, io.perms(?st) & 0o777);
-    if (ok != 0 && verbose != 0) { io.outn(src, sn); io.out(" -> "); io.outn(dst, dn); io.putc(10); }
+    if (ok != 0 && verbose != 0) { io.outn(src, sn); io.msg(" -> "); io.outn(dst, dn); io.putc(10); }
     ret ok;
 }
 
 fun copy(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
     var identity: os.stat_t;
     if (io.stat(src, ?identity) >= 0 && identity.st_dev::u64 == root_dev && identity.st_ino::u64 == root_ino) {
-        io.err("cp: cannot copy a directory into itself\n"); ret 0;
+        io.emsg("cp: cannot copy a directory into itself\n"); ret 0;
     }
     if (is_dir(src, sn) == 0) { ret copy_file(src, sn, dst, dn); }
     var target: os.stat_t;
     if (io.stat(dst, ?target) >= 0 && io.stat(src, ?identity) >= 0 && target.st_dev == identity.st_dev && target.st_ino == identity.st_ino) {
-        io.err("cp: source and destination are the same directory\n"); ret 0;
+        io.emsg("cp: source and destination are the same directory\n"); ret 0;
     }
     if (recursive == 0) {
-        io.err("cp: \0");
+        io.emsg("cp: \0");
         io.errn(src, sn);
-        io.err(": is a directory (use -r)\n\0");
+        io.emsg(": is a directory (use -r)\n\0");
         ret 0;
     }
     if (is_dir(dst, dn) == 0) {
@@ -99,7 +99,7 @@ fun copy(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
         }
     }
     var created: os.stat_t;
-    if (io.stat(dst, ?created) < 0) { io.err("cp: cannot stat destination\n"); ret 0; }
+    if (io.stat(dst, ?created) < 0) { io.emsg("cp: cannot stat destination\n"); ret 0; }
     if (root_ino == 0) { root_dev = created.st_dev::u64; root_ino = created.st_ino::u64; }
     val h: i64 = io.open_read(src);
     if (h < 0) {
@@ -116,7 +116,7 @@ fun copy(src: *u8, sn: u64, dst: *u8, dn: u64) u8 {
         var s: [256]u8;
         var d: [256]u8;
         if (sn + 1 + dir.len >= 256 || dn + 1 + dir.len >= 256) {
-            io.err("cp: path too long\n\0");
+            io.emsg("cp: path too long\n\0");
             ok = 0;
             cnt;
         }
@@ -151,9 +151,9 @@ fun run(argc: u64, argv: **u8) u64 {
     val dl: u64 = io.len(dest);
     val into: u8 = is_dir(dest, dl);
     if (argc - i > 2 && into == 0) {
-        io.err("cp: \0");
+        io.emsg("cp: \0");
         io.err(dest);
-        io.err(": not a directory\n\0");
+        io.emsg(": not a directory\n\0");
         ret 1;
     }
     var status: u64 = 0;
@@ -171,7 +171,7 @@ fun run(argc: u64, argv: **u8) u64 {
             for (s > 0 && src[s - 1] != 47) { s = s - 1; }
             var d: [256]u8;
             if (dl + 1 + (b - s) >= 256) {
-                io.err("cp: path too long\n\0");
+                io.emsg("cp: path too long\n\0");
                 status = 1;
             } or {
                 io.copy(?d[0], dest, dl);

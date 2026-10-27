@@ -1,13 +1,19 @@
-# find [PATH...] [-name PATTERN] [-type f|d]: list everything under PATH
-# (default .), or what matches. PATTERN takes * and ?
+# find [PATH...] [EXPRESSION]: walk paths and select matching entries.
 
 use os:  std.system.os;
 use io:  userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 use text: userland.lib.text;
 
 var pat: *u8 = nil;
+var path_pat: *u8 = nil;
+var ignore_case: u8 = 0;
+var path_ignore_case: u8 = 0;
 var want: u64 = 0; # 0 any, else io.KIND_*
+var min_depth: u64 = 0;
+var max_depth: u64 = 0xFFFFFFFFFFFFFFFF;
+var status: u64 = 0;
 
 fun base(p: *u8, n: u64) u64 {
     var s: u64 = n;
@@ -15,24 +21,43 @@ fun base(p: *u8, n: u64) u64 {
     ret s;
 }
 
-fun visit(p: *u8, n: u64, kind: u64) {
-    var show: u8 = 1;
+fun lower(c: u8) u8 {
+    if (c >= 65 && c <= 90) { ret c + 32; }
+    ret c;
+}
+
+fun matches(pattern: *u8, value: *u8, n: u64, insensitive: u8) u8 {
+    if (insensitive == 0) { ret text.glob(pattern, io.len(pattern), value, n); }
+    if (n >= 256 || io.len(pattern) >= 256) { ret 0; }
+    var folded_pattern: [256]u8;
+    var folded_value: [256]u8;
+    var i: u64 = 0;
+    val pn: u64 = io.len(pattern);
+    for (i < pn) { folded_pattern[i] = lower(pattern[i]); i = i + 1; }
+    i = 0;
+    for (i < n) { folded_value[i] = lower(value[i]); i = i + 1; }
+    ret text.glob(?folded_pattern[0], pn, ?folded_value[0], n);
+}
+
+fun visit(p: *u8, n: u64, kind: u64, depth: u64) {
+    var show: u8 = (depth >= min_depth)::u8;
     if (want != 0 && kind != want) { show = 0; }
     if (pat != nil) {
         val b: u64 = base(p, n);
-        if (text.glob(pat, io.len(pat), ?p[b], n - b) == 0) { show = 0; }
+        if (matches(pat, ?p[b], n - b, ignore_case) == 0) { show = 0; }
     }
+    if (path_pat != nil && matches(path_pat, p, n, path_ignore_case) == 0) { show = 0; }
     if (show != 0) {
         io.outn(p, n);
         io.putc(10);
     }
-    if (kind != io.KIND_DIR) { ret; }
+    if (kind != io.KIND_DIR || depth >= max_depth) { ret; }
     val h: i64 = io.open_read(p);
-    if (h < 0) { ret; }
+    if (h < 0) { io.fail("find", p, h); status = 1; ret; }
     var dir: io.Dir;
-    if (io.dir_from(?dir, h) < 0) { ret; }
+    if (io.dir_from(?dir, h) < 0) { io.close(h); status = 1; ret; }
     for (io.dir_next(?dir) > 0) {
-        if (n + 1 + dir.len >= 256) { cnt; }
+        if (n + 1 + dir.len >= 256) { io.emsg("find: path too long\n"); status = 1; cnt; }
         var c: [256]u8;
         io.copy(?c[0], p, n);
         var cn: u64 = n;
@@ -42,7 +67,7 @@ fun visit(p: *u8, n: u64, kind: u64) {
         }
         io.copy(?c[cn], dir.name, dir.len);
         c[cn + dir.len] = 0;
-        visit(?c[0], cn + dir.len, io.dir_kind(?dir));
+        visit(?c[0], cn + dir.len, io.dir_kind(?dir), depth + 1);
     }
     io.dir_close(?dir);
 }
@@ -51,30 +76,51 @@ fun visit(p: *u8, n: u64, kind: u64) {
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
+    if (opt.standard(argc, argv, "find", "usage: find [PATH...] [-name PATTERN] [-iname PATTERN] [-path PATTERN] [-type f|d] [-mindepth N] [-maxdepth N]\n  -name, -iname  match the entry name (* and ?; -iname folds ASCII case)\n  -path, -ipath  match the entire path\n  -type           select files or directories\n  -mindepth, -maxdepth  limit levels below each starting path\n  -print          print matches (the default)") != 0) { ret 0; }
     var roots: [16]*u8;
     var nroots: u64 = 0;
     var i: u64 = 1;
+    var operands: u8 = 0;
     for (i < argc) {
-        if (io.streq(argv[i], "-name\0") != 0 && i + 1 < argc) {
-            pat = argv[i + 1];
+        val arg: *u8 = argv[i];
+        if (operands == 0 && io.streq(arg, "--") != 0) { operands = 1; i = i + 1; cnt; }
+        if (operands == 0 && io.streq(arg, "-print") != 0) { i = i + 1; cnt; }
+        if (operands == 0 && (io.streq(arg, "-name") != 0 || io.streq(arg, "-iname") != 0 ||
+                              io.streq(arg, "-path") != 0 || io.streq(arg, "-ipath") != 0 ||
+                              io.streq(arg, "-type") != 0 || io.streq(arg, "-maxdepth") != 0 ||
+                              io.streq(arg, "-mindepth") != 0)) {
+            if (i + 1 >= argc) { ret opt.error("find"); }
+            val value: *u8 = argv[i + 1];
+            if (io.streq(arg, "-name") != 0 || io.streq(arg, "-iname") != 0) {
+                pat = value; ignore_case = io.streq(arg, "-iname");
+            } or (io.streq(arg, "-path") != 0 || io.streq(arg, "-ipath") != 0) {
+                path_pat = value; path_ignore_case = io.streq(arg, "-ipath");
+            } or (io.streq(arg, "-type") != 0) {
+                if (io.streq(value, "d") != 0) { want = io.KIND_DIR; }
+                or (io.streq(value, "f") != 0) { want = io.KIND_FILE; }
+                or { ret opt.error("find"); }
+            } or {
+                var ok: u8 = 0;
+                val depth: u64 = io.parse_dec(value, io.len(value), ?ok);
+                if (ok == 0) { ret opt.error("find"); }
+                if (io.streq(arg, "-maxdepth") != 0) { max_depth = depth; }
+                or { min_depth = depth; }
+            }
             i = i + 2;
-        } or (io.streq(argv[i], "-type\0") != 0 && i + 1 < argc) {
-            if (argv[i + 1][0] == 100) { want = io.KIND_DIR; }
-            or                         { want = io.KIND_FILE; }
-            i = i + 2;
+        } or (operands == 0 && arg[0] == 45 && arg[1] != 0) {
+            ret opt.error("find");
         } or (nroots < 16) {
             roots[nroots] = argv[i];
             nroots = nroots + 1;
             i = i + 1;
         } or {
-            i = i + 1;
+            ret opt.error("find");
         }
     }
     if (nroots == 0) {
         roots[0] = ".\0";
         nroots = 1;
     }
-    var status: u64 = 0;
     i = 0;
     for (i < nroots) {
         var st: os.stat_t;
@@ -84,7 +130,7 @@ fun run(argc: u64, argv: **u8) u64 {
             io.fail("find\0", roots[i], r);
             status = 1;
         } or {
-            visit(roots[i], n, io.kind_of(st.st_mode));
+            visit(roots[i], n, io.kind_of(st.st_mode), 0);
         }
         i = i + 1;
     }

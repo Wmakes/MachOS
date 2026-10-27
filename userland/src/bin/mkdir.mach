@@ -15,7 +15,7 @@ fun create(path: *u8, mode: u64, parents: u8, verbose: u8) u64 {
         if (parents != 0 && io.stat(path, ?st) >= 0 && io.is_dir(?st) != 0) { ret 0; }
         io.fail("mkdir", path, r); ret 1;
     }
-    if (verbose != 0) { io.out("mkdir: created directory '"); io.out(path); io.out("'\n"); }
+    if (verbose != 0) { io.msg("mkdir: created directory '"); io.out(path); io.msg("'\n"); }
     ret 0;
 }
 
@@ -35,7 +35,7 @@ fun run(argc: u64, argv: **u8) u64 {
     var status: u64 = 0;
     for (p.at < argc) {
         val path: *u8 = argv[p.at]; val n: u64 = io.len(path);
-        if (n == 0 || n >= 4096) { io.err("mkdir: invalid path\n"); status = 1; }
+        if (n == 0 || n >= 4096) { io.emsg("mkdir: invalid path\n"); status = 1; }
         or {
             var buf: [4096]u8; io.copy(?buf[0], path, n + 1);
             var i: u64 = 1;

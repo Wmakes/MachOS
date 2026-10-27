@@ -35,7 +35,7 @@ pub fun load(verbose: bool) *cert.TrustStore {
         }
         available = bundle.load(?pages, path, ?roots) == bundle.OK;
         if (verbose && roots.bundle.skipped != 0) {
-            io.err("wget: warning: unusable certificates skipped in CA bundle\n");
+            io.emsg("wget: warning: unusable certificates skipped in CA bundle\n");
         }
     }
     if (!available) { ret nil; }

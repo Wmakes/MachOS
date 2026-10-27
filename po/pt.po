@@ -1,0 +1,1223 @@
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: MachOS 0.9.4\n"
+"PO-Revision-Date: 2026-10-27 00:00+0100\n"
+"Last-Translator: MachOS contributors\n"
+"Language-Team: pt\n"
+"Language: pt\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"X-Generator: MachOS Linux-catalog seed\n"
+
+msgid ": invalid option or argument; try --help\n"
+msgstr ""
+
+msgid ""
+"\n"
+"  --help       show this help\n"
+"  --version    show the MachOS version\n"
+msgstr ""
+
+msgid ": command not found\n"
+msgstr ""
+
+msgid ": not found\n"
+msgstr ""
+
+msgid ": not a directory\n"
+msgstr ""
+
+msgid ": not a regular file\n"
+msgstr ""
+
+msgid ": is a directory (use -r)\n"
+msgstr ""
+
+msgid ": stdin is not a terminal\n"
+msgstr ""
+
+msgid "usage: "
+msgstr "utilização: "
+
+msgid "directory"
+msgstr "pasta"
+
+msgid "device"
+msgstr "dispositivo"
+
+msgid "regular file"
+msgstr "ficheiro normal"
+
+msgid "no such file or directory"
+msgstr "Ficheiro ou pasta inexistente"
+
+msgid "already exists"
+msgstr ""
+
+msgid "not a directory"
+msgstr "não é uma pasta"
+
+msgid "is a directory"
+msgstr "É pasta"
+
+msgid "bad handle"
+msgstr ""
+
+msgid "out of memory"
+msgstr "memória esgotada"
+
+msgid "invalid argument"
+msgstr "argumento inválido"
+
+msgid "not an executable"
+msgstr ""
+
+msgid "directory not empty"
+msgstr "A pasta não está vazia"
+
+msgid "broken pipe"
+msgstr "Pipe quebrado"
+
+msgid "name too long"
+msgstr ""
+
+msgid "no space left on device"
+msgstr "Sem espaço livre no dispositivo"
+
+msgid "input/output error"
+msgstr "erro de entrada/saída"
+
+msgid "busy"
+msgstr "Ocupado"
+
+msgid "not a terminal"
+msgstr ""
+
+msgid "interrupted"
+msgstr "Interrompido"
+
+msgid "operation not permitted"
+msgstr "Operação não permitida"
+
+msgid "permission denied"
+msgstr "permissão negada"
+
+msgid "not supported"
+msgstr "não suportado"
+
+msgid "read-only filesystem"
+msgstr ""
+
+msgid "timed out"
+msgstr "Expirou"
+
+msgid "network unreachable"
+msgstr "Rede inacessível"
+
+msgid "connection reset"
+msgstr ""
+
+msgid "connection refused"
+msgstr "ligação recusada"
+
+msgid "host unreachable"
+msgstr "Servidor inacessível"
+
+msgid "removed "
+msgstr "Removido "
+
+msgid "running "
+msgstr "em execução "
+
+msgid "waiting "
+msgstr "Em espera "
+
+msgid "stopped "
+msgstr "parada "
+
+msgid "zombie  "
+msgstr "morto-vivo  "
+
+msgid ""
+"   alt+F1..F6 switch terminals\n"
+"\n"
+msgstr ""
+
+msgid " login: "
+msgstr " sessão: "
+
+msgid "Password: "
+msgstr "Senha: "
+
+msgid "New password: "
+msgstr "Nova palavra-passe: "
+
+msgid "Again: "
+msgstr ""
+
+msgid "Login incorrect\n"
+msgstr "Login incorrecto\n"
+
+msgid "A password is required before starting this session.\n"
+msgstr ""
+
+msgid "A password is required for this account.\n"
+msgstr ""
+
+msgid "Password cannot be empty.\n"
+msgstr ""
+
+msgid "Passwords do not match.\n"
+msgstr "As senhas não correspondem.\n"
+
+msgid "login: -f is for root\n"
+msgstr ""
+
+msgid "login: cannot switch to that user\n"
+msgstr ""
+
+msgid "login: no such user: "
+msgstr ""
+
+msgid "User name: "
+msgstr "Utilizador: "
+
+msgid "Create an administrator account? Type yes or no: "
+msgstr ""
+
+msgid "Choose a password for "
+msgstr ""
+
+msgid "It cannot be empty.\n"
+msgstr ""
+
+msgid "They do not match; once more.\n"
+msgstr ""
+
+msgid "Password set.\n"
+msgstr ""
+
+msgid "passwd: password changed\n"
+msgstr ""
+
+msgid "passwd: wrong password\n"
+msgstr ""
+
+msgid "passwd: no such user\n"
+msgstr ""
+
+msgid "passwd: account is locked or unavailable\n"
+msgstr ""
+
+msgid "su: wrong password\n"
+msgstr ""
+
+msgid "su: no such user: "
+msgstr ""
+
+msgid "su: cannot switch user\n"
+msgstr ""
+
+msgid "su: that account is locked\n"
+msgstr ""
+
+msgid "se: authentication failed\n"
+msgstr ""
+
+msgid "se: user is not an administrator\n"
+msgstr ""
+
+msgid "adduser: added "
+msgstr ""
+
+msgid "adduser: that user exists\n"
+msgstr ""
+
+msgid "adduser: bad name\n"
+msgstr ""
+
+msgid "adduser: only root may add users\n"
+msgstr ""
+
+msgid "adduser: cannot allocate a user ID\n"
+msgstr ""
+
+msgid "adduser: cannot write the account files\n"
+msgstr ""
+
+msgid "usermod: administrator membership updated\n"
+msgstr ""
+
+msgid "usermod: root is required\n"
+msgstr ""
+
+msgid "config: cannot read settings file\n"
+msgstr ""
+
+msgid "config: file too large\n"
+msgstr ""
+
+msgid "config: settings path is not a regular file\n"
+msgstr ""
+
+msgid "config: saved; boot settings take effect after reboot\n"
+msgstr ""
+
+msgid "config: unknown setting or invalid value\n"
+msgstr ""
+
+msgid "config: write failed\n"
+msgstr ""
+
+msgid "init: NTP synchronization failed\n"
+msgstr ""
+
+msgid "init: rescue mode, root shell (fsck -y /dev/sda2 checks the disk)\n"
+msgstr ""
+
+msgid "init: legacy migration failed; boot rescue to repair the system\n"
+msgstr ""
+
+msgid "ntpdate: invalid or unsynchronized reply\n"
+msgstr ""
+
+msgid "ntpdate: no complete reply\n"
+msgstr ""
+
+msgid "server time "
+msgstr ""
+
+msgid "time set to "
+msgstr ""
+
+msgid " from "
+msgstr " de "
+
+msgid "cp: cannot copy a directory into itself\n"
+msgstr ""
+
+msgid "cp: cannot stat destination\n"
+msgstr ""
+
+msgid "cp: cannot stat source\n"
+msgstr ""
+
+msgid "cp: path too long\n"
+msgstr ""
+
+msgid "cp: source and destination are the same file\n"
+msgstr ""
+
+msgid "mv: destination must be a directory\n"
+msgstr ""
+
+msgid "mv: destination path too long\n"
+msgstr ""
+
+msgid "rm: refusing to remove . or ..\n"
+msgstr ""
+
+msgid "rm: refusing to remove root directory\n"
+msgstr ""
+
+msgid "mkdir: created directory '"
+msgstr ""
+
+msgid "mkdir: invalid path\n"
+msgstr ""
+
+msgid "find: path too long\n"
+msgstr ""
+
+msgid "grep: path too long\n"
+msgstr ""
+
+msgid "grep: input line exceeds 65536 bytes\n"
+msgstr ""
+
+msgid "sort: input exceeds capacity or read failed\n"
+msgstr ""
+
+msgid "sort: too many lines\n"
+msgstr ""
+
+msgid "diff: files over 1000 lines are not supported\n"
+msgstr ""
+
+msgid "less: no terminal\n"
+msgstr ""
+
+msgid "  (q quits) "
+msgstr ""
+
+msgid "  lines "
+msgstr "  linhas "
+
+msgid "Filesystem Size Used Avail Use% Mounted on\n"
+msgstr ""
+
+msgid "Filesystem        KiB      Used     Avail Use% Mounted on\n"
+msgstr ""
+
+msgid "  File: "
+msgstr "  Ficheiro: "
+
+msgid ""
+"\n"
+"  Type: "
+msgstr ""
+"\n"
+"  Tipo: "
+
+msgid ""
+"\n"
+"  Size: "
+msgstr ""
+"\n"
+"  Tamanho: "
+
+msgid ""
+"\n"
+"Change: "
+msgstr ""
+
+msgid "fsck: cannot read the group descriptors\n"
+msgstr ""
+
+msgid "fsck: no ext2 filesystem on "
+msgstr ""
+
+msgid "fsck: only 4 KiB blocks are supported\n"
+msgstr ""
+
+msgid "fsck: the superblock makes no sense\n"
+msgstr ""
+
+msgid " problems fixed\n"
+msgstr ""
+
+msgid " problems (run fsck -y to fix them)\n"
+msgstr ""
+
+msgid "host: "
+msgstr "Máquina: "
+
+msgid " has address "
+msgstr ""
+
+msgid "no reply for icmp_seq="
+msgstr ""
+
+msgid " packets transmitted, "
+msgstr ""
+
+msgid " received, "
+msgstr ""
+
+msgid "% packet loss\n"
+msgstr ""
+
+msgid "wget: no reply\n"
+msgstr ""
+
+msgid "wget: sending the request failed\n"
+msgstr ""
+
+msgid "wget: too many redirects\n"
+msgstr ""
+
+msgid "wget: a redirect without a Location\n"
+msgstr ""
+
+msgid "wget: only absolute redirects work\n"
+msgstr ""
+
+msgid "wget: HTTPS is required for this download\n"
+msgstr ""
+
+msgid "wget: cannot load trusted CA certificates\n"
+msgstr ""
+
+msgid "wget: writing the file failed\n"
+msgstr ""
+
+msgid "ca-update: CA bundle updated\n"
+msgstr ""
+
+msgid "ca-update: download failed; existing CA bundle kept\n"
+msgstr ""
+
+msgid "nc: sending failed\n"
+msgstr ""
+
+msgid ""
+"\n"
+"\\033[7m  PID USER     STATE     CPU%   MEM     TIME  NAME          \\033[0m\n"
+msgstr ""
+
+msgid "\\033[1mtop\\033[0m - up "
+msgstr ""
+
+msgid " cores, memory "
+msgstr ""
+
+msgid " processes\n"
+msgstr " processos\n"
+
+msgid ": no such job\n"
+msgstr ""
+
+msgid ": bad file descriptor\n"
+msgstr ""
+
+msgid "kill: not a pid: "
+msgstr ""
+
+msgid "test: unsupported expression\n"
+msgstr ""
+
+msgid "mpm: archive verified\n"
+msgstr ""
+
+msgid "mpm: installed "
+msgstr ""
+
+msgid "mpm: installed files verified\n"
+msgstr ""
+
+msgid "mpm: installed packages are up to date\n"
+msgstr ""
+
+msgid "mpm: removed packages"
+msgstr ""
+
+msgid "mpm: missing or incompatible dependency: "
+msgstr ""
+
+msgid "mpm: file belongs to another package: "
+msgstr ""
+
+msgid "mpm: installation failed; transaction rolled back\n"
+msgstr ""
+
+msgid "mpm: no safe transaction to recover\n"
+msgstr ""
+
+msgid "mpm: refreshed verified stable repository\n"
+msgstr ""
+
+msgid "mpm: WARNING: unsigned package: "
+msgstr ""
+
+msgid "New Buffer"
+msgstr "Novo buffer"
+
+msgid "File: "
+msgstr "Ficheiro: "
+
+msgid "Modified"
+msgstr "Modificado"
+
+msgid "Help"
+msgstr "Ajuda"
+
+msgid "Write Out"
+msgstr "Gravar"
+
+msgid "Where Is"
+msgstr "Procurar"
+
+msgid "Cut"
+msgstr "Cortar"
+
+msgid "Read File"
+msgstr "Carregar"
+
+msgid "Location"
+msgstr "Posição"
+
+msgid "Undo"
+msgstr "Desfazer"
+
+msgid "Exit"
+msgstr "Sair"
+
+msgid "Save"
+msgstr "Gravar"
+
+msgid "Replace"
+msgstr "Substituir"
+
+msgid "Paste"
+msgstr "Colar"
+
+msgid "Copy"
+msgstr "Copiar"
+
+msgid "Go To Line"
+msgstr "Ir p/ linha"
+
+msgid "Redo"
+msgstr "Refazer"
+
+msgid "Cancel"
+msgstr "Cancelar"
+
+msgid "Accept"
+msgstr "Aceitar"
+
+msgid "Yes"
+msgstr "Sim"
+
+msgid "All"
+msgstr "Todos"
+
+msgid "No"
+msgstr "Não"
+
+msgid "Close"
+msgstr "Fechar"
+
+msgid "Cancelled"
+msgstr "Cancelado"
+
+msgid "Nothing to undo"
+msgstr "Nada a desfazer"
+
+msgid "Undid an edit"
+msgstr ""
+
+msgid "Nothing to redo"
+msgstr "Nada a refazer"
+
+msgid "Redid an edit"
+msgstr ""
+
+msgid "Error writing the file"
+msgstr ""
+
+msgid "Wrote "
+msgstr ""
+
+msgid " lines"
+msgstr " linhas"
+
+msgid "Search Wrapped"
+msgstr "Procura recomeçou"
+
+msgid "Search"
+msgstr "Procurar"
+
+msgid "Search Backwards"
+msgstr "Procurar para trás"
+
+msgid "Search (to replace)"
+msgstr ""
+
+msgid "Replace with: "
+msgstr "Substituir por: "
+
+msgid "Replace this instance?"
+msgstr "Substituir esta ocorrência?"
+
+msgid "Replaced 1 occurrence"
+msgstr ""
+
+msgid "Replaced "
+msgstr ""
+
+msgid " occurrences"
+msgstr ""
+
+msgid "Enter line number, column number: "
+msgstr ""
+
+msgid "Invalid line or column number"
+msgstr "Número de linha ou coluna inválido"
+
+msgid "Copied a line"
+msgstr ""
+
+msgid "The cutbuffer is empty"
+msgstr ""
+
+msgid "File to insert: "
+msgstr ""
+
+msgid "Read "
+msgstr "Leitura "
+
+msgid "File Name to Write: "
+msgstr ""
+
+msgid "New File"
+msgstr "Novo ficheiro"
+
+msgid "The file was cut at 1 MiB"
+msgstr ""
+
+msgid "the file is full (1 MiB)"
+msgstr ""
+
+msgid "Save modified buffer?  "
+msgstr "Gravar buffer modificado?  "
+
+msgid "  Help"
+msgstr "  Ajuda"
+
+msgid "Main nano help text"
+msgstr ""
+
+msgid " In prompts: Enter accepts, ^C cancels, ^U clears."
+msgstr ""
+
+msgid "usage: adduser [--admin|--optional-admin] [-R DIR] [NAME]\n"
+msgstr ""
+
+msgid ""
+"usage: adduser [--admin|--optional-admin] [-R DIR] [NAME]\n"
+"  A nonempty password is required. Root only.\n"
+msgstr ""
+
+msgid "usage: ca-update [--provider mozilla | --url HTTPS_URL]\n"
+msgstr ""
+
+msgid "usage: chmod MODE FILE...\n"
+msgstr ""
+
+msgid "usage: chown OWNER[:GROUP] FILE...\n"
+msgstr ""
+
+msgid "usage: date [-u] [+%s] [-s \"YYYY-MM-DD HH:MM[:SS]\" | -s @SECONDS]\n"
+msgstr ""
+
+msgid "usage: diff A B\n"
+msgstr ""
+
+msgid "usage: dmesg [-t] [-x] [-r] [-l LEVEL] [-w] [-c|-C]\n"
+msgstr ""
+
+msgid "usage: events [-n COUNT]\n"
+msgstr ""
+
+msgid "usage: fsck [-y] PART\n"
+msgstr ""
+
+msgid "usage: gpt [--check] DISK\n"
+msgstr ""
+
+msgid "usage: hd [-n BYTES] [FILE]\n"
+msgstr ""
+
+msgid "usage: host NAME...\n"
+msgstr ""
+
+msgid "usage: ip [stats | neigh | dhcp | off | set IP/PREFIX GATEWAY [DNS]]\n"
+msgstr ""
+
+msgid "usage: kill [-SIGNAL] PID...  |  kill -l\n"
+msgstr ""
+
+msgid "usage: mkext2 PART\n"
+msgstr ""
+
+msgid "usage: mkfat PART [SRC:DEST ...]\n"
+msgstr ""
+
+msgid "usage: mount [DEV DIR]\n"
+msgstr ""
+
+msgid "usage: nc [-u] [-w SECONDS] HOST PORT, or nc -l [-w SECONDS] PORT\n"
+msgstr ""
+
+msgid "usage: ntpdate [-q] [-p PORT] SERVER[:PORT]\n"
+msgstr ""
+
+msgid "usage: partname DISK N\n"
+msgstr ""
+
+msgid "usage: ping [-c COUNT] HOST\n"
+msgstr ""
+
+msgid "usage: printf FORMAT [ARG...]\n"
+msgstr ""
+
+msgid "usage: tar -c|-x|-t [-v] -f ARCHIVE [PATH...]\n"
+msgstr ""
+
+msgid "usage: top [-n COUNT]\n"
+msgstr ""
+
+msgid "usage: tr SET1 SET2 | tr -d SET\n"
+msgstr ""
+
+msgid "usage: umount DIR|DEV\n"
+msgstr ""
+
+msgid "usage: usermod --admin|--no-admin USER\n"
+msgstr ""
+
+msgid ""
+"usage: usermod --admin|--no-admin USER\n"
+"  Change administrator membership. Root only.\n"
+msgstr ""
+
+msgid ""
+"usage: wget [-q] [--https-only] [--max-size BYTES] [-O FILE|-] "
+"http[s]://HOST[:PORT]/PATH\n"
+msgstr ""
+
+msgid "usage: xargs COMMAND [ARGS...]\n"
+msgstr ""
+
+msgid "adduser: a name is lowercase letters, digits, - and _\n"
+msgstr ""
+
+msgid "adduser: cannot grant administrator membership\n"
+msgstr ""
+
+msgid "adduser: password setup failed; account remains locked\n"
+msgstr ""
+
+msgid "ca-update: a verified HTTPS URL is required\n"
+msgstr ""
+
+msgid "ca-update: cannot create a staging file\n"
+msgstr ""
+
+msgid "ca-update: cannot replace CA bundle; existing CA bundle kept\n"
+msgstr ""
+
+msgid "ca-update: cannot set CA bundle permissions; existing CA bundle kept\n"
+msgstr ""
+
+msgid "ca-update: invalid CA bundle; existing CA bundle kept\n"
+msgstr ""
+
+msgid "ca-update: warning: cannot record CA bundle source\n"
+msgstr ""
+
+msgid "ca-update: warning: some CA roots are unsupported by this build\n"
+msgstr ""
+
+msgid "chmod: bad mode: "
+msgstr ""
+
+msgid "chown: no such user or group\n"
+msgstr ""
+
+msgid "cp: source and destination are the same directory\n"
+msgstr ""
+
+msgid "cp: write failed: "
+msgstr ""
+
+msgid "date: not a date: "
+msgstr ""
+
+msgid "dmesg: only root may clear the log\n"
+msgstr ""
+
+msgid "dmesg: unknown level "
+msgstr ""
+
+msgid "du: path too long\n"
+msgstr ""
+
+msgid "env: --null requires no command\n"
+msgstr ""
+
+msgid "env: too many variables\n"
+msgstr ""
+
+msgid "id: /proc/self cannot be read\n"
+msgstr ""
+
+msgid "gpt: target must be a whole disk, not a partition or character device\n"
+msgstr ""
+
+msgid "gpt: the disk is too small (at least 100 MiB)\n"
+msgstr ""
+
+msgid "gpt: this disk has 4096-byte sectors; MachOS can only partition\n"
+msgstr ""
+
+msgid "gpt: writing the disk failed (a filesystem on it may be mounted)\n"
+msgstr ""
+
+msgid "mkext2: the partition is too large or too small\n"
+msgstr ""
+
+msgid "mkext2: writing the disk failed\n"
+msgstr ""
+
+msgid "mkfat: expected SRC:DEST, got "
+msgstr ""
+
+msgid "mkfat: the partition is full\n"
+msgstr ""
+
+msgid "mkfat: the partition must be 33 to 128 MiB\n"
+msgstr ""
+
+msgid "mkfat: too many directories or entries\n"
+msgstr ""
+
+msgid "mkfat: too many entries in one directory\n"
+msgstr ""
+
+msgid "mkfat: writing the disk failed\n"
+msgstr ""
+
+msgid "passwd: cannot write /etc/shadow\n"
+msgstr ""
+
+msgid "passwd: not installed set-user-id root\n"
+msgstr ""
+
+msgid "passwd: only root may change another user's password\n"
+msgstr ""
+
+msgid "passwd: only root may use -R\n"
+msgstr ""
+
+msgid "se: not installed set-user-id root\n"
+msgstr ""
+
+msgid "su: not installed set-user-id root\n"
+msgstr ""
+
+msgid "tar: archive read failed or ended too early\n"
+msgstr ""
+
+msgid "tar: no -z: pipe through gzip / gunzip instead\n"
+msgstr ""
+
+msgid "tar: skipping unsafe name "
+msgstr ""
+
+msgid "tar: the archive ends too early\n"
+msgstr ""
+
+msgid "tar: this is not a tar archive (or it is damaged)\n"
+msgstr ""
+
+msgid "tr: empty SET2\n"
+msgstr ""
+
+msgid "usermod: select an existing non-root user\n"
+msgstr ""
+
+msgid "wget: invalid HTTP response framing\n"
+msgstr ""
+
+msgid "wget: not an http:// or https:// URL: "
+msgstr ""
+
+msgid "wget: redirected to "
+msgstr ""
+
+msgid "wget: that is no HTTP reply\n"
+msgstr ""
+
+msgid "wget: that URL is too long\n"
+msgstr ""
+
+msgid "wget: the Location is too long\n"
+msgstr ""
+
+msgid "wget: the Location is unusable\n"
+msgstr ""
+
+msgid "wget: the reply's header is too long\n"
+msgstr ""
+
+msgid "wget: the server closed the connection without a reply\n"
+msgstr ""
+
+msgid "wget: TLS handshake or certificate verification failed: "
+msgstr ""
+
+msgid "wget: truncated, invalid, or unauthenticated response body\n"
+msgstr ""
+
+msgid "wget: warning: unusable certificates skipped in CA bundle\n"
+msgstr ""
+
+msgid "xargs: too much input\n"
+msgstr ""
+
+msgid ""
+"mpm: cannot acquire transaction; use mpm recover after an interrupted "
+"operation\n"
+msgstr ""
+
+msgid "mpm: changed or missing: "
+msgstr ""
+
+msgid "mpm: committed; run mpm recover to finish cleanup\n"
+msgstr ""
+
+msgid "mpm: duplicate transaction destination\n"
+msgstr ""
+
+msgid "mpm: invalid legacy migration data\n"
+msgstr ""
+
+msgid "mpm: invalid migration package record: "
+msgstr ""
+
+msgid "mpm: keeping edited configuration; new version: "
+msgstr ""
+
+msgid "mpm: legacy migration completed; future updates use mpm upgrade\n"
+msgstr ""
+
+msgid "mpm: migration data is missing required records\n"
+msgstr ""
+
+msgid "mpm: refusing a non-regular destination\n"
+msgstr ""
+
+msgid ""
+"mpm: rollback incomplete; keep the transaction directory and run mpm "
+"recover\n"
+msgstr ""
+
+msgid "mpm: transaction owner is still running\n"
+msgstr ""
+
+msgid "mpm: unsupported migration member: "
+msgstr ""
+
+msgid "mpm: WARNING: existing unowned file: "
+msgstr ""
+
+msgid "hello from user mode, written in mach!\n"
+msgstr ""
+
+msgid "not a tty\n"
+msgstr "não é tty\n"
+
+msgid "==> standard input <==\n"
+msgstr ""
+
+msgid "  PID  PPID  GROUP STATE     MEM  NAME\n"
+msgstr ""
+
+msgid "  cpu"
+msgstr ""
+
+msgid " blocks used"
+msgstr ""
+
+msgid " files\n"
+msgstr " ficheiros\n"
+
+msgid " files, "
+msgstr " ficheiros, "
+
+msgid " groups, "
+msgstr ""
+
+msgid " inodes\n"
+msgstr ""
+
+msgid " could not be fixed\n"
+msgstr ""
+
+msgid " problems, "
+msgstr ""
+
+msgid "  lost+found is full\n"
+msgstr ""
+
+msgid " is mounted; unmount it (for the root: boot MachOS (rescue))\n"
+msgstr ""
+
+msgid ", clean\n"
+msgstr ""
+
+msgid " (fixed)"
+msgstr ""
+
+msgid " (not fixed)\n"
+msgstr ""
+
+msgid " bytes from "
+msgstr ""
+
+msgid " ping statistics ---\n"
+msgstr ""
+
+msgid " saved, "
+msgstr ""
+
+msgid " cannot be read\n"
+msgstr ""
+
+msgid " more\n"
+msgstr " Mais\n"
+
+msgid " processes, "
+msgstr ""
+
+msgid " on "
+msgstr " Em "
+
+msgid " type "
+msgstr " tipo "
+
+msgid ""
+"MachOS Package Manager\n"
+"usage: mpm install [--allow-unsigned] [--force] NAME|FILE.mpa...\n"
+"       mpm remove [--purge] NAME...\n"
+"       mpm refresh | search [TEXT] | upgrade\n"
+"       mpm list [--available] | info NAME|FILE.mpa | recover\n"
+"  --force overwrites unowned files; other packages retain their ownership.\n"
+"  Signed stable repository and local archives. Signatures are FILE.mpa.sig; trusted keys: /etc/mpm/keys.\n"
+msgstr ""
+
+msgid "mpm: system upgrade committed; reboot to start "
+msgstr ""
+
+msgid ""
+"se: superuser exec\n"
+"usage: se [-k | -v | COMMAND [ARG...]]\n"
+"  -k forget authentication; -v authenticate without running a command\n"
+msgstr ""
+
+msgid ""
+"usage: machboot [list | default N | timeout SECONDS | hide | show | dualboot"
+" on|off |\n"
+msgstr ""
+
+msgid ""
+"                add NAME [KERNEL [INITRD|- [CMDLINE...]]] | remove N | edit "
+"|\n"
+msgstr ""
+
+msgid "                cmdline N [TEXT...] |\n"
+msgstr ""
+
+msgid ""
+"                ensure NAME KERNEL [INITRD] | update | install PARTITION]\n"
+msgstr ""
+
+msgid "machboot is installed on "
+msgstr ""
+
+msgid "machboot on the EFI partition is now /boot/BOOTX64.EFI\n"
+msgstr ""
+
+msgid "This reformats "
+msgstr ""
+
+msgid " (everything on it is lost) and puts machboot there\n"
+msgstr ""
+
+msgid "(machboot reads its settings, the kernel and the initrd from /boot).\n"
+msgstr ""
+
+msgid "  other systems on EFI partitions are offered too\n"
+msgstr ""
+
+msgid "  the menu is hidden: hold a key while the machine starts to see it\n"
+msgstr ""
+
+msgid ""
+"\\033[0m\n"
+"        another system: "
+msgstr ""
+
+msgid ""
+"\\033[0m\n"
+"        kernel "
+msgstr ""
+
+msgid ""
+"\n"
+"  menu waits "
+msgstr ""
+
+msgid " s, boots entry "
+msgstr ""
+
+msgid " unless another is picked\n"
+msgstr ""
+
+msgid ", command line "
+msgstr ""
+
+msgid ", initrd "
+msgstr ""
+
+msgid "(none)"
+msgstr "(nenhum)"
+
+msgid "     512-byte-sector disks so far (most disks are)\n"
+msgstr ""
+
+msgid "  requires "
+msgstr ""
+
+msgid " (kernel and userland written in mach)"
+msgstr ""
+
+msgid " [-d] [-c] [-k] [FILE...]\n"
+msgstr ""
+
+msgid " [FILE]\n"
+msgstr " [FICH]\n"
+
+msgid " [config only]"
+msgstr ""
+
+msgid " [config]"
+msgstr ""
+
+msgid " [protected]"
+msgstr ""
+
+msgid " at migration archive offset "
+msgstr ""
+
+msgid " on the new system\n"
+msgstr ""
+
+msgid ": not a disk\n"
+msgstr ""
+
+msgid ": requested lines exceed buffer capacity\n"
+msgstr ""
+
+msgid "; configuration preserved"
+msgstr ""
+
+msgid "download bytes: "
+msgstr ""
+
+msgid "installed bytes: "
+msgstr ""
+
+msgid " running "
+msgstr " em execução "
+
+msgid " stopped "
+msgstr " parada "
+
+msgid " waiting "
+msgstr " Em espera "
+
+msgid " zombie  "
+msgstr " morto-vivo  "
+
+msgid ""
+"\n"
+"real  "
+msgstr ""
+"\n"
+"Verdadeiro  "

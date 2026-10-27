@@ -20,14 +20,14 @@ fun run(argc: u64, argv: **u8) u64 {
     if (p.bad != 0 || argc - p.at < 2) { ret opt.error("mv"); }
     val dest: *u8 = argv[argc - 1]; var st: os.stat_t;
     val directory: u8 = (io.stat(dest, ?st) >= 0 && io.is_dir(?st))::u8;
-    if (argc - p.at > 2 && directory == 0) { io.err("mv: destination must be a directory\n"); ret 1; }
+    if (argc - p.at > 2 && directory == 0) { io.emsg("mv: destination must be a directory\n"); ret 1; }
     var status: u64 = 0;
     for (p.at + 1 < argc) {
         val from: *u8 = argv[p.at]; var to: [4096]u8; var n: u64 = io.len(dest);
         var end: u64 = io.len(from); for (end > 1 && from[end - 1] == 47) { end = end - 1; }
         var start: u64 = end; for (start > 0 && from[start - 1] != 47) { start = start - 1; }
         var extra: u64 = 0; if (directory != 0) { extra = 1 + end - start; }
-        if (n + extra >= 4096) { io.err("mv: destination path too long\n"); status = 1; }
+        if (n + extra >= 4096) { io.emsg("mv: destination path too long\n"); status = 1; }
         or {
             io.copy(?to[0], dest, n);
             if (directory != 0) { to[n] = 47; n = n + 1; io.copy(?to[n], ?from[start], end - start); n = n + end - start; }
@@ -35,7 +35,7 @@ fun run(argc: u64, argv: **u8) u64 {
             if (keep == 0 || io.stat(?to[0], ?st) < 0) {
                 val r: i64 = io.rename(from, ?to[0]);
                 if (r < 0) { io.fail("mv", from, r); status = 1; }
-                or (verbose != 0) { io.out(from); io.out(" -> "); io.out(?to[0]); io.putc(10); }
+                or (verbose != 0) { io.out(from); io.msg(" -> "); io.out(?to[0]); io.putc(10); }
             }
         }
         p.at = p.at + 1;

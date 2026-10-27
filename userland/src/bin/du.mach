@@ -29,7 +29,7 @@ fun walk(p: *u8, n: u64, top: u8) u64 {
     if (io.dir_from(?dir, h) < 0) { io.close(h); status = 1; ret 0; }
     for (io.dir_next(?dir) > 0) {
         if (io.dir_kind(?dir) == io.KIND_DEV) { cnt; }
-        if (n + 1 + dir.len >= 256) { io.err("du: path too long\n"); status = 1; cnt; }
+        if (n + 1 + dir.len >= 256) { io.emsg("du: path too long\n"); status = 1; cnt; }
         var c: [256]u8;
         io.copy(?c[0], p, n);
         var cn: u64 = n;

@@ -146,9 +146,9 @@ pub fun open_disk(prog: *u8, path: *u8, write: u8) u64 {
     sys.stat(path, io.len(path), ?st);
     if (st.kind != abi.KIND_DEV) {
         io.err(prog);
-        io.err(": \0");
+        io.emsg(": \0");
         io.err(path);
-        io.err(": not a disk\n\0");
+        io.emsg(": not a disk\n\0");
         sys.close(h);
         ret abi.err(abi.E_INVAL);
     }

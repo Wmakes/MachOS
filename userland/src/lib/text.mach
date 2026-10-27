@@ -101,13 +101,13 @@ pub fun glob(p: *u8, pn: u64, s: *u8, sn: u64) u8 {
 pub fun human(bytes: u64) {
     if (bytes >= 1073741824) {
         io.dec(bytes / 1073741824);
-        io.out("G\0");
+        io.msg("G\0");
     } or (bytes >= 1048576) {
         io.dec(bytes / 1048576);
-        io.out("M\0");
+        io.msg("M\0");
     } or (bytes >= 1024) {
         io.dec(bytes / 1024);
-        io.out("K\0");
+        io.msg("K\0");
     } or {
         io.dec(bytes);
     }

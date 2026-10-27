@@ -63,6 +63,22 @@ selects the full suite and is unnecessary for most contributions.
 For documentation-only changes, check formatting, links and command accuracy;
 OS runtime tests are unnecessary.
 
+## Localization
+
+MachOS follows the Linux/POSIX locale variables (`LC_ALL`, `LC_MESSAGES`, then
+`LANG`) and uses GNU gettext-compatible catalogs under
+`/usr/share/locale/LOCALE/LC_MESSAGES/`. Keep command names, option names and
+paths unchanged in translated text, and test terminal layout as well as the
+wording.
+
+The initial localization infrastructure and translations were AI-assisted.
+They should be treated as reviewable translations, not authoritative wording.
+If you find an incorrect, unclear, culturally inappropriate, truncated or
+context-mismatched translation, please report it through the issue tracker.
+The Latin-script seed catalogs also use established GNU/Linux terminology for
+exactly matching messages; untranslated entries deliberately fall back to the
+English source text until a speaker reviews them.
+
 ## Pull requests
 
 Target `main`. Explain the problem, the resulting behavior and the scope of the

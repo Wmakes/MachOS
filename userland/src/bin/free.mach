@@ -13,7 +13,7 @@ fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 fun row(name: *u8, bytes: u64) {
     io.out(name);
     opt.size(bytes, unit);
-    if (unit == 1024) { io.out(" KiB"); } or (unit == 1048576) { io.out(" MiB"); }
+    if (unit == 1024) { io.msg(" KiB"); } or (unit == 1048576) { io.msg(" MiB"); }
     io.putc(10);
 }
 

@@ -34,7 +34,7 @@ fun pump(h: i64, name: *u8) u64 {
                 }
             }
             if (c == 10 && ends != 0) { io.putc(36); }
-            if (c == 9 && tabs != 0) { io.out("^I"); }
+            if (c == 9 && tabs != 0) { io.msg("^I"); }
             or { if (io.write_all(io.STDOUT, ?buf[i - 1], 1) == 0) { ret 1; } }
             beginning = (c == 10)::u8;
         }

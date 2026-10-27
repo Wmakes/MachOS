@@ -63,7 +63,7 @@ fun default_port() u64 {
 }
 
 fun usage() i64 {
-    io.err("usage: wget [-q] [--https-only] [--max-size BYTES] [-O FILE|-] http[s]://HOST[:PORT]/PATH\n");
+    io.emsg("usage: wget [-q] [--https-only] [--max-size BYTES] [-O FILE|-] http[s]://HOST[:PORT]/PATH\n");
     ret 2;
 }
 
@@ -281,14 +281,14 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
     if (encrypted != 0) {
         val trust: *cert.TrustStore = roots.load(quiet == 0);
         if (trust == nil) {
-            io.err("wget: cannot load trusted CA certificates\n");
+            io.emsg("wget: cannot load trusted CA certificates\n");
             tcp.stream_close(?s);
             ret 1;
         }
         if (!secure.open(?s, ?host[0], trust)) {
-            io.err("wget: TLS handshake or certificate verification failed: ");
+            io.emsg("wget: TLS handshake or certificate verification failed: ");
             io.err(secure.reason());
-            io.err("\n");
+            io.emsg("\n");
             disconnect(?s);
             ret 1;
         }
@@ -298,7 +298,7 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
     for (sent < n) {
         val w: res[usize, io_error.Error] = send(?s, ?req[sent], (n - sent)::usize);
         if (sel w.err) {
-            io.err("wget: sending the request failed\n");
+            io.emsg("wget: sending the request failed\n");
             disconnect(?s);
             ret 1;
         }
@@ -310,18 +310,18 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
     var hlen: u64 = 0;
     for (hlen == 0) {
         if (have >= 32768) {
-            io.err("wget: the reply's header is too long\n");
+            io.emsg("wget: the reply's header is too long\n");
             disconnect(?s);
             ret 1;
         }
         val r: res[usize, io_error.Error] = receive(?s, ?head[have], (32768 - have)::usize);
         if (sel r.err) {
-            io.err("wget: no reply\n");
+            io.emsg("wget: no reply\n");
             disconnect(?s);
             ret 1;
         }
         if (r.ok == 0) {
-            io.err("wget: the server closed the connection without a reply\n");
+            io.emsg("wget: the server closed the connection without a reply\n");
             disconnect(?s);
             ret 1;
         }
@@ -349,27 +349,27 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
         }
     }
     if (bad != 0) {
-        io.err("wget: that is no HTTP reply\n");
+        io.emsg("wget: that is no HTTP reply\n");
         disconnect(?s);
         ret 1;
     }
     val code: u64 = (head[9] - 48)::u64 * 100 + (head[10] - 48)::u64 * 10 + (head[11] - 48)::u64;
     if (quiet == 0 || code != 200) {
         io.errn(?head[0], line_end(0, hlen));
-        io.err("\n");
+        io.emsg("\n");
     }
 
     if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
         val l: u64 = find_header(hlen, "location");
         if (l == 0) {
-            io.err("wget: a redirect without a Location\n");
+            io.emsg("wget: a redirect without a Location\n");
             disconnect(?s);
             ret 1;
         }
         val e:   u64 = line_end(l, hlen);
         val len: u64 = e - l;
         if (len == 0 || len > 7168) {
-            io.err("wget: the Location is unusable\n");
+            io.emsg("wget: the Location is unusable\n");
             disconnect(?s);
             ret 1;
         }
@@ -389,12 +389,12 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
             t = put_n(?target[0], 0, ?head[l], len);
         }
         or {
-            io.err("wget: only absolute redirects work\n");
+            io.emsg("wget: only absolute redirects work\n");
             disconnect(?s);
             ret 1;
         }
         if (t >= 8191) {
-            io.err("wget: the Location is too long\n");
+            io.emsg("wget: the Location is too long\n");
             disconnect(?s);
             ret 1;
         }
@@ -419,7 +419,7 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
     }
     val headers: parser.Feed = parser.feed(?response, ?head[0], hlen::usize);
     if (headers.status != parser.PARSE_HEADERS || headers.consumed != hlen::usize) {
-        io.err("wget: invalid HTTP response framing\n");
+        io.emsg("wget: invalid HTTP response framing\n");
         disconnect(?s);
         ret 1;
     }
@@ -461,20 +461,20 @@ fun get(ip4: u32, quiet: u8, output: *u8) i64 {
     disconnect(?s);
     if (fd != 1) { io.close(fd); }
     if (body_write_failed != 0) {
-        io.err("wget: writing the file failed\n");
+        io.emsg("wget: writing the file failed\n");
         ret 1;
     }
     if (lost != 0) {
-        io.err("wget: truncated, invalid, or unauthenticated response body\n");
+        io.emsg("wget: truncated, invalid, or unauthenticated response body\n");
         ret 1;
     }
     if (quiet == 0) {
         var nb: [24]u8;
-        io.err("wget: ");
+        io.emsg("wget: ");
         io.err(name);
-        io.err(" saved, ");
+        io.emsg(" saved, ");
         io.errn(?nb[0], io.fmt_dec(got, ?nb[0]));
-        io.err(" bytes\n");
+        io.emsg(" bytes\n");
     }
     ret 0;
 }
@@ -503,7 +503,7 @@ fun main(argc: i64, argv: **u8) i64 {
     if (argc - i != 1) { ret usage(); }
     val ulen: u64 = io.len(argv[i]);
     if (ulen >= 8191) {
-        io.err("wget: that URL is too long\n");
+        io.emsg("wget: that URL is too long\n");
         ret 1;
     }
     io.copy(?target[0], argv[i], ulen);
@@ -515,33 +515,33 @@ fun main(argc: i64, argv: **u8) i64 {
     for {
         val parsed: u8 = parse_url();
         if (parsed == 0) {
-            io.err("wget: not an http:// or https:// URL: ");
+            io.emsg("wget: not an http:// or https:// URL: ");
             io.err(?target[0]);
-            io.err("\n");
+            io.emsg("\n");
             ret 1;
         }
         if (https_only != 0 && encrypted == 0) {
-            io.err("wget: HTTPS is required for this download\n");
+            io.emsg("wget: HTTPS is required for this download\n");
             ret 1;
         }
         var ip4: u32 = 0;
         if (addr.lookup(?host[0], ?ip4) == 0) {
-            io.err("wget: ");
+            io.emsg("wget: ");
             io.err(?host[0]);
-            io.err(": not found\n");
+            io.emsg(": not found\n");
             ret 1;
         }
         val r: i64 = get(ip4, quiet, output);
         if (r != 2) { ret r; }
         hops = hops + 1;
         if (hops > max_hops) {
-            io.err("wget: too many redirects\n");
+            io.emsg("wget: too many redirects\n");
             ret 1;
         }
         if (quiet == 0) {
-            io.err("wget: redirected to ");
+            io.emsg("wget: redirected to ");
             io.err(?target[0]);
-            io.err("\n");
+            io.emsg("\n");
         }
     }
     ret 1;

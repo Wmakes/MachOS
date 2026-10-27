@@ -1,0 +1,168 @@
+# GNU gettext-compatible message lookup for MachOS programs. The active
+# message locale follows Linux/POSIX precedence: LC_ALL, LC_MESSAGES, LANG.
+# C and POSIX use the source text. Catalogs live at the conventional
+# /usr/share/locale/LOCALE/LC_MESSAGES/machos.mo path and fall back from
+# language_TERRITORY.codeset@modifier to language_TERRITORY, then language.
+
+use abi: sdk.abi;
+use sys: sdk.sys;
+use env: sdk.env;
+
+val CAP: u64 = 131072;
+var data: [131072]u8;
+var size: u64 = 0;
+var count: u64 = 0;
+var originals: u64 = 0;
+var translations: u64 = 0;
+var swapped: u8 = 0;
+var ready: u8 = 0;
+
+fun len(s: *u8) u64 {
+    var n: u64 = 0;
+    for (s[n] != 0) { n = n + 1; }
+    ret n;
+}
+
+fun equal(a: *u8, an: u64, b: *u8, bn: u64) u8 {
+    if (an != bn) { ret 0; }
+    var i: u64 = 0;
+    for (i < an) { if (a[i] != b[i]) { ret 0; } i = i + 1; }
+    ret 1;
+}
+
+fun raw32(at: u64) u32 {
+    if (at + 4 > size) { ret 0; }
+    ret data[at]::u32 | (data[at + 1]::u32 << 8) |
+        (data[at + 2]::u32 << 16) | (data[at + 3]::u32 << 24);
+}
+
+fun word(at: u64) u64 {
+    val v: u32 = raw32(at);
+    if (swapped == 0) { ret v::u64; }
+    ret (((v & 0x000000FF) << 24) | ((v & 0x0000FF00) << 8) |
+        ((v & 0x00FF0000) >> 8) | ((v & 0xFF000000) >> 24))::u64;
+}
+
+fun valid_name(s: *u8, n: u64) u8 {
+    if (n == 0 || n > 63) { ret 0; }
+    var i: u64 = 0;
+    for (i < n) {
+        val c: u8 = s[i];
+        if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+              (c >= 48 && c <= 57) || c == 95 || c == 45 || c == 46 || c == 64)) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+fun load(name: *u8, n: u64) u8 {
+    if (valid_name(name, n) == 0) { ret 0; }
+    var path: [128]u8;
+    val prefix: *u8 = "/usr/share/locale/";
+    val suffix: *u8 = "/LC_MESSAGES/machos.mo";
+    var p: u64 = 0;
+    var i: u64 = 0;
+    for (prefix[i] != 0) { path[p] = prefix[i]; p = p + 1; i = i + 1; }
+    i = 0;
+    for (i < n) { path[p] = name[i]; p = p + 1; i = i + 1; }
+    i = 0;
+    for (suffix[i] != 0) { path[p] = suffix[i]; p = p + 1; i = i + 1; }
+    path[p] = 0;
+    val h: u64 = sys.open(?path[0], p, abi.O_READ);
+    if (abi.is_err(h) != 0) { ret 0; }
+    size = 0;
+    for (size < CAP) {
+        val got: u64 = sys.read(h, ?data[size], CAP - size);
+        if (abi.is_err(got) != 0) { size = 0; brk; }
+        if (got == 0) { brk; }
+        size = size + got;
+    }
+    sys.close(h);
+    if (size < 28) { size = 0; ret 0; }
+    val magic: u32 = raw32(0);
+    if (magic == 0x950412DE) { swapped = 0; }
+    or (magic == 0xDE120495) { swapped = 1; }
+    or { size = 0; ret 0; }
+    count = word(8);
+    originals = word(12);
+    translations = word(16);
+    if (count > 4096 || originals + count * 8 > size || translations + count * 8 > size) {
+        size = 0;
+        ret 0;
+    }
+    ret 1;
+}
+
+fun initialize(name_: *u8) {
+    if (ready != 0) { ret; }
+    ready = 1;
+    val name: *u8 = name_;
+    if (name == nil || name[0] == 0) { ret; }
+    val n: u64 = len(name);
+    if ((n == 1 && name[0] == 67) || equal(name, n, "POSIX\0", 5) != 0 ||
+        equal(name, n, "C.UTF-8\0", 7) != 0) { ret; }
+    if (load(name, n) != 0) { ret; }
+    var dot: u64 = n;
+    var modifier: u64 = n;
+    var i: u64 = 0;
+    for (i < n) {
+        if (name[i] == 46 && dot == n) { dot = i; }
+        if (name[i] == 64 && modifier == n) { modifier = i; }
+        i = i + 1;
+    }
+    var base: u64 = dot;
+    if (modifier < base) { base = modifier; }
+    var language: u64 = base;
+    i = 0;
+    for (i < base) { if (name[i] == 95) { language = i; brk; } i = i + 1; }
+
+    # A Unix modifier describes a language variant. Try it both with and
+    # without the territory before falling back to the unmodified locale:
+    # sr_RS.UTF-8@latin -> sr_RS@latin -> sr@latin -> sr_RS -> sr.
+    if (modifier < n) {
+        var variant: [64]u8;
+        var used: u64 = 0;
+        i = 0;
+        for (i < base) { variant[used] = name[i]; used = used + 1; i = i + 1; }
+        i = modifier;
+        for (i < n) { variant[used] = name[i]; used = used + 1; i = i + 1; }
+        if (load(?variant[0], used) != 0) { ret; }
+        if (language < base) {
+            used = language;
+            i = modifier;
+            for (i < n) { variant[used] = name[i]; used = used + 1; i = i + 1; }
+            if (load(?variant[0], used) != 0) { ret; }
+        }
+    }
+    if (base != n && load(name, base) != 0) { ret; }
+    if (language != base) { load(name, language); }
+}
+
+# The translated NUL-terminated string, or the original when no catalog or
+# entry exists. Pointers returned from a catalog remain valid for the process.
+pub fun text_for(source: *u8, locale: *u8) *u8 {
+    initialize(locale);
+    if (size == 0) { ret source; }
+    val source_len: u64 = len(source);
+    var i: u64 = 0;
+    for (i < count) {
+        val on: u64 = word(originals + i * 8);
+        val oo: u64 = word(originals + i * 8 + 4);
+        if (oo + on < size && equal(source, source_len, ?data[oo], on) != 0) {
+            val tn: u64 = word(translations + i * 8);
+            val to: u64 = word(translations + i * 8 + 4);
+            if (tn != 0 && to + tn < size) { ret ?data[to]; }
+            ret source;
+        }
+        i = i + 1;
+    }
+    ret source;
+}
+
+# Lookup for programs using the small SDK runtime.
+pub fun text(source: *u8) *u8 {
+    var locale: *u8 = env.get("LC_ALL\0");
+    if (locale == nil || locale[0] == 0) { locale = env.get("LC_MESSAGES\0"); }
+    if (locale == nil || locale[0] == 0) { locale = env.get("LANG\0"); }
+    ret text_for(source, locale);
+}

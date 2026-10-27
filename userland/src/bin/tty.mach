@@ -10,11 +10,11 @@ fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 fun run(argc: u64, argv: **u8) u64 {
     val n: u64 = system.tty_number(io.STDIN);
     if (n != 0) {
-        io.out("/dev/tty");
+        io.msg("/dev/tty");
         io.dec(n);
         io.putc(10);
         ret 0;
     }
-    io.out("not a tty\n");
+    io.msg("not a tty\n");
     ret 1;
 }

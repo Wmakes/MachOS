@@ -26,9 +26,9 @@ fun run(argc: u64, argv: **u8) u64 {
             if ((fields & bit) != 0) {
                 if (first == 0) { io.putc(32); } first = 0;
                 var value: [64]u8;
-                if (bit == 1 || bit == 16) { io.out("MachOS"); }
+                if (bit == 1 || bit == 16) { io.msg("MachOS"); }
                 or (bit == 2) { system.line("/proc/sys/kernel/hostname", ?value[0], 64); io.out(?value[0]); }
-                or (bit == 8) { io.out("x86_64"); }
+                or (bit == 8) { io.msg("x86_64"); }
                 or { system.release(?value[0], 64); io.out(?value[0]); }
             }
             bit = bit * 2;
@@ -43,11 +43,11 @@ fun run(argc: u64, argv: **u8) u64 {
         var rel: [32]u8;
         system.line("/proc/sys/kernel/hostname", ?host[0], 64);
         system.release(?rel[0], 32);
-        io.out(" ");
+        io.msg(" ");
         io.out(?rel[0]);
-        io.out(" x86_64 on ");
+        io.msg(" x86_64 on ");
         io.out(?host[0]);
-        io.out(" (kernel and userland written in mach)");
+        io.msg(" (kernel and userland written in mach)");
     }
     io.putc(10);
     ret 0;

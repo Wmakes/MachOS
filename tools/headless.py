@@ -217,15 +217,15 @@ def main():
                     break
             elif kind == "login":
                 user, password = arg.split(":", 1)
-                wait_for("login: ")
+                wait_for("(?:login|logowanie): ")
                 type_line(user)
-                prompt = wait_for("New password: |Password: ")
+                prompt = wait_for("New password: |Password: |Nowe hasło: |Hasło: ")
                 type_line(password)
-                if prompt.group() == b"New password: ":
-                    wait_for("Again: ")
+                if prompt.group() in (b"New password: ", "Nowe hasło: ".encode()):
+                    wait_for("Again: |Ponownie: ")
                     type_line(password)
-                result = wait_for(r"Login incorrect|[^\r\n ]+@[^\r\n :]+:[^\r\n]*[$#] ")
-                if result.group() == b"Login incorrect":
+                result = wait_for(r"Login incorrect|Nieprawidłowe logowanie|[^\r\n ]+@[^\r\n :]+:[^\r\n]*[$#] ")
+                if result.group() in (b"Login incorrect", "Nieprawidłowe logowanie".encode()):
                     raise RuntimeError("login failed for " + user)
                 mark = result.start()  # leave the shell prompt for the next wait step
             elif kind == "send":

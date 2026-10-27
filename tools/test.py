@@ -610,6 +610,41 @@ def udp_echo():
     threading.Thread(target=serve, daemon=True).start()
 
 
+NTP_SERVER = []
+
+
+def ntp_server():
+    """A fresh disk and a deterministic NTPv4 server on host UDP port 8123."""
+    import socket as pysocket
+    sh(f"tools/mkimage.sh {PROFILE[0]} --fresh")
+    config = os.path.join(ROOT, "out", "headless", "ntp-time.conf")
+    with open(config, "w") as output:
+        output.write("timezone UTC0\nrtc utc\nntp 10.0.2.2:8123\n")
+    subprocess.run(["tools/put.sh", config, "/etc/time.conf", disk()], cwd=ROOT,
+                   check=True, stdout=subprocess.PIPE)
+    if NTP_SERVER:
+        return
+    srv = pysocket.socket(pysocket.AF_INET, pysocket.SOCK_DGRAM)
+    srv.setsockopt(pysocket.SOL_SOCKET, pysocket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 8123))
+    NTP_SERVER.append(srv)
+
+    def serve():
+        seconds = 1893456000 + 2208988800  # 2030-01-01 00:00:00 UTC
+        while True:
+            data, peer = srv.recvfrom(2048)
+            if len(data) < 48:
+                continue
+            answer = bytearray(48)
+            answer[0] = 0x24  # leap 0, version 4, server mode
+            answer[1] = 1
+            answer[24:32] = data[40:48]
+            answer[32:36] = seconds.to_bytes(4, "big")
+            answer[40:44] = seconds.to_bytes(4, "big")
+            srv.sendto(answer, peer)
+    threading.Thread(target=serve, daemon=True).start()
+
+
 HTTP_SERVER = []
 
 
@@ -1056,13 +1091,15 @@ TESTS = [
     ("usability", False, True,
      ["--prep", with_usability, "--boot", disk,
       "wait:" + P, "send:sh /bin/usability-test; echo usability-status $?\\n", "wait:" + P,
-      "send:config set hostname configured; config set ttys 1; uname -n\\n", "wait:" + P],
+      "send:config set hostname configured; config set locale pl_PL.UTF-8; config set keymap de; config set ttys 1; uname -n\\n", "wait:" + P],
      ["usability: all assertions passed", "usability-status 0", "config: saved", "machos"]),
 
     ("usability-reboot", True, True,
      ["wait:" + P,
-      "send:uname -n; config get ttys; test \"$(uname -n)\" = configured; echo boot-config-status $?\\n", "wait:" + P],
-     ["MachOS 0.9.3", "configured", "1", "boot-config-status 0"]),
+      "send:uname -n; config get ttys; env; cat /proc/sys/kernel/keymap; config set keymap de; env LC_ALL=C config set keymap de; env LANG=de_DE.UTF-8 stat /; env LANG=mt_MT.UTF-8 stat /; env LANG=sr_RS.UTF-8@latin stat /; test \"$(uname -n)\" = configured; echo boot-config-status $?\\n", "wait:" + P],
+     ["MachOS 0.9.3", "logowanie: ", "configured", "1", "LANG=pl_PL.UTF-8", "de",
+      "config: zapisano", "config: saved", "Verzeichnis", "direttorju", "fascikla",
+      "boot-config-status 0"]),
 
     ("boot", False, False,
      ["wait:" + P, "send:uname -a; ls /\\n", "wait:" + P],
@@ -1089,24 +1126,59 @@ TESTS = [
 
     ("line-editing", False, False,
      ["wait:" + P, "send:echo one\\n", "wait:" + P, "send:echo two\\n", "wait:" + P,
-      "send:\\x1b[A\\x1b[A", "sleep:0.3", "send:\\n", "wait:" + P,
+      "send:\\x1b[A", "sleep:0.1", "send:\\x1b[A", "sleep:0.3", "send:\\n", "sleep:0.3", "wait:" + P,
       "send:ech\\t", "sleep:0.3", "send:tab-ok\\n", "wait:" + P,
       "send:cat /etc/mo\\t", "sleep:0.3", "send:\\n", "wait:" + P,
-      "send:echo wrld\\x1b[D\\x1b[D\\x1b[Do\\n", "wait:" + P,
+      "keys:echo wrld<left><left><left>o<ret>", "sleep:0.3", "wait:" + P,
       "send:junk\\x03", "wait:" + P,
       "send:cat\\n", "sleep:0.3", "send:canon\\n", "sleep:0.3", "send:\\x03", "wait:" + P,
-      "keys:echo ps2 hist<ret>", "wait:" + P, "keys:<up><left><left><left><left>X<ret>", "wait:" + P],
+      "keys:echo ps2 hist<ret>", "wait:" + P, "keys:<up><left><left><left><left>X<ret>", "sleep:0.5", "wait:" + P],
      ["one", "two", "echo one\none", "tab-ok", "Welcome", "world", "junk^C", "canon\ncanon",
       "ps2 Xhist"]),
+
+    ("keymap", False, False,
+     ["wait:" + P, "send:echo de > /proc/sys/kernel/keymap\\n", "wait:" + P,
+      "keys:echo yzy<ret>", "wait:" + P,
+      "send:echo pl > /proc/sys/kernel/keymap\\n", "wait:" + P,
+      "keys:printf '<alt_r-a><alt_r-c><alt_r-e><alt_r-l><alt_r-n><alt_r-o><alt_r-s><alt_r-x><alt_r-z>' > /tmp/pl<ret>", "wait:" + P,
+      "keys:echo <alt_r-a><alt_r-e><left><alt_r-c><ret>", "sleep:1", "wait:ąćę",
+      "keys:printf '<alt_r-a><alt_r-c><backspace><alt_r-e>' > /tmp/pl-backspace; echo pl-backspace-done<ret>", "sleep:1", "wait:pl-backspace-done",
+      "keys:cat > /tmp/pl-canon<ret>", "sleep:0.5", "keys:<alt_r-a><alt_r-c><backspace><alt_r-e><ret><ctrl-d>", "sleep:0.8", "wait:" + P,
+      "send:wc -c /tmp/pl; sha256sum /tmp/pl; hd /tmp/pl-backspace; hd /tmp/pl-canon; echo us > /proc/sys/kernel/keymap\\n", "wait:" + P,
+      "keys:echo yzy<ret>", "wait:" + P],
+     ["zyz", "ąćę", "18 /tmp/pl", "ed24ca9d4d2cc14d3f818b58df7ba4f3428f923f7a98e75a4859561e71cc39c2",
+      "c4 85 c4 99", "c4 85 c4 99 0a", "yzy"]),
+
+    ("completion", False, False,
+     ["wait:" + P,
+      "send:expor\\t COMPLETED=yes\\n", "wait:" + P,
+      "send:env | grep -q COMPLETED=yes; echo builtin-completion $?\\n", "wait:" + P,
+      "send:ls --human-r\\t /bin/sh; echo switch-completion $?\\n", "wait:" + P,
+      "send:cd /tm\\t; pwd\\n", "wait:" + P,
+      "send:find /etc -in\\t '*motd*'; echo find-completion $?\\n", "wait:" + P,
+      "send:mkdir '/tmp/space dir'; printf spaced > '/tmp/space dir/a file'\\n", "wait:" + P,
+      "send:cd /tmp/space\\t; pwd\\n", "wait:" + P,
+      "send:cat \"a\\t; echo quoted-completion $?\\n", "wait:" + P,
+      "send:mkdir /tmp/tools; cp /bin/true /tmp/tools/customcmd; export PATH=/tmp/tools:/bin\\n", "wait:" + P,
+      "send:customc\\t; echo path-completion $?\\n", "wait:" + P,
+      "send:tar -cf /tmp/test-archive.tar /etc/motd\\n", "wait:" + P,
+      "send:tar --list --file=/tmp/test-arch\\t; echo attached-completion $?\\n", "wait:" + P],
+     ["builtin-completion 0", "switch-completion 0", "/tmp", "find-completion 0",
+      "/tmp/space dir", "spaced", "quoted-completion 0", "path-completion 0", "attached-completion 0"]),
 
     # a USB keyboard on xHCI with the PS/2 controller switched off; a key
     # held for 900 ms repeats
     ("usb-keyboard", False, False,
-     USB + ["wait:" + P, "keys:echo USB_kbd ok!<ret>", "wait:" + P,
+     USB + ["wait:" + P, "send:echo de > /proc/sys/kernel/keymap\\n", "wait:" + P,
+      "keys:echo yzy<ret>", "wait:" + P,
+      "send:echo pl > /proc/sys/kernel/keymap\\n", "wait:" + P,
+      "keys:printf '<alt_r-a>' | hd<ret>", "wait:" + P,
+      "send:echo us > /proc/sys/kernel/keymap\\n", "wait:" + P,
+      "keys:echo USB_kbd ok!<ret>", "wait:" + P,
       "keys:<up><left><left><left>X<ret>", "wait:" + P,
       "keys:junk<ctrl-c>", "wait:" + P,
       "keys:echo [<x 900>]<ret>", "wait:" + P],
-     ["usb: 1 xhci controller(s), 1 keyboard(s)", "USB_kbd ok!", "USB_kbd Xok!", "junk^C",
+     ["usb: 1 xhci controller(s), 1 keyboard(s)", "zyz", "c4 85", "USB_kbd ok!", "USB_kbd Xok!", "junk^C",
       "[xxxxxxxxxx"]),
 
     # the keyboard two hubs deep, next to a mouse
@@ -1122,6 +1194,14 @@ TESTS = [
       "send:\\x18", "sleep:0.5", "send:y", "sleep:0.5", "send:\\r", "sleep:0.8",
       "send:cat /tmp/t.txt; tty\\n", "wait:" + P],
      ["Replaced 1 occurrence", "second LINE\nhello world", "/dev/tty1"]),
+
+    ("nano-utf8", False, False,
+     ["wait:" + P, "send:echo pl > /proc/sys/kernel/keymap; nano /tmp/utf8.txt\\n", "sleep:1",
+      "keys:<alt_r-a><alt_r-c><alt_r-e><left><backspace>", "sleep:0.5",
+      "keys:<ctrl-s>", "sleep:0.8", "keys:<ctrl-x>", "wait:" + P,
+      "send:hd /tmp/utf8.txt; less /tmp/utf8.txt\\n", "sleep:0.8", "wait:ąę",
+      "keys:q", "wait:" + P],
+     ["c4 85 c4 99", "ąę"]),
 
     # six terminals: log in on tty2 with the keyboard, then back to tty1
     ("terminals", False, False,
@@ -1382,6 +1462,12 @@ TESTS = [
      ["address 10.0.2.15/24", "gateway 10.0.2.2", "dns 10.0.2.3", "method dhcp", "nameserver 10.0.2.3",
       "64 bytes from 10.0.2.2: icmp_seq=0", "64 bytes from 10.0.2.2: icmp_seq=1", "0% packet loss",
       "localhost has address 127.0.0.1", "echo: hello", "eth0", "10.0.2.2 52:55:0a:00:02:02"]),
+
+    ("ntp", False, False,
+     ["--prep", ntp_server, "--boot", disk,
+      "wait:" + P, "send:date -u; ntpdate -q -p 8123 10.0.2.2\\n", "wait:" + P],
+     ["ntpdate: time set to 1893456000 from 10.0.2.2", "2030-01-01 00:00:00 UTC",
+      "ntpdate: server time 1893456000 from 10.0.2.2"]),
 
     ("tcp", False, False,
      ["--prep", http_server, "--boot", disk,

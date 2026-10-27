@@ -132,9 +132,9 @@ fun run(argc: u64, argv: **u8) u64 {
     }
     var extra: u8 = 0; val more: i64 = io.read(h, ?extra, 1);
     if (h != io.STDIN) { io.close(h); }
-    if (more != 0) { io.err("sort: input exceeds capacity or read failed\n"); ret 1; }
+    if (more != 0) { io.emsg("sort: input exceeds capacity or read failed\n"); ret 1; }
     val count: u64 = text.split_lines(?buf[0], n, ?starts[0], ?lens[0], MAXL);
-    if (count == MAXL && starts[count - 1] + lens[count - 1] + 1 < n) { io.err("sort: too many lines\n"); ret 1; }
+    if (count == MAXL && starts[count - 1] + lens[count - 1] + 1 < n) { io.emsg("sort: too many lines\n"); ret 1; }
     var k: u64 = 0;
     for (k < count) {
         order[k] = k;

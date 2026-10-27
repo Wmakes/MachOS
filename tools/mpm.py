@@ -119,11 +119,22 @@ def stock(root, version, output, definitions):
     for name, group in groups.items():
         deps = group.get("dependencies", []) + ([] if name == "machos-base" else ["machos-base"])
         package_version = group.get("version", version)
+        tree_files = []
+        for tree in group.get("trees", []):
+            relative = Path(tree)
+            if relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
+                raise ValueError("invalid package tree: " + tree)
+            source = root / relative
+            if not source.is_dir():
+                raise ValueError("package tree is not a directory: " + tree)
+            tree_files += [dict(path="/" + str(path.relative_to(root)), config=False)
+                           for path in sorted(source.rglob("*")) if path.is_file()]
         definition = dict(name=name, version=package_version, protected=group.get("protected", False),
                           dependencies=[dict(name=d, version=">=" + version) for d in deps],
                           files=[dict(path="/bin/" + tool, config=False) for tool in group["tools"]]
                           + [dict(path="/etc/" + cfg, config=True) for cfg in group.get("configs", [])]
                           + [dict(path=path, config=False) for path in group.get("boot", []) if (root / path[1:]).is_file()]
+                          + tree_files
                           + ([dict(path="/" + str(p.relative_to(root)), config=False)
                               for p in sorted((root / "usr/share/licenses").rglob("*")) if p.is_file()]
                              if group.get("licenses", False) else []))

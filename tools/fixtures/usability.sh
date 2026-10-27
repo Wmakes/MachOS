@@ -151,6 +151,23 @@ config set autologin '' || exit 147
 config set network '192.168.1.20/24 192.168.1.1 1.1.1.1' || exit 148
 config get network > visible || exit 149
 test "$(cat visible)" = '192.168.1.20/24 192.168.1.1 1.1.1.1' || exit 150
+config set locale pl_PL.UTF-8 || exit 150
+config set locale eo.UTF-8 || exit 150
+test "$(config get locale)" = eo.UTF-8 || exit 150
+config set locale sr_RS.UTF-8@latin || exit 150
+test "$(config get locale)" = sr_RS.UTF-8@latin || exit 150
+config set locale pl_PL.UTF-8 || exit 150
+config set keymap uk || exit 150
+config set keymap pl || exit 150
+config set ntp 10.0.2.2:8123 || exit 150
+test "$(config get locale)" = pl_PL.UTF-8 || exit 150
+test "$(config get keymap)" = pl || exit 150
+test "$(config get ntp)" = 10.0.2.2:8123 || exit 150
+config set locale pl_pl.UTF-8 && exit 150
+config set locale sr_RS.UTF-8@Latin && exit 150
+config set keymap fr && exit 150
+config set ntp 'bad/name' && exit 150
+config set ntp time.example:70000 && exit 150
 config list | grep -q 'hostname testing' || exit 151
 cp original /etc/system.conf || exit 152
 cp original-time /etc/time.conf || exit 152
@@ -300,4 +317,24 @@ head -c0 input > visible || exit 39
 test -z "$(cat visible)" || exit 40
 tail -n0 input > visible || exit 41
 test -z "$(cat visible)" || exit 42
+mkdir -p search/Sub || exit 43
+printf found > search/Sub/ReadMe.TXT || exit 44
+test "$(find search -maxdepth 0)" = search || exit 45
+test "$(find search -mindepth 1 -maxdepth 1 -type d)" = search/Sub || exit 46
+test "$(find search -iname '*.txt')" = search/Sub/ReadMe.TXT || exit 47
+test "$(find search -ipath '*/sub/readme.txt')" = search/Sub/ReadMe.TXT || exit 48
+find search -type x && exit 49
+find search -maxdepth nope && exit 50
+tar --create --file=search.tar search || exit 51
+tar --list --file=search.tar | grep -q 'search/Sub/ReadMe.TXT' || exit 52
+tar -cfcopy.tar search || exit 53
+tar -tfcopy.tar | grep -q 'search/Sub/ReadMe.TXT' || exit 54
+find --help | grep -q usage: || exit 55
+tar --version | grep -q 0.9.3 || exit 56
+grep -r -n found search > visible || exit 57
+test "$(cat visible)" = 'search/Sub/ReadMe.TXT:1:found' || exit 58
+printf '%s\n' '-special' > search/Special || exit 59
+grep -e -special -e absent search/Special > visible || exit 60
+test "$(cat visible)" = '-special' || exit 61
+grep --recursive -q found search || exit 62
 echo usability: all assertions passed

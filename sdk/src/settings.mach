@@ -5,8 +5,8 @@ use sdk.io;
 use sdk.sys;
 
 pub fun path(key: *u8) *u8 {
-    if (io.streq(key, "hostname\0") != 0)                                                                                                                 { ret "/etc/system.conf\0"; }
-    if (io.streq(key, "timezone\0") != 0 || io.streq(key, "rtc\0") != 0)                                                                                  { ret "/etc/time.conf\0"; }
+    if (io.streq(key, "hostname\0") != 0 || io.streq(key, "locale\0") != 0 || io.streq(key, "keymap\0") != 0)                                          { ret "/etc/system.conf\0"; }
+    if (io.streq(key, "timezone\0") != 0 || io.streq(key, "rtc\0") != 0 || io.streq(key, "ntp\0") != 0)                                               { ret "/etc/time.conf\0"; }
     if (io.streq(key, "ttys\0") != 0 || io.streq(key, "autologin\0") != 0 || io.streq(key, "login.tries\0") != 0 || io.streq(key, "login.banner\0") != 0) { ret "/etc/login.conf\0"; }
     if (io.streq(key, "network\0") != 0)                                                                                                                  { ret "/etc/network.conf\0"; }
     if (io.streq(key, "se.timeout\0") != 0)                                                                                                               { ret "/etc/se.conf\0"; }

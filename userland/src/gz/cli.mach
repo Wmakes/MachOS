@@ -18,13 +18,13 @@ var keep: u8 = 0;
 
 fun complain(path: *u8, what: *u8) {
     io.err(prog);
-    io.err(": \0");
+    io.emsg(": \0");
     if (path != nil) {
         io.err(path);
-        io.err(": \0");
+        io.emsg(": \0");
     }
     io.err(what);
-    io.err("\n\0");
+    io.emsg("\n\0");
 }
 
 # transform handle `h` into handle `o`; whether it worked
@@ -138,9 +138,9 @@ pub fun main(argc: u64, argv: **u8, name: *u8, unzip: u8) u64 {
             or (c == 99) { to_stdout = 1; }
             or (c == 107) { keep = 1; }
             or {
-                io.err("usage: \0");
+                io.emsg("usage: \0");
                 io.err(prog);
-                io.err(" [-d] [-c] [-k] [FILE...]\n\0");
+                io.emsg(" [-d] [-c] [-k] [FILE...]\n\0");
                 ret 2;
             }
             k = k + 1;

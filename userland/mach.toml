@@ -454,6 +454,14 @@ targets = ["machos"]
 link = []
 need = []
 
+[artifact.ntpdate]
+kind = "bin"
+entry = "bin/ntpdate.mach"
+out = "bin/ntpdate"
+targets = ["machos"]
+link = []
+need = []
+
 [artifact.partname]
 kind = "bin"
 entry = "bin/partname.mach"

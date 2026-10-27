@@ -20,7 +20,7 @@ fun id_of(s: *u8, n: u64, group: u8) u64 {
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     if (argc < 3) {
-        io.err("usage: chown OWNER[:GROUP] FILE...\n\0");
+        io.emsg("usage: chown OWNER[:GROUP] FILE...\n\0");
         ret 2;
     }
     val spec: *u8 = argv[1];
@@ -32,7 +32,7 @@ fun main(argc: u64, argv: **u8) u64 {
     if (colon > 0) { uid = id_of(spec, colon, 0); }
     if (colon + 1 < sn) { gid = id_of(?spec[colon + 1], sn - colon - 1, 1); }
     if (uid == abi.NO_ID - 1 || (colon + 1 < sn && gid == abi.NO_ID)) {
-        io.err("chown: no such user or group\n\0");
+        io.emsg("chown: no such user or group\n\0");
         ret 1;
     }
     var status: u64 = 0;

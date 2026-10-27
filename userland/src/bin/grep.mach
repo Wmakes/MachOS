@@ -2,24 +2,34 @@
 
 use io: userland.lib.cli;
 use opt: userland.lib.options;
+use os: std.system.os;
 use std.runtime;
 
 var invert: u8 = 0; var count_only: u8 = 0; var quiet: u8 = 0;
 var insensitive: u8 = 0; var exact: u8 = 0; var numbered: u8 = 0;
 var filenames: u8 = 0; var labels: u8 = 0;
-var pat: *u8 = nil; var plen: u64 = 0;
+var recursive: u8 = 0;
+var patterns: [16]*u8; var pattern_lens: [16]u64; var pattern_count: u64 = 0;
 var matches: u64 = 0; var file_matches: u64 = 0; var line_number: u64 = 0;
 var buf: [8192]u8; var line: [65536]u8;
 
 fun fold(c: u8) u8 { if (insensitive != 0 && c >= 65 && c <= 90) { ret c + 32; } ret c; }
 fun contains(n: u64) u8 {
-    if (plen > n || (exact != 0 && plen != n)) { ret 0; }
-    var i: u64 = 0;
-    for (i + plen <= n) {
-        var j: u64 = 0;
-        for (j < plen && fold(line[i + j]) == fold(pat[j])) { j = j + 1; }
-        if (j == plen) { ret 1; }
-        if (exact != 0) { ret 0; } i = i + 1;
+    var p: u64 = 0;
+    for (p < pattern_count) {
+        val pat: *u8 = patterns[p];
+        val plen: u64 = pattern_lens[p];
+        if (plen <= n && (exact == 0 || plen == n)) {
+            var i: u64 = 0;
+            for (i + plen <= n) {
+                var j: u64 = 0;
+                for (j < plen && fold(line[i + j]) == fold(pat[j])) { j = j + 1; }
+                if (j == plen) { ret 1; }
+                if (exact != 0) { brk; }
+                i = i + 1;
+            }
+        }
+        p = p + 1;
     }
     ret 0;
 }
@@ -46,7 +56,7 @@ fun scan(h: i64, name: *u8, display: *u8) u8 {
                 check(n, display); n = 0;
                 if (quiet != 0 && file_matches != 0) { ret 1; }
             } or {
-                if (n == 65536) { io.err("grep: input line exceeds 65536 bytes\n"); ret 0; }
+                if (n == 65536) { io.emsg("grep: input line exceeds 65536 bytes\n"); ret 0; }
                 line[n] = buf[i]; n = n + 1;
             }
             i = i + 1;
@@ -59,37 +69,88 @@ fun scan(h: i64, name: *u8, display: *u8) u8 {
     }
     ret 1;
 }
+
+fun scan_path(path: *u8, status: *u64) {
+    var st: os.stat_t;
+    val sr: i64 = io.lstat(path, ?st);
+    if (sr < 0) { io.fail("grep", path, sr); @status = 2; ret; }
+    if ((st.st_mode & os.S_IFMT) == os.S_IFLNK) { ret; }
+    if (io.kind_of(st.st_mode) == io.KIND_DIR && recursive != 0) {
+        var dir: io.Dir;
+        val dr: i64 = io.dir_open(?dir, path);
+        if (dr < 0) { io.fail("grep", path, dr); @status = 2; ret; }
+        val n: u64 = io.len(path);
+        for (io.dir_next(?dir) > 0) {
+            if (n + dir.len + 2 >= 256) { io.emsg("grep: path too long\n"); @status = 2; cnt; }
+            var child: [256]u8;
+            io.copy(?child[0], path, n);
+            var at: u64 = n;
+            if (at == 0 || child[at - 1] != 47) { child[at] = 47; at = at + 1; }
+            io.copy(?child[at], dir.name, dir.len);
+            child[at + dir.len] = 0;
+            scan_path(?child[0], status);
+            if (quiet != 0 && matches != 0) { brk; }
+        }
+        io.dir_close(?dir);
+        ret;
+    }
+    val h: i64 = io.open_read(path);
+    if (h < 0) { io.fail("grep", path, h); @status = 2; ret; }
+    var label: *u8 = nil;
+    if (labels == 2 || (labels == 0 && recursive != 0)) { label = path; }
+    if (scan(h, path, label) == 0) { @status = 2; }
+    io.close(h);
+}
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 fun run(argc: u64, argv: **u8) u64 {
-    if (opt.standard(argc, argv, "grep", "usage: grep [-FivcxnqlHh] [--] TEXT [FILE...]\n  Literal text matching (ASCII case folding).\n  -F, --fixed-strings  literal pattern\n  -i, --ignore-case    ignore ASCII case\n  -v, --invert-match   select nonmatching lines\n  -x, --line-regexp    match the whole line\n  -c, --count          counts per input\n  -n, --line-number    prefix line numbers\n  -q, --quiet          exit status only\n  -l, --files-with-matches  print matching filenames\n  -H, --with-filename / -h, --no-filename  filename prefixes") != 0) { ret 0; }
+    if (opt.standard(argc, argv, "grep", "usage: grep [-FivcxnqlHhr] [-e PATTERN] [--] TEXT [FILE...]\n  Literal text matching (ASCII case folding).\n  -F, --fixed-strings  literal pattern\n  -i, --ignore-case    ignore ASCII case\n  -v, --invert-match   select nonmatching lines\n  -x, --line-regexp    match the whole line\n  -c, --count          counts per input\n  -n, --line-number    prefix line numbers\n  -q, --quiet          exit status only\n  -l, --files-with-matches  print matching filenames\n  -r, --recursive     descend into directories\n  -e, --regexp        add a literal pattern\n  -H, --with-filename / -h, --no-filename  filename prefixes") != 0) { ret 0; }
     var p: opt.Parser; opt.init(?p, argc, argv);
     for {
-        val c: u8 = opt.next(?p, "fixed-strings=F,ignore-case=i,invert-match=v,line-regexp=x,count=c,line-number=n,quiet=q,silent=q,files-with-matches=l,with-filename=H,no-filename=h");
+        val c: u8 = opt.next(?p, "fixed-strings=F,ignore-case=i,invert-match=v,line-regexp=x,count=c,line-number=n,quiet=q,silent=q,files-with-matches=l,recursive=r,regexp=e,with-filename=H,no-filename=h");
         if (c == 0) { brk; }
         if (c == 70) { }
         or (c == 105) { insensitive = 1; } or (c == 118) { invert = 1; }
         or (c == 120) { exact = 1; } or (c == 99) { count_only = 1; }
         or (c == 110) { numbered = 1; } or (c == 113) { quiet = 1; }
         or (c == 108) { filenames = 1; } or (c == 72) { labels = 2; }
-        or (c == 104) { labels = 1; } or { p.bad = 1; }
+        or (c == 104) { labels = 1; } or (c == 114) { recursive = 1; }
+        or (c == 101) {
+            val value: *u8 = opt.argument(?p);
+            if (value == nil || pattern_count == 16) { p.bad = 1; }
+            or {
+                patterns[pattern_count] = value;
+                pattern_lens[pattern_count] = io.len(value);
+                pattern_count = pattern_count + 1;
+            }
+        } or { p.bad = 1; }
     }
-    if (p.bad != 0 || p.at == argc) { ret opt.error("grep"); }
-    pat = argv[p.at]; plen = io.len(pat); p.at = p.at + 1;
+    if (p.bad != 0 || (pattern_count == 0 && p.at == argc)) { ret opt.error("grep"); }
+    if (pattern_count == 0) {
+        patterns[0] = argv[p.at]; pattern_lens[0] = io.len(argv[p.at]); pattern_count = 1;
+        p.at = p.at + 1;
+    }
     var status: u64 = 0; val many: u8 = (argc - p.at > 1)::u8;
     if (p.at == argc) {
-        var label: *u8 = nil; if (labels == 2) { label = "(standard input)"; }
-        if (scan(io.STDIN, "(standard input)", label) == 0) { status = 2; }
+        if (recursive != 0) { scan_path(".", ?status); }
+        or {
+            var label: *u8 = nil; if (labels == 2) { label = "(standard input)"; }
+            if (scan(io.STDIN, "(standard input)", label) == 0) { status = 2; }
+        }
     }
     for (p.at < argc) {
-        val path: *u8 = argv[p.at]; var h: i64 = io.STDIN;
-        if (io.streq(path, "-") == 0) { h = io.open_read(path); }
-        if (h < 0) { io.fail("grep", path, h); status = 2; }
+        val path: *u8 = argv[p.at];
+        if (io.streq(path, "-") == 0 && recursive != 0) { scan_path(path, ?status); }
         or {
-            var label: *u8 = nil; if (labels == 2 || (labels == 0 && many != 0)) { label = path; }
-            if (scan(h, path, label) == 0) { status = 2; }
-            if (h != io.STDIN) { io.close(h); }
-            if (quiet != 0 && matches != 0) { ret 0; }
+            var h: i64 = io.STDIN;
+            if (io.streq(path, "-") == 0) { h = io.open_read(path); }
+            if (h < 0) { io.fail("grep", path, h); status = 2; }
+            or {
+                var label: *u8 = nil; if (labels == 2 || (labels == 0 && many != 0)) { label = path; }
+                if (scan(h, path, label) == 0) { status = 2; }
+                if (h != io.STDIN) { io.close(h); }
+                if (quiet != 0 && matches != 0) { ret 0; }
+            }
         }
         p.at = p.at + 1;
     }

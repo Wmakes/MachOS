@@ -56,7 +56,7 @@ fun problem(what: *u8, n: u64, rest: *u8) {
         io.dec(n);
     }
     io.out(rest);
-    if (fix != 0) { io.out(" (fixed)\0"); }
+    if (fix != 0) { io.msg(" (fixed)\0"); }
     io.putc(10);
     if (fix != 0) { fixed = fixed + 1; }
 }
@@ -68,7 +68,7 @@ fun unfixable(what: *u8, n: u64, rest: *u8) {
     io.out(what);
     io.dec(n);
     io.out(rest);
-    io.out(" (not fixed)\n\0");
+    io.msg(" (not fixed)\n\0");
 }
 
 fun mark(b: u64) u8 {
@@ -378,7 +378,7 @@ fun pass3() {
                     refs[ino] = 1;
                     if (inode_kind[ino] == 2) { refs[11] = refs[11] + 1; } # its ".." now
                 } or {
-                    io.out("  lost+found is full\n\0");
+                    io.msg("  lost+found is full\n\0");
                     fixed = fixed - 1;
                 }
             }
@@ -478,7 +478,7 @@ fun main(argc: u64, argv: **u8) u64 {
         i = i + 1;
     }
     if (i + 1 != argc) {
-        io.err("usage: fsck [-y] PART\n\0");
+        io.emsg("usage: fsck [-y] PART\n\0");
         ret 8;
     }
     val path: *u8 = argv[i];
@@ -486,13 +486,13 @@ fun main(argc: u64, argv: **u8) u64 {
     disk = bd.open_disk("fsck\0", path, fix);
     if (abi.is_err(disk) != 0) { ret 8; }
     if (bd.pread(disk, 1024, ?sb[0], 1024) == 0 || g16(?sb[0], 56) != 0xEF53) {
-        io.err("fsck: no ext2 filesystem on \0");
+        io.emsg("fsck: no ext2 filesystem on \0");
         io.err(path);
-        io.err("\n\0");
+        io.emsg("\n\0");
         ret 8;
     }
     if (g32(?sb[0], 24) != 2) {
-        io.err("fsck: only 4 KiB blocks are supported\n\0");
+        io.emsg("fsck: only 4 KiB blocks are supported\n\0");
         ret 8;
     }
     blocks = g32(?sb[0], 4);
@@ -504,21 +504,21 @@ fun main(argc: u64, argv: **u8) u64 {
         first_ino = g32(?sb[0], 84);
     }
     if (bpg == 0 || ipg == 0 || blocks > MAX_BLOCKS || ninodes >= MAX_INODES || isz < 128) {
-        io.err("fsck: the superblock makes no sense\n\0");
+        io.emsg("fsck: the superblock makes no sense\n\0");
         ret 8;
     }
     groups = (blocks - g32(?sb[0], 20) + bpg - 1) / bpg;
     if (groups * 32 > 131072 || bd.pread(disk, (g32(?sb[0], 20) + 1) * BS, ?gdt[0], groups * 32) == 0) {
-        io.err("fsck: cannot read the group descriptors\n\0");
+        io.emsg("fsck: cannot read the group descriptors\n\0");
         ret 8;
     }
     if (fix != 0) {
         # writes go straight to the device; a mounted filesystem refuses them
         var probe: [512]u8;
         if (bd.pread(disk, 0, ?probe[0], 512) == 0 || bd.pwrite(disk, 0, ?probe[0], 512) == 0) {
-            io.err("fsck: \0");
+            io.emsg("fsck: \0");
             io.err(path);
-            io.err(" is mounted; unmount it (for the root: boot MachOS (rescue))\n\0");
+            io.emsg(" is mounted; unmount it (for the root: boot MachOS (rescue))\n\0");
             ret 8;
         }
     }
@@ -545,29 +545,29 @@ fun main(argc: u64, argv: **u8) u64 {
         k = k + 1;
     }
     io.out(path);
-    io.out(": \0");
+    io.msg(": \0");
     io.dec(files);
-    io.out(" files, \0");
+    io.msg(" files, \0");
     io.dec(blocks - g32(?sb[0], 12));
     io.putc(47);
     io.dec(blocks);
-    io.out(" blocks used\0");
+    io.msg(" blocks used\0");
     if (errors == 0) {
-        io.out(", clean\n\0");
+        io.msg(", clean\n\0");
         ret 0;
     }
-    io.out(", \0");
+    io.msg(", \0");
     io.dec(errors);
     if (fix != 0 && left == 0) {
-        io.out(" problems fixed\n\0");
+        io.msg(" problems fixed\n\0");
         ret 1;
     }
     if (fix != 0) {
-        io.out(" problems, \0");
+        io.msg(" problems, \0");
         io.dec(left);
-        io.out(" could not be fixed\n\0");
+        io.msg(" could not be fixed\n\0");
         ret 4;
     }
-    io.out(" problems (run fsck -y to fix them)\n\0");
+    io.msg(" problems (run fsck -y to fix them)\n\0");
     ret 4;
 }

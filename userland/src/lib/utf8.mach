@@ -1,0 +1,96 @@
+# Small UTF-8 boundary and encoding helpers for terminal programs. Invalid
+# input advances by one byte so editors never get stuck on damaged files.
+
+pub fun continuation(c: u8) u8 { ret ((c & 0xC0) == 0x80)::u8; }
+
+pub fun sequence(data: *u8, at: u64, len: u64) u64 {
+    if (at >= len) { ret 0; }
+    val first: u8 = data[at];
+    if (first < 0x80) { ret 1; }
+    var n: u64 = 0;
+    if (first >= 0xC2 && first <= 0xDF) { n = 2; }
+    or (first >= 0xE0 && first <= 0xEF) { n = 3; }
+    or (first >= 0xF0 && first <= 0xF4) { n = 4; }
+    or { ret 1; }
+    if (at + n > len) { ret 1; }
+    var i: u64 = 1;
+    for (i < n) {
+        if (continuation(data[at + i]) == 0) { ret 1; }
+        i = i + 1;
+    }
+    if (first == 0xE0 && data[at + 1] < 0xA0) { ret 1; }
+    if (first == 0xED && data[at + 1] >= 0xA0) { ret 1; }
+    if (first == 0xF0 && data[at + 1] < 0x90) { ret 1; }
+    if (first == 0xF4 && data[at + 1] >= 0x90) { ret 1; }
+    ret n;
+}
+
+pub fun next(data: *u8, at: u64, len: u64) u64 {
+    val n: u64 = sequence(data, at, len);
+    if (n == 0) { ret len; }
+    ret at + n;
+}
+
+pub fun previous(data: *u8, at: u64) u64 {
+    if (at == 0) { ret 0; }
+    var i: u64 = at - 1;
+    for (i > 0 && continuation(data[i]) != 0) { i = i - 1; }
+    ret i;
+}
+
+pub fun decode(data: *u8, at: u64, len: u64) u32 {
+    val n: u64 = sequence(data, at, len);
+    if (n == 0) { ret 0; }
+    if (n == 1) {
+        if (data[at] < 0x80) { ret data[at]::u32; }
+        ret 0xFFFD;
+    }
+    if (n == 2) { ret ((data[at] & 0x1F)::u32 << 6) | (data[at + 1] & 0x3F)::u32; }
+    if (n == 3) {
+        ret ((data[at] & 0x0F)::u32 << 12) | ((data[at + 1] & 0x3F)::u32 << 6) |
+            (data[at + 2] & 0x3F)::u32;
+    }
+    ret ((data[at] & 0x07)::u32 << 18) | ((data[at + 1] & 0x3F)::u32 << 12) |
+        ((data[at + 2] & 0x3F)::u32 << 6) | (data[at + 3] & 0x3F)::u32;
+}
+
+pub fun width(cp: u32) u64 {
+    if ((cp >= 0x0300 && cp <= 0x036F) || (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+        (cp >= 0x1DC0 && cp <= 0x1DFF) || (cp >= 0x20D0 && cp <= 0x20FF) ||
+        (cp >= 0xFE20 && cp <= 0xFE2F)) { ret 0; }
+    ret 1;
+}
+
+pub fun count(data: *u8, start: u64, end: u64) u64 {
+    var n: u64 = 0;
+    var i: u64 = start;
+    for (i < end) {
+        n = n + width(decode(data, i, end));
+        i = next(data, i, end);
+    }
+    ret n;
+}
+
+pub fun encode(cp: u32, out: *u8) u64 {
+    if (cp <= 0x7F) { out[0] = cp::u8; ret 1; }
+    if (cp <= 0x7FF) {
+        out[0] = (0xC0 | (cp >> 6))::u8;
+        out[1] = (0x80 | (cp & 0x3F))::u8;
+        ret 2;
+    }
+    if (cp >= 0xD800 && cp <= 0xDFFF) { ret 0; }
+    if (cp <= 0xFFFF) {
+        out[0] = (0xE0 | (cp >> 12))::u8;
+        out[1] = (0x80 | ((cp >> 6) & 0x3F))::u8;
+        out[2] = (0x80 | (cp & 0x3F))::u8;
+        ret 3;
+    }
+    if (cp <= 0x10FFFF) {
+        out[0] = (0xF0 | (cp >> 18))::u8;
+        out[1] = (0x80 | ((cp >> 12) & 0x3F))::u8;
+        out[2] = (0x80 | ((cp >> 6) & 0x3F))::u8;
+        out[3] = (0x80 | (cp & 0x3F))::u8;
+        ret 4;
+    }
+    ret 0;
+}

@@ -1,0 +1,130 @@
+# Console keyboard layouts shared by PS/2 and USB boot keyboards. Names follow
+# Linux console/XKB conventions for the layouts MachOS currently implements.
+
+val US: u8 = 0;
+val GB: u8 = 1;
+val DE: u8 = 2;
+val PL: u8 = 3;
+
+var selected: u8 = US;
+
+pub fun set(name: *u8, n: u64) u8 {
+    if (n == 2 && name[0] == 117 && name[1] == 115) { selected = US; ret 1; }
+    if (n == 2 && name[0] == 103 && name[1] == 98) { selected = GB; ret 1; }
+    if (n == 2 && name[0] == 117 && name[1] == 107) { selected = GB; ret 1; }
+    if (n == 2 && name[0] == 100 && name[1] == 101) { selected = DE; ret 1; }
+    if (n == 2 && name[0] == 112 && name[1] == 108) { selected = PL; ret 1; }
+    ret 0;
+}
+
+pub fun name() *u8 {
+    if (selected == GB) { ret "gb\0"; }
+    if (selected == DE) { ret "de\0"; }
+    if (selected == PL) { ret "pl\0"; }
+    ret "us\0";
+}
+
+fun letter(usage: u8) u8 {
+    val letters: *u8 = "abcdefghijklmnopqrstuvwxyz\0";
+    var c: u8 = letters[(usage - 4)::u64];
+    if (selected == DE) {
+        if (c == 121) { c = 122; }
+        or (c == 122) { c = 121; }
+    }
+    ret c;
+}
+
+fun polish_altgr(usage: u8, upper: u8) u32 {
+    var cp: u32 = 0;
+    if (usage == 0x04) { cp = 0x0105; }      # a -> ą
+    or (usage == 0x06) { cp = 0x0107; }      # c -> ć
+    or (usage == 0x08) { cp = 0x0119; }      # e -> ę
+    or (usage == 0x0F) { cp = 0x0142; }      # l -> ł
+    or (usage == 0x11) { cp = 0x0144; }      # n -> ń
+    or (usage == 0x12) { cp = 0x00F3; }      # o -> ó
+    or (usage == 0x16) { cp = 0x015B; }      # s -> ś
+    or (usage == 0x1B) { cp = 0x017A; }      # x -> ź
+    or (usage == 0x1D) { cp = 0x017C; }      # z -> ż
+    if (upper != 0) {
+        if (cp == 0x0105) { cp = 0x0104; }
+        or (cp == 0x0107) { cp = 0x0106; }
+        or (cp == 0x0119) { cp = 0x0118; }
+        or (cp == 0x0142) { cp = 0x0141; }
+        or (cp == 0x0144) { cp = 0x0143; }
+        or (cp == 0x00F3) { cp = 0x00D3; }
+        or (cp == 0x015B) { cp = 0x015A; }
+        or (cp == 0x017A) { cp = 0x0179; }
+        or (cp == 0x017C) { cp = 0x017B; }
+    }
+    ret cp;
+}
+
+fun german_altgr(usage: u8) u32 {
+    if (usage == 0x14) { ret 64; }       # q -> @
+    if (usage == 0x08) { ret 0x20AC; }   # e -> euro
+    if (usage == 0x10) { ret 0x00B5; }   # m -> micro
+    if (usage == 0x24) { ret 123; }      # 7 -> {
+    if (usage == 0x25) { ret 91; }       # 8 -> [
+    if (usage == 0x26) { ret 93; }       # 9 -> ]
+    if (usage == 0x27) { ret 125; }      # 0 -> }
+    if (usage == 0x2D) { ret 92; }       # sharp-s key -> backslash
+    if (usage == 0x30) { ret 126; }      # plus key -> tilde
+    ret 0;
+}
+
+# One HID boot-keyboard usage to one Unicode codepoint.
+pub fun character(usage: u8, shift: u8, caps: u8, altgr: u8) u32 {
+    if (altgr != 0 && selected == PL) { ret polish_altgr(usage, shift ^ caps); }
+    if (altgr != 0 && selected == DE) { ret german_altgr(usage); }
+    if (altgr != 0) { ret 0; }
+    if (usage >= 4 && usage <= 0x1D) {
+        var c: u8 = letter(usage);
+        if ((shift ^ caps) != 0) { c = c - 32; }
+        ret c::u32;
+    }
+    if (usage >= 0x1E && usage <= 0x27) {
+        val normal: *u8 = "1234567890\0";
+        var shifted: *u8 = "!@#$%^&*()\0";
+        if (selected == GB) { shifted = "!\"#$%^&*()\0"; }
+        if (selected == DE) { shifted = "!\"#$%&/()=\0"; }
+        if (shift != 0) { ret shifted[(usage - 0x1E)::u64]::u32; }
+        ret normal[(usage - 0x1E)::u64]::u32;
+    }
+    if (usage == 0x2C) { ret 32; }
+    if (selected == DE && usage >= 0x2D && usage <= 0x38) {
+        val normal: [12]u32 = [12]u32{0x00DF, 0x00B4, 0x00FC, 43, 35, 60, 0x00F6, 0x00E4, 94, 44, 46, 45};
+        val shifted: [12]u32 = [12]u32{63, 96, 0x00DC, 42, 39, 62, 0x00D6, 0x00C4, 0x00B0, 59, 58, 95};
+        val at: u64 = (usage - 0x2D)::u64;
+        if (shift != 0) { ret shifted[at]; }
+        ret normal[at];
+    }
+    if (usage >= 0x2D && usage <= 0x38) {
+        var normal: *u8 = "-=[]\\#;'`,./\0";
+        var shifted: *u8 = "_+{}|~:\"~<>?\0";
+        if (selected == GB) {
+            normal = "-=[]\\#;'`,./\0";
+            shifted = "_+{}|~:@~<>?\0";
+        }
+        if (shift != 0) { ret shifted[(usage - 0x2D)::u64]::u32; }
+        ret normal[(usage - 0x2D)::u64]::u32;
+    }
+    ret 0;
+}
+
+# PS/2 set-1 make code to the equivalent USB HID usage.
+pub fun ps2_usage(code: u8) u8 {
+    if (code >= 2 && code <= 11) { ret 0x1E + code - 2; }
+    if (code == 0x0C) { ret 0x2D; } if (code == 0x0D) { ret 0x2E; }
+    val row1: *u8 = "\x14\x1a\x08\x15\x17\x1c\x18\x0c\x12\x13\0";
+    if (code >= 0x10 && code <= 0x19) { ret row1[(code - 0x10)::u64]; }
+    if (code == 0x1A) { ret 0x2F; } if (code == 0x1B) { ret 0x30; }
+    val row2: *u8 = "\x04\x16\x07\x09\x0a\x0b\x0d\x0e\x0f\0";
+    if (code >= 0x1E && code <= 0x26) { ret row2[(code - 0x1E)::u64]; }
+    if (code == 0x27) { ret 0x33; } if (code == 0x28) { ret 0x34; }
+    if (code == 0x29) { ret 0x35; } if (code == 0x2B) { ret 0x31; }
+    val row3: *u8 = "\x1d\x1b\x06\x19\x05\x11\x10\0";
+    if (code >= 0x2C && code <= 0x32) { ret row3[(code - 0x2C)::u64]; }
+    if (code == 0x33) { ret 0x36; } if (code == 0x34) { ret 0x37; }
+    if (code == 0x35) { ret 0x38; } if (code == 0x39) { ret 0x2C; }
+    ret 0;
+}

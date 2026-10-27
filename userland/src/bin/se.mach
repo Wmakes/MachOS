@@ -12,11 +12,11 @@ use sdk.users;
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     if (argc < 2 || io.streq(argv[1], "--help\0") != 0) {
-        io.out("se: superuser exec\nusage: se [-k | -v | COMMAND [ARG...]]\n  -k forget authentication; -v authenticate without running a command\n\0");
+        io.msg("se: superuser exec\nusage: se [-k | -v | COMMAND [ARG...]]\n  -k forget authentication; -v authenticate without running a command\n\0");
         ret 0;
     }
     if (sys.geteuid() != 0) {
-        io.err("se: not installed set-user-id root\n\0");
+        io.emsg("se: not installed set-user-id root\n\0");
         ret 1;
     }
     val uid:  u64 = sys.getuid();
@@ -28,13 +28,13 @@ fun main(argc: u64, argv: **u8) u64 {
     }
     if (uid != 0) {
         if (users.in_group(?user, "admin\0") == 0) {
-            io.err("se: user is not an administrator\n\0");
+            io.emsg("se: user is not an administrator\n\0");
             ret 1;
         }
         var timeout: u64 = settings.number("se.timeout\0", 300);
         if (timeout > 300) { timeout = 300; }
         if (auth.approve(?user, timeout, (io.streq(argv[1], "-v\0") != 0)::u8) == 0) {
-            io.err("se: authentication failed\n\0");
+            io.emsg("se: authentication failed\n\0");
             ret 1;
         }
     }

@@ -62,10 +62,10 @@ fun show(n: u64) {
             at = at + 1; # ;
             if (seq >= next && lv <= max_level) {
                 var paint: u8 = 0;
-                if (color != 0 && lv <= 3) { io.out("\x1b[91m\0"); paint = 1; }
-                or (color != 0 && lv == 4) { io.out("\x1b[93m\0"); paint = 1; }
+                if (color != 0 && lv <= 3) { io.msg("\x1b[91m\0"); paint = 1; }
+                or (color != 0 && lv == 4) { io.msg("\x1b[93m\0"); paint = 1; }
                 if (no_time == 0) {
-                    if (color != 0 && paint == 0) { io.out("\x1b[90m\0"); }
+                    if (color != 0 && paint == 0) { io.msg("\x1b[90m\0"); }
                     io.putc(91);
                     io.dec_pad(us / 1000000, 5);
                     io.putc(46);
@@ -78,8 +78,8 @@ fun show(n: u64) {
                         x = x / 10;
                     }
                     io.outn(?frac[0], 6);
-                    io.out("] \0");
-                    if (color != 0 && paint == 0) { io.out("\x1b[0m\0"); }
+                    io.msg("] \0");
+                    if (color != 0 && paint == 0) { io.msg("\x1b[0m\0"); }
                 }
                 if (levels != 0) {
                     io.out(NAMES[lv]);
@@ -88,10 +88,10 @@ fun show(n: u64) {
                         io.putc(32);
                         p = p + 1;
                     }
-                    io.out(": \0");
+                    io.msg(": \0");
                 }
                 io.outn(?buf[at], e - at);
-                if (paint != 0) { io.out("\x1b[0m\0"); }
+                if (paint != 0) { io.msg("\x1b[0m\0"); }
                 io.putc(10);
             }
             if (seq >= next) { next = seq + 1; }
@@ -110,7 +110,7 @@ fun clear_log() u8 {
 }
 
 fun usage() u64 {
-    io.err("usage: dmesg [-t] [-x] [-r] [-l LEVEL] [-w] [-c|-C]\n\0");
+    io.emsg("usage: dmesg [-t] [-x] [-r] [-l LEVEL] [-w] [-c|-C]\n\0");
     ret 2;
 }
 
@@ -139,9 +139,9 @@ fun run(argc: u64, argv: **u8) u64 {
                 i = i + 1;
                 max_level = level_of(argv[i]);
                 if (max_level == 99) {
-                    io.err("dmesg: unknown level \0");
+                    io.emsg("dmesg: unknown level \0");
                     io.err(argv[i]);
-                    io.err("\n\0");
+                    io.emsg("\n\0");
                     ret 2;
                 }
                 brk;
@@ -152,7 +152,7 @@ fun run(argc: u64, argv: **u8) u64 {
     }
     if (clear_only != 0) {
         if (clear_log() == 0) {
-            io.err("dmesg: only root may clear the log\n\0");
+            io.emsg("dmesg: only root may clear the log\n\0");
             ret 1;
         }
         ret 0;
@@ -160,7 +160,7 @@ fun run(argc: u64, argv: **u8) u64 {
     color = io.isatty(io.STDOUT);
     show(system.read_file("/proc/kmsg", ?buf[0], 524288));
     if (clear != 0 && clear_log() == 0) {
-        io.err("dmesg: only root may clear the log\n\0");
+        io.emsg("dmesg: only root may clear the log\n\0");
         ret 1;
     }
     for (follow != 0) {

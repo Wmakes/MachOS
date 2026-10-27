@@ -49,9 +49,9 @@ var dualboot: u8 = 1;
 var text: [16384]u8;
 
 fun fail(why: *u8) u64 {
-    io.err("machboot: \0");
+    io.emsg("machboot: \0");
     io.err(why);
-    io.err("\n\0");
+    io.emsg("\n\0");
     ret 1;
 }
 
@@ -181,46 +181,46 @@ fun save() u64 {
 }
 
 fun list() u64 {
-    io.out("\x1b[95mmachboot\x1b[0m  \0");
+    io.msg("\x1b[95mmachboot\x1b[0m  \0");
     io.out(PATH);
-    io.out("\n  menu waits \0");
+    io.msg("\n  menu waits \0");
     io.dec(timeout);
-    io.out(" s, boots entry \0");
+    io.msg(" s, boots entry \0");
     io.dec(default);
-    io.out(" unless another is picked\n\0");
-    if (hidden != 0) { io.out("  the menu is hidden: hold a key while the machine starts to see it\n\0"); }
-    if (dualboot != 0) { io.out("  other systems on EFI partitions are offered too\n\0"); }
+    io.msg(" unless another is picked\n\0");
+    if (hidden != 0) { io.msg("  the menu is hidden: hold a key while the machine starts to see it\n\0"); }
+    if (dualboot != 0) { io.msg("  other systems on EFI partitions are offered too\n\0"); }
     io.putc(10);
     var i: u64 = 0;
     for (i < count) {
         val e: *Entry = ?entries[i];
-        if (i + 1 == default) { io.out("  * \0"); } or { io.out("    \0"); }
+        if (i + 1 == default) { io.msg("  * \0"); } or { io.msg("    \0"); }
         io.dec(i + 1);
-        io.out("  \x1b[1m\0");
+        io.msg("  \x1b[1m\0");
         io.outn(?e.name[0], e.nlen);
         if (e.hlen > 0) {
-            io.out("\x1b[0m - \0");
+            io.msg("\x1b[0m - \0");
             io.outn(?e.help[0], e.hlen);
         }
         if (e.elen > 0) {
-            io.out("\x1b[0m\n        another system: \0");
+            io.msg("\x1b[0m\n        another system: \0");
             io.outn(?e.efi[0], e.elen);
             io.putc(10);
             i = i + 1;
             cnt;
         }
-        io.out("\x1b[0m\n        kernel \0");
+        io.msg("\x1b[0m\n        kernel \0");
         io.outn(?e.kernel[0], e.klen);
         if (e.ilen > 0) {
-            io.out(", initrd \0");
+            io.msg(", initrd \0");
             io.outn(?e.initrd[0], e.ilen);
         }
-        io.out(", command line \0");
+        io.msg(", command line \0");
         if (e.clen > 0) {
             io.putc(39);
             io.outn(?e.cmdline[0], e.clen);
             io.putc(39);
-        } or { io.out("(none)\0"); }
+        } or { io.msg("(none)\0"); }
         io.putc(10);
         i = i + 1;
     }
@@ -277,7 +277,7 @@ fun update_esp() u64 {
     n = n + 31;
     if (run("/bin/cp\0", ?a[0], n) != 0) { ret fail("copying it failed\0"); }
     sys.sync();
-    io.out("machboot on the EFI partition is now /boot/BOOTX64.EFI\n\0");
+    io.msg("machboot on the EFI partition is now /boot/BOOTX64.EFI\n\0");
     ret 0;
 }
 
@@ -287,10 +287,10 @@ fun install(part: *u8) u64 {
     if (abi.is_err(sys.stat(part, io.len(part), ?st)) != 0 || st.kind != abi.KIND_DEV) {
         ret fail("give the EFI system partition, e.g. /dev/sda1\0");
     }
-    io.out("This reformats \0");
+    io.msg("This reformats \0");
     io.out(part);
-    io.out(" (everything on it is lost) and puts machboot there\n\0");
-    io.out("(machboot reads its settings, the kernel and the initrd from /boot).\n\0");
+    io.msg(" (everything on it is lost) and puts machboot there\n\0");
+    io.msg("(machboot reads its settings, the kernel and the initrd from /boot).\n\0");
     var cargs: [64]u8;
     var cl: u64 = 0;
     io.copy(?cargs[0], "confirm\0", 8);
@@ -310,7 +310,7 @@ fun install(part: *u8) u64 {
     io.copy(?a[n], f1, io.len(f1) + 1);
     n = n + io.len(f1) + 1;
     if (run("/bin/mkfat\0", ?a[0], n) != 0) { ret fail("writing the EFI partition failed\0"); }
-    io.out("machboot is installed on \0");
+    io.msg("machboot is installed on \0");
     io.out(part);
     io.putc(10);
     ret 0;
@@ -410,9 +410,9 @@ fun main(argc: u64, argv: **u8) u64 {
         count = count + 1;
         ret save();
     }
-    io.err("usage: machboot [list | default N | timeout SECONDS | hide | show | dualboot on|off |\n\0");
-    io.err("                cmdline N [TEXT...] |\n\0");
-    io.err("                add NAME [KERNEL [INITRD|- [CMDLINE...]]] | remove N | edit |\n\0");
-    io.err("                ensure NAME KERNEL [INITRD] | update | install PARTITION]\n\0");
+    io.emsg("usage: machboot [list | default N | timeout SECONDS | hide | show | dualboot on|off |\n\0");
+    io.emsg("                cmdline N [TEXT...] |\n\0");
+    io.emsg("                add NAME [KERNEL [INITRD|- [CMDLINE...]]] | remove N | edit |\n\0");
+    io.emsg("                ensure NAME KERNEL [INITRD] | update | install PARTITION]\n\0");
     ret 2;
 }

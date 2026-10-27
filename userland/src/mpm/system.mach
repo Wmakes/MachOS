@@ -13,7 +13,7 @@ use tx:   userland.mpm.transaction;
 pub val EFI: *u8 = "/boot/efi/EFI/BOOT/BOOTX64.EFI";
 
 fun fail(why: *u8) u8 {
-    io.err("mpm: ");
+    io.emsg("mpm: ");
     io.err(why);
     io.putc(10);
     ret 0;

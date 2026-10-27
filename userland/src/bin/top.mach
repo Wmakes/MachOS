@@ -79,13 +79,13 @@ fun sort() {
 fun bar(pct: u64) {
     io.putc(91);
     var k: u64 = 0;
-    io.out("\x1b[95m\0");
+    io.msg("\x1b[95m\0");
     for (k < 20) {
         if (k * 5 < pct) { io.putc(124); }
         or               { io.putc(32); }
         k = k + 1;
     }
-    io.out("\x1b[0m\0");
+    io.msg("\x1b[0m\0");
     io.putc(93);
 }
 
@@ -106,21 +106,21 @@ fun sample(inf: *Info) {
 }
 
 fun screen(inf: *Info, rows_max: u64) {
-    io.out("\x1b[2J\x1b[H\0");
+    io.msg("\x1b[2J\x1b[H\0");
     val secs: u64 = inf.uptime_ms / 1000;
-    io.out("\x1b[1mtop\x1b[0m - up \0");
+    io.msg("\x1b[1mtop\x1b[0m - up \0");
     io.dec(secs / 3600);
     io.putc(58);
     io.dec_pad((secs / 60) % 60, 2);
-    io.out(", \0");
+    io.msg(", \0");
     io.dec(nrows);
-    io.out(" processes, \0");
+    io.msg(" processes, \0");
     io.dec(inf.cpu.count);
-    io.out(" cores, memory \0");
+    io.msg(" cores, memory \0");
     io.dec((inf.mem.total - inf.mem.free) / 1048576);
-    io.out(" / \0");
+    io.msg(" / \0");
     io.dec(inf.mem.total / 1048576);
-    io.out(" MiB\n\n\0");
+    io.msg(" MiB\n\n\0");
     var c: u64 = 0;
     for (c < inf.cpu.count) {
         val db: u64 = inf.cpu.busy[c] - prev_busy[c];
@@ -129,16 +129,16 @@ fun screen(inf: *Info, rows_max: u64) {
         prev_all[c] = inf.cpu.ticks[c];
         var pct: u64 = 0;
         if (da > 0) { pct = db * 100 / da; }
-        io.out("  cpu\0");
+        io.msg("  cpu\0");
         io.dec(c);
         if (c < 10) { io.putc(32); }
         io.putc(32);
         bar(pct);
         io.dec_pad(pct, 4);
-        io.out("%\n\0");
+        io.msg("%\n\0");
         c = c + 1;
     }
-    io.out("\n\x1b[7m  PID USER     STATE     CPU%   MEM     TIME  NAME          \x1b[0m\n\0");
+    io.msg("\n\x1b[7m  PID USER     STATE     CPU%   MEM     TIME  NAME          \x1b[0m\n\0");
     var shown: u64 = 0;
     var i: u64 = 0;
     for (i < nrows && shown < rows_max) {
@@ -155,19 +155,19 @@ fun screen(inf: *Info, rows_max: u64) {
             io.putc(32);
             pad = pad + 1;
         }
-        if (w.state == 82)      { io.out("running \0"); }
-        or (w.state == 83)      { io.out("waiting \0"); }
-        or (w.state == 84)      { io.out("stopped \0"); }
-        or                                      { io.out("zombie  \0"); }
+        if (w.state == 82)      { io.msg("running \0"); }
+        or (w.state == 83)      { io.msg("waiting \0"); }
+        or (w.state == 84)      { io.msg("stopped \0"); }
+        or                                      { io.msg("zombie  \0"); }
         io.dec_pad(w.delta, 5); # ticks per second = percent of one core
-        io.out("%\0");
+        io.msg("%\0");
         io.dec_pad(w.pages * 4, 6);
-        io.out("K\0");
+        io.msg("K\0");
         val t: u64 = w.ticks / 100;
         io.dec_pad(t / 60, 6);
         io.putc(58);
         io.dec_pad(t % 60, 2);
-        io.out("  \0");
+        io.msg("  \0");
         io.outn(?w.name[0], w.nlen);
         io.putc(10);
         shown = shown + 1;
@@ -184,7 +184,7 @@ fun run(argc: u64, argv: **u8) u64 {
         var okk: u8 = 0;
         count = io.parse_dec(argv[2], io.len(argv[2]), ?okk);
         if (okk == 0) {
-            io.err("usage: top [-n COUNT]\n\0");
+            io.emsg("usage: top [-n COUNT]\n\0");
             ret 2;
         }
     }

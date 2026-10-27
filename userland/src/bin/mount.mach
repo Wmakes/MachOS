@@ -16,9 +16,9 @@ fun main(argc: u64, argv: **u8) u64 {
             val r: u64 = sys.mounts(i, ?m);
             if (abi.is_err(r) != 0 || r == 0) { brk; }
             io.out(?m.dev[0]);
-            io.out(" on \0");
+            io.msg(" on \0");
             io.out(?m.dir[0]);
-            io.out(" type \0");
+            io.msg(" type \0");
             io.out(?m.fstype[0]);
             io.putc(10);
             i = i + 1;
@@ -26,7 +26,7 @@ fun main(argc: u64, argv: **u8) u64 {
         ret 0;
     }
     if (argc != 3) {
-        io.err("usage: mount [DEV DIR]\n\0");
+        io.emsg("usage: mount [DEV DIR]\n\0");
         ret 2;
     }
     val r: u64 = sys.mount(argv[1], io.len(argv[1]), argv[2], io.len(argv[2]));

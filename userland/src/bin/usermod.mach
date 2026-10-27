@@ -9,23 +9,23 @@ use sdk.users;
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
     if (argc == 2 && io.streq(argv[1], "--help\0") != 0) {
-        io.out("usage: usermod --admin|--no-admin USER\n  Change administrator membership. Root only.\n\0");
+        io.msg("usage: usermod --admin|--no-admin USER\n  Change administrator membership. Root only.\n\0");
         ret 0;
     }
     if (argc != 3 || (io.streq(argv[1], "--admin\0") == 0 && io.streq(argv[1], "--no-admin\0") == 0)) {
-        io.err("usage: usermod --admin|--no-admin USER\n\0");
+        io.emsg("usage: usermod --admin|--no-admin USER\n\0");
         ret 2;
     }
     if (sys.getuid() != 0 || sys.geteuid() != 0) {
-        io.err("usermod: root is required\n\0");
+        io.emsg("usermod: root is required\n\0");
         ret 1;
     }
     var user: users.User;
     if (users.by_name(argv[2], io.len(argv[2]), ?user) == 0 || user.uid == 0) {
-        io.err("usermod: select an existing non-root user\n\0");
+        io.emsg("usermod: select an existing non-root user\n\0");
         ret 1;
     }
     if (users.set_admin("/etc/group\0", ?user.name[0], user.name_len, (io.streq(argv[1], "--admin\0") != 0)::u8) == 0) { ret 1; }
-    io.out("usermod: administrator membership updated\n\0");
+    io.msg("usermod: administrator membership updated\n\0");
     ret 0;
 }

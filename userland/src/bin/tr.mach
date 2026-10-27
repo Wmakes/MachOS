@@ -64,7 +64,7 @@ fun run(argc: u64, argv: **u8) u64 {
         val n: u64 = expand(argv[1], ?a[0]);
         val m: u64 = expand(argv[2], ?b[0]);
         if (m == 0) {
-            io.err("tr: empty SET2\n\0");
+            io.emsg("tr: empty SET2\n\0");
             ret 2;
         }
         i = 0;
@@ -75,7 +75,7 @@ fun run(argc: u64, argv: **u8) u64 {
             i = i + 1;
         }
     } or {
-        io.err("usage: tr SET1 SET2 | tr -d SET\n\0");
+        io.emsg("usage: tr SET1 SET2 | tr -d SET\n\0");
         ret 2;
     }
     for {

@@ -15,6 +15,7 @@ use mem:  machos.kern.mem;
 use tty:  machos.kern.tty;
 use cpu:  machos.arch.x86_64.cpu;
 use fbcon: machos.dev.fbcon;
+use keymap: machos.dev.keymap;
 
 val MAX_CTRL: u64 = 4;
 val MAX_KBD: u64 = 4;
@@ -267,12 +268,6 @@ fun ok(code: u32) u8 {
 
 # --- keyboards ----------------------------------------------------------------
 
-val NORMAL: *u8 = "abcdefghijklmnopqrstuvwxyz1234567890\0";
-val SHIFT_DIGITS: *u8 = "!@#$%^&*()\0";
-# usages 0x2D-0x38 unshifted and shifted
-val PUNCT: *u8 = "-=[]\\#;'`,./\0";
-val PUNCT_SHIFT: *u8 = "_+{}|~:\"~<>?\0";
-
 fun seq(final: u8) {
     tty.input(27);
     tty.input(91);
@@ -290,7 +285,8 @@ fun tilde(n: u8) {
 fun press(usage: u8, mods: u8) {
     val shift: u8 = ((mods & 0x22) != 0)::u8;
     val ctrl: u8 = ((mods & 0x11) != 0)::u8;
-    val alt: u8 = ((mods & 0x44) != 0)::u8;
+    val alt: u8 = ((mods & 0x04) != 0)::u8;
+    val altgr: u8 = ((mods & 0x40) != 0)::u8;
     if (alt != 0) { # alt+F1..F6 and alt+left/right switch terminals
         if (usage >= 0x3A && usage <= 0x3F) {
             tty.switch_to((usage - 0x3A)::u64);
@@ -307,22 +303,16 @@ fun press(usage: u8, mods: u8) {
     }
     # keys that type a character: ctrl makes control codes of them, alt
     # sends ESC first (as terminals do)
-    var c: u8 = 0;
-    if (usage >= 0x04 && usage <= 0x1D) {
-        c = NORMAL[(usage - 4)::u64];
-        if ((shift ^ caps) != 0) { c = c - 32; }
-    } or (usage >= 0x1E && usage <= 0x27) {
-        if (shift != 0) { c = SHIFT_DIGITS[(usage - 0x1E)::u64]; }
-        or              { c = NORMAL[(usage - 4)::u64]; }
-    } or (usage == 0x2C) { c = 32; }
-    or (usage >= 0x2D && usage <= 0x38) {
-        if (shift != 0) { c = PUNCT_SHIFT[(usage - 0x2D)::u64]; }
-        or              { c = PUNCT[(usage - 0x2D)::u64]; }
+    var cp: u32 = keymap.character(usage, shift, caps, altgr);
+    if (cp != 0) {
+        if (ctrl != 0) {
+            if (cp <= 127) { cp = tty.control(cp::u8)::u32; }
+            or             { cp = 0; }
+        }
     }
-    if (c != 0) {
-        if (ctrl != 0) { c = tty.control(c); }
+    if (cp != 0) {
         if (alt != 0) { tty.input(27); }
-        tty.input(c);
+        tty.input_codepoint(cp);
         ret;
     }
     if (usage == 0x28 || usage == 0x58) { tty.input(10); }      # enter, keypad enter

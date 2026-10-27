@@ -9,9 +9,9 @@ use rt:    sdk.rt;
 
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
-    if (argc == 2 && io.streq(argv[1], "--help\0") != 0) { io.out("usage: adduser [--admin|--optional-admin] [-R DIR] [NAME]\n  A nonempty password is required. Root only.\n\0"); ret 0; }
+    if (argc == 2 && io.streq(argv[1], "--help\0") != 0) { io.msg("usage: adduser [--admin|--optional-admin] [-R DIR] [NAME]\n  A nonempty password is required. Root only.\n\0"); ret 0; }
     if (sys.getuid() != 0 || sys.geteuid() != 0) {
-        io.err("adduser: only root may add users\n\0"); ret 1;
+        io.emsg("adduser: only root may add users\n\0"); ret 1;
     }
     var prefix: *u8 = "\0";
     var admin: u8 = 0;
@@ -23,12 +23,12 @@ fun main(argc: u64, argv: **u8) u64 {
         or (io.streq(argv[arg], "--admin\0") != 0) { admin = 1; }
         or (io.streq(argv[arg], "-R\0") != 0 && arg + 1 < argc) { arg = arg + 1; prefix = argv[arg]; }
         or (name == nil) { name = argv[arg]; }
-        or { io.err("usage: adduser [--admin|--optional-admin] [-R DIR] [NAME]\n\0"); ret 2; }
+        or { io.emsg("usage: adduser [--admin|--optional-admin] [-R DIR] [NAME]\n\0"); ret 2; }
         arg = arg + 1;
     }
     if (optional != 0) {
         for {
-            io.out("Create an administrator account? Type yes or no: \0");
+            io.msg("Create an administrator account? Type yes or no: \0");
             var reply: [16]u8;
             val n: u64 = users.read_line(?reply[0], 15);
             if (n == abi.NO_ID) { ret 1; }
@@ -38,7 +38,7 @@ fun main(argc: u64, argv: **u8) u64 {
     }
     var entered: [32]u8;
     if (name == nil) {
-        io.out("User name: \0");
+        io.msg("User name: \0");
         val count: u64 = users.read_line(?entered[0], 31);
         if (count == abi.NO_ID) { ret 1; }
         entered[count] = 0; name = ?entered[0];
@@ -54,22 +54,22 @@ fun main(argc: u64, argv: **u8) u64 {
     for (i < n) {
         val c: u8 = name[i];
         if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57 && i > 0) || c == 95 || c == 45)) {
-            io.err("adduser: a name is lowercase letters, digits, - and _\n\0");
+            io.emsg("adduser: a name is lowercase letters, digits, - and _\n\0");
             ret 1;
         }
         i = i + 1;
     }
     if (n == 0 || n > 31) {
-        io.err("adduser: bad name\n\0");
+        io.emsg("adduser: bad name\n\0");
         ret 1;
     }
     var u: users.User;
     if (users.by_name_in(?passwd[0], name, n, ?u) != 0) {
-        io.err("adduser: that user exists\n\0");
+        io.emsg("adduser: that user exists\n\0");
         ret 1;
     }
     val uid: u64 = users.next_uid_in(?passwd[0]);
-    if (uid == abi.NO_ID) { io.err("adduser: cannot allocate a user ID\n\0"); ret 1; }
+    if (uid == abi.NO_ID) { io.emsg("adduser: cannot allocate a user ID\n\0"); ret 1; }
     var password: [128]u8;
     val password_len: u64 = users.new_password(?password[0]);
     if (password_len == abi.NO_ID) { ret 1; }
@@ -88,15 +88,15 @@ fun main(argc: u64, argv: **u8) u64 {
     }
     sys.chown(?target[0], pl + 6 + n, uid, uid);
     if (users.add_in(?passwd[0], ?group[0], ?shadow[0], name, n, uid, ?home[0], "/bin/sh\0") == 0) {
-        io.err("adduser: cannot write the account files\n\0");
+        io.emsg("adduser: cannot write the account files\n\0");
         ret 1;
     }
     if (users.set_password_in(?shadow[0], name, n, ?password[0], password_len) == 0) {
-        io.err("adduser: password setup failed; account remains locked\n\0"); ret 1;
+        io.emsg("adduser: password setup failed; account remains locked\n\0"); ret 1;
     }
     if (admin != 0 && users.add_admin(?group[0], name, n) == 0) {
-        io.err("adduser: cannot grant administrator membership\n\0"); ret 1;
+        io.emsg("adduser: cannot grant administrator membership\n\0"); ret 1;
     }
-    io.out("adduser: added \0"); io.out(name); io.putc(10);
+    io.msg("adduser: added \0"); io.out(name); io.putc(10);
     ret 0;
 }

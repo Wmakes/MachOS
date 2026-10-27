@@ -13,7 +13,7 @@ use rt:    sdk.rt;
 # -R: another system's root password, which must not be empty
 fun for_install(dir: *u8, name: *u8) u64 {
     if (sys.getuid() != 0) {
-        io.err("passwd: only root may use -R\n\0");
+        io.emsg("passwd: only root may use -R\n\0");
         ret 1;
     }
     var shadow: [256]u8;
@@ -25,28 +25,28 @@ fun for_install(dir: *u8, name: *u8) u64 {
     for {
         var a: [128]u8;
         var b: [128]u8;
-        io.out("Choose a password for \0");
+        io.msg("Choose a password for \0");
         io.out(name);
-        io.out(" on the new system\n\0");
+        io.msg(" on the new system\n\0");
         val an: u64 = users.read_secret("New password: \0", ?a[0], 127);
         if (an == abi.NO_ID) { ret 1; }
         if (an == 0) {
-            io.out("It cannot be empty.\n\0");
+            io.msg("It cannot be empty.\n\0");
             cnt;
         }
         val bn: u64 = users.read_secret("Again: \0", ?b[0], 127);
         if (bn == abi.NO_ID) { ret 1; }
         if (io.eq(?a[0], an, ?b[0], bn) == 0) {
-            io.out("They do not match; once more.\n\0");
+            io.msg("They do not match; once more.\n\0");
             cnt;
         }
         if (users.set_password_in(?shadow[0], name, nl, ?a[0], an) == 0) {
-            io.err("passwd: cannot write \0");
+            io.emsg("passwd: cannot write \0");
             io.err(?shadow[0]);
-            io.err("\n\0");
+            io.emsg("\n\0");
             ret 1;
         }
-        io.out("Password set.\n\0");
+        io.msg("Password set.\n\0");
         ret 0;
     }
     ret 1;
@@ -66,27 +66,27 @@ fun main(argc: u64, argv: **u8) u64 {
     }
     var u: users.User;
     if (users.by_name(target, tn, ?u) == 0) {
-        io.err("passwd: no such user\n\0");
+        io.emsg("passwd: no such user\n\0");
         ret 1;
     }
     if (sys.geteuid() != 0) {
-        io.err("passwd: not installed set-user-id root\n\0");
+        io.emsg("passwd: not installed set-user-id root\n\0");
         ret 1;
     }
     if (real != 0) {
         if (u.uid != real) {
-            io.err("passwd: only root may change another user's password\n\0");
+            io.emsg("passwd: only root may change another user's password\n\0");
             ret 1;
         }
         var h: [128]u8;
         val hn: u64 = users.stored(target, tn, ?h[0]);
-        if (hn == abi.NO_ID || users.locked(?h[0], hn) != 0) { io.err("passwd: account is locked or unavailable\n\0"); ret 1; }
+        if (hn == abi.NO_ID || users.locked(?h[0], hn) != 0) { io.emsg("passwd: account is locked or unavailable\n\0"); ret 1; }
         if (hn > 0) {
             var old: [128]u8;
             val on: u64 = users.read_secret("Current password: \0", ?old[0], 127);
             if (on == abi.NO_ID || users.matches(?h[0], hn, ?old[0], on) == 0) {
                 sys.sleep(1000);
-                io.err("passwd: wrong password\n\0");
+                io.emsg("passwd: wrong password\n\0");
                 ret 1;
             }
         }
@@ -95,9 +95,9 @@ fun main(argc: u64, argv: **u8) u64 {
     val an: u64 = users.new_password(?a[0]);
     if (an == abi.NO_ID) { ret 1; }
     if (users.set_password(target, tn, ?a[0], an) == 0) {
-        io.err("passwd: cannot write /etc/shadow\n\0");
+        io.emsg("passwd: cannot write /etc/shadow\n\0");
         ret 1;
     }
-    io.out("passwd: password changed\n\0");
+    io.msg("passwd: password changed\n\0");
     ret 0;
 }

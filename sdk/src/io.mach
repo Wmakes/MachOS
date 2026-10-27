@@ -2,6 +2,7 @@
 
 use abi: sdk.abi;
 use sys: sdk.sys;
+use i18n: sdk.i18n;
 
 pub fun len(s: *u8) u64 {
     var n: u64 = 0;
@@ -45,6 +46,8 @@ pub fun out(s: *u8) { write_all(abi.STDOUT, s, len(s)); }
 pub fun outn(s: *u8, n: u64) { write_all(abi.STDOUT, s, n); }
 pub fun err(s: *u8) { write_all(abi.STDERR, s, len(s)); }
 pub fun errn(s: *u8, n: u64) { write_all(abi.STDERR, s, n); }
+pub fun msg(s: *u8) { val t: *u8 = i18n.text(s); out(t); }
+pub fun emsg(s: *u8) { val t: *u8 = i18n.text(s); err(t); }
 
 pub fun putc(c: u8) {
     var b: u8 = c;
@@ -110,7 +113,7 @@ pub fun fail(prog: *u8, what: *u8, e: u64) {
         err(what);
         err(": \0");
     }
-    err(abi.err_name(e));
+    emsg(abi.err_name(e));
     err("\n\0");
 }
 

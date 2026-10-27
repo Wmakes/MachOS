@@ -90,7 +90,7 @@ fun parse(s: *u8, z: *time.Zone) i64 {
 }
 
 fun usage() u64 {
-    io.err("usage: date [-u] [+%s] [-s \"YYYY-MM-DD HH:MM[:SS]\" | -s @SECONDS]\n");
+    io.emsg("usage: date [-u] [+%s] [-s \"YYYY-MM-DD HH:MM[:SS]\" | -s @SECONDS]\n");
     ret 2;
 }
 
@@ -110,9 +110,9 @@ fun run(argc: u64, argv: **u8) u64 {
             if (i + 1 >= argc) { ret usage(); }
             val t: i64 = parse(argv[i + 1], ?z);
             if (t < 0) {
-                io.err("date: not a date: ");
+                io.emsg("date: not a date: ");
                 io.err(argv[i + 1]);
-                io.err("\n");
+                io.emsg("\n");
                 ret 2;
             }
             # the kernel sets its clock and the hardware clock

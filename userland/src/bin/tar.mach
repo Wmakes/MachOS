@@ -8,6 +8,7 @@
 
 use os:  std.system.os;
 use io:  userland.lib.cli;
+use opt: userland.lib.options;
 use std.runtime;
 use sdk.abi;
 
@@ -20,12 +21,12 @@ var hdr: [512]u8;
 var blockbuf: [65536]u8;
 
 fun complain(what: *u8, path: *u8, e: i64) {
-    io.err("tar: \0");
+    io.emsg("tar: \0");
     io.err(path);
-    io.err(": \0");
+    io.emsg(": \0");
     if (e != 0) { io.err(io.reason(e)); }
     or          { io.err(what); }
-    io.err("\n\0");
+    io.emsg("\n\0");
     failures = failures + 1;
 }
 
@@ -115,7 +116,7 @@ fun add(path: *u8, plen: u64) {
         }
         if (dl != 1 || dn[0] != 47) {
             if (header(?dn[0], dl, 53, 0, ?st) == 0) { complain("name too long\0", path, 0); ret; }
-            if (verbose != 0) { io.errn(?dn[0], dl); io.err("\n\0"); }
+            if (verbose != 0) { io.errn(?dn[0], dl); io.emsg("\n\0"); }
         }
         var dir: io.Dir;
         val o: i64 = io.dir_open(?dir, path);
@@ -154,7 +155,7 @@ fun add(path: *u8, plen: u64) {
         io.close(h);
         ret;
     }
-    if (verbose != 0) { io.errn(name, nlen); io.err("\n\0"); }
+    if (verbose != 0) { io.errn(name, nlen); io.emsg("\n\0"); }
     var left: u64 = st.st_size::u64;
     for (left > 0) {
         var want: u64 = 65536;
@@ -188,7 +189,7 @@ fun read_exact(buf: *u8, n: u64) u8 {
     var got: u64 = 0;
     for (got < n) {
         val r: i64 = io.read(arch, ?buf[got], n - got);
-        if (r <= 0) { io.err("tar: archive read failed or ended too early\n\0"); failures = failures + 1; ret 0; }
+        if (r <= 0) { io.emsg("tar: archive read failed or ended too early\n\0"); failures = failures + 1; ret 0; }
         got = got + r::u64;
     }
     ret 1;
@@ -305,7 +306,7 @@ fun extract() {
             i = i + 1;
         }
         if (sum != parse_octal(?hdr[148], 8)) {
-            io.err("tar: this is not a tar archive (or it is damaged)\n\0");
+            io.emsg("tar: this is not a tar archive (or it is damaged)\n\0");
             failures = failures + 1;
             brk;
         }
@@ -340,7 +341,7 @@ fun extract() {
         if (mode == 116) { # list
             if (verbose != 0) {
                 io.dec_pad(size, 10);
-                io.out("  \0");
+                io.msg("  \0");
             }
             io.outn(p, pn);
             io.putc(10);
@@ -348,9 +349,9 @@ fun extract() {
             cnt;
         }
         if (unsafe != 0 || pn == 0 || safe_destination(p, pn) == 0) {
-            io.err("tar: skipping unsafe name \0");
+            io.emsg("tar: skipping unsafe name \0");
             io.errn(?name[0], nl);
-            io.err("\n\0");
+            io.emsg("\n\0");
             failures = failures + 1;
             if (skip_bytes(padded) == 0) { brk; }
             cnt;
@@ -395,7 +396,7 @@ fun extract() {
         io.close(h);
         io.chmod(?zp[0], fmode);
         if (broken != 0) {
-            io.err("tar: the archive ends too early\n\0");
+            io.emsg("tar: the archive ends too early\n\0");
             failures = failures + 1;
             brk;
         }
@@ -403,7 +404,7 @@ fun extract() {
 }
 
 fun usage() u64 {
-    io.err("usage: tar -c|-x|-t [-v] -f ARCHIVE [PATH...]\n\0");
+    io.emsg("usage: tar -c|-x|-t [-v] -f ARCHIVE [PATH...]\n\0");
     ret 2;
 }
 
@@ -411,11 +412,28 @@ fun usage() u64 {
 fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
+    if (opt.standard(argc, argv, "tar", "usage: tar -c|-x|-t [-v] -f ARCHIVE [PATH...]\n  -c, --create   create archive\n  -x, --extract  extract archive\n  -t, --list     list contents\n  -v, --verbose  print processed names\n  -f, --file     archive path (- for standard input/output)") != 0) { ret 0; }
     var file: *u8 = nil;
     var i: u64 = 1;
     var want_file: u8 = 0;
     for (i < argc && argv[i][0] == 45 && argv[i][1] != 0) {
         val a: *u8 = argv[i];
+        if (io.streq(a, "--") != 0) { i = i + 1; brk; }
+        if (a[1] == 45) {
+            if (io.streq(a, "--create") != 0) { if (mode != 0 && mode != 99) { ret usage(); } mode = 99; }
+            or (io.streq(a, "--extract") != 0) { if (mode != 0 && mode != 120) { ret usage(); } mode = 120; }
+            or (io.streq(a, "--list") != 0) { if (mode != 0 && mode != 116) { ret usage(); } mode = 116; }
+            or (io.streq(a, "--verbose") != 0) { verbose = 1; }
+            or (io.streq(a, "--file") != 0) { want_file = 1; }
+            or (io.eq(a, 7, "--file=", 7) != 0 && a[7] != 0) { file = ?a[7]; }
+            or { ret usage(); }
+            i = i + 1;
+            if (want_file != 0) {
+                if (i >= argc) { ret usage(); }
+                file = argv[i]; want_file = 0; i = i + 1;
+            }
+            cnt;
+        }
         var k: u64 = 1;
         for (a[k] != 0) {
             val c: u8 = a[k];
@@ -423,9 +441,12 @@ fun run(argc: u64, argv: **u8) u64 {
                 if (mode != 0 && mode != c) { ret usage(); }
                 mode = c;
             } or (c == 118) { verbose = 1; }
-            or (c == 102) { want_file = 1; }
+            or (c == 102) {
+                if (a[k + 1] != 0) { file = ?a[k + 1]; brk; }
+                want_file = 1;
+            }
             or (c == 122) {
-                io.err("tar: no -z: pipe through gzip / gunzip instead\n\0");
+                io.emsg("tar: no -z: pipe through gzip / gunzip instead\n\0");
                 ret 2;
             } or { ret usage(); }
             k = k + 1;

@@ -1,16 +1,18 @@
-src/dev/font8x16.bin -- the console font
+src/dev/font8x16.bin and src/dev/font8x16.map -- the console font
 
-The glyphs are taken from the 8x16 normal face of Terminus Font 4.49.1
-(ter-u16n.bdf) by Dimitar Toshkov Zhekov, converted to a raw table of 256
-glyphs in code page 437 order, 16 bytes each. As a converted (modified)
-version it does not carry the Reserved Font Name "Terminus Font".
+The glyphs are rasterized at 8x16 from Noto Sans Mono Regular. The table
+contains ASCII, all 1,653 assigned Latin-script characters in Unicode 18.0,
+combining diacritics, Greek, Cyrillic, and common terminal symbols. Latin
+characters absent from the source face are compact derivatives of related
+Noto glyphs. The companion map contains the Unicode codepoints for non-ASCII
+glyphs. This converted version does not use "Noto" as its font name.
 
-This file, and only this file, is licensed under the SIL Open Font License
+These two files, and only these files, are licensed under the SIL Open Font License
 1.1, reproduced in full below. It places no conditions on the software it
 is bundled with.
 
-Copyright (C) 2020 Dimitar Toshkov Zhekov,
-with Reserved Font Name "Terminus Font".
+Copyright 2022 The Noto Project Authors
+(https://github.com/notofonts/latin-greek-cyrillic)
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
 This license is copied below, and is also available with a FAQ at:

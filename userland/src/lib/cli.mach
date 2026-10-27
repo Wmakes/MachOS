@@ -7,6 +7,7 @@ use std.types.bool.bool;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use i18n: sdk.i18n;
 
 pub fun len(s: *u8) u64 { ret str_len(s::str)::u64; }
 
@@ -46,6 +47,26 @@ pub fun out(s: *u8) { write_all(1, s, len(s)); }
 pub fun outn(s: *u8, n: u64) { write_all(1, s, n); }
 pub fun err(s: *u8) { write_all(2, s, len(s)); }
 pub fun errn(s: *u8, n: u64) { write_all(2, s, n); }
+
+var locale: [64]u8;
+
+fun locale_value(name: *u8) *u8 {
+    val n: i64 = os.getenv(name, ?locale[0], 64);
+    if (n > 0 && n < 64) { ret ?locale[0]; }
+    ret nil;
+}
+
+# std-runtime programs keep their environment in std.system.os rather than
+# sdk.env, so hand the selected POSIX message locale to the shared MO reader.
+pub fun text(s: *u8) *u8 {
+    var active: *u8 = locale_value("LC_ALL");
+    if (active == nil) { active = locale_value("LC_MESSAGES"); }
+    if (active == nil) { active = locale_value("LANG"); }
+    ret i18n.text_for(s, active);
+}
+
+pub fun msg(s: *u8) { out(text(s)); }
+pub fun emsg(s: *u8) { err(text(s)); }
 
 pub fun putc(c: u8) {
     var b: u8 = c;
@@ -116,7 +137,7 @@ pub fun fail(prog: *u8, what: *u8, code: i64) {
         err(what);
         err(": ");
     }
-    err(reason(code));
+    emsg(reason(code));
     err("\n");
 }
 

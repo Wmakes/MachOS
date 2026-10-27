@@ -394,9 +394,9 @@ fun substitute(cmd: *u8, n: u64, out: *u8, cap: u64) u64 {
 }
 
 fun syntax(msg: *u8) u8 {
-    io.err("sh: \0");
+    io.emsg("sh: \0");
     io.err(msg);
-    io.err("\n\0");
+    io.emsg("\n\0");
     status = 2;
     ret 0;
 }
@@ -670,7 +670,7 @@ fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
         tb[tk + 3] = 48 + (ms % 10)::u8;
         tb[tk + 4] = 115;
         tb[tk + 5] = 10;
-        io.err("\nreal  \0");
+        io.emsg("\nreal  \0");
         io.errn(?tb[0], tk + 6);
         ret 1;
     }
@@ -713,7 +713,7 @@ fun builtin(name: *u8, argc: u64, args: **u8, out: u64) u8 {
         val j: *Job = pick_job(argc, args);
         if (j == nil) {
             io.err(name);
-            io.err(": no such job\n\0");
+            io.emsg(": no such job\n\0");
             status = 1;
             ret 1;
         }
@@ -1003,9 +1003,9 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
                     var okk: u8 = 0;
                     val from: u64 = io.parse_dec(?fname[0], io.len(?fname[0]), ?okk);
                     if (okk == 0 || from >= 10 || fds[from] == abi.FD_NONE) {
-                        io.err("sh: \0");
+                        io.emsg("sh: \0");
                         io.err(?fname[0]);
-                        io.err(": bad file descriptor\n\0");
+                        io.emsg(": bad file descriptor\n\0");
                         status = 1;
                         bad = 1;
                         brk;
@@ -1085,7 +1085,7 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
             val fl: u64 = resolve(args[0], ?full[0]);
             if (fl == 0) {
                 io.err(args[0]);
-                io.err(": command not found\n\0");
+                io.emsg(": command not found\n\0");
                 status = 127;
             } or {
                 var g: u64 = group;
@@ -1168,9 +1168,9 @@ fun run_pipeline(a: u64, b: u64, background: u8) {
     if (background != 0) {
         last_background = pids[spawned - 1];
         if (interactive != 0) {
-            io.out("[\0");
+            io.msg("[\0");
             io.dec(j.id);
-            io.out("] \0");
+            io.msg("] \0");
             io.dec(g);
             io.putc(10);
         }
@@ -1331,6 +1331,12 @@ fun motd() {
 
 #[symbol("umain")]
 fun main(argc: u64, argv: **u8) u64 {
+    # Keep LANG available even when the shell was started by an older login
+    # binary or directly in rescue mode.
+    if (env.get("LANG\0") == nil) {
+        var locale: [64]u8;
+        if (settings.get("locale\0", ?locale[0], 64) > 0) { env.set("LANG\0", ?locale[0]); }
+    }
     var src: u64 = abi.STDIN;
     if (argc > 2 && io.streq(argv[1], "-c\0") != 0) {
         run_string(argv[2], io.len(argv[2]));
@@ -1357,7 +1363,7 @@ fun main(argc: u64, argv: **u8) u64 {
             reap_jobs();
             val en: u64 = edit.read_line(prompt());
             if (en == edit.EOF) {
-                io.out("exit\n\0");
+                io.msg("exit\n\0");
                 brk;
             }
             edit.remember(edit.text(), en);
@@ -1370,7 +1376,7 @@ fun main(argc: u64, argv: **u8) u64 {
         }
         val n: u64 = getline(src, ?line[0], 1024);
         if (n == NONE) {
-            if (interactive != 0) { io.out("exit\n\0"); }
+            if (interactive != 0) { io.msg("exit\n\0"); }
             brk;
         }
         run_string(?line[0], n);

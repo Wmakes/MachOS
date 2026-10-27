@@ -1,0 +1,146 @@
+# ntpdate [-q] [-p PORT] SERVER: query an NTPv4 server and set the system
+# clock. SERVER may also end in :PORT, which is useful for local servers.
+
+use std.runtime;
+use os:     std.system.os;
+use machos: std.system.os.machos;
+use std.types.size.usize;
+use io:     userland.lib.cli;
+use addr:   userland.lib.netaddr;
+
+var request: [48]u8;
+var reply:   [48]u8;
+var host:    [256]u8;
+
+fun usage() i64 {
+    io.emsg("usage: ntpdate [-q] [-p PORT] SERVER[:PORT]\n");
+    ret 2;
+}
+
+fun split_server(server: *u8, port: *u64) u8 {
+    val n: u64 = io.len(server);
+    if (n == 0 || n >= 256) { ret 0; }
+    var colon: u64 = n;
+    var i: u64 = 0;
+    for (i < n) {
+        if (server[i] == 58) {
+            if (colon != n) { ret 0; }
+            colon = i;
+        }
+        i = i + 1;
+    }
+    var hn: u64 = n;
+    if (colon != n) {
+        if (colon == 0 || colon + 1 == n) { ret 0; }
+        var ok: u8 = 0;
+        val p: u64 = io.parse_dec(?server[colon + 1], n - colon - 1, ?ok);
+        if (ok == 0 || p == 0 || p > 65535) { ret 0; }
+        @port = p;
+        hn = colon;
+    }
+    io.copy(?host[0], server, hn);
+    host[hn] = 0;
+    ret 1;
+}
+
+fun be32(buf: *u8) u64 {
+    ret (buf[0]::u64 << 24) | (buf[1]::u64 << 16) | (buf[2]::u64 << 8) | buf[3]::u64;
+}
+
+fun set_clock(seconds: u64) u8 {
+    val h: i64 = io.open_mode("/proc/sys/kernel/clock", os.O_WRONLY, 0);
+    if (h < 0) {
+        io.fail("ntpdate", "/proc/sys/kernel/clock", h);
+        ret 0;
+    }
+    var text: [24]u8;
+    val n: u64 = io.fmt_dec(seconds, ?text[0]);
+    val w: i64 = io.write(h, ?text[0], n);
+    io.close(h);
+    if (w < 0) {
+        io.fail("ntpdate", "cannot set the clock", w);
+        ret 0;
+    }
+    ret 1;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var query: u8 = 0;
+    var port: u64 = 123;
+    var i: i64 = 1;
+    for (i < argc && argv[i][0] == 45) {
+        if (io.streq(argv[i], "-q") != 0) { query = 1; }
+        or (io.streq(argv[i], "-p") != 0 && i + 1 < argc) {
+            var ok: u8 = 0;
+            port = io.parse_dec(argv[i + 1], io.len(argv[i + 1]), ?ok);
+            if (ok == 0 || port == 0 || port > 65535) { ret usage(); }
+            i = i + 1;
+        } or { ret usage(); }
+        i = i + 1;
+    }
+    if (argc - i != 1 || split_server(argv[i], ?port) == 0) { ret usage(); }
+
+    var ip: u32 = 0;
+    if (addr.lookup(?host[0], ?ip) == 0) {
+        io.emsg("ntpdate: ");
+        io.err(?host[0]);
+        io.emsg(": not found\n");
+        ret 1;
+    }
+    var fd: usize = 0;
+    val made: i64 = machos.sock_create(machos.AF_INET, machos.SOCK_DGRAM, 0, ?fd);
+    if (made < 0) {
+        io.fail("ntpdate", "socket", made);
+        ret 1;
+    }
+    var sa: [16]u8;
+    sa[0] = 2;
+    sa[2] = (port >> 8)::u8;
+    sa[3] = port::u8;
+    sa[4] = (ip >> 24)::u8;
+    sa[5] = (ip >> 16)::u8;
+    sa[6] = (ip >> 8)::u8;
+    sa[7] = ip::u8;
+    val connected: i64 = machos.sock_connect(fd, ?sa[0], 16);
+    if (connected < 0) {
+        io.fail("ntpdate", "connect", connected);
+        machos.sock_close(fd);
+        ret 1;
+    }
+    request[0] = 0x23; # leap 0, NTP version 4, client mode
+    machos.sock_set_rcvtimeo(fd, 3000);
+    val sent: i64 = machos.sock_send(fd, ?request[0], 48);
+    if (sent != 48) {
+        io.fail("ntpdate", "send", sent);
+        machos.sock_close(fd);
+        ret 1;
+    }
+    val received: i64 = machos.sock_recv(fd, ?reply[0], 48);
+    machos.sock_close(fd);
+    if (received < 48) {
+        io.emsg("ntpdate: no complete reply\n");
+        ret 1;
+    }
+    val mode: u8 = reply[0] & 7;
+    val version: u8 = (reply[0] >> 3) & 7;
+    val leap: u8 = reply[0] >> 6;
+    if (mode != 4 || version < 3 || leap == 3 || reply[1] == 0 || reply[1] > 15) {
+        io.emsg("ntpdate: invalid or unsynchronized reply\n");
+        ret 1;
+    }
+    val ntp: u64 = be32(?reply[40]);
+    var unix: u64 = 0;
+    if (ntp >= 2208988800) { unix = ntp - 2208988800; }
+    or { unix = 2085978496 + ntp; } # NTP era beginning in 2036
+    if (be32(?reply[44]) >= 0x80000000) { unix = unix + 1; }
+    if (query == 0 && set_clock(unix) == 0) { ret 1; }
+    io.msg("ntpdate: ");
+    if (query != 0) { io.msg("server time "); }
+    or { io.msg("time set to "); }
+    io.dec(unix);
+    io.msg(" from ");
+    io.out(?host[0]);
+    io.putc(10);
+    ret 0;
+}

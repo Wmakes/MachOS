@@ -45,7 +45,7 @@ fun output(h: i64, name: *u8, want: u64, bytes: u8, last: u8) u64 {
             take = take + 1;
         }
         if (take == stored && overflow != 0 && lines < want) {
-            io.err(name); io.err(": requested lines exceed buffer capacity\n"); ret 1;
+            io.err(name); io.emsg(": requested lines exceed buffer capacity\n"); ret 1;
         }
     }
     var start: u64 = (at + 4194304 - take) % 4194304;
@@ -75,7 +75,7 @@ pub fun run(argc: u64, argv: **u8, name: *u8, last: u8) u64 {
     var status: u64 = 0; var printed: u8 = 0;
     val many: u8 = (argc - p.at > 1)::u8;
     if (p.at == argc) {
-        if (headers == 2) { io.out("==> standard input <==\n"); }
+        if (headers == 2) { io.msg("==> standard input <==\n"); }
         ret output(io.STDIN, name, want, bytes, last);
     }
     for (p.at < argc) {
@@ -85,7 +85,7 @@ pub fun run(argc: u64, argv: **u8, name: *u8, last: u8) u64 {
         or {
             if (headers == 2 || (headers == 0 && many != 0)) {
                 if (printed != 0) { io.putc(10); }
-                io.out("==> "); io.out(path); io.out(" <==\n"); printed = 1;
+                io.msg("==> "); io.out(path); io.msg(" <==\n"); printed = 1;
             }
             if (output(h, name, want, bytes, last) != 0) { status = 1; }
             if (h != io.STDIN) { io.close(h); }

@@ -5,17 +5,17 @@ use io:   userland.lib.cli;
 use tmos: std.terminal.machos;
 use std.types.size.usize;
 
-pub val KEY_UP:    u64 = 0x101;
-pub val KEY_DOWN:  u64 = 0x102;
-pub val KEY_RIGHT: u64 = 0x103;
-pub val KEY_LEFT:  u64 = 0x104;
-pub val KEY_HOME:  u64 = 0x105;
-pub val KEY_END:   u64 = 0x106;
-pub val KEY_DEL:   u64 = 0x107;
-pub val KEY_PGUP:  u64 = 0x108;
-pub val KEY_PGDN:  u64 = 0x109;
+pub val KEY_UP:    u64 = 0x110001;
+pub val KEY_DOWN:  u64 = 0x110002;
+pub val KEY_RIGHT: u64 = 0x110003;
+pub val KEY_LEFT:  u64 = 0x110004;
+pub val KEY_HOME:  u64 = 0x110005;
+pub val KEY_END:   u64 = 0x110006;
+pub val KEY_DEL:   u64 = 0x110007;
+pub val KEY_PGUP:  u64 = 0x110008;
+pub val KEY_PGDN:  u64 = 0x110009;
 pub val KEY_EOF:   u64 = 0xFFFFFFFFFFFFFFFF;
-pub val KEY_ALT:   u64 = 0x1000; # + the key: alt+key, or escape then key ("M-x")
+pub val KEY_ALT:   u64 = 0x200000; # + the codepoint: alt+key, or escape then key ("M-x")
 
 var tty: i64 = 0;     # where keys come from (a terminal handle)
 var rows: u64 = 24;
@@ -26,14 +26,14 @@ pub fun start(h: i64) u8 {
     tty = h;
     if (tmos.size(h::usize, ?rows, ?cols) < 0) { ret 0; }
     tmos.raw(h::usize);
-    io.out("\x1b[2J\x1b[H\0");
+    io.msg("\x1b[2J\x1b[H\0");
     ret 1;
 }
 
 # hand the terminal back: line mode, a clean screen
 pub fun stop() {
     tmos.restore(tty::usize);
-    io.out("\x1b[0m\x1b[2J\x1b[H\0");
+    io.msg("\x1b[0m\x1b[2J\x1b[H\0");
 }
 
 pub fun height() u64 { ret rows; }
@@ -41,17 +41,17 @@ pub fun width() u64 { ret cols; }
 
 # row and col count from 0
 pub fun go(row: u64, col: u64) {
-    io.out("\x1b[\0");
+    io.msg("\x1b[\0");
     io.dec(row + 1);
     io.putc(59);
     io.dec(col + 1);
     io.putc(72);
 }
 
-pub fun clear_eol() { io.out("\x1b[K\0"); }
+pub fun clear_eol() { io.msg("\x1b[K\0"); }
 pub fun reverse(on: u8) {
-    if (on != 0) { io.out("\x1b[7m\0"); }
-    or           { io.out("\x1b[0m\0"); }
+    if (on != 0) { io.msg("\x1b[7m\0"); }
+    or           { io.msg("\x1b[0m\0"); }
 }
 
 fun byte() u64 {
@@ -61,15 +61,35 @@ fun byte() u64 {
     ret c::u64;
 }
 
+fun decode(first: u64) u64 {
+    if (first < 0x80 || first == KEY_EOF) { ret first; }
+    var cp: u64 = 0;
+    var need: u64 = 0;
+    var minimum: u64 = 0;
+    if (first >= 0xC2 && first <= 0xDF) { cp = first & 0x1F; need = 1; minimum = 0x80; }
+    or (first >= 0xE0 && first <= 0xEF) { cp = first & 0x0F; need = 2; minimum = 0x800; }
+    or (first >= 0xF0 && first <= 0xF4) { cp = first & 7; need = 3; minimum = 0x10000; }
+    or { ret 0xFFFD; }
+    var i: u64 = 0;
+    for (i < need) {
+        val c: u64 = byte();
+        if (c < 0x80 || c >= 0xC0) { ret 0xFFFD; }
+        cp = (cp << 6) | (c & 0x3F);
+        i = i + 1;
+    }
+    if (cp < minimum || (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) { ret 0xFFFD; }
+    ret cp;
+}
+
 pub fun key() u64 {
     val c: u64 = byte();
     if (c != 27) {
         if (c == 13) { ret 10; }
-        ret c;
+        ret decode(c);
     }
     val c2: u64 = byte();
     if (c2 == 27 || c2 == KEY_EOF) { ret 27; }
-    if (c2 != 91 && c2 != 79) { ret KEY_ALT + c2; }
+    if (c2 != 91 && c2 != 79) { ret KEY_ALT + decode(c2); }
     var num: u64 = 0;
     var f: u64 = byte();
     for (f >= 48 && f <= 57) {

@@ -10,7 +10,15 @@
 use machos.boot.info;
 
 #[embed("font8x16.bin")]
-val FONT: [4096]u8; # 256 glyphs, 16 rows each, msb = leftmost pixel
+val FONT: [59216]u8; # 3701 Unicode glyphs, 16 rows each, msb = leftmost pixel
+
+# Sorted little-endian Unicode values for FONT slots 128 onward. Slots 0..127
+# match ASCII directly. Keeping the map binary avoids thousands of integer
+# literals in this module while retaining a logarithmic lookup.
+#[embed("font8x16.map")]
+val FONT_MAP: [14292]u8;
+val FONT_MAP_COUNT: u64 = 3573;
+val REPLACEMENT_GLYPH: u64 = 3452;
 
 val GW:        u64 = 8;
 val GH:        u64 = 16;
@@ -23,9 +31,9 @@ pub val SCREENS: u64 = 6;
 # one terminal's screen: its characters, colours, cursor, escape parser
 # and history. only the screen shown is painted
 rec Screen {
-    cells:     [32768]u8;
+    cells:     [32768]u64; # base + two 21-bit combining codepoints
     attrs:     [32768]u64; # packed framebuffer pixels: foreground low, background high
-    hist_c:    [98304]u8; # lines that scrolled off, a ring of hist_max lines
+    hist_c:    [98304]u64; # lines that scrolled off, a ring of hist_max lines
     hist_a:    [98304]u64;
     hist_head: u64; # where the next line goes
     hist_n:    u64; # lines kept
@@ -41,6 +49,9 @@ rec Screen {
     params:    [32]u64;
     nparams:   u64;
     invalid:   u8; # discard overlong or overflowing CSI sequences
+    utf_code:  u32; # partially decoded UTF-8 codepoint
+    utf_min:   u32; # shortest legal value for this sequence length
+    utf_need:  u8;  # continuation bytes still required
 }
 
 var screens: [6]Screen;
@@ -76,17 +87,44 @@ fun rgb(f: *info.Framebuffer, r: u32, g: u32, b: u32) u32 {
 }
 
 fun paint(i: u64, a: u64) {
-    paint_char(i, s.cells[i], a);
+    val cell: u64 = s.cells[i];
+    if ((cell >> 21) == 0) { paint_char(i, cell::u32, a); ret; }
+    paint_cell(i, cell::u32 & 0x1FFFFF, ((cell >> 21)::u32) & 0x1FFFFF,
+               ((cell >> 42)::u32) & 0x1FFFFF, a);
 }
 
-fun paint_char(i: u64, ch: u8, a: u64) {
-    val c:  u64 = ch::u64;
+fun map_code(i: u64) u32 {
+    val at: u64 = i * 4;
+    ret FONT_MAP[at]::u32 | (FONT_MAP[at + 1]::u32 << 8) |
+        (FONT_MAP[at + 2]::u32 << 16) | (FONT_MAP[at + 3]::u32 << 24);
+}
+
+fun font_index(cp: u32) u64 {
+    if (cp < 128) { ret cp::u64; }
+    var lo: u64 = 0;
+    var hi: u64 = FONT_MAP_COUNT;
+    for (lo < hi) {
+        val mid: u64 = lo + (hi - lo) / 2;
+        val found: u32 = map_code(mid);
+        if (found < cp) { lo = mid + 1; }
+        or              { hi = mid; }
+    }
+    if (lo < FONT_MAP_COUNT && map_code(lo) == cp) { ret lo + 128; }
+    ret REPLACEMENT_GLYPH;
+}
+
+fun glyph_row(cp: u32, y: u64) u8 {
+    if (cp < 128) { ret FONT[cp::u64 * GH + y]; }
+    ret FONT[font_index(cp) * GH + y];
+}
+
+fun paint_char(i: u64, cp: u32, a: u64) {
     val fg: u32 = a::u32;
     val bg: u32 = (a >> 32)::u32;
     val px: u64 = base + (i / cols) * GH * pitch + (i % cols) * GW * 4;
     var y:  u64 = 0;
     for (y < GH) {
-        val bits: u8   = FONT[c * GH + y];
+        val bits: u8   = glyph_row(cp, y);
         val row:  *u32 = (px + y * pitch)::*u32;
         var x:    u64  = 0;
         for (x < GW) {
@@ -98,6 +136,28 @@ fun paint_char(i: u64, ch: u8, a: u64) {
     }
 }
 
+fun overlay_char(i: u64, cp: u32, fg: u32) {
+    if (cp == 0) { ret; }
+    val px: u64 = base + (i / cols) * GH * pitch + (i % cols) * GW * 4;
+    var y: u64 = 0;
+    for (y < GH) {
+        val bits: u8 = glyph_row(cp, y);
+        val row: *u32 = (px + y * pitch)::*u32;
+        var x: u64 = 0;
+        for (x < GW) {
+            if (((bits << x::u8) & 0x80) != 0) { row[x] = fg; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fun paint_cell(i: u64, cp: u32, m1: u32, m2: u32, a: u64) {
+    paint_char(i, cp, a);
+    if (m1 != 0) { overlay_char(i, m1, a::u32); }
+    if (m2 != 0) { overlay_char(i, m2, a::u32); }
+}
+
 fun draw(i: u64) {
     paint(i, s.attrs[i]);
 }
@@ -107,13 +167,19 @@ fun visible() u8 {
     ret (s == ?screens[shown] && s.view == 0)::u8;
 }
 
-fun set(i: u64, c: u8, a: u64) {
-    if (s.cells[i] != c || s.attrs[i] != a) {
-        s.cells[i] = c;
+fun set_packed(i: u64, cell: u64, a: u64) {
+    if (s.cells[i] != cell || s.attrs[i] != a) {
+        s.cells[i] = cell;
         s.attrs[i] = a;
         if (visible() != 0) { draw(i); }
     }
 }
+
+fun set_full(i: u64, c: u32, m1: u32, m2: u32, a: u64) {
+    set_packed(i, c::u64 | (m1::u64 << 21) | (m2::u64 << 42), a);
+}
+
+fun set(i: u64, c: u32, a: u64) { set_packed(i, c::u64, a); }
 
 # the cursor is the cell under it drawn with fg and bg swapped
 fun cursor_cell() u64 {
@@ -164,7 +230,7 @@ fun scroll() {
     val n: u64 = (rows - 1) * cols;
     var i: u64 = 0;
     for (i < n) {
-        set(i, s.cells[i + cols], s.attrs[i + cols]);
+        set_packed(i, s.cells[i + cols], s.attrs[i + cols]);
         i = i + 1;
     }
     for (i < rows * cols) {
@@ -365,6 +431,9 @@ pub fun init(f: *info.Framebuffer) u8 {
         s.esc       = 0;
         s.nparams   = 0;
         s.invalid   = 0;
+        s.utf_code  = 0;
+        s.utf_min   = 0;
+        s.utf_need  = 0;
         n           = n + 1;
     }
     hist_max = HIST_CELLS / cols;
@@ -383,14 +452,18 @@ fun repaint() {
             # history line (view - r) back from the newest
             val line: u64 = (s.hist_head + hist_max - (s.view - r)) % hist_max;
             for (k < cols) {
-                paint_char(r * cols + k, s.hist_c[line * cols + k], s.hist_a[line * cols + k]);
+                val cell: u64 = s.hist_c[line * cols + k];
+                paint_cell(r * cols + k, cell::u32 & 0x1FFFFF, ((cell >> 21)::u32) & 0x1FFFFF,
+                           ((cell >> 42)::u32) & 0x1FFFFF, s.hist_a[line * cols + k]);
                 k = k + 1;
             }
         }
         or {
             val src: u64 = (r - s.view) * cols;
             for (k < cols) {
-                paint_char(r * cols + k, s.cells[src + k], s.attrs[src + k]);
+                val cell: u64 = s.cells[src + k];
+                paint_cell(r * cols + k, cell::u32 & 0x1FFFFF, ((cell >> 21)::u32) & 0x1FFFFF,
+                           ((cell >> 42)::u32) & 0x1FFFFF, s.attrs[src + k]);
                 k = k + 1;
             }
         }
@@ -445,6 +518,48 @@ pub fun rows_of() u64 {
     ret rows;
 }
 
+# The Unicode codepoint stored in a terminal cell (also useful to diagnostics).
+pub fun cell_at(screen: u64, cell: u64) u32 {
+    if (screen >= SCREENS || cell >= rows * cols) { ret 0; }
+    ret screens[screen].cells[cell]::u32 & 0x1FFFFF;
+}
+
+pub fun mark_at(screen: u64, cell: u64, second: u8) u32 {
+    if (screen >= SCREENS || cell >= rows * cols) { ret 0; }
+    val packed: u64 = screens[screen].cells[cell];
+    if (second != 0) { ret ((packed >> 42)::u32) & 0x1FFFFF; }
+    ret ((packed >> 21)::u32) & 0x1FFFFF;
+}
+
+fun combining(cp: u32) u8 {
+    ret ((cp >= 0x0300 && cp <= 0x036F) || (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+         (cp >= 0x1DC0 && cp <= 0x1DFF) || (cp >= 0x20D0 && cp <= 0x20FF) ||
+         (cp >= 0xFE20 && cp <= 0xFE2F))::u8;
+}
+
+fun put_code(cp: u32) {
+    if (combining(cp) != 0) {
+        if (s.cx == 0) { ret; }
+        val i: u64 = s.cy * cols + s.cx - 1;
+        var cell: u64 = s.cells[i];
+        if (((cell >> 21) & 0x1FFFFF) == 0) { cell = cell | (cp::u64 << 21); }
+        or                                  { cell = (cell & 0x3FFFFFFFFFF) | (cp::u64 << 42); }
+        s.cells[i] = cell;
+        if (visible() != 0) { draw(i); }
+        ret;
+    }
+    if (s.cx >= cols) { newline(); }
+    set(s.cy * cols + s.cx, cp, colours());
+    s.cx = s.cx + 1;
+}
+
+fun replacement() {
+    s.utf_code = 0;
+    s.utf_min = 0;
+    s.utf_need = 0;
+    put_code(0xFFFD);
+}
+
 fun put(c: u8) {
     if (s.esc == 1) {
         if (c == 91) { # [
@@ -482,36 +597,78 @@ fun put(c: u8) {
         ret;
     }
     if (c == 27) {
+        if (s.utf_need != 0) { replacement(); }
         s.esc = 1;
         ret;
     }
     if (c == 10) {
+        if (s.utf_need != 0) { replacement(); }
         newline();
         ret;
     }
     if (c == 13) {
+        if (s.utf_need != 0) { replacement(); }
         s.cx = 0;
         ret;
     }
     if (c == 12) { # form feed clears the screen
+        if (s.utf_need != 0) { replacement(); }
         clear_from(0, rows * cols);
         s.cx = 0;
         s.cy = 0;
         ret;
     }
     if (c == 8) {
+        if (s.utf_need != 0) { replacement(); }
         if (s.cx > 0) { s.cx = s.cx - 1; }
         ret;
     }
     if (c == 9) {
-        put(32);
-        for ((s.cx % 8) != 0 && s.cx < cols) { put(32); }
+        if (s.utf_need != 0) { replacement(); }
+        put_code(32);
+        for ((s.cx % 8) != 0 && s.cx < cols) { put_code(32); }
         ret;
     }
-    if (c < 32)       { ret; }
-    if (s.cx >= cols) { newline(); }
-    set(s.cy * cols + s.cx, c, colours());
-    s.cx = s.cx + 1;
+    if (c < 32) {
+        if (s.utf_need != 0) { replacement(); }
+        ret;
+    }
+    if (c < 128) {
+        if (s.utf_need != 0) { replacement(); }
+        put_code(c::u32);
+        ret;
+    }
+    if (c >= 0x80 && c < 0xC0) {
+        if (s.utf_need == 0) { replacement(); ret; }
+        s.utf_code = (s.utf_code << 6) | (c & 0x3F)::u32;
+        s.utf_need = s.utf_need - 1;
+        if (s.utf_need == 0) {
+            val cp: u32 = s.utf_code;
+            val minimum: u32 = s.utf_min;
+            s.utf_code = 0;
+            s.utf_min = 0;
+            if (cp < minimum || (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) { replacement(); }
+            or { put_code(cp); }
+        }
+        ret;
+    }
+    if (s.utf_need != 0) { replacement(); }
+    if (c >= 0xC2 && c <= 0xDF) {
+        s.utf_code = (c & 0x1F)::u32;
+        s.utf_min = 0x80;
+        s.utf_need = 1;
+    }
+    or (c >= 0xE0 && c <= 0xEF) {
+        s.utf_code = (c & 0x0F)::u32;
+        s.utf_min = 0x800;
+        s.utf_need = 2;
+    }
+    or (c >= 0xF0 && c <= 0xF4) {
+        s.utf_code = (c & 0x07)::u32;
+        s.utf_min = 0x10000;
+        s.utf_need = 3;
+    }
+    or { replacement(); }
 }
 
 # a byte for screen `n`

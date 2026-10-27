@@ -61,7 +61,7 @@ pub var target_version: [128]u8;
 var     local_version:  [128]u8;
 
 fun fail(message: *u8) u8 {
-    io.err("mpm: ");
+    io.emsg("mpm: ");
     io.err(message);
     io.putc(10);
     ret 0;
@@ -538,7 +538,7 @@ pub fun refresh() u8 {
     if (fetch_pair(?current.url[0], ?current.signature_url[0], "/var/lib/mpm/transaction/current.download", LIMIT, ?active) == 0 || index(?active, ?current) == 0)                                                                                                                                                                                                  { ret fail("invalid current-OS repository index"); }
     if (fetch_pair(?newest.url[0], ?newest.signature_url[0], "/var/lib/mpm/transaction/latest.download", LIMIT, ?latest) == 0 || index(?latest, ?newest) == 0)                                                                                                                                                                                                      { ret fail("invalid latest-OS repository index"); }
     if (add_cache("/var/lib/mpm/repository/stable.toml", "/var/lib/mpm/transaction/stable.download", ?root) == 0 || add_cache("/var/lib/mpm/repository/current.toml", "/var/lib/mpm/transaction/current.download", ?active) == 0 || add_cache("/var/lib/mpm/repository/latest.toml", "/var/lib/mpm/transaction/latest.download", ?latest) == 0 || tx.commit() == 0) { ret 0; }
-    io.out("mpm: refreshed verified stable repository\n");
+    io.msg("mpm: refreshed verified stable repository\n");
     ret 1;
 }
 
@@ -578,7 +578,7 @@ pub fun search(query: *u8) u8 {
                 io.out(?entries[i].name[0]);
                 io.putc(32);
                 io.out(?entries[i].version[0]);
-                io.out(" - ");
+                io.msg(" - ");
                 io.out(?entries[i].description[0]);
                 io.putc(10);
             }

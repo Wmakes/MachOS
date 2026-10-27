@@ -63,7 +63,7 @@ fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
     if (argc < 3) {
-        io.err("usage: chmod MODE FILE...\n\0");
+        io.emsg("usage: chmod MODE FILE...\n\0");
         ret 2;
     }
     var status: u64 = 0;
@@ -79,9 +79,9 @@ fun run(argc: u64, argv: **u8) u64 {
         }
         val mode: u64 = apply(argv[1], io.len(argv[1]), (st.st_mode & 0o7777)::u64);
         if (mode == NO_MODE) {
-            io.err("chmod: bad mode: \0");
+            io.emsg("chmod: bad mode: \0");
             io.err(argv[1]);
-            io.err("\n\0");
+            io.emsg("\n\0");
             ret 2;
         }
         val r: i64 = io.chmod(argv[i], mode);

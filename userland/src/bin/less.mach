@@ -9,6 +9,7 @@ use os:  std.system.os;
 use io:  userland.lib.cli;
 use std.runtime;
 use term: userland.ui.term;
+use utf8: userland.lib.utf8;
 
 val CAP: u64 = 4194304; # 4 MiB
 var text: [4194304]u8;
@@ -60,12 +61,17 @@ fun draw() {
         if (ln < nlines) {
             var i: u64 = starts[ln];
             var n: u64 = 0;
-            for (i < len && text[i] != 10 && n < w) {
-                var c: u8 = text[i];
-                if (c == 9 || c < 32 || c >= 127) { c = 32; }
-                io.putc(c);
-                n = n + 1;
-                i = i + 1;
+            var drawn_base: u8 = 0;
+            for (i < len && text[i] != 10) {
+                val bytes: u64 = utf8.sequence(?text[0], i, len);
+                val char_width: u64 = utf8.width(utf8.decode(?text[0], i, len));
+                if (char_width != 0 && n >= w) { brk; }
+                if (text[i] == 9 || text[i] < 32) { io.putc(32); }
+                or (bytes == 1 && text[i] >= 128) { io.putc(63); }
+                or (char_width != 0 || drawn_base != 0) { io.outn(?text[i], bytes); }
+                if (char_width != 0) { drawn_base = 1; }
+                n = n + char_width;
+                i = i + bytes;
             }
         } or {
             io.putc(126);
@@ -75,9 +81,9 @@ fun draw() {
     }
     term.go(page(), 0);
     term.reverse(1);
-    io.out(" \0");
+    io.msg(" \0");
     io.out(name);
-    io.out("  lines \0");
+    io.msg("  lines \0");
     io.dec(top + 1);
     io.putc(45);
     var bottom: u64 = top + page();
@@ -86,10 +92,10 @@ fun draw() {
     io.putc(47);
     io.dec(nlines);
     if (note != nil) {
-        io.out("  \0");
+        io.msg("  \0");
         io.out(note);
     }
-    io.out("  (q quits) \0");
+    io.msg("  (q quits) \0");
     term.reverse(0);
     term.clear_eol();
 }
@@ -127,10 +133,14 @@ fun ask() {
             plen = 0;
             ret;
         }
-        if ((k == 127 || k == 8) && plen > 0) { plen = plen - 1; }
-        if (k >= 32 && k < 127 && plen < 128) {
-            pattern[plen] = k::u8;
-            plen = plen + 1;
+        if ((k == 127 || k == 8) && plen > 0) { plen = utf8.previous(?pattern[0], plen); }
+        if (k >= 32 && k <= 0x10FFFF) {
+            var encoded: [4]u8;
+            val bytes: u64 = utf8.encode(k::u32, ?encoded[0]);
+            if (bytes != 0 && plen + bytes <= 128) {
+                io.copy(?pattern[plen], ?encoded[0], bytes);
+                plen = plen + bytes;
+            }
         }
     }
     if (plen > 0) { search(); }
@@ -160,7 +170,7 @@ fun run(argc: u64, argv: **u8) u64 {
     # keys come from the terminal even when the text came through a pipe
     val tty: i64 = io.open_mode("/dev/console\0", os.O_RDONLY, 0o666);
     if (tty < 0 || term.start(tty) == 0) {
-        io.err("less: no terminal\n\0");
+        io.emsg("less: no terminal\n\0");
         ret 1;
     }
     index_lines();

@@ -50,9 +50,9 @@ fun permitted(path: *u8) u8 {
 }
 
 fun invalid(why: *u8, offset: u64) u8 {
-    io.err("mpm: ");
+    io.emsg("mpm: ");
     io.err(why);
-    io.err(" at migration archive offset ");
+    io.emsg(" at migration archive offset ");
     io.dec(offset);
     io.putc(10);
     ret 0;
@@ -77,7 +77,7 @@ fun parse(blob: *fs.Blob) u8 {
                 at = at + 1;
             }
             if (essential != 31 || count < 5) {
-                io.err("mpm: migration data is missing required records\n");
+                io.emsg("mpm: migration data is missing required records\n");
                 ret 0;
             }
             ret 1;
@@ -107,7 +107,7 @@ fun parse(blob: *fs.Blob) u8 {
         io.copy(?m.path[1], h, n);
         m.path[n + 1] = 0;
         if (permitted(?m.path[0]) == 0) {
-            io.err("mpm: unsupported migration member: ");
+            io.emsg("mpm: unsupported migration member: ");
             io.err(?m.path[0]);
             io.putc(10);
             ret 0;
@@ -123,7 +123,7 @@ fun parse(blob: *fs.Blob) u8 {
         if (io.eq(?m.path[0], prefix_len, RECORDS, prefix_len) != 0) {
             var p: pkg.Package;
             if (pkg.parse(?p, m.data, m.len) == 0) {
-                io.err("mpm: invalid migration package record: ");
+                io.emsg("mpm: invalid migration package record: ");
                 io.err(?m.path[0]);
                 io.putc(10);
                 ret 0;
@@ -166,7 +166,7 @@ pub fun run() u8 {
     if (fs.read(BUNDLE, 4194304, ?blob) == 0) { ret 0; }
     fin { fs.release(?blob); }
     if (parse(?blob) == 0) {
-        io.err("mpm: invalid legacy migration data\n");
+        io.emsg("mpm: invalid legacy migration data\n");
         ret 0;
     }
     var args: [3]*u8 = [3]*u8{"config", "migrate", nil};
@@ -186,6 +186,6 @@ pub fun run() u8 {
     if (fs.exists("/bin/update") != 0 && io.remove("/bin/update") < 0) { ret 0; }
     if (io.remove(BUNDLE) < 0)                                         { ret 0; }
     sys.sync();
-    io.out("mpm: legacy migration completed; future updates use mpm upgrade\n");
+    io.msg("mpm: legacy migration completed; future updates use mpm upgrade\n");
     ret 1;
 }

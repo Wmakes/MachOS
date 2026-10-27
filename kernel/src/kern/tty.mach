@@ -73,6 +73,13 @@ fun echo(n: u64, c: u8) {
     if ((terms[n].lflag & abi.ECHO) != 0) { out(n, c); }
 }
 
+fun previous(text: *u8, at: u64) u64 {
+    if (at == 0) { ret 0; }
+    var i: u64 = at - 1;
+    for (i > 0 && (text[i] & 0xC0) == 0x80) { i = i - 1; }
+    ret i;
+}
+
 fun canonical(n: u64, c: u8) {
     val t: *Term = ?terms[n];
     # skip ESC [ ... final, or ESC O x
@@ -100,14 +107,14 @@ fun canonical(n: u64, c: u8) {
     }
     if (c == 8) {
         if (t.line_len > 0) {
-            t.line_len = t.line_len - 1;
+            t.line_len = previous(?t.line[0], t.line_len);
             if ((t.lflag & abi.ECHO) != 0) { outs(n, "\x08 \x08\0"); }
         }
         ret;
     }
     if (c == 21) { # ^U: kill the line
         for (t.line_len > 0) {
-            t.line_len = t.line_len - 1;
+            t.line_len = previous(?t.line[0], t.line_len);
             if ((t.lflag & abi.ECHO) != 0) { outs(n, "\x08 \x08\0"); }
         }
         ret;
@@ -119,7 +126,7 @@ fun canonical(n: u64, c: u8) {
         commit(t);
         ret;
     }
-    if ((c >= 32 && c < 127) || c == 9) {
+    if (c >= 32 || c == 9) {
         if (t.line_len < LINE - 1) {
             t.line[t.line_len] = c;
             t.line_len = t.line_len + 1;
@@ -177,6 +184,42 @@ pub fun control(c: u8) u8 {
 
 # a byte from the keyboard: to the terminal on screen
 pub fun input(c: u8) { input_to(active, c); }
+
+# Encode one keyboard codepoint as UTF-8 bytes into the active terminal.
+pub fun input_codepoint(cp: u32) {
+    var bytes: [4]u8;
+    var n: u64 = 0;
+    if (cp <= 0x7F) { bytes[0] = cp::u8; n = 1; }
+    or (cp <= 0x7FF) {
+        bytes[0] = (0xC0 | (cp >> 6))::u8;
+        bytes[1] = (0x80 | (cp & 0x3F))::u8;
+        n = 2;
+    }
+    if (cp >= 0xD800 && cp <= 0xDFFF) { ret; }
+    if (n == 0 && cp <= 0xFFFF) {
+        bytes[0] = (0xE0 | (cp >> 12))::u8;
+        bytes[1] = (0x80 | ((cp >> 6) & 0x3F))::u8;
+        bytes[2] = (0x80 | (cp & 0x3F))::u8;
+        n = 3;
+    }
+    if (n == 0 && cp <= 0x10FFFF) {
+        bytes[0] = (0xF0 | (cp >> 18))::u8;
+        bytes[1] = (0x80 | ((cp >> 12) & 0x3F))::u8;
+        bytes[2] = (0x80 | ((cp >> 6) & 0x3F))::u8;
+        bytes[3] = (0x80 | (cp & 0x3F))::u8;
+        n = 4;
+    }
+    if (n == 0) { ret; }
+    setup();
+    val t: *Term = ?terms[active];
+    if ((t.lflag & abi.ICANON) != 0 && t.line_len + n >= LINE) { ret; }
+    if ((t.lflag & abi.ICANON) == 0 && t.count + n > RING) { ret; }
+    var i: u64 = 0;
+    for (i < n) {
+        input_to(active, bytes[i]);
+        i = i + 1;
+    }
+}
 
 # show terminal `n` (alt+Fn)
 pub fun switch_to(n: u64) {

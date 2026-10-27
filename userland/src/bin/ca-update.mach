@@ -20,7 +20,7 @@ val DESTINATION: *u8 = "/etc/ssl/certs/ca-certificates.crt";
 var temporary: [256]u8;
 
 fun usage() i64 {
-    io.err("usage: ca-update [--provider mozilla | --url HTTPS_URL]\n");
+    io.emsg("usage: ca-update [--provider mozilla | --url HTTPS_URL]\n");
     ret 2;
 }
 
@@ -64,7 +64,7 @@ fun main(argc: i64, argv: **u8) i64 {
     or (argc == 3 && io.streq(argv[1], "--url") != 0) { url = argv[2]; }
     or (argc != 1) { ret usage(); }
     if (!https(url)) {
-        io.err("ca-update: a verified HTTPS URL is required\n");
+        io.emsg("ca-update: a verified HTTPS URL is required\n");
         ret 1;
     }
     # Keep staging on the same filesystem. O_EXCL prevents concurrent runs from
@@ -76,7 +76,7 @@ fun main(argc: i64, argv: **u8) i64 {
     temporary[n] = 0;
     val opened: i64 = io.open_mode(?temporary[0], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600);
     if (opened < 0) {
-        io.err("ca-update: cannot create a staging file\n");
+        io.emsg("ca-update: cannot create a staging file\n");
         ret 1;
     }
     io.close(opened);
@@ -91,7 +91,7 @@ fun main(argc: i64, argv: **u8) i64 {
     }
     if (!downloaded) {
         io.remove(?temporary[0]);
-        io.err("ca-update: download failed; existing CA bundle kept\n");
+        io.emsg("ca-update: download failed; existing CA bundle kept\n");
         ret 1;
     }
     var pages: allocator.Allocator;
@@ -109,27 +109,27 @@ fun main(argc: i64, argv: **u8) i64 {
                 i = i + 1;
             }
             if (valid && parsed.bundle.skipped != 0) {
-                io.err("ca-update: warning: some CA roots are unsupported by this build\n");
+                io.emsg("ca-update: warning: some CA roots are unsupported by this build\n");
             }
             bundle.release(?pages, ?parsed);
         }
     }
     if (!valid) {
         io.remove(?temporary[0]);
-        io.err("ca-update: invalid CA bundle; existing CA bundle kept\n");
+        io.emsg("ca-update: invalid CA bundle; existing CA bundle kept\n");
         ret 1;
     }
     if (io.chmod(?temporary[0], 0o644) < 0) {
         io.remove(?temporary[0]);
-        io.err("ca-update: cannot set CA bundle permissions; existing CA bundle kept\n");
+        io.emsg("ca-update: cannot set CA bundle permissions; existing CA bundle kept\n");
         ret 1;
     }
     if (io.rename(?temporary[0], DESTINATION) < 0) {
         io.remove(?temporary[0]);
-        io.err("ca-update: cannot replace CA bundle; existing CA bundle kept\n");
+        io.emsg("ca-update: cannot replace CA bundle; existing CA bundle kept\n");
         ret 1;
     }
-    if (!provenance(url)) { io.err("ca-update: warning: cannot record CA bundle source\n"); }
-    io.out("ca-update: CA bundle updated\n");
+    if (!provenance(url)) { io.emsg("ca-update: warning: cannot record CA bundle source\n"); }
+    io.msg("ca-update: CA bundle updated\n");
     ret 0;
 }

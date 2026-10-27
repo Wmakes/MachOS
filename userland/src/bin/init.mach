@@ -1,13 +1,10 @@
-# pid 1: apply /etc/machos.conf, then keep a login prompt on each terminal,
+# pid 1: apply the focused files in /etc, then keep a login prompt on each terminal,
 # tty1..tty6 (alt+F1..F6 switch between them; tty1 is also the serial
 # port). in rescue mode: one root shell on the console, no password asked,
 # for repairing the system
 #
-# from /etc/machos.conf: hostname, ttys (how many terminals get a login
-# prompt), autologin (a user logged in on tty1 without a password), and
-# rtc (utc, or local when the hardware clock keeps local time, as Windows
-# does: the time zone's offset is handed to the kernel) and network (dhcp,
-# off, or a fixed "IP/PREFIX GATEWAY DNS")
+# The settings include identity, locale, console keymap, clock, login and
+# network configuration. An enabled NTP server is queried after networking.
 
 use sdk.auth;
 use std.runtime;
@@ -55,7 +52,7 @@ fun reap() i64 {
 
 fun rescue_shell() {
     for {
-        io.out("init: rescue mode, root shell (fsck -y /dev/sda2 checks the disk)\n");
+        io.msg("init: rescue mode, root shell (fsck -y /dev/sda2 checks the disk)\n");
         var argv: [2]*u8;
         argv[0] = "-sh";
         argv[1] = nil;
@@ -92,13 +89,25 @@ fun clamp(v: u64, lo: u64, hi: u64) u64 {
 
 # the settings that are the system's
 fun configure() {
-    var v: [64]u8;
-    if (conf.get("hostname", ?v[0], 64) > 0) { tell("/proc/sys/kernel/hostname", ?v[0]); }
+    var v: [256]u8;
+    if (conf.get("hostname", ?v[0], 256) > 0) { tell("/proc/sys/kernel/hostname", ?v[0]); }
+    if (conf.get("keymap", ?v[0], 256) > 0) { tell("/proc/sys/kernel/keymap", ?v[0]); }
     ttys = clamp(conf.number("ttys", 6), 1, TTYS);
     conf.get("autologin", ?autologin[0], 32);
-    if (conf.get("rtc", ?v[0], 64) > 0 && io.streq(?v[0], "local") != 0) { rtc_local(); }
+    if (conf.get("rtc", ?v[0], 256) > 0 && io.streq(?v[0], "local") != 0) { rtc_local(); }
     # the network: dhcp (the kernel already asks), off, or "IP/PREFIX GATEWAY DNS"
-    if (conf.get("network", ?v[0], 64) > 0 && io.streq(?v[0], "dhcp") == 0) { tell("/proc/net/config", ?v[0]); }
+    if (conf.get("network", ?v[0], 256) > 0 && io.streq(?v[0], "dhcp") == 0) { tell("/proc/net/config", ?v[0]); }
+    if (conf.get("ntp", ?v[0], 256) > 0 && io.streq(?v[0], "off") == 0) {
+        var args: [3]*u8 = [3]*u8{"ntpdate", ?v[0], nil};
+        var tries: u64 = 0;
+        var status: i64 = 1;
+        for (tries < 3 && status != 0) {
+            status = io.run_program("/bin/ntpdate", ?args[0], nil);
+            tries = tries + 1;
+            if (status != 0 && tries < 3) { io.sleep_ms(1000); }
+        }
+        if (status != 0) { io.emsg("init: NTP synchronization failed\n"); }
+    }
 }
 
 # v as decimal text, with a minus when it is negative, into out (24 bytes)
@@ -137,7 +146,7 @@ fun main(argc: i64, argv: **u8) i64 {
     if (io.exists("/bin/mpm-bootstrap.tar")) {
         var args: [3]*u8 = [3]*u8{"mpm", "--bootstrap", nil};
         if (io.run_program("/bin/mpm", ?args[0], nil) != 0) {
-            io.err("init: legacy migration failed; boot rescue to repair the system\n");
+            io.emsg("init: legacy migration failed; boot rescue to repair the system\n");
             for { io.sleep_ms(1000); }
         }
     }

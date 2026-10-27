@@ -3,13 +3,12 @@
 use cpu: machos.arch.x86_64.cpu;
 use tty: machos.kern.tty;
 use fbcon: machos.dev.fbcon;
-
-val NORMAL: [58]u8 = [58]u8{0x00, 0x1b, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30, 0x2d, 0x3d, 0x08, 0x09, 0x71, 0x77, 0x65, 0x72, 0x74, 0x79, 0x75, 0x69, 0x6f, 0x70, 0x5b, 0x5d, 0x0a, 0x00, 0x61, 0x73, 0x64, 0x66, 0x67, 0x68, 0x6a, 0x6b, 0x6c, 0x3b, 0x27, 0x60, 0x00, 0x5c, 0x7a, 0x78, 0x63, 0x76, 0x62, 0x6e, 0x6d, 0x2c, 0x2e, 0x2f, 0x00, 0x2a, 0x00, 0x20};
-val SHIFTED: [58]u8 = [58]u8{0x00, 0x1b, 0x21, 0x40, 0x23, 0x24, 0x25, 0x5e, 0x26, 0x2a, 0x28, 0x29, 0x5f, 0x2b, 0x08, 0x09, 0x51, 0x57, 0x45, 0x52, 0x54, 0x59, 0x55, 0x49, 0x4f, 0x50, 0x7b, 0x7d, 0x0a, 0x00, 0x41, 0x53, 0x44, 0x46, 0x47, 0x48, 0x4a, 0x4b, 0x4c, 0x3a, 0x22, 0x7e, 0x00, 0x7c, 0x5a, 0x58, 0x43, 0x56, 0x42, 0x4e, 0x4d, 0x3c, 0x3e, 0x3f, 0x00, 0x2a, 0x00, 0x20};
+use keymap: machos.dev.keymap;
 
 var shift: u8 = 0;
 var ctrl: u8 = 0;
 var alt: u8 = 0;
+var altgr: u8 = 0;
 var caps: u8 = 0;
 var extended: u8 = 0;
 
@@ -49,15 +48,18 @@ fun key(code: u8) {
     }
     if (code == 0x1D) { ctrl = 1; ret; }
     if (code == 0x3A) { caps = caps ^ 1; ret; }
-    if (code::u64 >= 58) { ret; }
-    var c: u8 = NORMAL[code];
-    if (shift != 0) { c = SHIFTED[code]; }
-    if (caps != 0 && c >= 97 && c <= 122 && shift == 0) { c = c - 32; }
-    or (caps != 0 && c >= 65 && c <= 90 && shift != 0) { c = c + 32; }
-    if (ctrl != 0) { c = tty.control(c); }  # ^A = 1 ..., ^\ ^_ ...
-    if (c != 0) {
+    if (code == 0x01) { tty.input(27); ret; }
+    if (code == 0x0E) { tty.input(127); ret; }
+    if (code == 0x0F) { tty.input(9); ret; }
+    if (code == 0x1C) { tty.input(10); ret; }
+    var cp: u32 = keymap.character(keymap.ps2_usage(code), shift, caps, altgr);
+    if (ctrl != 0) {
+        if (cp <= 127) { cp = tty.control(cp::u8)::u32; }
+        or             { cp = 0; }
+    }
+    if (cp != 0) {
         if (alt != 0) { tty.input(27); }  # alt+key: ESC first, as terminals send it
-        tty.input(c);
+        tty.input_codepoint(cp);
     }
 }
 
@@ -76,7 +78,7 @@ fun tilde(n: u8) {
 
 # keys behind the 0xE0 prefix: what a VT100-style terminal would send
 fun special(code: u8) {
-    if (code == 0x38) { alt = 1; ret; }     # right alt
+    if (code == 0x38) { altgr = 1; ret; }   # right alt (AltGr)
     if (alt != 0 && code == 0x4B) { cycle(tty.COUNT - 1); ret; }
     if (alt != 0 && code == 0x4D) { cycle(1); ret; }
     if (code == 0x48) { seq(65); }          # up     ESC [ A
@@ -111,7 +113,7 @@ pub fun irq() {
         if (extended != 0) {
             extended = 0;
             if ((code & 0x7F) == 0x1D) { ctrl = (code & 0x80) ^ 0x80; } # right ctrl
-            if (code == 0xB8) { alt = 0; }
+            if (code == 0xB8) { altgr = 0; }
             if ((code & 0x80) == 0) { special(code); }
             cnt;
         }

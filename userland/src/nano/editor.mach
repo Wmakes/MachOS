@@ -14,10 +14,12 @@ use os:  std.system.os;
 use io:  userland.lib.cli;
 use term: userland.ui.term;
 use system: userland.lib.system;
+use utf8: userland.lib.utf8;
 
 val CAP: u64 = 1048576;   # largest file: 1 MiB
 val MAXROWS: u64 = 128;
 val MAXCOLS: u64 = 512;
+val ROW_BYTES: u64 = 2048;
 val NONE: u64 = 0xFFFFFFFFFFFFFFFF;
 
 var text: [1048576]u8;
@@ -43,7 +45,7 @@ var last_was_cut: u8 = 0;
 var last_find: [128]u8;
 var last_find_len: u64 = 0;
 
-var shown: [128][512]u8;  # what each screen row shows now
+var shown: [128][2048]u8;  # UTF-8 bytes shown in each screen row
 var shown_len: [128]u64;
 var shown_ok: [128]u8;
 
@@ -71,7 +73,10 @@ fun on(s: *u8, n: u64) {
     }
 }
 
-fun o(s: *u8) { on(s, io.len(s)); }
+fun o(s: *u8) {
+    val translated: *u8 = io.text(s);
+    on(translated, io.len(translated));
+}
 
 fun odec(v: u64) {
     var b: [20]u8;
@@ -93,19 +98,22 @@ fun rev(on_: u8) {
 }
 
 fun say(s: *u8) {
-    msg_len = io.len(s);
+    val translated: *u8 = io.text(s);
+    msg_len = io.len(translated);
     if (msg_len > 255) { msg_len = 255; }
-    io.copy(?msg[0], s, msg_len);
+    io.copy(?msg[0], translated, msg_len);
 }
 
 # say "<a><number><b>"
 fun say_num(a: *u8, v: u64, b: *u8) {
     var t: [256]u8;
-    var k: u64 = io.len(a);
-    io.copy(?t[0], a, k);
+    val ta: *u8 = io.text(a);
+    val tb: *u8 = io.text(b);
+    var k: u64 = io.len(ta);
+    io.copy(?t[0], ta, k);
     k = k + io.fmt_dec(v, ?t[k]);
-    val bn: u64 = io.len(b);
-    io.copy(?t[k], b, bn);
+    val bn: u64 = io.len(tb);
+    io.copy(?t[k], tb, bn);
     k = k + bn;
     io.copy(?msg[0], ?t[0], k);
     msg_len = k;
@@ -148,17 +156,15 @@ fun nth_line(n: u64) u64 {
     ret i;
 }
 
-fun advance(col: u64, c: u8) u64 {
-    if (c == 9) { ret (col / 8 + 1) * 8; }
-    ret col + 1;
-}
-
 fun col_of(p: u64) u64 {
     var col: u64 = 0;
     var i: u64 = line_start(p);
     for (i < p) {
-        col = advance(col, text[i]);
-        i = i + 1;
+        if (text[i] == 9) { col = (col / 8 + 1) * 8; i = i + 1; }
+        or {
+            col = col + utf8.width(utf8.decode(?text[0], i, p));
+            i = utf8.next(?text[0], i, p);
+        }
     }
     ret col;
 }
@@ -168,10 +174,12 @@ fun at_col(s: u64, col: u64) u64 {
     var c: u64 = 0;
     var i: u64 = s;
     for (i < len && text[i] != 10) {
-        val n: u64 = advance(c, text[i]);
+        var n: u64 = c + utf8.width(utf8.decode(?text[0], i, len));
+        var after: u64 = utf8.next(?text[0], i, len);
+        if (text[i] == 9) { n = (c / 8 + 1) * 8; after = i + 1; }
         if (n > col) { brk; }
         c = n;
-        i = i + 1;
+        i = after;
     }
     ret i;
 }
@@ -261,10 +269,10 @@ fun del(pos: u64, n: u64, rec_: u8) {
     dirty = 1;
 }
 
-fun type_char(c: u8) {
-    var b: [1]u8;
-    b[0] = c;
-    if (ins(cur, ?b[0], 1, 1) != 0) { cur = cur + 1; }
+fun type_codepoint(cp: u32) {
+    var b: [4]u8;
+    val n: u64 = utf8.encode(cp, ?b[0]);
+    if (n != 0 && ins(cur, ?b[0], n, 1) != 0) { cur = cur + n; }
 }
 
 fun undo() {
@@ -355,7 +363,7 @@ fun write_out(p: *u8, pn: u64) u8 {
 
 # --- drawing ----------------------------------------------------------------
 
-var row_buf: [512]u8;
+var row_buf: [2048]u8;
 
 fun height() u64 {
     var h: u64 = term.height();
@@ -388,17 +396,36 @@ fun render_line(s: u64, w: u64) u64 {
     var n: u64 = 0;
     var col: u64 = 0;
     var i: u64 = s;
-    for (i < len && text[i] != 10 && n < w) {
-        val next: u64 = advance(col, text[i]);
-        for (col < next) {
-            if (col >= hoff && n < w) {
-                if (text[i] == 9 || text[i] < 32 || text[i] >= 127) { row_buf[n] = 32; }
-                or                                                  { row_buf[n] = text[i]; }
-                n = n + 1;
+    var drawn_base: u8 = 0;
+    for (i < len && text[i] != 10) {
+        var after: u64 = utf8.next(?text[0], i, len);
+        val char_width: u64 = utf8.width(utf8.decode(?text[0], i, len));
+        if (char_width != 0 && col >= hoff + w) { brk; }
+        var next_col: u64 = col + char_width;
+        if (text[i] == 9) { after = i + 1; next_col = (col / 8 + 1) * 8; }
+        if (text[i] == 9 || text[i] < 32) {
+            drawn_base = 0;
+            for (col < next_col) {
+                if (col >= hoff && n < ROW_BYTES) {
+                    row_buf[n] = 32;
+                    n = n + 1;
+                }
+                col = col + 1;
             }
-            col = col + 1;
         }
-        i = i + 1;
+        or {
+            if ((char_width == 0 && drawn_base != 0) ||
+                (char_width != 0 && col >= hoff && col < hoff + w)) {
+                val bytes: u64 = after - i;
+                if (n + bytes <= ROW_BYTES) {
+                    io.copy(?row_buf[n], ?text[i], bytes);
+                    n = n + bytes;
+                }
+            }
+            if (char_width != 0) { drawn_base = (col >= hoff && col < hoff + w)::u8; }
+            col = next_col;
+        }
+        i = after;
     }
     ret n;
 }
@@ -501,10 +528,11 @@ fun shortcuts(h: u64, w: u64, keys: **u8, labels: **u8, count: u64) {
                 o(keys[i]);
                 rev(0);
                 oc(32);
+                val label: *u8 = io.text(labels[i]);
                 var t: u64 = io.len(keys[i]) + 1;
-                var ll: u64 = io.len(labels[i]);
+                var ll: u64 = io.len(label);
                 if (t + ll > colw - 1) { ll = colw - 1 - t; }
-                on(labels[i], ll);
+                on(label, ll);
                 t = t + ll;
                 pad(t, colw);
                 used = used + colw;
@@ -585,22 +613,25 @@ fun ask(q: *u8, out: *u8, start: u64, cap: u64) u64 {
     var n: u64 = start;
     val h: u64 = height();
     val w: u64 = width();
+    val translated_q: *u8 = io.text(q);
     shortcuts(h, w, ?ask_keys[0], ?ask_labels[0], 2);
     for {
         go(h - 3, 0);
         rev(1);
-        o(q);
+        on(translated_q, io.len(translated_q));
         var shown_n: u64 = n;
         var from: u64 = 0;
-        val ql: u64 = io.len(q);
-        if (ql + n + 1 > w) {
-            from = ql + n + 1 - w;
-            shown_n = n - from;
+        val ql: u64 = io.len(translated_q);
+        var shown_cols: u64 = utf8.count(out, 0, n);
+        for (ql + shown_cols + 1 > w && from < n) {
+            from = utf8.next(out, from, n);
+            shown_cols = utf8.count(out, from, n);
         }
+        shown_n = n - from;
         on(?out[from], shown_n);
-        pad(ql + shown_n, w);
+        pad(ql + shown_cols, w);
         rev(0);
-        go(h - 3, ql + shown_n);
+        go(h - 3, ql + shown_cols);
         flush();
         val k: u64 = term.key();
         if (k == 10) { ret n; }
@@ -608,11 +639,15 @@ fun ask(q: *u8, out: *u8, start: u64, cap: u64) u64 {
             say("Cancelled\0");
             ret NONE;
         }
-        if ((k == 127 || k == 8) && n > 0) { n = n - 1; }
+        if ((k == 127 || k == 8) && n > 0) { n = utf8.previous(out, n); }
         if (k == 21) { n = 0; } # ^U: clear
-        if (((k >= 32 && k < 127) || k == 9) && n < cap) {
-            out[n] = k::u8;
-            n = n + 1;
+        if ((k >= 32 && k <= 0x10FFFF) || k == 9) {
+            var encoded: [4]u8;
+            val bytes: u64 = utf8.encode(k::u32, ?encoded[0]);
+            if (bytes != 0 && n + bytes <= cap) {
+                io.copy(?out[n], ?encoded[0], bytes);
+                n = n + bytes;
+            }
         }
     }
     ret NONE;
@@ -936,9 +971,10 @@ fun help() {
     var r: u64 = 0;
     for (r < count && r + 2 < h - 3) {
         go(r + 2, 0);
-        var n: u64 = io.len(help_lines[r]);
+        val line: *u8 = io.text(help_lines[r]);
+        var n: u64 = io.len(line);
         if (n > w) { n = w; }
-        on(help_lines[r], n);
+        on(line, n);
         r = r + 1;
     }
     var k1: [1]*u8;
@@ -977,9 +1013,9 @@ fun move_lines(k: u64, up: u8) {
 pub fun run(argc: u64, argv: **u8, prog: *u8) u64 {
     title = prog;
     if (argc > 2) {
-        io.err("usage: \0");
+        io.emsg("usage: \0");
         io.err(prog);
-        io.err(" [FILE]\n\0");
+        io.emsg(" [FILE]\n\0");
         ret 2;
     }
     system.release(?release[0], 64);
@@ -992,7 +1028,7 @@ pub fun run(argc: u64, argv: **u8, prog: *u8) u64 {
         var st: os.stat_t;
         if (io.stat(?name[0], ?st) >= 0 && io.kind_of(st.st_mode) != io.KIND_FILE) {
             io.err(prog);
-            io.err(": not a regular file\n\0");
+            io.emsg(": not a regular file\n\0");
             ret 1;
         }
         val got: u64 = read_in(?name[0], name_len, 0, 0);
@@ -1011,7 +1047,7 @@ pub fun run(argc: u64, argv: **u8, prog: *u8) u64 {
     }
     if (term.start(io.STDIN) == 0) {
         io.err(prog);
-        io.err(": stdin is not a terminal\n\0");
+        io.emsg(": stdin is not a terminal\n\0");
         ret 1;
     }
     for {
@@ -1063,12 +1099,12 @@ pub fun run(argc: u64, argv: **u8, prog: *u8) u64 {
         if (k == term.KEY_ALT + 92) { cur = 0; want_col = 0; cnt; }
         if (k == term.KEY_ALT + 47) { cur = nth_line(lines() - 1); want_col = 0; cnt; }
         if (k == term.KEY_LEFT || k == 2) {
-            if (cur > 0) { cur = cur - 1; }
+            if (cur > 0) { cur = utf8.previous(?text[0], cur); }
             want_col = col_of(cur);
             cnt;
         }
         if (k == term.KEY_RIGHT || k == 6) {
-            if (cur < len) { cur = cur + 1; }
+            if (cur < len) { cur = utf8.next(?text[0], cur, len); }
             want_col = col_of(cur);
             cnt;
         }
@@ -1088,19 +1124,20 @@ pub fun run(argc: u64, argv: **u8, prog: *u8) u64 {
         }
         if (k == 127 || k == 8) {
             if (cur > 0) {
-                cur = cur - 1;
-                del(cur, 1, 1);
+                val before: u64 = utf8.previous(?text[0], cur);
+                del(before, cur - before, 1);
+                cur = before;
             }
             want_col = col_of(cur);
             cnt;
         }
         if (k == term.KEY_DEL || k == 4) {
-            if (cur < len) { del(cur, 1, 1); }
+            if (cur < len) { del(cur, utf8.next(?text[0], cur, len) - cur, 1); }
             cnt;
         }
-        if (k == 10 || k == 9 || (k >= 32 && k < 127)) {
+        if (k == 10 || k == 9 || (k >= 32 && k <= 0x10FFFF)) {
             typing = was_typing;
-            type_char(k::u8);
+            type_codepoint(k::u32);
             typing = 1;
             if (k == 10) { typing = 0; } # a new line starts a new undo step
             want_col = col_of(cur);

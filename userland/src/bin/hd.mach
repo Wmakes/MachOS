@@ -25,7 +25,7 @@ fun run(argc: u64, argv: **u8) u64 {
         var okk: u8 = 0;
         limit = io.parse_dec(argv[i + 1], io.len(argv[i + 1]), ?okk);
         if (okk == 0) {
-            io.err("usage: hd [-n BYTES] [FILE]\n\0");
+            io.emsg("usage: hd [-n BYTES] [FILE]\n\0");
             ret 2;
         }
         i = i + 2;
@@ -51,26 +51,26 @@ fun run(argc: u64, argv: **u8) u64 {
         }
         if (got == 0) { brk; }
         hex(off, 8);
-        io.out("  \0");
+        io.msg("  \0");
         var k: u64 = 0;
         for (k < 16) {
             if (k < got::u64) {
                 hex(row[k]::u64, 2);
                 io.putc(32);
             } or {
-                io.out("   \0");
+                io.msg("   \0");
             }
             if (k == 7) { io.putc(32); }
             k = k + 1;
         }
-        io.out(" |\0");
+        io.msg(" |\0");
         k = 0;
         for (k < got::u64) {
             if (row[k] >= 32 && row[k] < 127) { io.putc(row[k]); }
             or                               { io.putc(46); }
             k = k + 1;
         }
-        io.out("|\n\0");
+        io.msg("|\n\0");
         off = off + got::u64;
         if (got < want) { brk; }
     }

@@ -9,7 +9,7 @@ fun main(argc: i64, argv: **u8) i64 { ret run(argc::u64, argv)::i64; }
 
 fun run(argc: u64, argv: **u8) u64 {
     if (argc != 3) {
-        io.err("usage: partname DISK N\n\0");
+        io.emsg("usage: partname DISK N\n\0");
         ret 2;
     }
     val d: *u8 = argv[1];
