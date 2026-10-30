@@ -25,7 +25,7 @@ A small Unix-like operating system for x86_64, written in [mach](https://machlan
 
 You don't need to build MachOS from source to try it out! Prebuilt ISO images are available on the project's GitHub Releases page.
 
-Download the latest `MachOS-*.*.*.iso` from the [Releases page](../../releases/latest).
+Download the latest `machos-*.*.*.iso` from the [Releases page](../../releases/latest).
 
 MachOS supports UEFI booting and can run in a virtual machine or directly on compatible x86_64 hardware.
 
@@ -41,7 +41,7 @@ Boot the downloaded ISO:
 qemu-system-x86_64 \
   -m 2G \
   -smp 2 \
-  -cdrom MachOS-*.*.*.iso \
+  -cdrom machos-*.*.*.iso \
   -boot d \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd
 ```
@@ -59,13 +59,13 @@ MachOS can also boot directly on a physical x86_64 computer using a USB drive.
 **Requirements:**
 - A 64-bit x86_64 computer with UEFI firmware
 - A USB drive
-- The downloaded `MachOS-*.*.*.iso`
+- The downloaded `machos-*.*.*.iso`
 - Secure Boot disabled
 
 **Option 1: Ventoy**
 
 1. Install [Ventoy](https://www.ventoy.net/) on your USB drive.
-2. Copy `MachOS-*.*.*.iso` onto the Ventoy drive.
+2. Copy `machos-*.*.*.iso` onto the Ventoy drive.
 3. Reboot your computer and open its boot menu.
 4. Select the USB drive and boot MachOS.
 
@@ -80,7 +80,7 @@ lsblk
 Then write the ISO to it:
 
 ```bash
-sudo dd if=MachOS-*.*.*.iso of=/dev/sdX bs=4M status=progress conv=fsync
+sudo dd if=machos-*.*.*.iso of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 (Replace *.*.* with the actual version in the .iso filename and replace `/dev/sdX` with your actual USB device, not a partition.) 
 **Warning:** This command will erase all data on the selected USB drive. Double-check the device before running it.
@@ -91,7 +91,7 @@ On Windows, you can use a graphical utility to create a bootable USB drive.
 
 1. Download and install [Rufus](https://rufus.ie/) or [balenaEtcher](https://etcher.balena.io/).
 2. Insert your USB drive.
-3. Select the downloaded `MachOS-*.*.*.iso`.
+3. Select the downloaded `machos-*.*.*.iso`.
 4. Select your USB drive as the target.
 5. Write the image to the drive. If Rufus offers a choice between ISO and DD modes, use DD mode.
 6. Reboot and select the USB drive from your UEFI boot menu.
