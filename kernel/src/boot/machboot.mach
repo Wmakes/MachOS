@@ -62,5 +62,12 @@ pub fun collect(h_pa: u64, bi: *info.BootInfo) *u8 {
         i = i + 1;
     }
     bi.loader[31] = 0;
+    if (h.entropy_len > 64) { ret "boot: invalid entropy seed length\0"; }
+    bi.entropy_len = h.entropy_len;
+    i = 0;
+    for (i < bi.entropy_len) {
+        bi.entropy[i] = h.entropy[i];
+        i = i + 1;
+    }
     ret nil;
 }

@@ -43,4 +43,6 @@ pub rec BootInfo {
     trampoline: u64;      # 4 pages below 1 MiB for starting cpus (physical), 0: none
     root_guid:  [16]u8;   # the GPT partition the kernel was loaded from (zeros: unknown)
     loader:     [32]u8;   # the boot loader's name and version
+    entropy:    [64]u8;   # seed copied from firmware by the boot loader
+    entropy_len: u64;
 }

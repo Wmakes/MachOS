@@ -1,0 +1,178 @@
+# HMAC-DRBG with SHA-256, following NIST SP 800-90A revision 1.
+#
+# This module is freestanding so kernels and boot code can use it without a
+# runtime. Callers must provide at least 256 bits of entropy and a nonce that
+# is unique for the lifetime of that entropy source.
+
+use sha256: sdk.sha256;
+
+pub val MIN_ENTROPY: u64 = 32;
+pub val MAX_REQUEST: u64 = 65536;
+val MAX_INPUT: u64 = 1048576;
+val RESEED_INTERVAL: u64 = 281474976710656; # 2^48 requests
+
+pub rec State {
+    key:            [32]u8;
+    value:          [32]u8;
+    reseed_counter: u64;
+    ready:          u8;
+}
+
+rec Hmac {
+    inner: sha256.Ctx;
+    outer: [64]u8;
+}
+
+fun wipe(p: *u8, n: u64) {
+    var i: u64 = 0;
+    for (i < n) {
+        p[i] = 0;
+        i = i + 1;
+    }
+}
+
+fun copy(dst: *u8, src: *u8, n: u64) {
+    var i: u64 = 0;
+    for (i < n) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+fun hmac_init(h: *Hmac, key: *u8) {
+    var inner: [64]u8;
+    var i: u64 = 0;
+    for (i < 64) {
+        var k: u8 = 0;
+        if (i < 32) { k = key[i]; }
+        inner[i] = k ^ 0x36;
+        h.outer[i] = k ^ 0x5c;
+        i = i + 1;
+    }
+    sha256.init(?h.inner);
+    sha256.update(?h.inner, ?inner[0], 64);
+    wipe(?inner[0], 64);
+}
+
+fun hmac_add(h: *Hmac, data: *u8, n: u64) {
+    if (n != 0) { sha256.update(?h.inner, data, n); }
+}
+
+fun hmac_finish(h: *Hmac, out: *u8) {
+    var digest: [32]u8;
+    sha256.finish(?h.inner, ?digest[0]);
+    var outer: sha256.Ctx;
+    sha256.init(?outer);
+    sha256.update(?outer, ?h.outer[0], 64);
+    sha256.update(?outer, ?digest[0], 32);
+    sha256.finish(?outer, out);
+    wipe(?digest[0], 32);
+    wipe(?h.outer[0], 64);
+}
+
+fun hmac_value(out: *u8, key: *u8, value: *u8) {
+    var h: Hmac;
+    hmac_init(?h, key);
+    hmac_add(?h, value, 32);
+    hmac_finish(?h, out);
+}
+
+fun valid(data: *u8, n: u64) u8 {
+    ret (n <= MAX_INPUT && (n == 0 || data != nil))::u8;
+}
+
+# HMAC_DRBG_Update with provided_data = first || second || third.
+fun update(s: *State, first: *u8, first_len: u64, second: *u8,
+    second_len: u64, third: *u8, third_len: u64) {
+    var next: [32]u8;
+    var control: u8 = 0;
+    var h: Hmac;
+    hmac_init(?h, ?s.key[0]);
+    hmac_add(?h, ?s.value[0], 32);
+    hmac_add(?h, ?control, 1);
+    hmac_add(?h, first, first_len);
+    hmac_add(?h, second, second_len);
+    hmac_add(?h, third, third_len);
+    hmac_finish(?h, ?next[0]);
+    copy(?s.key[0], ?next[0], 32);
+    hmac_value(?next[0], ?s.key[0], ?s.value[0]);
+    copy(?s.value[0], ?next[0], 32);
+
+    if (first_len + second_len + third_len != 0) {
+        control = 1;
+        hmac_init(?h, ?s.key[0]);
+        hmac_add(?h, ?s.value[0], 32);
+        hmac_add(?h, ?control, 1);
+        hmac_add(?h, first, first_len);
+        hmac_add(?h, second, second_len);
+        hmac_add(?h, third, third_len);
+        hmac_finish(?h, ?next[0]);
+        copy(?s.key[0], ?next[0], 32);
+        hmac_value(?next[0], ?s.key[0], ?s.value[0]);
+        copy(?s.value[0], ?next[0], 32);
+    }
+    wipe(?next[0], 32);
+}
+
+# Instantiate from entropy, a nonce, and optional personalization data.
+# Returns 0 without creating usable state when an input is invalid.
+pub fun init(s: *State, entropy: *u8, entropy_len: u64, nonce: *u8,
+    nonce_len: u64, personalization: *u8, personalization_len: u64) u8 {
+    if (s == nil || entropy_len < MIN_ENTROPY || valid(entropy, entropy_len) == 0 ||
+        valid(nonce, nonce_len) == 0 || valid(personalization, personalization_len) == 0 ||
+        entropy_len + nonce_len < entropy_len ||
+        entropy_len + nonce_len + personalization_len < entropy_len + nonce_len) { ret 0; }
+    wipe(?s.key[0], 32);
+    var i: u64 = 0;
+    for (i < 32) {
+        s.value[i] = 1;
+        i = i + 1;
+    }
+    s.ready = 0;
+    s.reseed_counter = 0;
+    update(s, entropy, entropy_len, nonce, nonce_len, personalization, personalization_len);
+    s.reseed_counter = 1;
+    s.ready = 1;
+    ret 1;
+}
+
+# Add fresh entropy. The additional input may be empty.
+pub fun reseed(s: *State, entropy: *u8, entropy_len: u64,
+    additional: *u8, additional_len: u64) u8 {
+    if (s == nil || s.ready == 0 || entropy_len < MIN_ENTROPY ||
+        valid(entropy, entropy_len) == 0 || valid(additional, additional_len) == 0 ||
+        entropy_len + additional_len < entropy_len) { ret 0; }
+    update(s, entropy, entropy_len, additional, additional_len, nil, 0);
+    s.reseed_counter = 1;
+    ret 1;
+}
+
+# Generate up to MAX_REQUEST bytes. Additional input may be empty.
+pub fun generate(s: *State, out: *u8, n: u64,
+    additional: *u8, additional_len: u64) u8 {
+    if (s == nil || s.ready == 0 || n > MAX_REQUEST || (n != 0 && out == nil) ||
+        valid(additional, additional_len) == 0 || s.reseed_counter > RESEED_INTERVAL) { ret 0; }
+    if (additional_len != 0) { update(s, additional, additional_len, nil, 0, nil, 0); }
+    var at: u64 = 0;
+    for (at < n) {
+        var next: [32]u8;
+        hmac_value(?next[0], ?s.key[0], ?s.value[0]);
+        copy(?s.value[0], ?next[0], 32);
+        var take: u64 = n - at;
+        if (take > 32) { take = 32; }
+        copy((out::u64 + at)::*u8, ?next[0], take);
+        wipe(?next[0], 32);
+        at = at + take;
+    }
+    update(s, additional, additional_len, nil, 0, nil, 0);
+    s.reseed_counter = s.reseed_counter + 1;
+    ret 1;
+}
+
+pub fun destroy(s: *State) {
+    if (s == nil) { ret; }
+    wipe(?s.key[0], 32);
+    wipe(?s.value[0], 32);
+    s.reseed_counter = 0;
+    s.ready = 0;
+}

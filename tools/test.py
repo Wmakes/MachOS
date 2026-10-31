@@ -1388,10 +1388,12 @@ TESTS = [
       "wait:" + P, "send:runtests /bin/socket-tests 0 19\\n", "wait:runtests:", "wait:" + P],
      ["runtests: 20 passed, 0 failed, 0 hung"]),
 
-    ("socket-kernel-no-entropy", False, True,
-     ["--prep", with_kernel_sockets, "--boot", disk, "--qemu=-cpu", "--qemu=max,-rdrand,-rdseed",
-      "wait:" + P, "send:runtests /bin/socket-tests 0 19\\n", "wait:runtests:", "wait:" + P],
-     ["runtests: 20 passed, 0 failed, 0 hung"]),
+    ("entropy-required", False, False,
+     ["--nologin", "--boot", disk, "--qemu=-cpu", "--qemu=max,-rdrand,-rdseed",
+      "wait:secure random entropy is unavailable"],
+     ["This machine or VM does not provide the required entropy source.",
+      "If this is a VM, check that its CPU flags are correct.",
+      "https://github.com/Wmakes/MachOS/issues"]),
 
     ("tlstest", False, False,
      ["--prep", with_tlssuite, "--boot", disk, tlssuite_steps],

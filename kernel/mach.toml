@@ -85,3 +85,11 @@ out = "console-tests"
 targets = ["host"]
 link = []
 need = []
+
+[artifact.drbg-tests]
+kind = "bin"
+entry = "tests/drbg.mach"
+out = "drbg-tests"
+targets = ["host"]
+link = []
+need = []

@@ -54,4 +54,6 @@ pub rec Handoff {
     root_guid:  [16]u8;    # unique GUID of the GPT partition the kernel came from (zeros: the EFI partition)
     loader:     [32]u8;    # "machboot 0.8.0", NUL-terminated
     boot_us:    u64;       # microseconds machboot spent (from its start to the jump), 0 if unknown
+    entropy:    [64]u8;    # EFI_RNG_PROTOCOL seed, when firmware provides one
+    entropy_len: u64;      # 0 or 64; appended compatibly to protocol version 1
 }

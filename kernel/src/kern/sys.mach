@@ -38,6 +38,7 @@ use mmap:   machos.kern.mmap;
 use smp:    machos.arch.x86_64.smp;
 use fs_lock: machos.kern.fs_lock;
 use work: machos.kern.work;
+use random: machos.kern.random;
 
 val ARGS_MAX: u64 = 65536;
 val ENV_MAX: u64 = 65536;
@@ -1301,31 +1302,13 @@ fun sys_clock(id: u64, out: u64) u64 {
     ret 0;
 }
 
-# GETRANDOM uses the CPU entropy source directly. timer/RTC/TSC values do
-# not have a measured entropy budget, so machines without RDSEED/RDRAND
-# fail explicitly instead of silently serving a predictable PRNG to TLS.
+# GETRANDOM uses the kernel HMAC-DRBG, seeded from firmware and/or CPU
+# entropy before boot can continue.
 fun sys_getrandom(buf: u64, n: u64) u64 {
     if (n > 0x100000) { ret e(abi.E_INVAL); }
     if (ok(buf, n, 1) == 0) { ret e(abi.E_FAULT); }
     if (n == 0) { ret 0; }
-    if (cpu.has_random_source() == 0) { ret e(abi.E_NOTSUP); }
-    var i: u64 = 0;
-    for (i < n) {
-        var good: u8 = 0;
-        var v: u64 = cpu.rdseed(?good);
-        if (good == 0) { v = cpu.rdrand(?good); }
-        if (good == 0) {
-            if (i > 0) { ret i; }
-            ret e(abi.E_AGAIN);
-        }
-        var k: u64 = 0;
-        for (k < 8 && i < n) {
-            @((buf + i)::*u8) = (v & 0xFF)::u8;
-            v = v >> 8;
-            k = k + 1;
-            i = i + 1;
-        }
-    }
+    if (random.fill(buf::*u8, n) == 0) { ret e(abi.E_AGAIN); }
     ret n;
 }
 

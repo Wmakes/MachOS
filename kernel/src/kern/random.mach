@@ -1,0 +1,67 @@
+# Kernel cryptographic random generator. Firmware entropy passed by machboot
+# and the x86 RDSEED/RDRAND source are mixed into HMAC-DRBG during boot.
+
+use cpu:  machos.arch.x86_64.cpu;
+use drbg: sdk.hmac_drbg;
+
+var state: drbg.State;
+
+fun wipe(p: *u8, n: u64) {
+    var i: u64 = 0;
+    for (i < n) {
+        p[i] = 0;
+        i = i + 1;
+    }
+}
+
+fun cpu_seed(out: *u8, n: u64) u64 {
+    var at: u64 = 0;
+    for (at < n) {
+        var okay: u8 = 0;
+        var value: u64 = cpu.rdseed(?okay);
+        if (okay == 0) { value = cpu.rdrand(?okay); }
+        if (okay == 0) { ret at; }
+        var i: u64 = 0;
+        for (i < 8 && at < n) {
+            out[at] = (value & 0xff)::u8;
+            value = value >> 8;
+            at = at + 1;
+            i = i + 1;
+        }
+    }
+    ret at;
+}
+
+# Seed from firmware, the CPU, or both. Firmware bytes are wiped whether or
+# not initialization succeeds. Returns 0 when no adequate source exists.
+pub fun init(firmware: *u8, firmware_len: u64) u8 {
+    var seed: [128]u8;
+    var n: u64 = 0;
+    if (firmware != nil && firmware_len <= 64) {
+        for (n < firmware_len) {
+            seed[n] = firmware[n];
+            firmware[n] = 0;
+            n = n + 1;
+        }
+    }
+    if (cpu.has_random_source() != 0) { n = n + cpu_seed(?seed[n], 128 - n); }
+    if (n < 48) {
+        wipe(?seed[0], 128);
+        ret 0;
+    }
+    # Reserve 16 random bytes for the SP 800-90A nonce.
+    val okay: u8 = drbg.init(?state, ?seed[0], n - 16, ?seed[n - 16], 16, nil, 0);
+    wipe(?seed[0], 128);
+    ret okay;
+}
+
+pub fun fill(out: *u8, n: u64) u8 {
+    var at: u64 = 0;
+    for (at < n) {
+        var take: u64 = n - at;
+        if (take > drbg.MAX_REQUEST) { take = drbg.MAX_REQUEST; }
+        if (drbg.generate(?state, (out::u64 + at)::*u8, take, nil, 0) == 0) { ret 0; }
+        at = at + take;
+    }
+    ret 1;
+}

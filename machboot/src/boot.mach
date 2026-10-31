@@ -173,6 +173,18 @@ fun acpi(h: *ho.Handoff) {
     }
 }
 
+# Preserve firmware entropy before ExitBootServices removes the RNG protocol.
+# Failure is not fatal here: the kernel can still use RDSEED or RDRAND.
+fun entropy(h: *ho.Handoff) {
+    h.entropy_len = 0;
+    var g: efi.Guid;
+    efi.rng_guid(?g);
+    var rp: u64 = 0;
+    if (efi.failed(efi.bs.locate_protocol(?g, 0, ?rp)) != 0 || rp == 0) { ret; }
+    val rng: *efi.Rng = rp::*efi.Rng;
+    if (efi.failed(rng.get_rng(rng, nil, 64, ?h.entropy[0])) == 0) { h.entropy_len = 64; }
+}
+
 # --- the memory map ---------------------------------------------------------
 
 var map: u64 = 0;
@@ -310,6 +322,7 @@ pub fun boot(e: *conf.Entry) u8 {
     }
     framebuffer(h);
     acpi(h);
+    entropy(h);
     h.trampoline = efi.alloc_pages(4, 0x9F000); # below 640 KiB, for starting cpus
     h.regions = efi.alloc_pages((ho.MAX_REGIONS * 24 + 4095) / 4096, 0);
     if (h.regions == 0) { ret fail("out of memory\0"); }
