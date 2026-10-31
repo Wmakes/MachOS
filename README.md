@@ -39,6 +39,8 @@ Boot the downloaded ISO:
 
 ```bash
 qemu-system-x86_64 \
+  -M q35 \
+  -cpu max \
   -m 2G \
   -smp 2 \
   -cdrom machos-*.*.*.iso \
