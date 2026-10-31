@@ -21,7 +21,7 @@ def version_ok(value):
     if plus and (not build or any(not re.fullmatch(r"[0-9A-Za-z-]+", part) for part in build.split("."))):
         return False
     core, dash, pre = main.partition("-")
-    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", core):
+    if not re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2,}", core):
         return False
     if any(int(part) > 2**64 - 1 for part in core.split(".")):
         return False

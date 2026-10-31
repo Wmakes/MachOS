@@ -9,7 +9,6 @@ use std.system.os;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
-use sem: std.types.semver;
 use std.types.size.usize;
 use std.types.string.str;
 use io: userland.lib.cli;
@@ -122,23 +121,177 @@ fun integer(table: *toml.Table, key: str, out: *u64) u8 {
     ret 1;
 }
 
+rec Version {
+    core_end:  u64;
+    pre_start: u64;
+    pre_end:   u64;
+    has_pre:   u8;
+}
+
+fun digit(c: u8) u8 {
+    ret (c >= 48 && c <= 57)::u8;
+}
+
+fun version_char(c: u8) u8 {
+    ret ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45)::u8;
+}
+
+fun core_part(input: *u8, pos: *u64, end: u64, out: *u64) u8 {
+    val start: u64 = @pos;
+    if (start >= end || digit(input[start]) == 0)                              { ret 0; }
+    if (input[start] == 48 && start + 1 < end && digit(input[start + 1]) != 0) { ret 0; }
+    var value: u64 = 0;
+    for (@pos < end && digit(input[@pos]) != 0) {
+        val n: u64 = (input[@pos] - 48)::u64;
+        if (value > 1844674407370955161u64 || (value == 1844674407370955161u64 && n > 5)) { ret 0; }
+        value = value * 10 + n;
+        @pos  = @pos + 1;
+    }
+    @out = value;
+    ret 1;
+}
+
+fun identifiers(input: *u8, start: u64, end: u64, prerelease: u8) u8 {
+    if (start >= end) { ret 0; }
+    var pos: u64 = start;
+    for (pos < end) {
+        val first:   u64 = pos;
+        var numeric: u8  = 1;
+        for (pos < end && input[pos] != 46) {
+            if (version_char(input[pos]) == 0) { ret 0; }
+            if (digit(input[pos]) == 0)        { numeric = 0; }
+            pos = pos + 1;
+        }
+        if (pos == first || (prerelease != 0 && numeric != 0 && pos - first > 1 && input[first] == 48)) { ret 0; }
+        if (pos < end) {
+            pos = pos + 1;
+            if (pos == end) { ret 0; }
+        }
+    }
+    ret 1;
+}
+
+fun inspect(input: *u8, out: *Version) u8 {
+    val n: u64 = io.len(input);
+    if (n == 0 || n > 127) { ret 0; }
+    var pos:   u64 = 0;
+    var count: u64 = 0;
+    var part:  u64 = 0;
+    for {
+        if (core_part(input, ?pos, n, ?part) == 0) { ret 0; }
+        count = count + 1;
+        if (pos == n || input[pos] == 45 || input[pos] == 43) { brk; }
+        if (input[pos] != 46)                                 { ret 0; }
+        pos = pos + 1;
+    }
+    if (count < 3) { ret 0; }
+    (@out).core_end  = pos;
+    (@out).pre_start = 0;
+    (@out).pre_end   = 0;
+    (@out).has_pre   = 0;
+    if (pos < n && input[pos] == 45) {
+        pos              = pos + 1;
+        (@out).pre_start = pos;
+        for (pos < n && input[pos] != 43) { pos = pos + 1; }
+        (@out).pre_end = pos;
+        (@out).has_pre = 1;
+        if (identifiers(input, (@out).pre_start, (@out).pre_end, 1) == 0) { ret 0; }
+    }
+    if (pos < n && input[pos] == 43) {
+        pos = pos + 1;
+        if (identifiers(input, pos, n, 0) == 0) { ret 0; }
+        pos = n;
+    }
+    ret (pos == n)::u8;
+}
+
+fun bounded(left: *u8, left_start: u64, left_end: u64, right: *u8, right_start: u64, right_end: u64) i64 {
+    val left_len:  u64 = left_end - left_start;
+    val right_len: u64 = right_end - right_start;
+    var n:         u64 = left_len;
+    if (right_len < n) { n = right_len; }
+    var i: u64 = 0;
+    for (i < n) {
+        if (left[left_start + i] < right[right_start + i]) { ret -1; }
+        if (left[left_start + i] > right[right_start + i]) { ret 1; }
+        i = i + 1;
+    }
+    if (left_len < right_len) { ret -1; }
+    if (left_len > right_len) { ret 1; }
+    ret 0;
+}
+
+fun numeric(input: *u8, start: u64, end: u64) u8 {
+    var i: u64 = start;
+    for (i < end) {
+        if (digit(input[i]) == 0) { ret 0; }
+        i = i + 1;
+    }
+    ret (end > start)::u8;
+}
+
+fun prerelease(left: *u8, l: *Version, right: *u8, r: *Version) i64 {
+    if ((@l).has_pre == 0 && (@r).has_pre == 0) { ret 0; }
+    if ((@l).has_pre == 0)                      { ret 1; }
+    if ((@r).has_pre == 0)                      { ret -1; }
+    var lp: u64 = (@l).pre_start;
+    var rp: u64 = (@r).pre_start;
+    for {
+        if (lp >= (@l).pre_end && rp >= (@r).pre_end) { ret 0; }
+        if (lp >= (@l).pre_end)                       { ret -1; }
+        if (rp >= (@r).pre_end)                       { ret 1; }
+        var le: u64 = lp;
+        var re: u64 = rp;
+        for (le < (@l).pre_end && left[le] != 46) { le = le + 1; }
+        for (re < (@r).pre_end && right[re] != 46) { re = re + 1; }
+        val ln: u8 = numeric(left, lp, le);
+        val rn: u8 = numeric(right, rp, re);
+        if (ln != 0 && rn == 0) { ret -1; }
+        if (ln == 0 && rn != 0) { ret 1; }
+        if (ln != 0 && rn != 0) {
+            if (le - lp < re - rp) { ret -1; }
+            if (le - lp > re - rp) { ret 1; }
+        }
+        val order: i64 = bounded(left, lp, le, right, rp, re);
+        if (order != 0) { ret order; }
+        lp = le + 1;
+        rp = re + 1;
+    }
+    ret 0;
+}
+
 pub fun compare(left: *u8, right: *u8) i64 {
-    val a: *A.Allocator = allocator();
-    if (a == nil) { ret -2; }
-    var storage:     arena.Arena;
-    val initialized: err[A.Error] = arena.init(?storage, a, 4096);
-    if (sel initialized.err) { ret -2; }
-    fin { arena.dnit(?storage); }
-    var scratch: A.Allocator;
-    val made:    err[A.Error] = arena.make(?scratch, ?storage);
-    if (sel made.err) { ret -2; }
-    val x: res[sem.Semver, sem.SemverError] = sem.semver_parse(left::str, ?scratch);
-    val y: res[sem.Semver, sem.SemverError] = sem.semver_parse(right::str, ?scratch);
-    if (sel x.err) { ret -2; }
-    if (sel y.err) { ret -2; }
-    var one: sem.Semver = x.ok;
-    var two: sem.Semver = y.ok;
-    ret sem.semver_compare(?one, ?two);
+    var l: Version;
+    var r: Version;
+    if (inspect(left, ?l) == 0 || inspect(right, ?r) == 0) { ret -2; }
+    var lp: u64 = 0;
+    var rp: u64 = 0;
+    for (lp < l.core_end || rp < r.core_end) {
+        var lv: u64 = 0;
+        var rv: u64 = 0;
+        if (lp < l.core_end) {
+            core_part(left, ?lp, l.core_end, ?lv);
+            if (lp < l.core_end) { lp = lp + 1; }
+        }
+        if (rp < r.core_end) {
+            core_part(right, ?rp, r.core_end, ?rv);
+            if (rp < r.core_end) { rp = rp + 1; }
+        }
+        if (lv < rv) { ret -1; }
+        if (lv > rv) { ret 1; }
+    }
+    ret prerelease(left, ?l, right, ?r);
+}
+
+test compare__extended_numeric_versions {
+    if (compare("0.9.4.1", "0.9.4") <= 0)           { ret 1; }
+    if (compare("0.9.4.1.2", "0.9.4.1.1") <= 0)     { ret 1; }
+    if (compare("0.9.4.0", "0.9.4") != 0)           { ret 1; }
+    if (compare("0.9.4.1-alpha", "0.9.4.1") >= 0)   { ret 1; }
+    if (compare("0.9.4.1+one", "0.9.4.1+two") != 0) { ret 1; }
+    if (compare("0.9.4.01", "0.9.4.01") != -2)      { ret 1; }
+    if (compare("0.9.4.", "0.9.4.") != -2)          { ret 1; }
+    ret 0;
 }
 
 pub fun satisfies(version: *u8, constraint: *u8) u8 {
