@@ -244,9 +244,14 @@ fun kmain(handoff: u64) {
     val us: u64 = cpu.us_since_boot(cpu.rdtsc());
     kprint.dec(us / 1000);
     kprint.puts(" ms, starting /bin/init\0");
-    if (rescue() != 0) { kprint.puts(" (rescue mode)\0"); }
+    val rescue_mode: u8 = rescue();
+    if (rescue_mode != 0) { kprint.puts(" (rescue mode)\0"); }
     kprint.putc(10);
-    val pid: u64 = sys.spawn_init("/bin/init\0", rescue());
+    # Once the normal login UI owns tty1, keep routine asynchronous kernel
+    # messages in dmesg instead of writing through its prompt. Explicit debug
+    # boots and rescue mode retain the live kernel console.
+    if (rescue_mode == 0 && kprint.console_level() == kprint.INFO) { kprint.set_console_level(kprint.WARN); }
+    val pid: u64 = sys.spawn_init("/bin/init\0", rescue_mode);
     if (abi.is_err(pid) != 0) {
         kprint.puts("/bin/init: \0");
         kprint.panic(abi.err_name(pid));
